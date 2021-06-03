@@ -5,7 +5,7 @@ use std::env::args;
 use std::ffi::CString;
 use std::ptr;
 
-use unshare::{Child, Command, Error, Stdio};
+use unshare::{Command, Error, ExitStatus, Stdio};
 
 /// callback that mounts a new proc filesystem
 /// this cannot allocate
@@ -25,7 +25,7 @@ fn mount_proc() -> std::io::Result<()> {
 
 /// launch actual child process in new uts and pid namespaces
 /// with chroot and new proc filesystem
-fn child() -> Result<Child, Error> {
+fn child() -> Result<ExitStatus, Error> {
     unsafe {
         Command::new(args().nth(1).unwrap())
             .unshare(
@@ -40,7 +40,7 @@ fn child() -> Result<Child, Error> {
             .stdout(Stdio::inherit())
             .chroot_dir("/home/rootfs")
             .pre_exec(mount_proc)
-            .spawn()
+            .status()
     }
 }
 
@@ -51,11 +51,5 @@ fn main() {
         panic!("Not enough argument supplied.  Gotta run something!")
     }
 
-    panic_spawn(&child);
-}
-
-fn panic_spawn(p: &(dyn Fn() -> Result<Child, Error>)) {
-    p().expect("failed to fork child")
-        .wait()
-        .expect("failed to wait for child to exit");
+    child().expect("failed to spawn child");
 }
