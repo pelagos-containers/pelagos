@@ -1,3 +1,4 @@
 {
-    "rust-client.rustupPath": "~/.cargo/bin/rustup"
+    "rust-client.rustupPath": "~/.cargo/bin/rustup",
+    "workbench.editor.showTabs": false
 }

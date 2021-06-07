@@ -8,6 +8,6 @@ edition = "2018"
 [dependencies]
 subprocess = "*"
 cgroups-fs = "*"
-unshare = "*"
+unshare = {path = "../unshare"}
 palaver = "*"
 libc = "*"
