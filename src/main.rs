@@ -2,15 +2,16 @@
 
 use core::panic;
 use std::env::args;
+use std::env::ArgsOs;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
-fn fork_exec(_to_run: PathBuf) -> Result<Child, Error> {
-    let self_exe = palaver::env::exe_path();
-    let new_args: Vec<_> = std::env::args_os().skip(1).collect();
-    Command::new(self_exe.unwrap())
+fn fork_exec(to_run: PathBuf, args: ArgsOs) -> Result<Child, Error> {
+    let new_args: Vec<_> = args.skip(1).collect();
+    println!("fork exec to_run: {:?}, new args: {:?}", to_run, new_args);
+    Command::new(to_run)
         .args(&new_args)
         .arg0("child")
         .stdin(Stdio::inherit())
@@ -42,9 +43,12 @@ fn fork_exec(_to_run: PathBuf) -> Result<Child, Error> {
 
 /// launch actual child process in new uts and pid namespaces
 /// with chroot and new proc filesystem
-fn child(to_run: PathBuf) -> Result<Child, Error> {
+fn child(to_run: PathBuf, args: ArgsOs) -> Result<Child, Error> {
     unsafe {
+        let new_args: Vec<_> = args.skip(2).collect();
+        println!("child to_run: {:?}, new args: {:?}", to_run, new_args);
         Command::new(to_run)
+            .args(&new_args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -66,16 +70,21 @@ fn main() {
     match args().nth(0).as_deref() {
         Some("child") => {
             println!("CHILD: {}", std::process::id());
-            panic_spawn("child", &child, PathBuf::from(args().nth(1).unwrap()));
+            let new_args = std::env::args_os();
+            panic_spawn(
+                "child",
+                &child,
+                PathBuf::from(args().nth(1).unwrap()),
+                new_args,
+            );
         }
         Some(_) => {
             println!("PARENT: {}", std::process::id());
             println!("Gonna run '{:?}'", args());
-            panic_spawn(
-                "fork exec",
-                &fork_exec,
-                PathBuf::from(args().nth(1).unwrap()),
-            );
+
+            let self_exe = palaver::env::exe_path().unwrap();
+            let new_args = std::env::args_os();
+            panic_spawn("fork exec", &fork_exec, self_exe, new_args);
         }
         _ => {
             panic!("NEITHER PARENT NOR CHILD?");
@@ -85,11 +94,12 @@ fn main() {
 
 fn panic_spawn(
     which: &'static str,
-    p: &(dyn Fn(PathBuf) -> Result<Child, Error>),
+    p: &(dyn Fn(PathBuf, ArgsOs) -> Result<Child, Error>),
     to_run: PathBuf,
+    args: ArgsOs,
 ) {
     println!("spawning '{}'", which);
-    p(to_run)
+    p(to_run, args)
         .expect(format!("panicking on {}", which).as_str())
         .wait()
         .expect(format!("failed to wait for {} to exit", which).as_str());
