@@ -141,8 +141,9 @@ fn main() {
             }
             "" => {
                 println!("PID of PARENT: {}", std::process::id());
+                //mount_sys().unwrap();
                 //mount_cgroup().unwrap();
-                //nmount_sys().unwrap();
+                
 
                 let self_exe = palaver::env::exe_path().unwrap();
                 let mut new_args : Vec<OsString> = std::env::args_os().skip(1).collect();
