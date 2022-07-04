@@ -14,8 +14,9 @@ use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
 const ALPINE_ROOTFS : &str = "alpine-rootfs";
-#[allow(dead_code)]
 const ALPINE_SYS : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys";
+#[allow(dead_code)]
+const ALPINE_CGROUP : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys/fs";
 #[allow(dead_code)]
 const SYSFS : &str = "sysfs";
 const USERNAME : &str = "vagrant";
@@ -143,8 +144,7 @@ fn main() {
             }
             "" => {
                 println!("PID of PARENT: {}", std::process::id());
-                //mount_sys().unwrap();                
-                //mount_cgroup().unwrap();
+                mount_sys().unwrap();
 
                 let self_exe = palaver::env::exe_path().unwrap();
                 let mut new_args : Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -210,11 +210,11 @@ fn mount_proc() -> std::io::Result<()> {
 #[allow(dead_code)]
 fn mount_cgroup() -> std::io::Result<()> {
     unsafe {
-        let cgroups_str = CString::new("sys/fs/cgroup")?;
         let src_str = "cgroup_root";
         println!("source is {:?}", src_str);        
         let fs_type_str = "cgroup";
         println!("fs_type is {:?}", fs_type_str);        
+        let cgroups_str = CString::new(ALPINE_CGROUP)?;        
         let cgroups_str_ptr = cgroups_str.as_ptr();
         let src_str_ptr = src_str.as_ptr();
         
@@ -272,4 +272,18 @@ fn umount_sys() -> std::io::Result<()> {
             _ => Err(std::io::Error::last_os_error()),
         }
     }
+}
+
+#[allow(dead_code)]
+fn mounts() -> std::io::Result<()> {
+    match mount_proc() {
+        Ok(_) => println!("mounted proc"),
+        Err(e) => println!("failed to mount sys {:?}",e)
+    }
+
+    match mount_cgroup() {
+        Ok(_) => println!("mounted cgroup"),
+        Err(e) => println!("failed to mount cgroup {:?}",e)        
+    }
+    Ok(())
 }
