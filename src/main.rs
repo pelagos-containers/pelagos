@@ -1,20 +1,13 @@
 #![crate_name = "remora"]
+#![feature(core_c_str)]
 
 use clap::Parser;
-use core::panic;
-use std::str::FromStr;
-use libc::{MS_SHARED, MS_REC, MS_BIND};
-use libc::{gid_t, uid_t};
-use std::env::current_dir;
-use std::ffi::CString;
-use std::ffi::OsString;
-use std::fs::read_link;
-use std::path::PathBuf;
-use std::ptr;
+use core::{ffi::CStr, panic};
+use libc::{MS_BIND, gid_t, uid_t};
+use std::{str::FromStr, env::current_dir, ffi::{CString,OsString}, fs::read_link, path::PathBuf, ptr};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
 const ALPINE_ROOTFS : &str = "alpine-rootfs";
-const ALPINE_SYS : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys";
 #[allow(dead_code)]
 const ALPINE_CGROUP : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys/fs";
 #[allow(dead_code)]
@@ -112,6 +105,8 @@ fn child(
 }
 fn main() {
     println!("Entering main!");
+    let cur_dir = std::env::current_dir().unwrap();
+    println!("current dir: {:?}", cur_dir);
 
     let clap_args = Args::parse();
     println!("args: {:?}", clap_args);
@@ -144,7 +139,17 @@ fn main() {
             }
             "" => {
                 println!("PID of PARENT: {}", std::process::id());
-                mount_sys().unwrap();
+
+                let mut path = PathBuf::new();
+                path.push(std::env::current_dir().unwrap());
+                path.push(r"alpine-rootfs");
+                path.push(r"sys");
+                let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
+                
+                match mount_sys(sys_mount.as_ref()) {
+                    Ok(_) => println!("mounted sys"),
+                    Err(e) => println!("failed to mount sys: {:?}", e)
+                }
 
                 let self_exe = palaver::env::exe_path().unwrap();
                 let mut new_args : Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -161,10 +166,10 @@ fn main() {
                     pw_gid,
                 );
                 
-//                match umount_sys() {
-//                    Ok(_) => println!("unmounted sys"),
-//                    Err(e) => println!("failed to unmount sys {:?}",e)
-//                }
+                match umount_sys(sys_mount.as_ref()) {
+                    Ok(_) => println!("unmounted sys"),
+                    Err(e) => println!("failed to unmount sys {:?}",e)
+                }
             },
             _ => { panic!("didn't understand command line");}
         }
@@ -232,26 +237,25 @@ fn mount_cgroup() -> std::io::Result<()> {
     }
 }
 
-#[allow(dead_code)]
-fn mount_sys() -> std::io::Result<()> {
+fn mount_sys(target_str: &CStr) -> std::io::Result<()> {
+    let src_str = CString::new("/sys").unwrap();
     unsafe {
-        let src_str = CString::new("/sys")?;
-        let _src_str_ptr = src_str.as_ptr();
+        let src_str_ptr = src_str.as_ptr();
         println!("source is {:?}", src_str);
-
-        let target_str = CString::new(ALPINE_SYS)?;
         let target_str_ptr = target_str.as_ptr();
         println!("target is {:?}", target_str);
-
         let fs_type_str = CString::new(SYSFS)?;
         let fs_type_str_ptr = fs_type_str.as_ptr();
         println!("fs_type is {:?}", fs_type_str);
 
         match libc::mount(
-            _src_str_ptr,
+            src_str_ptr,
             target_str_ptr,
             fs_type_str_ptr,
-            MS_BIND | MS_SHARED | MS_REC,
+            // shared and recursive means
+            // 1. you can't unmount on exit
+            // 2. mounting sys also mounts all cgroup related stuff
+            MS_BIND, // | MS_SHARED | MS_REC,
             ptr::null(),
         ) {
             0 => Ok(()),
@@ -260,11 +264,8 @@ fn mount_sys() -> std::io::Result<()> {
     }
 }
 
-#[allow(dead_code)]
-fn umount_sys() -> std::io::Result<()> {
-    let target_str = CString::new(ALPINE_SYS)?;
-    let target_str_ptr = target_str.as_ptr();
-    println!("target is {:?}", target_str);
+fn umount_sys(sys_mount: &CStr) -> std::io::Result<()> {
+    let target_str_ptr = sys_mount.as_ptr();
 
     unsafe {
         match libc::umount(target_str_ptr) {
