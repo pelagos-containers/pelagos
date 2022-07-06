@@ -8,7 +8,6 @@ use log::{info};
 use std::{str::FromStr, env::current_dir, ffi::{CString,OsString}, fs::read_link, path::PathBuf, ptr};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
-const ALPINE_ROOTFS : &str = "alpine-rootfs";
 #[allow(dead_code)]
 const ALPINE_CGROUP : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys/fs";
 #[allow(dead_code)]
@@ -32,11 +31,11 @@ fn fork_exec(
     uid_parent: uid_t,
     gid_parent: gid_t,
 ) -> Result<Child, Error> {
-    let new_args: Vec<_> = args.into_iter().collect();
     let exe_path = read_link(to_run.as_path()).unwrap();
-    info!("fork exec to_run: {:?}, args: {:?}", exe_path, new_args);
+    let arg_vec = args.into_iter().collect::<Vec<OsString>>();
+    info!("fork exec to_run: {:?}, args: {:?}", exe_path, &arg_vec);
     Command::new(exe_path.as_os_str())
-        .args(&new_args)
+        .args(&(arg_vec)[..])
         .arg0(exe_path.as_os_str())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -83,17 +82,17 @@ mount -o bind /sys ${chroot_dir}/sys
 /// with chroot and new proc filesystem
 fn child(
     to_run: PathBuf,
-    _args: impl IntoIterator<Item = OsString>,
+    child_args: impl IntoIterator<Item = OsString>,
     uid_parent: uid_t,
     gid_parent: gid_t,
 ) -> Result<Child, Error> {
     unsafe {
-        let new_args: Vec<OsString> = vec![];
-        info!("child to_run: {:?}, new args: {:?}", to_run, new_args);
         let mut curdir = current_dir().unwrap();
-        curdir.push(ALPINE_ROOTFS);
+        let clap_args = Args::parse();        
+        curdir.push(clap_args.rootfs);
+
         Command::new(to_run)
-            .args(&new_args)
+            .args(&(child_args.into_iter().collect::<Vec<OsString>>())[..])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -127,7 +126,7 @@ fn main() {
                 let pw_gid = libc::getgid();
                 info!("match for child: uid: {}, gid: {}", pw_uid, pw_gid);
                 info!("PID of CHILD: {}", std::process::id());
-                let new_args = std::env::args_os();
+                let new_args = vec![];
                 info!("new args in child: {:?}", new_args);                
                 panic_spawn(
                     "child",
@@ -143,7 +142,7 @@ fn main() {
 
                 let mut path = PathBuf::new();
                 path.push(std::env::current_dir().unwrap());
-                path.push(r"alpine-rootfs");
+                path.push(clap_args.rootfs);
                 path.push(r"sys");
                 let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
                 
