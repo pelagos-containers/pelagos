@@ -10,6 +10,7 @@ log = "*"
 env_logger = "*"
 subprocess = "*"
 cgroups-fs = "*"
+nix = "*"
 unshare = {path = "../unshare"}
 palaver = "*"
 libc = "*"

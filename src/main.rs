@@ -1,12 +1,14 @@
 #![crate_name = "remora"]
 #![feature(core_c_str)]
+#![allow(unused_imports)]
 
 use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
-use log::{info};
-use std::{str::FromStr, env::current_dir, ffi::{CString,OsString}, fs::read_link, path::PathBuf, ptr};
+use log::{info,error};
+use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
+use nix::unistd::{chroot};
 
 #[allow(dead_code)]
 const ALPINE_CGROUP : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys/fs";
@@ -23,46 +25,6 @@ struct Args {
     exe: String,
     #[clap(short, long, default_value="")]
     forked: String    
-}
-
-fn fork_exec(
-    to_run: PathBuf,
-    args: impl IntoIterator<Item = OsString>,
-    uid_parent: uid_t,
-    gid_parent: gid_t,
-) -> Result<Child, Error> {
-    let exe_path = read_link(to_run.as_path()).unwrap();
-    let arg_vec = args.into_iter().collect::<Vec<OsString>>();
-    info!("fork exec to_run: {:?}, args: {:?}", exe_path, &arg_vec);
-    Command::new(exe_path.as_os_str())
-        .args(&(arg_vec)[..])
-        .arg0(exe_path.as_os_str())
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .unshare(
-            [
-                unshare::Namespace::Uts,
-                unshare::Namespace::Mount,
-                unshare::Namespace::Pid,
-                unshare::Namespace::Cgroup,
-            ]
-            .iter(),
-        )
-        .set_id_maps(
-            vec![UidMap {
-                inside_uid: 0,
-                outside_uid: uid_parent,
-                count: 1,
-            }],
-            vec![GidMap {
-                inside_gid: 0,
-                outside_gid: gid_parent,
-                count: 1,
-            }],
-        )
-        .uid(0)
-        .gid(0)
-        .spawn()
 }
 
 /* NOTE: do these in the alpine make rootfs instead?
@@ -98,8 +60,29 @@ fn child(
             .stderr(Stdio::inherit())
             .chroot_dir(curdir)
             .pre_exec(&mount_proc)
-            .uid(uid_parent)
-            .gid(gid_parent)
+            .unshare(
+                [
+                    unshare::Namespace::Uts,
+                    unshare::Namespace::Mount,
+                    unshare::Namespace::Pid,
+                    unshare::Namespace::Cgroup,
+                ]
+                .iter(),
+            )
+            .set_id_maps(
+                vec![UidMap {
+                    inside_uid: 0,
+                    outside_uid: uid_parent,
+                    count: 1,
+                }],
+                vec![GidMap {
+                    inside_gid: 0,
+                    outside_gid: gid_parent,
+                    count: 1,
+                }],
+            )
+            .uid(0)
+            .gid(0)            
             .spawn()
     }
 }
@@ -118,66 +101,40 @@ fn main() {
         let pw_uid = (*passwd).pw_uid;
         let pw_gid = (*passwd).pw_gid;
 
-        info!("Before match for parent or child: uid: {}, gid: {}", pw_uid, pw_gid);
+        info!("PID of PARENT: {}", std::process::id());
 
-        match clap_args.forked.as_str() {
-            "child" => {
-                let pw_uid = libc::getuid();
-                let pw_gid = libc::getgid();
-                info!("match for child: uid: {}, gid: {}", pw_uid, pw_gid);
-                info!("PID of CHILD: {}", std::process::id());
-                let new_args = vec![];
-                info!("new args in child: {:?}", new_args);                
-                panic_spawn(
-                    "child",
-                    child,
-                    PathBuf::from(clap_args.exe),
-                    new_args,
-                    pw_uid,
-                    pw_gid,
-                );
-            }
-            "" => {
-                info!("PID of PARENT: {}", std::process::id());
-
-                let mut path = PathBuf::new();
-                path.push(std::env::current_dir().unwrap());
-                path.push(clap_args.rootfs);
-                path.push(r"sys");
-                let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
-                
-                match mount_sys(sys_mount.as_ref()) {
-                    Ok(_) => info!("mounted sys"),
-                    Err(e) => info!("failed to mount sys: {:?}", e)
-                }
-
-                let self_exe = palaver::env::exe_path().unwrap();
-                let mut new_args : Vec<OsString> = std::env::args_os().skip(1).collect();
-                new_args.push(OsString::from_str("--forked").unwrap());
-                new_args.push(OsString::from_str("child").unwrap());
-                info!("new args: {:?}", new_args);
-                
-                panic_spawn(
-                    "fork exec",
-                    fork_exec,
-                    self_exe,
-                    new_args,
-                    pw_uid,
-                    pw_gid,
-                );
-                
-                match umount_sys(sys_mount.as_ref()) {
-                    Ok(_) => info!("unmounted sys"),
-                    Err(e) => info!("failed to unmount sys {:?}",e)
-                }
-            },
-            _ => { panic!("didn't understand command line");}
+        let mut path = PathBuf::new();
+        path.push(std::env::current_dir().unwrap());
+        path.push(clap_args.rootfs);
+        path.push(r"sys");
+        let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
+        
+        match mount_sys(sys_mount.as_ref()) {
+            Ok(_) => info!("mounted sys"),
+            Err(e) => info!("failed to mount sys: {:?}", e)
         }
+        
+        let new_args : Vec<OsString> = vec![];
+        let thing_to_launch = &clap_args.exe.as_str();
+        panic_spawn(
+            thing_to_launch,
+            child,
+            PathBuf::from(thing_to_launch),
+            new_args,
+            pw_uid,
+            pw_gid,
+        );
+        
+        match umount_sys(sys_mount.as_ref()) {
+            Ok(_) => info!("unmounted sys"),
+            Err(e) => info!("failed to unmount sys {:?}",e)
+        }
+
     }
 }
 
 fn panic_spawn<I>(
-    which: &'static str,
+    which: &str,
     p: impl Fn(PathBuf, I, uid_t, gid_t) -> Result<Child, Error>,
     to_run: PathBuf,
     args: I,
