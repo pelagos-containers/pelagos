@@ -1,0 +1,46 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'remora'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=remora",
+                    "--package=remora"
+                ],
+                "filter": {
+                    "name": "remora",
+                    "kind": "bin"
+                }
+            },
+            "args": ["--exe", "/bin/ash", "--rootfs", "./alpine-rootfs", "--uid","1000", "--gid", "1000"],
+            "env": {"RUST_BACKTRACE": "full", "RUST_LOG": "info"},
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'remora'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=remora",
+                    "--package=remora"
+                ],
+                "filter": {
+                    "name": "remora",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
