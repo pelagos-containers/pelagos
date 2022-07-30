@@ -1,5 +1,5 @@
 #!/bin/sh
-ALPINE_BUILD=example-20220715.tar.gz
+ALPINE_BUILD=example-20220730.tar.gz
 case "$1" in 
     "erase") cp ../alpine-make-rootfs/$ALPINE_BUILD ./ && sudo rm -fr ./alpine-rootfs && mkdir ./alpine-rootfs && cd ./alpine-rootfs/ && tar zxvf ../$ALPINE_BUILD ./ && cd .. ;;
     *) echo "not erasing" ;;
