@@ -2,6 +2,9 @@
 CON=con
 IP=172.16.0.1
 
+git config --global user.name "Christopher Brown"
+git config --global user.email cb@skeptomai.com
+
 echo "creating the namespace"
 sudo ip netns add $CON
 

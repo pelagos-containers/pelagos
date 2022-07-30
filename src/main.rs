@@ -1,5 +1,4 @@
 #![crate_name = "remora"]
-#![feature(core_c_str)]
 #![allow(unused_imports)]
 
 use clap::Parser;
@@ -43,8 +42,8 @@ mount -o bind /sys ${chroot_dir}/sys
 fn child(
     to_run: PathBuf,
     child_args: impl IntoIterator<Item = OsString>,
-    uid_parent: uid_t,
-    gid_parent: gid_t,
+    _uid_parent: uid_t,
+    _gid_parent: gid_t,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     unsafe {
         let mut curdir = current_dir().unwrap();
@@ -77,22 +76,21 @@ fn child(
                         //unshare::Namespace::Net,
                     ]
                     .iter(),
-                )
-                 .set_id_maps(
-                    vec![UidMap {
-                        inside_uid: 0,
-                        outside_uid: uid_parent,
-                        count: 1,
-                    }],
-                    vec![GidMap {
-                        inside_gid: 0,
-                        outside_gid: gid_parent,
-                        count: 1,
-                    }],
-                )
-                .uid(0)
-                .gid(0);
-
+                );
+/*                 .set_id_maps(
+                vec![UidMap {
+                    inside_uid: 0,
+                    outside_uid: _uid_parent,
+                    count: 1,
+                }],
+                vec![GidMap {
+                    inside_gid: 0,
+                    outside_gid: _gid_parent,
+                    count: 1,
+                }],
+            )
+            .uid(0)
+            .gid(0); */
 /* 
                 info!("setting namespace");
                 match cmd.set_namespace(&nsf, unshare::Namespace::Net){
