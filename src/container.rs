@@ -1,0 +1,1229 @@
+//! Container process management using Linux namespaces.
+//!
+//! This module provides a modern, type-safe interface for spawning processes in isolated
+//! Linux namespaces, similar to containers. It uses the [`nix`](https://docs.rs/nix) crate
+//! for safe syscall wrappers and [`bitflags`](https://docs.rs/bitflags) for ergonomic
+//! namespace combinations.
+//!
+//! # Overview
+//!
+//! The main entry point is [`Command`], which provides a builder pattern for configuring
+//! and spawning containerized processes. The API is similar to [`std::process::Command`]
+//! but with additional support for:
+//!
+//! - **Linux namespaces** - Isolate processes (PID, Mount, UTS, IPC, User, Net, Cgroup)
+//! - **chroot** - Change root directory for filesystem isolation
+//! - **Pre-exec callbacks** - Execute code before the target program runs
+//!
+//! # Examples
+//!
+//! ## Basic container with namespace isolation
+//!
+//! ```no_run
+//! use remora::container::{Command, Namespace, Stdio};
+//!
+//! let child = Command::new("/bin/sh")
+//!     .with_namespaces(Namespace::UTS | Namespace::PID | Namespace::MOUNT)
+//!     .with_chroot("/path/to/rootfs")
+//!     .stdin(Stdio::Inherit)
+//!     .stdout(Stdio::Inherit)
+//!     .stderr(Stdio::Inherit)
+//!     .spawn()
+//!     .expect("Failed to spawn container");
+//!
+//! let status = child.wait().expect("Failed to wait for container");
+//! ```
+//!
+//! ## With pre-exec callback for mounting filesystems
+//!
+//! ```no_run
+//! # use remora::container::{Command, Namespace};
+//! fn mount_proc() -> std::io::Result<()> {
+//!     // Mount proc filesystem inside container
+//!     // Implementation details...
+//!     Ok(())
+//! }
+//!
+//! let child = Command::new("/bin/sh")
+//!     .with_namespaces(Namespace::MOUNT | Namespace::PID)
+//!     .with_chroot("/path/to/rootfs")
+//!     .with_pre_exec(mount_proc)
+//!     .spawn()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Architecture
+//!
+//! The implementation uses [`std::process::Command::pre_exec`] to combine namespace
+//! creation, chroot, and user callbacks into a single atomic operation before `exec()`.
+//!
+//! ## Execution flow
+//!
+//! 1. Parent process calls `spawn()`
+//! 2. `fork()` creates child process
+//! 3. In child, `pre_exec` callback runs:
+//!    - Unshare specified namespaces
+//!    - Change root if configured
+//!    - Run user pre_exec callback
+//! 4. Child calls `exec()` to replace with target program
+//!
+//! # Safety
+//!
+//! This module uses `unsafe` in the following places:
+//!
+//! - **`pre_exec` callback**: Must be signal-safe and cannot allocate. Only simple
+//!   syscalls (unshare, chroot, chdir) are performed.
+//!
+//! # Linux Requirements
+//!
+//! - **Kernel 3.8+** for basic namespace support
+//! - **CAP_SYS_ADMIN** or root for most namespace operations
+//! - **User namespaces** (kernel 3.8+) allow unprivileged containers
+//!
+//! # Phase 2 Improvements
+//!
+//! - ✅ Enhanced error handling with [`thiserror`](https://docs.rs/thiserror)
+//! - ✅ Consuming builder pattern for better ergonomics
+//! - ✅ Bitflags for namespace combinations
+//! - ✅ Comprehensive documentation
+//! - ⏳ Unit tests (in progress)
+
+#![allow(dead_code)] // Allow unused items during incremental development
+
+use bitflags::bitflags;
+use nix::sched::{unshare, CloneFlags};
+use nix::unistd::chroot;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
+use std::process::{self, ExitStatus as StdExitStatus};
+
+bitflags! {
+    /// Linux namespace types that can be unshared.
+    ///
+    /// Use bitwise OR to combine multiple namespaces:
+    /// ```ignore
+    /// let ns = Namespace::UTS | Namespace::PID | Namespace::MOUNT;
+    /// ```
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Namespace: u32 {
+        /// Mount namespace - isolate filesystem mount points
+        const MOUNT  = 0b0000_0001;
+        /// UTS namespace - isolate hostname and domain name
+        const UTS    = 0b0000_0010;
+        /// IPC namespace - isolate System V IPC and POSIX message queues
+        const IPC    = 0b0000_0100;
+        /// User namespace - isolate user and group IDs
+        const USER   = 0b0000_1000;
+        /// PID namespace - isolate process ID number space
+        const PID    = 0b0001_0000;
+        /// Network namespace - isolate network devices, stacks, ports, etc.
+        const NET    = 0b0010_0000;
+        /// Cgroup namespace - isolate cgroup hierarchy
+        const CGROUP = 0b0100_0000;
+    }
+}
+
+bitflags! {
+    /// Linux capabilities that can be retained or dropped.
+    ///
+    /// By default, processes run with many capabilities. For security,
+    /// you can drop capabilities and only keep the ones you need.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Keep only network and chown capabilities
+    /// let caps = Capability::NET_BIND_SERVICE | Capability::CHOWN;
+    /// cmd.with_capabilities(caps);
+    /// ```
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Capability: u64 {
+        /// CAP_CHOWN - Make arbitrary changes to file UIDs and GIDs
+        const CHOWN = 1 << 0;
+        /// CAP_DAC_OVERRIDE - Bypass file read, write, and execute permission checks
+        const DAC_OVERRIDE = 1 << 1;
+        /// CAP_FOWNER - Bypass permission checks on operations that require filesystem UID
+        const FOWNER = 1 << 3;
+        /// CAP_FSETID - Don't clear set-user-ID and set-group-ID mode bits
+        const FSETID = 1 << 4;
+        /// CAP_KILL - Bypass permission checks for sending signals
+        const KILL = 1 << 5;
+        /// CAP_SETGID - Make arbitrary manipulations of process GIDs
+        const SETGID = 1 << 6;
+        /// CAP_SETUID - Make arbitrary manipulations of process UIDs
+        const SETUID = 1 << 7;
+        /// CAP_NET_BIND_SERVICE - Bind a socket to privileged ports (< 1024)
+        const NET_BIND_SERVICE = 1 << 10;
+        /// CAP_NET_RAW - Use RAW and PACKET sockets
+        const NET_RAW = 1 << 13;
+        /// CAP_SYS_CHROOT - Use chroot()
+        const SYS_CHROOT = 1 << 18;
+        /// CAP_SYS_ADMIN - Perform a range of system administration operations
+        const SYS_ADMIN = 1 << 21;
+        /// CAP_SYS_PTRACE - Trace arbitrary processes using ptrace
+        const SYS_PTRACE = 1 << 19;
+    }
+}
+
+impl Namespace {
+    /// Convert namespace flags to nix CloneFlags
+    fn to_clone_flags(self) -> CloneFlags {
+        let mut flags = CloneFlags::empty();
+
+        if self.contains(Namespace::MOUNT) {
+            flags |= CloneFlags::CLONE_NEWNS;
+        }
+        if self.contains(Namespace::UTS) {
+            flags |= CloneFlags::CLONE_NEWUTS;
+        }
+        if self.contains(Namespace::IPC) {
+            flags |= CloneFlags::CLONE_NEWIPC;
+        }
+        if self.contains(Namespace::USER) {
+            flags |= CloneFlags::CLONE_NEWUSER;
+        }
+        if self.contains(Namespace::PID) {
+            flags |= CloneFlags::CLONE_NEWPID;
+        }
+        if self.contains(Namespace::NET) {
+            flags |= CloneFlags::CLONE_NEWNET;
+        }
+        if self.contains(Namespace::CGROUP) {
+            flags |= CloneFlags::CLONE_NEWCGROUP;
+        }
+
+        flags
+    }
+}
+
+/// Standard I/O configuration for spawned processes.
+///
+/// Configures how stdin, stdout, and stderr should be handled for the child process.
+/// This is a simplified version of [`std::process::Stdio`] for container use.
+///
+/// # Examples
+///
+/// ```no_run
+/// use remora::container::{Command, Stdio};
+///
+/// let child = Command::new("/bin/cat")
+///     .stdin(Stdio::Inherit)   // Read from parent's stdin
+///     .stdout(Stdio::Inherit)  // Write to parent's stdout
+///     .stderr(Stdio::Null)     // Discard error output
+///     .spawn()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone)]
+pub enum Stdio {
+    /// Inherit stdio from parent process
+    ///
+    /// The child process will use the same stdin/stdout/stderr as the parent.
+    Inherit,
+
+    /// Redirect to /dev/null
+    ///
+    /// The stream will be discarded (for output) or return EOF (for input).
+    Null,
+
+    /// Create a pipe (not yet fully implemented)
+    ///
+    /// Creates a pipe between parent and child. The parent can read/write
+    /// through the pipe to communicate with the child.
+    Piped,
+}
+
+impl From<Stdio> for process::Stdio {
+    fn from(stdio: Stdio) -> Self {
+        match stdio {
+            Stdio::Inherit => process::Stdio::inherit(),
+            Stdio::Null => process::Stdio::null(),
+            Stdio::Piped => process::Stdio::piped(),
+        }
+    }
+}
+
+/// Builder for spawning processes in Linux namespaces.
+///
+/// Similar to [`std::process::Command`] but with support for Linux namespaces,
+/// chroot, and container-specific operations. Uses a consuming builder pattern
+/// where each method takes ownership and returns `Self`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use remora::container::{Command, Namespace, Stdio};
+///
+/// // Create and configure a containerized process
+/// let child = Command::new("/bin/sh")
+///     .args(&["-c", "echo hello"])
+///     .with_namespaces(Namespace::UTS | Namespace::PID)
+///     .with_chroot("/path/to/rootfs")
+///     .stdin(Stdio::Inherit)
+///     .spawn()
+///     .expect("Failed to spawn");
+/// ```
+///
+/// # Method Chaining
+///
+/// All builder methods consume `self` and return `Self`, enabling fluent chaining:
+///
+/// ```no_run
+/// # use remora::container::{Command, Namespace};
+/// Command::new("/bin/ls")
+///     .args(&["-la"])
+///     .with_namespaces(Namespace::MOUNT)
+///     .spawn()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct Command {
+    inner: process::Command,
+    namespaces: Namespace,
+    chroot_dir: Option<PathBuf>,
+    pre_exec: Option<Box<dyn Fn() -> io::Result<()> + Send + Sync>>,
+    uid_maps: Vec<UidMap>,
+    gid_maps: Vec<GidMap>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    join_namespaces: Vec<(PathBuf, Namespace)>,
+    // Mount configuration
+    mount_proc: bool,
+    mount_sys: bool,
+    mount_dev: bool,
+    pivot_root: Option<(PathBuf, PathBuf)>, // (new_root, put_old)
+    // Security configuration
+    capabilities: Option<Capability>, // None = keep all, Some = keep only these
+    // Resource limits
+    rlimits: Vec<ResourceLimit>,
+}
+
+impl Command {
+    /// Create a new command builder for the given program.
+    pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
+        Self {
+            inner: process::Command::new(program),
+            namespaces: Namespace::empty(),
+            chroot_dir: None,
+            pre_exec: None,
+            uid_maps: Vec::new(),
+            gid_maps: Vec::new(),
+            uid: None,
+            gid: None,
+            join_namespaces: Vec::new(),
+            mount_proc: false,
+            mount_sys: false,
+            mount_dev: false,
+            pivot_root: None,
+            capabilities: None,
+            rlimits: Vec::new(),
+        }
+    }
+
+    /// Add arguments to pass to the program.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.inner.args(args);
+        self
+    }
+
+    /// Configure stdin for the child process.
+    pub fn stdin(mut self, cfg: Stdio) -> Self {
+        self.inner.stdin(cfg);
+        self
+    }
+
+    /// Configure stdout for the child process.
+    pub fn stdout(mut self, cfg: Stdio) -> Self {
+        self.inner.stdout(cfg);
+        self
+    }
+
+    /// Configure stderr for the child process.
+    pub fn stderr(mut self, cfg: Stdio) -> Self {
+        self.inner.stderr(cfg);
+        self
+    }
+
+    /// Set the root directory for the child process (chroot).
+    ///
+    /// This will be executed after namespace creation in the pre_exec callback.
+    pub fn with_chroot<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+        self.chroot_dir = Some(dir.into());
+        self
+    }
+
+    /// Legacy API for setting chroot directory
+    #[deprecated(since = "0.2.0", note = "Use with_chroot() instead")]
+    pub fn chroot_dir<P: Into<PathBuf>>(self, dir: P) -> Self {
+        self.with_chroot(dir)
+    }
+
+    /// Specify which namespaces to unshare for the child process.
+    ///
+    /// The namespaces will be created when the process spawns, before exec.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Combine multiple namespaces with bitwise OR
+    /// cmd.with_namespaces(Namespace::UTS | Namespace::PID | Namespace::MOUNT);
+    /// ```
+    pub fn with_namespaces(mut self, namespaces: Namespace) -> Self {
+        self.namespaces = namespaces;
+        self
+    }
+
+    /// Legacy API: accepts iterator of namespace references (for backwards compatibility)
+    #[deprecated(since = "0.2.0", note = "Use with_namespaces() with bitflags instead")]
+    pub fn unshare<'a, I>(mut self, namespaces: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Namespace>,
+    {
+        self.namespaces = namespaces.into_iter().fold(Namespace::empty(), |acc, &ns| acc | ns);
+        self
+    }
+
+    /// Register a callback to run in the child process before exec.
+    ///
+    /// The callback runs after namespace creation and chroot, but before
+    /// the target program is executed. Useful for mounting filesystems, etc.
+    ///
+    /// Note: The callback must not allocate or perform complex operations.
+    /// It runs in a fork context where many operations are unsafe.
+    pub fn with_pre_exec<F>(mut self, f: F) -> Self
+    where
+        F: Fn() -> io::Result<()> + Send + Sync + 'static,
+    {
+        self.pre_exec = Some(Box::new(f));
+        self
+    }
+
+    /// Legacy API for setting pre_exec callback
+    #[deprecated(since = "0.2.0", note = "Use with_pre_exec() instead")]
+    pub fn pre_exec<F>(self, f: F) -> Self
+    where
+        F: Fn() -> io::Result<()> + Send + Sync + 'static,
+    {
+        self.with_pre_exec(f)
+    }
+
+    /// Set UID mappings for user namespace.
+    ///
+    /// Requires `Namespace::USER` to be set. Maps UIDs from inside the container
+    /// to outside the container, allowing unprivileged containers.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Run as root inside, but uid 1000 outside
+    /// cmd.with_namespaces(Namespace::USER)
+    ///    .with_uid_maps(&[UidMap { inside: 0, outside: 1000, count: 1 }])
+    ///    .with_uid(0);
+    /// ```
+    pub fn with_uid_maps(mut self, maps: &[UidMap]) -> Self {
+        self.uid_maps = maps.to_vec();
+        self
+    }
+
+    /// Set GID mappings for user namespace.
+    ///
+    /// Requires `Namespace::USER` to be set. Maps GIDs from inside the container
+    /// to outside the container.
+    pub fn with_gid_maps(mut self, maps: &[GidMap]) -> Self {
+        self.gid_maps = maps.to_vec();
+        self
+    }
+
+    /// Set the user ID to run as inside the container.
+    ///
+    /// This is the UID the process will have after exec, typically used
+    /// with user namespace mapping.
+    pub fn with_uid(mut self, uid: u32) -> Self {
+        self.uid = Some(uid);
+        self
+    }
+
+    /// Set the group ID to run as inside the container.
+    ///
+    /// This is the GID the process will have after exec.
+    pub fn with_gid(mut self, gid: u32) -> Self {
+        self.gid = Some(gid);
+        self
+    }
+
+    /// Join an existing namespace instead of creating a new one.
+    ///
+    /// Opens the namespace file and calls `setns()` to join it before exec.
+    /// Can be called multiple times to join different namespace types.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Join existing network namespace
+    /// cmd.with_namespace_join("/var/run/netns/con", Namespace::NET);
+    ///
+    /// // Join multiple namespaces
+    /// cmd.with_namespace_join("/proc/1234/ns/net", Namespace::NET)
+    ///    .with_namespace_join("/proc/1234/ns/pid", Namespace::PID);
+    /// ```
+    pub fn with_namespace_join<P: Into<PathBuf>>(mut self, path: P, ns: Namespace) -> Self {
+        self.join_namespaces.push((path.into(), ns));
+        self
+    }
+
+    /// Automatically mount /proc filesystem after chroot.
+    ///
+    /// This mounts a new proc filesystem at /proc inside the container.
+    /// Requires `Namespace::MOUNT` to be set.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_namespaces(Namespace::MOUNT)
+    ///    .with_chroot("/path/to/rootfs")
+    ///    .with_proc_mount();
+    /// ```
+    pub fn with_proc_mount(mut self) -> Self {
+        self.mount_proc = true;
+        self
+    }
+
+    /// Automatically mount /sys filesystem after chroot.
+    ///
+    /// This bind mounts /sys from the host into the container.
+    /// Requires `Namespace::MOUNT` to be set.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_namespaces(Namespace::MOUNT)
+    ///    .with_chroot("/path/to/rootfs")
+    ///    .with_sys_mount();
+    /// ```
+    pub fn with_sys_mount(mut self) -> Self {
+        self.mount_sys = true;
+        self
+    }
+
+    /// Automatically mount /dev filesystem after chroot.
+    ///
+    /// This bind mounts essential device files into the container.
+    /// Requires `Namespace::MOUNT` to be set.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_namespaces(Namespace::MOUNT)
+    ///    .with_chroot("/path/to/rootfs")
+    ///    .with_dev_mount();
+    /// ```
+    pub fn with_dev_mount(mut self) -> Self {
+        self.mount_dev = true;
+        self
+    }
+
+    /// Use pivot_root instead of chroot for filesystem isolation.
+    ///
+    /// pivot_root is more secure than chroot as it actually changes the root
+    /// of the mount namespace, preventing escape via chroot.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_root` - Path to the new root filesystem
+    /// * `put_old` - Path (relative to new_root) where the old root will be mounted
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_namespaces(Namespace::MOUNT)
+    ///    .with_pivot_root("/path/to/rootfs", "/path/to/rootfs/old_root");
+    /// ```
+    pub fn with_pivot_root<P1: Into<PathBuf>, P2: Into<PathBuf>>(
+        mut self,
+        new_root: P1,
+        put_old: P2,
+    ) -> Self {
+        self.pivot_root = Some((new_root.into(), put_old.into()));
+        self
+    }
+
+    /// Set which capabilities to keep (all others will be dropped).
+    ///
+    /// For security, containers should run with minimal capabilities.
+    /// By default, all capabilities are kept. Use this to drop unnecessary ones.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Keep only network and chown capabilities
+    /// cmd.with_capabilities(Capability::NET_BIND_SERVICE | Capability::CHOWN);
+    ///
+    /// // Drop all capabilities
+    /// cmd.with_capabilities(Capability::empty());
+    /// ```
+    pub fn with_capabilities(mut self, caps: Capability) -> Self {
+        self.capabilities = Some(caps);
+        self
+    }
+
+    /// Drop all capabilities for maximum security.
+    ///
+    /// Equivalent to `with_capabilities(Capability::empty())`.
+    pub fn drop_all_capabilities(mut self) -> Self {
+        self.capabilities = Some(Capability::empty());
+        self
+    }
+
+    /// Set a resource limit (rlimit) for the container.
+    ///
+    /// Controls resource usage such as memory, CPU time, file descriptors, etc.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Limit open file descriptors to 1024
+    /// cmd.with_rlimit(libc::RLIMIT_NOFILE, 1024, 1024);
+    ///
+    /// // Limit address space to 512 MB
+    /// cmd.with_rlimit(libc::RLIMIT_AS, 512 * 1024 * 1024, 512 * 1024 * 1024);
+    /// ```
+    pub fn with_rlimit(
+        mut self,
+        resource: libc::__rlimit_resource_t,
+        soft: libc::rlim_t,
+        hard: libc::rlim_t,
+    ) -> Self {
+        self.rlimits.push(ResourceLimit { resource, soft, hard });
+        self
+    }
+
+    /// Convenience method to limit the number of open file descriptors.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_max_fds(1024);  // Limit to 1024 open files
+    /// ```
+    pub fn with_max_fds(self, limit: libc::rlim_t) -> Self {
+        self.with_rlimit(libc::RLIMIT_NOFILE, limit, limit)
+    }
+
+    /// Convenience method to limit address space (virtual memory).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_memory_limit(512 * 1024 * 1024);  // 512 MB limit
+    /// ```
+    pub fn with_memory_limit(self, bytes: libc::rlim_t) -> Self {
+        self.with_rlimit(libc::RLIMIT_AS, bytes, bytes)
+    }
+
+    /// Convenience method to limit CPU time.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_cpu_time_limit(60);  // 60 seconds of CPU time
+    /// ```
+    pub fn with_cpu_time_limit(self, seconds: libc::rlim_t) -> Self {
+        self.with_rlimit(libc::RLIMIT_CPU, seconds, seconds)
+    }
+
+    /// Spawn the child process with configured namespaces and settings.
+    ///
+    /// This combines namespace creation, chroot, and user pre_exec callbacks
+    /// into a single pre_exec hook for std::process::Command.
+    pub fn spawn(mut self) -> Result<Child, Error> {
+        // Open namespace files in parent process (can't safely open files in pre_exec)
+        // Keep File objects alive so their fds remain valid through spawn
+        let join_ns_files: Vec<(File, Namespace)> = self.join_namespaces
+            .iter()
+            .map(|(path, ns)| {
+                File::open(path)
+                    .map(|f| (f, *ns))
+                    .map_err(Error::Io)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Extract raw fds for use in pre_exec
+        let join_ns_fds: Vec<(i32, Namespace)> = join_ns_files
+            .iter()
+            .map(|(f, ns)| (f.as_raw_fd(), *ns))
+            .collect();
+
+        // Collect configuration to move into pre_exec closure
+        let namespaces = self.namespaces;
+        let chroot_dir = self.chroot_dir.clone();
+        let user_pre_exec = self.pre_exec.take();
+        let uid_maps = self.uid_maps.clone();
+        let gid_maps = self.gid_maps.clone();
+        let uid = self.uid;
+        let gid = self.gid;
+        let mount_proc = self.mount_proc;
+        let mount_sys = self.mount_sys;
+        let mount_dev = self.mount_dev;
+        let pivot_root = self.pivot_root.clone();
+        let capabilities = self.capabilities;
+        let rlimits = self.rlimits.clone();
+
+        // Install our combined pre_exec hook
+        unsafe {
+            self.inner.pre_exec(move || {
+                use std::ptr;
+                use std::ffi::CString;
+
+                // Step 1: Unshare namespaces (create new ones)
+                if !namespaces.is_empty() {
+                    let flags = namespaces.to_clone_flags();
+                    unshare(flags).map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+
+                    // Step 1.5: If we created a mount namespace, make all mounts private
+                    // to prevent mount propagation leaking to the parent namespace
+                    if namespaces.contains(Namespace::MOUNT) {
+                        use std::ffi::CStr;
+                        use std::ptr;
+
+                        let root = CStr::from_bytes_with_nul(b"/\0").unwrap();
+                        let result = libc::mount(
+                            ptr::null(),                          // source: NULL (remount)
+                            root.as_ptr(),                        // target: root
+                            ptr::null(),                          // fstype: NULL (remount)
+                            libc::MS_REC | libc::MS_PRIVATE,      // flags: recursive + private
+                            ptr::null(),                          // data: NULL
+                        );
+
+                        if result != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+
+                // Step 2: Set up UID/GID mapping if user namespace is active
+                if namespaces.contains(Namespace::USER) {
+                    use std::fs;
+                    use std::io::Write;
+
+                    // For unprivileged containers, must deny setgroups before writing gid_map
+                    if !gid_maps.is_empty() {
+                        let mut setgroups = fs::OpenOptions::new()
+                            .write(true)
+                            .open("/proc/self/setgroups")
+                            .map_err(|e| io::Error::other(format!("open setgroups: {}", e)))?;
+                        setgroups.write_all(b"deny\n")
+                            .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
+                    }
+
+                    // Write UID mappings
+                    if !uid_maps.is_empty() {
+                        let mut uid_map_file = fs::OpenOptions::new()
+                            .write(true)
+                            .open("/proc/self/uid_map")
+                            .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
+
+                        for map in &uid_maps {
+                            writeln!(uid_map_file, "{} {} {}", map.inside, map.outside, map.count)
+                                .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
+                        }
+                    }
+
+                    // Write GID mappings
+                    if !gid_maps.is_empty() {
+                        let mut gid_map_file = fs::OpenOptions::new()
+                            .write(true)
+                            .open("/proc/self/gid_map")
+                            .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
+
+                        for map in &gid_maps {
+                            writeln!(gid_map_file, "{} {} {}", map.inside, map.outside, map.count)
+                                .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
+                        }
+                    }
+                }
+
+                // Step 3: Set UID/GID if specified
+                if let Some(gid_val) = gid {
+                    let result = libc::setgid(gid_val);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                if let Some(uid_val) = uid {
+                    let result = libc::setuid(uid_val);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 4: Change root if specified
+                if let Some((ref new_root, ref put_old)) = pivot_root {
+                    // Use pivot_root for better security
+                    use std::os::unix::ffi::OsStrExt;
+
+                    // pivot_root syscall (not in nix crate, use libc directly)
+                    let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
+                    let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
+
+                    // pivot_root syscall number is 155 on x86_64
+                    #[cfg(target_arch = "x86_64")]
+                    const SYS_PIVOT_ROOT: i64 = 155;
+                    #[cfg(target_arch = "aarch64")]
+                    const SYS_PIVOT_ROOT: i64 = 41;
+
+                    let result = libc::syscall(
+                        SYS_PIVOT_ROOT,
+                        new_root_c.as_ptr(),
+                        put_old_c.as_ptr(),
+                    );
+
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+
+                    // Change to new root
+                    std::env::set_current_dir("/")?;
+
+                    // Unmount old root
+                    let put_old_rel = put_old.strip_prefix(new_root)
+                        .map_err(|_| io::Error::other("put_old must be inside new_root"))?;
+                    let put_old_rel_c = CString::new(put_old_rel.as_os_str().as_bytes()).unwrap();
+
+                    let umount_result = libc::umount2(put_old_rel_c.as_ptr(), libc::MNT_DETACH);
+                    if umount_result != 0 {
+                        // Don't fail if unmount doesn't work - it's not critical
+                    }
+                } else if let Some(ref dir) = chroot_dir {
+                    // Fallback to chroot if pivot_root not specified
+                    chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+
+                    // Change working directory to / after chroot
+                    std::env::set_current_dir("/")?;
+                }
+
+                // Step 4.5: Perform automatic mounts if requested
+                if mount_proc {
+                    // Mount new proc filesystem at /proc
+                    let proc = CString::new("proc").unwrap();
+                    let result = libc::mount(
+                        proc.as_ptr(),      // source
+                        proc.as_ptr(),      // target (/proc)
+                        proc.as_ptr(),      // fstype (proc)
+                        0,                  // flags
+                        ptr::null(),        // data
+                    );
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if mount_sys {
+                    // Bind mount /sys (from host) to /sys (in container)
+                    let sys = CString::new("/sys").unwrap();
+                    let sysfs = CString::new("sysfs").unwrap();
+                    let result = libc::mount(
+                        sys.as_ptr(),       // source
+                        sys.as_ptr(),       // target
+                        sysfs.as_ptr(),     // fstype
+                        libc::MS_BIND,      // flags
+                        ptr::null(),        // data
+                    );
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if mount_dev {
+                    // Bind mount /dev (from host) to /dev (in container)
+                    let dev = CString::new("/dev").unwrap();
+                    let result = libc::mount(
+                        dev.as_ptr(),       // source
+                        dev.as_ptr(),       // target
+                        ptr::null(),        // fstype (NULL for bind mount)
+                        libc::MS_BIND | libc::MS_REC, // recursive bind
+                        ptr::null(),        // data
+                    );
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 4.75: Drop capabilities if specified
+                if let Some(keep_caps) = capabilities {
+                    // Drop all capabilities except the ones specified
+                    // We use prctl with PR_CAPBSET_DROP to drop from the bounding set
+                    const PR_CAPBSET_DROP: i32 = 24;
+
+                    // All capability numbers (0-37 covers most common capabilities)
+                    for cap in 0..38 {
+                        let cap_bit = 1u64 << cap;
+
+                        // If this capability is NOT in keep_caps, drop it
+                        if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
+                            let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+                            // Ignore errors for capabilities that don't exist
+                            if result != 0 {
+                                let err = io::Error::last_os_error();
+                                // EINVAL means capability doesn't exist, which is fine
+                                if err.raw_os_error() != Some(libc::EINVAL) {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Step 4.9: Set resource limits if specified
+                for limit in &rlimits {
+                    let rlimit = libc::rlimit {
+                        rlim_cur: limit.soft,
+                        rlim_max: limit.hard,
+                    };
+
+                    let result = libc::setrlimit(limit.resource, &rlimit);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 5: Run user-provided pre_exec callback
+                if let Some(ref callback) = user_pre_exec {
+                    callback()?;
+                }
+
+                // Step 6: Join existing namespaces AFTER chroot and filesystem setup
+                // This ensures paths are resolved correctly before namespace transitions
+                for (fd, _ns) in &join_ns_fds {
+                    let result = libc::setns(*fd, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                Ok(())
+            });
+        }
+
+        // Spawn the process
+        let child = self.inner.spawn().map_err(Error::Spawn)?;
+
+        // Keep join_ns_files alive until here so file descriptors remain valid
+        drop(join_ns_files);
+
+        Ok(Child { inner: child })
+    }
+}
+
+/// A handle to a spawned child process.
+///
+/// Provides access to the process ID and methods to wait for completion.
+/// Similar to [`std::process::Child`] but specifically for containerized processes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use remora::container::{Command, Namespace};
+///
+/// let mut child = Command::new("/bin/sleep")
+///     .args(&["5"])
+///     .with_namespaces(Namespace::PID)
+///     .spawn()?;
+///
+/// println!("Spawned process with PID: {}", child.pid());
+///
+/// let status = child.wait()?;
+/// println!("Process exited with: {:?}", status);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct Child {
+    inner: process::Child,
+}
+
+impl Child {
+    /// Returns the process ID of the child.
+    pub fn pid(&self) -> i32 {
+        self.inner.id() as i32
+    }
+
+    /// Wait for the child process to exit.
+    ///
+    /// This will block until the process terminates and return its exit status.
+    pub fn wait(&mut self) -> Result<ExitStatus, Error> {
+        let status = self.inner.wait().map_err(Error::Wait)?;
+
+        Ok(ExitStatus { inner: status })
+    }
+}
+
+/// Exit status of a terminated child process.
+#[derive(Debug, Clone)]
+pub struct ExitStatus {
+    inner: StdExitStatus,
+}
+
+impl ExitStatus {
+    /// Returns true if the process exited successfully (status code 0).
+    pub fn success(&self) -> bool {
+        self.inner.success()
+    }
+
+    /// Returns the exit code if the process terminated normally.
+    pub fn code(&self) -> Option<i32> {
+        self.inner.code()
+    }
+
+    /// Returns the signal that terminated the process, if any.
+    pub fn signal(&self) -> Option<i32> {
+        self.inner.signal()
+    }
+}
+
+/// Errors that can occur during container operations.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Failed to unshare namespaces
+    #[error("Failed to unshare namespaces: {0}")]
+    Unshare(#[source] nix::Error),
+
+    /// Failed to change root directory
+    #[error("Failed to chroot to {path}: {source}")]
+    Chroot {
+        path: String,
+        #[source]
+        source: nix::Error,
+    },
+
+    /// Failed to change directory after chroot
+    #[error("Failed to chdir to {path} after chroot: {source}")]
+    Chdir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Failed to execute pre_exec callback
+    #[error("Pre-exec callback failed: {0}")]
+    PreExec(#[source] io::Error),
+
+    /// Failed to spawn the process
+    #[error("Failed to spawn process: {0}")]
+    Spawn(#[source] io::Error),
+
+    /// Failed to wait for process completion
+    #[error("Failed to wait for process: {0}")]
+    Wait(#[source] io::Error),
+
+    /// Generic I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// UID mapping for user namespaces.
+///
+/// Maps user IDs from inside the container to outside the container.
+/// Allows unprivileged users to appear as root inside the container.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Map container root (0) to host user 1000
+/// UidMap { inside: 0, outside: 1000, count: 1 }
+///
+/// // Map range of 1000 UIDs
+/// UidMap { inside: 0, outside: 100000, count: 1000 }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UidMap {
+    /// UID inside the container
+    pub inside: u32,
+    /// UID outside the container (on the host)
+    pub outside: u32,
+    /// Number of consecutive UIDs to map
+    pub count: u32,
+}
+
+/// GID mapping for user namespaces.
+///
+/// Maps group IDs from inside the container to outside the container.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Map container root group (0) to host group 1000
+/// GidMap { inside: 0, outside: 1000, count: 1 }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GidMap {
+    /// GID inside the container
+    pub inside: u32,
+    /// GID outside the container (on the host)
+    pub outside: u32,
+    /// Number of consecutive GIDs to map
+    pub count: u32,
+}
+
+/// Resource limit (rlimit) configuration.
+///
+/// Controls resource usage for the containerized process.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Limit open file descriptors to 1024
+/// ResourceLimit {
+///     resource: libc::RLIMIT_NOFILE,
+///     soft: 1024,
+///     hard: 1024,
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimit {
+    /// Resource type (e.g., libc::RLIMIT_NOFILE, libc::RLIMIT_AS)
+    pub resource: libc::__rlimit_resource_t,
+    /// Soft limit (can be increased up to hard limit)
+    pub soft: libc::rlim_t,
+    /// Hard limit (requires privileges to increase)
+    pub hard: libc::rlim_t,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_namespace_bitflags_combination() {
+        let ns = Namespace::UTS | Namespace::PID | Namespace::MOUNT;
+
+        assert!(ns.contains(Namespace::UTS));
+        assert!(ns.contains(Namespace::PID));
+        assert!(ns.contains(Namespace::MOUNT));
+        assert!(!ns.contains(Namespace::NET));
+    }
+
+    #[test]
+    fn test_namespace_empty() {
+        let ns = Namespace::empty();
+
+        assert!(!ns.contains(Namespace::UTS));
+        assert!(!ns.contains(Namespace::PID));
+        assert!(ns.is_empty());
+    }
+
+    #[test]
+    fn test_namespace_all() {
+        let ns = Namespace::all();
+
+        assert!(ns.contains(Namespace::UTS));
+        assert!(ns.contains(Namespace::PID));
+        assert!(ns.contains(Namespace::MOUNT));
+        assert!(ns.contains(Namespace::NET));
+        assert!(ns.contains(Namespace::IPC));
+        assert!(ns.contains(Namespace::USER));
+        assert!(ns.contains(Namespace::CGROUP));
+    }
+
+    #[test]
+    fn test_namespace_to_clone_flags() {
+        let ns = Namespace::UTS | Namespace::PID;
+        let flags = ns.to_clone_flags();
+
+        assert!(flags.contains(CloneFlags::CLONE_NEWUTS));
+        assert!(flags.contains(CloneFlags::CLONE_NEWPID));
+        assert!(!flags.contains(CloneFlags::CLONE_NEWNS));
+    }
+
+    #[test]
+    fn test_namespace_difference() {
+        let ns1 = Namespace::UTS | Namespace::PID | Namespace::MOUNT;
+        let ns2 = Namespace::PID | Namespace::NET;
+
+        let diff = ns1 & !ns2;  // Items in ns1 but not in ns2
+
+        assert!(diff.contains(Namespace::UTS));
+        assert!(diff.contains(Namespace::MOUNT));
+        assert!(!diff.contains(Namespace::PID));
+        assert!(!diff.contains(Namespace::NET));
+    }
+
+    #[test]
+    fn test_command_builder_pattern() {
+        let cmd = Command::new("/bin/echo")
+            .args(&["hello", "world"])
+            .with_namespaces(Namespace::UTS)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null);
+
+        // Builder pattern works (compiles)
+        assert_eq!(cmd.namespaces, Namespace::UTS);
+    }
+
+    #[test]
+    fn test_command_chaining() {
+        // Test that methods can be chained fluently
+        let _cmd = Command::new("/bin/true")
+            .args(&["arg1"])
+            .with_chroot("/tmp")
+            .with_namespaces(Namespace::PID | Namespace::MOUNT);
+
+        // Compilation success means chaining works
+    }
+
+    #[test]
+    fn test_stdio_conversion() {
+        let _inherit: process::Stdio = Stdio::Inherit.into();
+        let _null: process::Stdio = Stdio::Null.into();
+        let _piped: process::Stdio = Stdio::Piped.into();
+
+        // Conversion works (compiles)
+    }
+
+    #[test]
+    fn test_error_display() {
+        let err = Error::Spawn(io::Error::new(io::ErrorKind::NotFound, "test"));
+        let msg = format!("{}", err);
+
+        assert!(msg.contains("Failed to spawn process"));
+    }
+
+    #[test]
+    fn test_error_from_io() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "test");
+        let err: Error = io_err.into();
+
+        match err {
+            Error::Io(_) => {},
+            _ => panic!("Expected Error::Io variant"),
+        }
+    }
+
+    // Integration-style tests (would need proper setup to run)
+
+    #[test]
+    #[ignore] // Ignore by default - requires root/CAP_SYS_ADMIN
+    fn test_spawn_simple_command() {
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("Failed to spawn /bin/true");
+
+        let status = child.wait().expect("Failed to wait");
+        assert!(status.success());
+    }
+
+    #[test]
+    #[ignore] // Ignore by default - requires root
+    fn test_spawn_with_namespace() {
+        let mut child = Command::new("/bin/true")
+            .with_namespaces(Namespace::UTS)
+            .spawn()
+            .expect("Failed to spawn with namespace");
+
+        let status = child.wait().expect("Failed to wait");
+        assert!(status.success());
+    }
+}

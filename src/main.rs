@@ -1,12 +1,14 @@
 #![crate_name = "remora"]
 #![allow(unused_imports)]
 
+mod container;
+
 use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
 use log::{info,error, warn};
 use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr, os::unix::prelude::{OsStrExt, IntoRawFd}};
-use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
+use container::{Child, Command, Error, GidMap, Stdio, UidMap, Namespace};
 use nix::unistd::chroot;
 
 const SYSFS : &str = "sysfs";
@@ -21,7 +23,10 @@ struct Args {
     #[clap(short, long)]
     uid: u32,
     #[clap(short, long)]
-    gid: u32,    
+    gid: u32,
+    /// Optional network namespace to join (e.g., "con" to join /var/run/netns/con)
+    #[clap(short = 'n', long)]
+    join_netns: Option<String>,
 }
 
 /* NOTE: do these in the alpine make rootfs instead?
@@ -52,67 +57,54 @@ fn child(
 
         info!("current user and group before spawn: uid {}, gid {}", libc::getuid(), libc::getgid());
 
-        let netns = std::fs::File::options().read(true).write(false).open("/var/run/netns/con");
+        info!("setting command info and spawning");
+        let mut cmd = Command::new(to_run)
+            .args(&(child_args.into_iter().collect::<Vec<OsString>>())[..])
+            .stdin(Stdio::Inherit)
+            .stdout(Stdio::Inherit)
+            .stderr(Stdio::Inherit)
+            .with_chroot(curdir)
+            .with_proc_mount()  // Automatically mount /proc
+            .with_namespaces(
+                Namespace::UTS | Namespace::MOUNT | Namespace::CGROUP
+                // NOTE: PID namespace is NOT created here because unshare(CLONE_NEWPID)
+                // doesn't put the calling process into the new namespace. The exec'd
+                // program would still be in the original PID namespace, and the new
+                // namespace would be empty, causing "can't fork: Out of memory" errors.
+                // Proper PID namespace support requires forking after unshare, which
+                // isn't possible with the current pre_exec architecture.
+            );
 
-        match netns {
-            Ok(nsf) => {
-                
-                info!("opened net namespace: {:?}", nsf);
-                let mut cmd = Command::new(to_run);
+        // Phase 3 feature: Network namespace joining
+        if let Some(netns_name) = &clap_args.join_netns {
+            let netns_path = format!("/var/run/netns/{}", netns_name);
+            info!("Joining network namespace: {}", netns_path);
+            cmd = cmd.with_namespace_join(netns_path, Namespace::NET);
+        }
 
-                info!("setting command info");
-                cmd.args(&(child_args.into_iter().collect::<Vec<OsString>>())[..])
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .chroot_dir(curdir)
-                .pre_exec(&mount_proc)
-                .unshare(
-                    [
-                        unshare::Namespace::Uts,
-                        unshare::Namespace::Mount,
-                        unshare::Namespace::Pid,
-                        unshare::Namespace::Cgroup,
-                        //unshare::Namespace::Net,
-                    ]
-                    .iter(),
-                );
-/*                 .set_id_maps(
-                vec![UidMap {
-                    inside_uid: 0,
-                    outside_uid: _uid_parent,
-                    count: 1,
-                }],
-                vec![GidMap {
-                    inside_gid: 0,
-                    outside_gid: _gid_parent,
-                    count: 1,
-                }],
-            )
-            .uid(0)
-            .gid(0); */
-/* 
-                info!("setting namespace");
-                match cmd.set_namespace(&nsf, unshare::Namespace::Net){
-                    Ok(c) => {info!("set network namespace in {:?}",c);},
-                    Err(e) => {warn!("failed to set namespace {:?}", e);}
-                };
+        /*  Phase 3 features - UID/GID mapping (TODO: add CLI flags)
+        cmd = cmd
+            .with_uid_maps(&[UidMap { inside: 0, outside: _uid_parent, count: 1 }])
+            .with_gid_maps(&[GidMap { inside: 0, outside: _gid_parent, count: 1 }])
+            .with_uid(0)
+            .with_gid(0);
+        */
 
- */
-                info!("spawning child process");
-                match cmd.spawn() {
-                    Ok(c) => {
-                        info!("spawned child {}", c.pid());
-                        Ok(c)
-                    },
-                    Err(e) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
-                }
-            
-            },
-            Err(e) => {info!("failed to open namespace {:?}", e); Err(Box::new(e))}
+        let result = cmd.spawn();
+
+        match result {
+            Ok(c) => {
+                info!("spawned child {}", c.pid());
+                Ok(c)
+            }
+            Err(e) => {
+                error!("failed to spawn child: {}", e);
+                Err(Box::new(e))
+            }
         }
     }
 }
+
 fn main() {
     env_logger::init();
     info!("Entering main!");
@@ -125,6 +117,10 @@ fn main() {
     let p_uid = clap_args.uid;
     let p_gid = clap_args.gid;
     info!("uid: {}, gid: {}", p_uid, p_gid);
+
+    // Save rootfs path for later use
+    let rootfs_path = clap_args.rootfs.clone();
+
     let mut path = PathBuf::new();
     path.push(std::env::current_dir().unwrap());
     path.push(clap_args.rootfs);
@@ -150,10 +146,20 @@ fn main() {
         p_gid,
     );
     
-    // unmount sys when child returns
+    // unmount filesystems when child returns
     match umount_sys(sys_mount.as_ref()) {
         Ok(_) => info!("unmounted sys"),
         Err(e) => info!("failed to unmount sys {:?}",e)
+    }
+
+    // Try to unmount proc if it leaked out of mount namespace
+    let mut proc_path = std::env::current_dir().unwrap();
+    proc_path.push(&rootfs_path);
+    proc_path.push("proc");
+    let proc_mount = CString::new(proc_path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
+    match umount_sys(proc_mount.as_ref()) {
+        Ok(_) => info!("unmounted proc"),
+        Err(_) => {} // Ignore error - proc might not be mounted
     }
 }
 
@@ -174,24 +180,8 @@ fn panic_spawn<I>(
         .expect(format!("failed to wait for {} to exit", which).as_str());
 }
 
-/// callback that mounts a new proc filesystem
-/// this cannot allocate
-fn mount_proc() -> std::io::Result<()> {
-    unsafe {
-        let proc_str = CString::new("proc")?;
-        let proc_str_ptr = proc_str.as_ptr();
-        match libc::mount(
-            proc_str_ptr,
-            proc_str_ptr,
-            proc_str_ptr,
-            0,
-            ptr::null(),
-        ) {
-            0 => Ok(()),
-            _ => Err(std::io::Error::last_os_error()),
-        }
-    }
-}
+// NOTE: mount_proc() was removed - we now use .with_proc_mount() instead
+// See Phase 3 enhanced mount support feature
 
 #[allow(dead_code)]
 fn mount_cgroup() -> std::io::Result<()> {
