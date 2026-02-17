@@ -11,8 +11,11 @@ Remora provides a safe, ergonomic API for creating containerized processes using
 - **Filesystem Isolation**: chroot and pivot_root support
 - **Automatic Mounts**: /proc, /sys, /dev helpers
 
-### Security
+### Security (Phase 1 Complete ✅)
 - **Seccomp Filtering**: Syscall filtering using BPF (Docker's default profile included)
+- **No-New-Privileges**: Prevent privilege escalation via setuid/setgid binaries
+- **Read-Only Rootfs**: Make container filesystem immutable
+- **Masked Paths**: Hide sensitive kernel information (/proc/kcore, /sys/firmware, etc.)
 - **Capability Management**: Drop unnecessary capabilities for least-privilege containers
 - **Resource Limits**: rlimits for memory, CPU time, file descriptors, etc.
 
@@ -38,7 +41,7 @@ remora = { path = "." }
 use remora::container::{Command, Namespace, Stdio};
 
 fn main() {
-    // Create a containerized process with security features
+    // Create a secure containerized process with Phase 1 security
     let mut child = Command::new("/bin/sh")
         .args(&["-c", "echo Hello from container!"])
         .stdin(Stdio::Inherit)
@@ -47,8 +50,11 @@ fn main() {
         .with_chroot("/path/to/rootfs")
         .with_namespaces(Namespace::UTS | Namespace::PID | Namespace::MOUNT)
         .with_proc_mount()              // Auto-mount /proc
-        .with_seccomp_default()         // Apply Docker's seccomp profile
-        .drop_all_capabilities()        // Run with minimal capabilities
+        .with_seccomp_default()         // Block dangerous syscalls
+        .with_no_new_privileges(true)   // Prevent privilege escalation
+        .with_readonly_rootfs(true)     // Immutable filesystem
+        .with_masked_paths_default()    // Hide sensitive kernel paths
+        .drop_all_capabilities()        // Minimal capabilities
         .with_max_fds(1024)             // Limit file descriptors
         .spawn()
         .expect("Failed to spawn container");

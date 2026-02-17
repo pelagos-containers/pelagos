@@ -43,8 +43,11 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - Filesystem isolation: chroot and pivot_root
 - Automatic mounts: /proc, /sys, /dev
 
-**Security:**
+**Security (Phase 1 COMPLETE ✅):**
 - **Seccomp filtering**: Docker's default profile + minimal profile
+- **No-new-privileges**: Prevent setuid/setgid escalation
+- **Read-only rootfs**: Immutable filesystem
+- **Masked paths**: Hide sensitive kernel info
 - **Capability management**: Drop/keep specific capabilities
 - **Resource limits**: rlimits for memory, CPU, file descriptors
 

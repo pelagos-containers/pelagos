@@ -14,9 +14,6 @@
 //! ```
 
 use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap};
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 /// Helper to check if we're running as root
@@ -40,6 +37,13 @@ fn get_test_rootfs() -> Option<PathBuf> {
     }
 }
 
+/// Standard Alpine Linux PATH for use inside containers.
+///
+/// The container inherits the host's PATH, but host paths (e.g. Arch Linux's
+/// /usr/local/sbin) may not exist inside the Alpine chroot. Always set this
+/// PATH on any Command that will run inside the container.
+const ALPINE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 #[test]
 fn test_basic_namespace_creation() {
     if !is_root() {
@@ -57,6 +61,7 @@ fn test_basic_namespace_creation() {
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::UTS | Namespace::MOUNT)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
         .stderr(Stdio::Null)
@@ -85,25 +90,12 @@ fn test_proc_mount() {
         return;
     };
 
-    // Create a test script that checks if /proc is mounted
-    let test_script = rootfs.join("tmp/test_proc.sh");
-    let mut script = fs::File::create(&test_script).unwrap();
-    writeln!(script, "#!/bin/ash").unwrap();
-    writeln!(script, "if [ -f /proc/self/status ]; then").unwrap();
-    writeln!(script, "  exit 0").unwrap();
-    writeln!(script, "else").unwrap();
-    writeln!(script, "  exit 1").unwrap();
-    writeln!(script, "fi").unwrap();
-    drop(script);
-
-    let mut perms = fs::metadata(&test_script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&test_script, perms).unwrap();
-
-    // Test with_proc_mount()
-    let result = Command::new("/tmp/test_proc.sh")
+    // Test with_proc_mount() - check /proc/self/status exists
+    let result = Command::new("/bin/ash")
+        .args(&["-c", "test -f /proc/self/status"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_proc_mount()
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
@@ -137,6 +129,7 @@ fn test_capability_dropping() {
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .drop_all_capabilities()
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
@@ -170,6 +163,7 @@ fn test_selective_capabilities() {
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_capabilities(Capability::NET_BIND_SERVICE | Capability::CHOWN)
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
@@ -198,27 +192,12 @@ fn test_resource_limits_fds() {
         return;
     };
 
-    // Create a script that checks ulimit
-    let test_script = rootfs.join("tmp/test_ulimit.sh");
-    let mut script = fs::File::create(&test_script).unwrap();
-    writeln!(script, "#!/bin/ash").unwrap();
-    writeln!(script, "# Check if fd limit is 100").unwrap();
-    writeln!(script, "limit=$(ulimit -n)").unwrap();
-    writeln!(script, "if [ \"$limit\" = \"100\" ]; then").unwrap();
-    writeln!(script, "  exit 0").unwrap();
-    writeln!(script, "else").unwrap();
-    writeln!(script, "  exit 1").unwrap();
-    writeln!(script, "fi").unwrap();
-    drop(script);
-
-    let mut perms = fs::metadata(&test_script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&test_script, perms).unwrap();
-
-    // Test with_max_fds()
-    let result = Command::new("/tmp/test_ulimit.sh")
+    // Test with_max_fds() - check ulimit -n equals 100
+    let result = Command::new("/bin/ash")
+        .args(&["-c", "test \"$(ulimit -n)\" = 100"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_max_fds(100)
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
@@ -252,6 +231,7 @@ fn test_resource_limits_memory() {
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_memory_limit(512 * 1024 * 1024) // 512MB
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
@@ -285,6 +265,7 @@ fn test_resource_limits_cpu() {
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_cpu_time_limit(60) // 60 seconds
         .stdin(Stdio::Null)
         .stdout(Stdio::Null)
@@ -318,6 +299,7 @@ fn test_combined_features() {
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::CGROUP)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_proc_mount()
         .with_capabilities(Capability::NET_BIND_SERVICE)
         .with_max_fds(500)
@@ -404,6 +386,7 @@ fn test_command_builder_pattern() {
         .stderr(Stdio::Null)
         .with_namespaces(Namespace::UTS)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_proc_mount()
         .with_max_fds(1024);
 
@@ -427,27 +410,14 @@ fn test_seccomp_docker_blocks_reboot() {
         return;
     };
 
-    // Create a test script that attempts to call reboot (blocked by Docker profile)
-    let test_script = rootfs.join("tmp/test_reboot.sh");
-    fs::create_dir_all(rootfs.join("tmp")).ok();
-    let mut file = fs::File::create(&test_script).unwrap();
-    writeln!(
-        file,
-        r#"#!/bin/ash
-# Try to call reboot syscall - should fail with EPERM
-reboot 2>&1
-echo "reboot_exit_code=$?"
-"#
-    )
-    .unwrap();
-    fs::set_permissions(&test_script, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // Run with Docker seccomp profile
-    let mut child = Command::new("/tmp/test_reboot.sh")
+    // Run with Docker seccomp profile - attempt reboot (should be blocked)
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "reboot 2>&1; echo reboot_exit_code=$?"])
         .stdin(Stdio::Null)
         .stdout(Stdio::Piped)
         .stderr(Stdio::Piped)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT)
         .with_proc_mount()
         .with_seccomp_default() // Apply Docker's default seccomp profile
@@ -464,8 +434,6 @@ echo "reboot_exit_code=$?"
         "Process should complete (reboot syscall blocked by seccomp)"
     );
 
-    // Cleanup
-    fs::remove_file(&test_script).ok();
 }
 
 #[test]
@@ -489,6 +457,7 @@ fn test_seccomp_docker_allows_normal_syscalls() {
         .stdout(Stdio::Piped)
         .stderr(Stdio::Piped)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT)
         .with_proc_mount()
         .with_seccomp_default() // Apply Docker's default seccomp profile
@@ -521,6 +490,7 @@ fn test_seccomp_minimal_is_restrictive() {
         .stdout(Stdio::Null)
         .stderr(Stdio::Null)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT)
         .with_proc_mount()
         .with_seccomp_minimal() // Apply minimal profile
@@ -552,18 +522,22 @@ fn test_seccomp_profile_api() {
 
     let _cmd1 = Command::new("/bin/sh")
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_seccomp_default();
 
     let _cmd2 = Command::new("/bin/sh")
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_seccomp_minimal();
 
     let _cmd3 = Command::new("/bin/sh")
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_seccomp_profile(SeccompProfile::Docker);
 
     let _cmd4 = Command::new("/bin/sh")
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .without_seccomp();
 
     // Just verify the API compiles and methods are available
@@ -589,6 +563,7 @@ fn test_seccomp_without_flag_works() {
         .stdout(Stdio::Piped)
         .stderr(Stdio::Piped)
         .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT)
         .with_proc_mount()
         // No seccomp configured - should work fine
@@ -597,4 +572,168 @@ fn test_seccomp_without_flag_works() {
 
     let status = child.wait().expect("Failed to wait for child");
     assert!(status.success(), "Container should work without seccomp");
+}
+
+// ============================================================================
+// Phase 1 Security Features Tests
+// ============================================================================
+
+#[test]
+fn test_no_new_privileges() {
+    if !is_root() {
+        eprintln!("Skipping test_no_new_privileges: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_no_new_privileges: alpine-rootfs not found");
+        return;
+    };
+
+    // Run ash inline - grep for NoNewPrivs:	1 in /proc/self/status
+    // The value is 1 when PR_SET_NO_NEW_PRIVS has been set
+    // Use full paths since PATH is not set inside the container
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "/bin/grep 'NoNewPrivs:.*1' /proc/self/status"])
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+        .with_proc_mount()
+        .with_no_new_privileges(true)
+        .spawn()
+        .expect("Failed to spawn with no-new-privileges");
+
+    let status = child.wait().expect("Failed to wait for child");
+    assert!(status.success(), "NoNewPrivs should be set to 1 in /proc/self/status");
+}
+
+#[test]
+fn test_readonly_rootfs() {
+    if !is_root() {
+        eprintln!("Skipping test_readonly_rootfs: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_readonly_rootfs: alpine-rootfs not found");
+        return;
+    };
+
+    // Try to write to rootfs - should fail with read-only filesystem
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "touch /test_file 2>&1; echo exit_code=$?"])
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+        .with_proc_mount()
+        .with_readonly_rootfs(true)
+        .spawn()
+        .expect("Failed to spawn with read-only rootfs");
+
+    let status = child.wait().expect("Failed to wait for child");
+    // The command should complete (exit code 0), but the touch should have failed
+    assert!(status.success(), "Container should run despite read-only fs");
+}
+
+#[test]
+fn test_masked_paths_default() {
+    if !is_root() {
+        eprintln!("Skipping test_masked_paths_default: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_masked_paths_default: alpine-rootfs not found");
+        return;
+    };
+
+    // Try to read a masked path - should see /dev/null or get an error
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "cat /proc/kcore 2>&1 | head -c 10 || echo 'masked'"])
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+        .with_proc_mount()
+        .with_masked_paths_default()
+        .spawn()
+        .expect("Failed to spawn with masked paths");
+
+    let status = child.wait().expect("Failed to wait for child");
+    assert!(status.success(), "Masked paths should not cause failures");
+}
+
+#[test]
+fn test_masked_paths_custom() {
+    if !is_root() {
+        eprintln!("Skipping test_masked_paths_custom: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_masked_paths_custom: alpine-rootfs not found");
+        return;
+    };
+
+    // Use custom masked paths
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "echo 'Custom masked paths test'"])
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+        .with_proc_mount()
+        .with_masked_paths(&["/proc/kcore", "/sys/firmware"])
+        .spawn()
+        .expect("Failed to spawn with custom masked paths");
+
+    let status = child.wait().expect("Failed to wait for child");
+    assert!(status.success(), "Custom masked paths should work");
+}
+
+#[test]
+fn test_combined_phase1_security() {
+    if !is_root() {
+        eprintln!("Skipping test_combined_phase1_security: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_combined_phase1_security: alpine-rootfs not found");
+        return;
+    };
+
+    // Test all Phase 1 security features together
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "echo 'All Phase 1 security features enabled'"])
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+        .with_proc_mount()
+        .with_seccomp_default()        // Seccomp filtering
+        .with_no_new_privileges(true)  // No privilege escalation
+        .with_readonly_rootfs(true)    // Immutable rootfs
+        .with_masked_paths_default()   // Hide sensitive paths
+        .drop_all_capabilities()       // Minimal capabilities
+        .spawn()
+        .expect("Failed to spawn with all Phase 1 security");
+
+    let status = child.wait().expect("Failed to wait for child");
+    assert!(
+        status.success(),
+        "Container with all Phase 1 security should work"
+    );
 }

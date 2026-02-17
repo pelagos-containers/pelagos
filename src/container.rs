@@ -300,6 +300,9 @@ pub struct Command {
     // Security configuration
     capabilities: Option<Capability>, // None = keep all, Some = keep only these
     seccomp_profile: Option<SeccompProfile>, // None = no seccomp, Some = apply profile
+    no_new_privileges: bool,          // Prevent privilege escalation via setuid
+    readonly_rootfs: bool,            // Make rootfs read-only
+    masked_paths: Vec<PathBuf>,       // Paths to mask with /dev/null
     // Resource limits
     rlimits: Vec<ResourceLimit>,
 }
@@ -323,6 +326,9 @@ impl Command {
             pivot_root: None,
             capabilities: None,
             seccomp_profile: None,
+            no_new_privileges: false,
+            readonly_rootfs: false,
+            masked_paths: Vec::new(),
             rlimits: Vec::new(),
         }
     }
@@ -340,6 +346,16 @@ impl Command {
     /// Configure stdin for the child process.
     pub fn stdin(mut self, cfg: Stdio) -> Self {
         self.inner.stdin(cfg);
+        self
+    }
+
+    /// Set an environment variable for the child process.
+    pub fn env<K, V>(mut self, key: K, val: V) -> Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.inner.env(key, val);
         self
     }
 
@@ -701,6 +717,98 @@ impl Command {
         self
     }
 
+    /// Enable no-new-privileges flag to prevent privilege escalation.
+    ///
+    /// This prevents the process from gaining new privileges via setuid/setgid
+    /// binaries or file capabilities. Essential for running untrusted code.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_no_new_privileges(true);
+    /// ```
+    ///
+    /// # Security
+    ///
+    /// This flag:
+    /// - Prevents setuid/setgid binaries from elevating privileges
+    /// - Blocks file capability-based privilege escalation
+    /// - Required for unprivileged seccomp filtering
+    /// - Cannot be unset once enabled
+    ///
+    /// Recommended for all production containers running untrusted code.
+    pub fn with_no_new_privileges(mut self, enabled: bool) -> Self {
+        self.no_new_privileges = enabled;
+        self
+    }
+
+    /// Make the root filesystem read-only.
+    ///
+    /// This prevents the container from modifying the filesystem, enforcing
+    /// immutable infrastructure and preventing malware persistence.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_readonly_rootfs(true);
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// You'll typically want writable tmpfs mounts for /tmp, /var/tmp, etc:
+    /// ```ignore
+    /// cmd.with_readonly_rootfs(true)
+    ///    .with_pre_exec(|| {
+    ///        // Mount tmpfs for writable areas
+    ///        mount_tmpfs("/tmp")?;
+    ///        Ok(())
+    ///    });
+    /// ```
+    pub fn with_readonly_rootfs(mut self, readonly: bool) -> Self {
+        self.readonly_rootfs = readonly;
+        self
+    }
+
+    /// Mask sensitive paths by mounting /dev/null over them.
+    ///
+    /// This hides sensitive kernel information from the container, preventing
+    /// information leakage and some escape vectors.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Use default masked paths
+    /// cmd.with_masked_paths_default();
+    ///
+    /// // Or specify custom paths
+    /// cmd.with_masked_paths(&["/proc/kcore", "/sys/firmware"]);
+    /// ```
+    pub fn with_masked_paths(mut self, paths: &[&str]) -> Self {
+        self.masked_paths = paths.iter().map(PathBuf::from).collect();
+        self
+    }
+
+    /// Use Docker's default set of masked paths.
+    ///
+    /// Masks the following sensitive paths:
+    /// - `/proc/kcore` - Physical memory access
+    /// - `/proc/keys` - Kernel keyring
+    /// - `/proc/timer_list` - Timing information
+    /// - `/proc/sched_debug` - Scheduler debugging
+    /// - `/sys/firmware` - Firmware access
+    /// - `/sys/devices/virtual/powercap` - Power capping info
+    pub fn with_masked_paths_default(mut self) -> Self {
+        self.masked_paths = vec![
+            PathBuf::from("/proc/kcore"),
+            PathBuf::from("/proc/keys"),
+            PathBuf::from("/proc/timer_list"),
+            PathBuf::from("/proc/sched_debug"),
+            PathBuf::from("/sys/firmware"),
+            PathBuf::from("/sys/devices/virtual/powercap"),
+        ];
+        self
+    }
+
     /// Spawn the child process with configured namespaces and settings.
     ///
     /// This combines namespace creation, chroot, and user pre_exec callbacks
@@ -750,6 +858,9 @@ impl Command {
         let pivot_root = self.pivot_root.clone();
         let capabilities = self.capabilities;
         let rlimits = self.rlimits.clone();
+        let no_new_privileges = self.no_new_privileges;
+        let readonly_rootfs = self.readonly_rootfs;
+        let masked_paths = self.masked_paths.clone();
 
         // Install our combined pre_exec hook
         unsafe {
@@ -878,6 +989,24 @@ impl Command {
                     }
                 } else if let Some(ref dir) = chroot_dir {
                     // Fallback to chroot if pivot_root not specified
+                    use std::os::unix::ffi::OsStrExt;
+
+                    // If readonly rootfs is requested, bind-mount the chroot dir to itself BEFORE chroot
+                    // This makes it a proper mount point so we can remount it readonly later
+                    if readonly_rootfs {
+                        let dir_c = CString::new(dir.as_os_str().as_bytes()).unwrap();
+                        let result = libc::mount(
+                            dir_c.as_ptr(),          // source: chroot dir
+                            dir_c.as_ptr(),          // target: same dir
+                            ptr::null(),             // fstype: NULL
+                            libc::MS_BIND | libc::MS_REC, // recursive bind mount
+                            ptr::null(),             // data: NULL
+                        );
+                        if result != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+
                     chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
                     // Change working directory to / after chroot
@@ -956,6 +1085,48 @@ impl Command {
                     }
                 }
 
+                // Step 4.8: Mask sensitive paths
+                if !masked_paths.is_empty() {
+                    let dev_null = CString::new("/dev/null").unwrap();
+                    for path in &masked_paths {
+                        let path_c = match CString::new(path.as_os_str().as_encoded_bytes()) {
+                            Ok(p) => p,
+                            Err(_) => continue, // Skip paths with null bytes
+                        };
+
+                        // Bind mount /dev/null over the path to mask it
+                        let result = libc::mount(
+                            dev_null.as_ptr(),           // source: /dev/null
+                            path_c.as_ptr(),             // target: path to mask
+                            ptr::null(),                 // fstype: NULL
+                            libc::MS_BIND,               // bind mount
+                            ptr::null(),                 // data: NULL
+                        );
+
+                        // Ignore errors - path might not exist, which is fine
+                        if result != 0 {
+                            // Don't fail, just skip this path
+                        }
+                    }
+                }
+
+                // Step 4.85: Make rootfs read-only if requested
+                // MUST come after all mounts (/proc, /sys, /dev, masked paths)
+                // Note: We already did bind mount before chroot, so just remount readonly now
+                if readonly_rootfs {
+                    let root = CString::new("/").unwrap();
+                    let result = libc::mount(
+                        ptr::null(),             // source: NULL (remount)
+                        root.as_ptr(),           // target: /
+                        ptr::null(),             // fstype: NULL (remount)
+                        libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_BIND, // remount readonly
+                        ptr::null(),             // data: NULL
+                    );
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
                 // Step 4.9: Set resource limits if specified
                 for limit in &rlimits {
                     let rlimit = libc::rlimit {
@@ -978,6 +1149,16 @@ impl Command {
                 // This ensures paths are resolved correctly before namespace transitions
                 for (fd, _ns) in &join_ns_fds {
                     let result = libc::setns(*fd, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 6.5: Set no-new-privileges flag if requested
+                // This prevents privilege escalation via setuid/setgid binaries
+                if no_new_privileges {
+                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                    let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -1042,6 +1223,19 @@ impl Child {
         let status = self.inner.wait().map_err(Error::Wait)?;
 
         Ok(ExitStatus { inner: status })
+    }
+
+    /// Wait for the child to exit and collect all output.
+    ///
+    /// Returns (exit_status, stdout_bytes, stderr_bytes).
+    /// Only works if Stdio::Piped was set for stdout/stderr.
+    pub fn wait_with_output(self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
+        let output = self.inner.wait_with_output().map_err(Error::Wait)?;
+        Ok((
+            ExitStatus { inner: output.status },
+            output.stdout,
+            output.stderr,
+        ))
     }
 }
 
