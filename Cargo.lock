@@ -740,6 +740,7 @@ dependencies = [
  "log",
  "nix 0.31.1",
  "seccompiler",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

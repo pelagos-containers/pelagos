@@ -59,6 +59,11 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Terminal restore**: `TerminalGuard` RAII ensures raw mode is always cleaned up
 - **`src/pty.rs`**: relay loop, `TerminalGuard`, `InteractiveSession`
 
+**Filesystem Flexibility (Phase 4 COMPLETE ✅):**
+- **Bind mounts**: `with_bind_mount()` (RW) and `with_bind_mount_ro()` (RO) — map host dirs into container
+- **tmpfs mounts**: `with_tmpfs()` — in-memory writable scratch space (works with read-only rootfs)
+- **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/remora/volumes/<name>/`; `with_volume()` builder method
+
 **Advanced:**
 - UID/GID mapping for user namespaces
 - Namespace joining (attach to existing namespaces)
@@ -75,7 +80,7 @@ src/
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 22 integration tests (require root)
+  integration_tests.rs    # 26 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -246,6 +251,11 @@ The spawn process has a carefully orchestrated setup:
 - ✅ SIGWINCH forwarding (window resize)
 - ✅ Session isolation (setsid + TIOCSCTTY)
 
+**Phase 4 - Filesystem Flexibility: COMPLETE ✅**
+- ✅ Bind mounts (RW and RO) — `with_bind_mount()`, `with_bind_mount_ro()`
+- ✅ tmpfs mounts — `with_tmpfs()`
+- ✅ Named volumes — `Volume::create/open/delete`, `with_volume()`
+
 **Phase 3 - Networking:**
 - CNI integration (delegate to external tools)
 
@@ -271,7 +281,10 @@ Many features require root or CAP_SYS_ADMIN
 | Capabilities | ✅ | ✅ |
 | Resource limits | ✅ rlimits | ✅ cgroups |
 | TTY/PTY | ✅ PTY relay | ✅ |
+| Bind mounts | ✅ RW + RO | ✅ |
+| tmpfs mounts | ✅ | ✅ |
+| Named volumes | ✅ | ✅ |
 | Networking | ⚠️ Join only | ✅ CNI |
 | OCI Compatible | ❌ | ✅ |
 
-**Current parity: ~45% of runc features**
+**Current parity: ~60% of runc features**

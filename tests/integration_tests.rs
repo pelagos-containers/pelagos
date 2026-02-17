@@ -13,7 +13,7 @@
 //! sudo -E cargo test --test integration_tests
 //! ```
 
-use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap};
+use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume};
 use std::path::PathBuf;
 
 /// Helper to check if we're running as root
@@ -736,4 +736,155 @@ fn test_combined_phase1_security() {
         status.success(),
         "Container with all Phase 1 security should work"
     );
+}
+
+// ============================================================================
+// Phase 4: Filesystem Flexibility Tests
+// ============================================================================
+
+#[test]
+fn test_bind_mount_rw() {
+    if !is_root() {
+        eprintln!("Skipping test_bind_mount_rw: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bind_mount_rw: alpine-rootfs not found");
+        return;
+    };
+
+    // Create a temp dir on the host and write a file into it
+    let host_dir = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::write(host_dir.path().join("hello.txt"), b"hello from host")
+        .expect("failed to write host file");
+
+    // Mount the host dir into /mnt/hostdir inside the container and verify the file is readable
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "cat /mnt/hostdir/hello.txt"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_bind_mount(host_dir.path(), "/mnt/hostdir")
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("Failed to spawn with bind mount");
+
+    let status = child.wait().expect("Failed to wait for child");
+    assert!(status.success(), "Container should read host file via bind mount");
+}
+
+#[test]
+fn test_bind_mount_ro() {
+    if !is_root() {
+        eprintln!("Skipping test_bind_mount_ro: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bind_mount_ro: alpine-rootfs not found");
+        return;
+    };
+
+    let host_dir = tempfile::tempdir().expect("failed to create temp dir");
+
+    // Attempt to write inside a read-only bind mount — should fail
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "touch /mnt/ro/newfile 2>/dev/null; echo exit=$?"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_bind_mount_ro(host_dir.path(), "/mnt/ro")
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("Failed to spawn with read-only bind mount");
+
+    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+    assert!(status.success(), "Shell should exit cleanly");
+    let out = String::from_utf8_lossy(&stdout);
+    // touch must fail (exit code != 0) because the mount is read-only
+    assert!(
+        out.contains("exit=1"),
+        "Write to read-only bind mount should fail, got: {}",
+        out
+    );
+}
+
+#[test]
+fn test_tmpfs_mount() {
+    if !is_root() {
+        eprintln!("Skipping test_tmpfs_mount: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_tmpfs_mount: alpine-rootfs not found");
+        return;
+    };
+
+    // Even with a read-only rootfs, tmpfs at /tmp should be writable
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "touch /tmp/testfile && echo ok"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_readonly_rootfs(true)
+        .with_tmpfs("/tmp", "size=10m,mode=1777")
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("Failed to spawn with tmpfs mount");
+
+    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+    assert!(status.success(), "Container should succeed with tmpfs /tmp");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(out.contains("ok"), "touch on tmpfs should succeed, got: {}", out);
+}
+
+#[test]
+fn test_named_volume() {
+    if !is_root() {
+        eprintln!("Skipping test_named_volume: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_named_volume: alpine-rootfs not found");
+        return;
+    };
+
+    // Clean up any leftover volume from a previous failed run
+    let _ = Volume::delete("testvol");
+
+    let vol = Volume::create("testvol").expect("Failed to create volume");
+
+    // Write a file from inside the container
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "echo persistent > /data/file.txt"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_volume(&vol, "/data")
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn with named volume");
+
+    let status = child.wait().expect("Failed to wait for child");
+    assert!(status.success(), "Container should write to volume");
+
+    // Verify the file persists on the host
+    let host_file = vol.path().join("file.txt");
+    assert!(host_file.exists(), "Volume file should exist on host after container exits");
+    let contents = std::fs::read_to_string(&host_file).expect("Failed to read volume file");
+    assert!(contents.contains("persistent"), "Volume file should contain expected content");
+
+    // Clean up
+    Volume::delete("testvol").expect("Failed to delete volume");
 }

@@ -249,6 +249,81 @@ impl From<Stdio> for process::Stdio {
     }
 }
 
+/// A bind mount that maps a host directory into the container.
+#[derive(Debug, Clone)]
+pub struct BindMount {
+    /// Absolute path on the host to mount from.
+    pub source: PathBuf,
+    /// Absolute path inside the container where it will be mounted (e.g. `/data`).
+    pub target: PathBuf,
+    /// If true, the bind mount is read-only inside the container.
+    pub readonly: bool,
+}
+
+/// A tmpfs mount inside the container.
+#[derive(Debug, Clone)]
+pub struct TmpfsMount {
+    /// Absolute path inside the container where tmpfs is mounted (e.g. `/tmp`).
+    pub target: PathBuf,
+    /// Mount options passed to the kernel (e.g. `"size=100m,mode=1777"`).
+    pub options: String,
+}
+
+/// A named volume backed by a host directory under `/var/lib/remora/volumes/<name>/`.
+///
+/// Volumes provide persistent storage that survives container restarts.
+///
+/// # Examples
+///
+/// ```ignore
+/// let vol = Volume::create("mydata")?;
+/// Command::new("/bin/sh")
+///     .with_volume(&vol, "/data")
+///     .spawn()?;
+/// ```
+pub struct Volume {
+    /// The volume name (used as directory name under `/var/lib/remora/volumes/`).
+    pub name: String,
+    /// Resolved absolute host path to the volume directory.
+    pub path: PathBuf,
+}
+
+impl Volume {
+    fn volumes_dir() -> PathBuf {
+        PathBuf::from("/var/lib/remora/volumes")
+    }
+
+    /// Create a new named volume, creating the backing directory if needed.
+    pub fn create(name: &str) -> io::Result<Self> {
+        let path = Self::volumes_dir().join(name);
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { name: name.to_string(), path })
+    }
+
+    /// Open an existing named volume, returning an error if it does not exist.
+    pub fn open(name: &str) -> io::Result<Self> {
+        let path = Self::volumes_dir().join(name);
+        if !path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("volume '{}' not found at {}", name, path.display()),
+            ));
+        }
+        Ok(Self { name: name.to_string(), path })
+    }
+
+    /// Delete a named volume and its contents.
+    pub fn delete(name: &str) -> io::Result<()> {
+        let path = Self::volumes_dir().join(name);
+        std::fs::remove_dir_all(&path)
+    }
+
+    /// Returns the absolute host path of this volume.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 /// Builder for spawning processes in Linux namespaces.
 ///
 /// Similar to [`std::process::Command`] but with support for Linux namespaces,
@@ -303,6 +378,9 @@ pub struct Command {
     no_new_privileges: bool,          // Prevent privilege escalation via setuid
     readonly_rootfs: bool,            // Make rootfs read-only
     masked_paths: Vec<PathBuf>,       // Paths to mask with /dev/null
+    // Filesystem mounts
+    bind_mounts: Vec<BindMount>,
+    tmpfs_mounts: Vec<TmpfsMount>,
     // Resource limits
     rlimits: Vec<ResourceLimit>,
 }
@@ -329,6 +407,8 @@ impl Command {
             no_new_privileges: false,
             readonly_rootfs: false,
             masked_paths: Vec::new(),
+            bind_mounts: Vec::new(),
+            tmpfs_mounts: Vec::new(),
             rlimits: Vec::new(),
         }
     }
@@ -809,6 +889,54 @@ impl Command {
         self
     }
 
+    /// Add a read-write bind mount from a host directory into the container.
+    ///
+    /// The `source` is an absolute path on the host; `target` is the absolute
+    /// path inside the container where it will appear.
+    ///
+    /// Requires `Namespace::MOUNT` to be set.
+    pub fn with_bind_mount<P1, P2>(mut self, source: P1, target: P2) -> Self
+    where
+        P1: Into<PathBuf>,
+        P2: Into<PathBuf>,
+    {
+        self.bind_mounts.push(BindMount { source: source.into(), target: target.into(), readonly: false });
+        self
+    }
+
+    /// Add a read-only bind mount from a host directory into the container.
+    ///
+    /// Identical to [`with_bind_mount`] but the mount is read-only inside the container.
+    pub fn with_bind_mount_ro<P1, P2>(mut self, source: P1, target: P2) -> Self
+    where
+        P1: Into<PathBuf>,
+        P2: Into<PathBuf>,
+    {
+        self.bind_mounts.push(BindMount { source: source.into(), target: target.into(), readonly: true });
+        self
+    }
+
+    /// Mount a tmpfs filesystem at `target` inside the container.
+    ///
+    /// `options` are passed directly to the kernel (e.g. `"size=100m,mode=1777"`).
+    /// Use an empty string for default options.
+    ///
+    /// tmpfs mounts are always writable and provide in-memory scratch space even
+    /// when the rootfs is read-only.
+    ///
+    /// Requires `Namespace::MOUNT` to be set.
+    pub fn with_tmpfs<P: Into<PathBuf>>(mut self, target: P, options: &str) -> Self {
+        self.tmpfs_mounts.push(TmpfsMount { target: target.into(), options: options.to_string() });
+        self
+    }
+
+    /// Mount a named volume at `target` inside the container.
+    ///
+    /// This is syntactic sugar for [`with_bind_mount`] using the volume's host path.
+    pub fn with_volume<P: Into<PathBuf>>(self, vol: &Volume, target: P) -> Self {
+        self.with_bind_mount(vol.path.clone(), target)
+    }
+
     /// Spawn the child process with configured namespaces and settings.
     ///
     /// This combines namespace creation, chroot, and user pre_exec callbacks
@@ -861,6 +989,8 @@ impl Command {
         let no_new_privileges = self.no_new_privileges;
         let readonly_rootfs = self.readonly_rootfs;
         let masked_paths = self.masked_paths.clone();
+        let bind_mounts = self.bind_mounts.clone();
+        let tmpfs_mounts = self.tmpfs_mounts.clone();
 
         // Install our combined pre_exec hook
         unsafe {
@@ -1007,6 +1137,50 @@ impl Command {
                         }
                     }
 
+                    // Perform bind mounts BEFORE chroot — source paths are host paths,
+                    // unreachable once we chroot.
+                    for bm in &bind_mounts {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        // Target inside the chroot on the host side
+                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
+                        let host_target = dir.join(rel);
+                        std::fs::create_dir_all(&host_target)
+                            .map_err(|e| io::Error::other(format!("bind mount mkdir: {}", e)))?;
+                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        // Step 1: establish the bind
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "bind mount {} -> {}: {}",
+                                bm.source.display(), host_target.display(),
+                                io::Error::last_os_error()
+                            )));
+                        }
+                        // Step 2 (if readonly): remount read-only — Linux requires two calls
+                        if bm.readonly {
+                            let r2 = libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                            if r2 != 0 {
+                                return Err(io::Error::other(format!(
+                                    "bind mount remount ro {}: {}",
+                                    host_target.display(), io::Error::last_os_error()
+                                )));
+                            }
+                        }
+                    }
+
                     chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
                     // Change working directory to / after chroot
@@ -1057,6 +1231,29 @@ impl Command {
                     );
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Mount tmpfs filesystems AFTER chroot — tmpfs has no host-side source
+                for tm in &tmpfs_mounts {
+                    std::fs::create_dir_all(&tm.target)
+                        .map_err(|e| io::Error::other(format!("tmpfs mkdir: {}", e)))?;
+                    let tgt_c = CString::new(tm.target.as_os_str().as_encoded_bytes()).unwrap();
+                    let tmpfs_c = CString::new("tmpfs").unwrap();
+                    let opts_c = CString::new(tm.options.as_bytes()).unwrap();
+                    let opts_ptr = if tm.options.is_empty() { ptr::null() } else { opts_c.as_ptr() as *const libc::c_void };
+                    let result = libc::mount(
+                        tmpfs_c.as_ptr(),   // source: "tmpfs"
+                        tgt_c.as_ptr(),     // target
+                        tmpfs_c.as_ptr(),   // fstype: "tmpfs"
+                        libc::MS_NOSUID | libc::MS_NODEV, // flags
+                        opts_ptr,           // data: mount options
+                    );
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "tmpfs mount {}: {}",
+                            tm.target.display(), io::Error::last_os_error()
+                        )));
                     }
                 }
 
@@ -1267,6 +1464,8 @@ impl Command {
         let no_new_privileges = self.no_new_privileges;
         let readonly_rootfs = self.readonly_rootfs;
         let masked_paths = self.masked_paths.clone();
+        let bind_mounts = self.bind_mounts.clone();
+        let tmpfs_mounts = self.tmpfs_mounts.clone();
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -1374,6 +1573,47 @@ impl Command {
                         }
                     }
 
+                    // Perform bind mounts BEFORE chroot — source paths are host paths,
+                    // unreachable once we chroot.
+                    for bm in &bind_mounts {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
+                        let host_target = dir.join(rel);
+                        std::fs::create_dir_all(&host_target)
+                            .map_err(|e| io::Error::other(format!("bind mount mkdir: {}", e)))?;
+                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "bind mount {} -> {}: {}",
+                                bm.source.display(), host_target.display(),
+                                io::Error::last_os_error()
+                            )));
+                        }
+                        if bm.readonly {
+                            let r2 = libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                            if r2 != 0 {
+                                return Err(io::Error::other(format!(
+                                    "bind mount remount ro {}: {}",
+                                    host_target.display(), io::Error::last_os_error()
+                                )));
+                            }
+                        }
+                    }
+
                     chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
                     std::env::set_current_dir("/")?;
                 }
@@ -1400,6 +1640,29 @@ impl Command {
                     let result = libc::mount(dev.as_ptr(), dev.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null());
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Mount tmpfs filesystems AFTER chroot
+                for tm in &tmpfs_mounts {
+                    std::fs::create_dir_all(&tm.target)
+                        .map_err(|e| io::Error::other(format!("tmpfs mkdir: {}", e)))?;
+                    let tgt_c = CString::new(tm.target.as_os_str().as_encoded_bytes()).unwrap();
+                    let tmpfs_c = CString::new("tmpfs").unwrap();
+                    let opts_c = CString::new(tm.options.as_bytes()).unwrap();
+                    let opts_ptr = if tm.options.is_empty() { ptr::null() } else { opts_c.as_ptr() as *const libc::c_void };
+                    let result = libc::mount(
+                        tmpfs_c.as_ptr(),
+                        tgt_c.as_ptr(),
+                        tmpfs_c.as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NODEV,
+                        opts_ptr,
+                    );
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "tmpfs mount {}: {}",
+                            tm.target.display(), io::Error::last_os_error()
+                        )));
                     }
                 }
 
