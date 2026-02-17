@@ -92,6 +92,7 @@
 
 use bitflags::bitflags;
 use nix::sched::{unshare, CloneFlags};
+pub use seccompiler::BpfProgram;
 use nix::unistd::chroot;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -418,6 +419,12 @@ pub struct Command {
     oci_sync: Option<(i32, i32)>,
     // Container working directory (set after chroot; relative to new root).
     container_cwd: Option<PathBuf>,
+    // Sysctl key=value pairs to write to /proc/sys/ in pre_exec.
+    sysctl: Vec<(String, String)>,
+    // Device nodes to create inside the container in pre_exec.
+    devices: Vec<DeviceNode>,
+    // Pre-compiled seccomp BPF program (takes priority over seccomp_profile).
+    seccomp_program: Option<seccompiler::BpfProgram>,
 }
 
 impl Command {
@@ -454,6 +461,9 @@ impl Command {
             overlay: None,
             oci_sync: None,
             container_cwd: None,
+            sysctl: Vec::new(),
+            devices: Vec::new(),
+            seccomp_program: None,
         }
     }
 
@@ -1141,6 +1151,34 @@ impl Command {
         self
     }
 
+    /// Set a kernel parameter inside the container's UTS/network namespace.
+    ///
+    /// Equivalent to `linux.sysctl` in OCI config. The key uses dot notation
+    /// (e.g. `"net.ipv4.ip_forward"`); it is translated to `/proc/sys/net/ipv4/ip_forward`
+    /// and written in pre_exec.
+    pub fn with_sysctl(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.sysctl.push((key.into(), value.into()));
+        self
+    }
+
+    /// Create a device node inside the container.
+    ///
+    /// Equivalent to `linux.devices` in OCI config. The node is created with
+    /// `mknod` in pre_exec after chroot, so `path` is relative to the container root.
+    pub fn with_device(mut self, device: DeviceNode) -> Self {
+        self.devices.push(device);
+        self
+    }
+
+    /// Apply a pre-compiled seccomp BPF program instead of a named profile.
+    ///
+    /// Takes priority over `with_seccomp_default()` / `with_seccomp_profile()`.
+    /// Used by the OCI `linux.seccomp` path.
+    pub fn with_seccomp_program(mut self, program: seccompiler::BpfProgram) -> Self {
+        self.seccomp_program = Some(program);
+        self
+    }
+
     /// Add a read-write bind mount from a host directory into the container.
     ///
     /// The `source` is an absolute path on the host; `target` is the absolute
@@ -1195,17 +1233,20 @@ impl Command {
     /// into a single pre_exec hook for std::process::Command.
     pub fn spawn(mut self) -> Result<Child, Error> {
         // Compile seccomp filter in parent process (requires allocation, can't be done in pre_exec)
-        let seccomp_filter = if let Some(profile) = &self.seccomp_profile {
-            match profile {
-                SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
-                    .map_err(|e| Error::Seccomp(e))?),
-                SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
-                    .map_err(|e| Error::Seccomp(e))?),
-                SeccompProfile::None => None,
-            }
-        } else {
-            None
-        };
+        let seccomp_filter: Option<seccompiler::BpfProgram> =
+            if let Some(prog) = self.seccomp_program.take() {
+                Some(prog)
+            } else if let Some(profile) = &self.seccomp_profile {
+                match profile {
+                    SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
+                        .map_err(Error::Seccomp)?),
+                    SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
+                        .map_err(Error::Seccomp)?),
+                    SeccompProfile::None => None,
+                }
+            } else {
+                None
+            };
 
         // Open namespace files in parent process (can't safely open files in pre_exec)
         // Keep File objects alive so their fds remain valid through spawn
@@ -1242,6 +1283,8 @@ impl Command {
         let readonly_rootfs = self.readonly_rootfs;
         let masked_paths = self.masked_paths.clone();
         let readonly_paths = self.readonly_paths.clone();
+        let sysctl = self.sysctl.clone();
+        let devices = self.devices.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         // Loopback mode: bring up lo inside pre_exec (after unshare(NEWNET)).
@@ -1672,6 +1715,45 @@ impl Command {
                     }
                 }
 
+                // Step 4.7: Apply sysctl settings (write to /proc/sys/)
+                for (key, value) in &sysctl {
+                    // Convert "net.ipv4.ip_forward" -> "/proc/sys/net/ipv4/ip_forward"
+                    let proc_path = format!("/proc/sys/{}", key.replace('.', "/"));
+                    let path_c = match std::ffi::CString::new(proc_path.as_bytes()) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let flags = libc::O_WRONLY | libc::O_TRUNC;
+                    let fd = libc::open(path_c.as_ptr(), flags, 0);
+                    if fd >= 0 {
+                        let bytes = value.as_bytes();
+                        libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                        libc::close(fd);
+                    }
+                    // Ignore errors — sysctl may not exist in this namespace
+                }
+
+                // Step 4.72: Create device nodes
+                if !devices.is_empty() {
+                    for dev in &devices {
+                        let path_c = match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let type_bits: libc::mode_t = match dev.kind {
+                            'b' => libc::S_IFBLK,
+                            'p' => libc::S_IFIFO,
+                            _ => libc::S_IFCHR, // 'c' and default
+                        };
+                        let devnum = libc::makedev(dev.major as libc::c_uint, dev.minor as libc::c_uint);
+                        let r = libc::mknod(path_c.as_ptr(), type_bits | (dev.mode as libc::mode_t), devnum);
+                        if r == 0 && (dev.uid != 0 || dev.gid != 0) {
+                            libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
+                        }
+                        // Ignore mknod errors — device may already exist
+                    }
+                }
+
                 // Step 4.75: Drop capabilities if specified
                 if let Some(keep_caps) = capabilities {
                     // Drop all capabilities except the ones specified
@@ -1896,17 +1978,20 @@ impl Command {
 
         // --- From here, identical setup to spawn() except we capture slave_raw_fd ---
 
-        let seccomp_filter = if let Some(profile) = &self.seccomp_profile {
-            match profile {
-                SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
-                    .map_err(|e| Error::Seccomp(e))?),
-                SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
-                    .map_err(|e| Error::Seccomp(e))?),
-                SeccompProfile::None => None,
-            }
-        } else {
-            None
-        };
+        let seccomp_filter: Option<seccompiler::BpfProgram> =
+            if let Some(prog) = self.seccomp_program.take() {
+                Some(prog)
+            } else if let Some(profile) = &self.seccomp_profile {
+                match profile {
+                    SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
+                        .map_err(Error::Seccomp)?),
+                    SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
+                        .map_err(Error::Seccomp)?),
+                    SeccompProfile::None => None,
+                }
+            } else {
+                None
+            };
 
         let join_ns_files: Vec<(File, Namespace)> = self.join_namespaces
             .iter()
@@ -1939,6 +2024,8 @@ impl Command {
         let readonly_rootfs = self.readonly_rootfs;
         let masked_paths = self.masked_paths.clone();
         let readonly_paths = self.readonly_paths.clone();
+        let sysctl = self.sysctl.clone();
+        let devices = self.devices.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
@@ -2283,6 +2370,39 @@ impl Command {
                             "tmpfs mount {}: {}",
                             tm.target.display(), io::Error::last_os_error()
                         )));
+                    }
+                }
+
+                for (key, value) in &sysctl {
+                    let proc_path = format!("/proc/sys/{}", key.replace('.', "/"));
+                    let path_c = match std::ffi::CString::new(proc_path.as_bytes()) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let fd = libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_TRUNC, 0);
+                    if fd >= 0 {
+                        let bytes = value.as_bytes();
+                        libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                        libc::close(fd);
+                    }
+                }
+
+                if !devices.is_empty() {
+                    for dev in &devices {
+                        let path_c = match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let type_bits: libc::mode_t = match dev.kind {
+                            'b' => libc::S_IFBLK,
+                            'p' => libc::S_IFIFO,
+                            _ => libc::S_IFCHR,
+                        };
+                        let devnum = libc::makedev(dev.major as libc::c_uint, dev.minor as libc::c_uint);
+                        let r = libc::mknod(path_c.as_ptr(), type_bits | (dev.mode as libc::mode_t), devnum);
+                        if r == 0 && (dev.uid != 0 || dev.gid != 0) {
+                            libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
+                        }
                     }
                 }
 
@@ -2693,6 +2813,28 @@ pub struct ResourceLimit {
     pub soft: libc::rlim_t,
     /// Hard limit (requires privileges to increase)
     pub hard: libc::rlim_t,
+}
+
+/// A device node to create inside the container.
+///
+/// Used with `with_device()` to create character (`'c'`), block (`'b'`), or
+/// FIFO (`'p'`) devices in the container's `/dev`.
+#[derive(Debug, Clone)]
+pub struct DeviceNode {
+    /// Absolute path inside the container (e.g. `/dev/fuse`)
+    pub path: PathBuf,
+    /// Device type: `'c'` character, `'b'` block, `'p'` FIFO
+    pub kind: char,
+    /// Major device number
+    pub major: u64,
+    /// Minor device number
+    pub minor: u64,
+    /// File mode (permissions), e.g. `0o666`
+    pub mode: u32,
+    /// Owner UID
+    pub uid: u32,
+    /// Owner GID
+    pub gid: u32,
 }
 
 #[cfg(test)]

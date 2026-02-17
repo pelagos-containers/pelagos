@@ -76,7 +76,7 @@
 | Unprivileged mode | ❌ | ✅ | ✅ | Planned |
 | Subuid/subgid | ❌ | ✅ | ✅ | Planned |
 | **Testing** |
-| Integration tests | ✅ | ✅ | ✅ | 55 tests, all passing |
+| Integration tests | ✅ | ✅ | ✅ | 61 tests, all passing |
 | Unit tests | ✅ | ✅ | ✅ | |
 
 ---

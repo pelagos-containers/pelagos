@@ -4,9 +4,11 @@
 //! and config.json parsing for OCI bundle compatibility.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // config.json types (first-pass — required fields only)
@@ -22,6 +24,8 @@ pub struct OciConfig {
     pub linux: Option<OciLinux>,
     #[serde(default)]
     pub mounts: Vec<OciMount>,
+    pub hooks: Option<OciHooks>,
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +49,17 @@ pub struct OciProcess {
     #[serde(default)]
     pub terminal: bool,
     pub capabilities: Option<OciCapabilities>,
+    #[serde(default)]
+    pub rlimits: Vec<OciRlimit>,
+}
+
+/// OCI rlimit entry from `process.rlimits`.
+#[derive(Debug, Deserialize)]
+pub struct OciRlimit {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub hard: u64,
+    pub soft: u64,
 }
 
 /// OCI capability sets — each is a list of capability names like "CAP_CHOWN".
@@ -84,6 +99,123 @@ pub struct OciLinux {
     pub masked_paths: Vec<String>,
     #[serde(default)]
     pub readonly_paths: Vec<String>,
+    pub resources: Option<OciResources>,
+    #[serde(default)]
+    pub sysctl: HashMap<String, String>,
+    #[serde(default)]
+    pub devices: Vec<OciDevice>,
+    pub seccomp: Option<OciSeccomp>,
+}
+
+// ---------------------------------------------------------------------------
+// linux.resources
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct OciResources {
+    pub memory: Option<OciMemoryResources>,
+    pub cpu: Option<OciCpuResources>,
+    pub pids: Option<OciPidsResources>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OciMemoryResources {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OciCpuResources {
+    pub shares: Option<u64>,
+    pub quota: Option<i64>,
+    pub period: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OciPidsResources {
+    pub limit: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// linux.devices
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciDevice {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub major: Option<u64>,
+    pub minor: Option<u64>,
+    #[serde(default = "default_file_mode")]
+    pub file_mode: u32,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+}
+
+fn default_file_mode() -> u32 { 0o666 }
+
+// ---------------------------------------------------------------------------
+// linux.seccomp
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciSeccomp {
+    pub default_action: String,
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    #[serde(default)]
+    pub syscalls: Vec<OciSyscallRule>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OciSyscallRule {
+    #[serde(default)]
+    pub names: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub args: Vec<OciSyscallArg>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OciSyscallArg {
+    pub index: u32,
+    pub value: u64,
+    pub op: String,
+}
+
+// ---------------------------------------------------------------------------
+// hooks
+// ---------------------------------------------------------------------------
+
+/// OCI lifecycle hooks. Run in the host namespace.
+#[derive(Debug, Deserialize, Default)]
+pub struct OciHooks {
+    #[serde(default)]
+    pub prestart: Vec<OciHook>,
+    #[serde(default)]
+    pub create_runtime: Vec<OciHook>,
+    #[serde(default)]
+    pub create_container: Vec<OciHook>,
+    #[serde(default)]
+    pub start_container: Vec<OciHook>,
+    #[serde(default)]
+    pub poststart: Vec<OciHook>,
+    #[serde(default)]
+    pub poststop: Vec<OciHook>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OciHook {
+    pub path: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    pub timeout: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,7 +462,7 @@ pub fn build_command(
         }
     }
 
-    // linux.maskedPaths / linux.readonlyPaths
+    // linux.maskedPaths / linux.readonlyPaths / resources / sysctl / devices / seccomp
     if let Some(ref linux) = config.linux {
         if !linux.masked_paths.is_empty() {
             let paths: Vec<&str> = linux.masked_paths.iter().map(|s| s.as_str()).collect();
@@ -339,6 +471,90 @@ pub fn build_command(
         if !linux.readonly_paths.is_empty() {
             let paths: Vec<&str> = linux.readonly_paths.iter().map(|s| s.as_str()).collect();
             cmd = cmd.with_readonly_paths(&paths);
+        }
+
+        // linux.resources → cgroup builders
+        if let Some(ref res) = linux.resources {
+            if let Some(ref mem) = res.memory {
+                if let Some(limit) = mem.limit {
+                    if limit > 0 {
+                        cmd = cmd.with_cgroup_memory(limit);
+                    }
+                }
+            }
+            if let Some(ref cpu) = res.cpu {
+                if let Some(shares) = cpu.shares {
+                    if shares > 0 {
+                        cmd = cmd.with_cgroup_cpu_shares(shares);
+                    }
+                }
+                if let (Some(quota), Some(period)) = (cpu.quota, cpu.period) {
+                    if quota > 0 && period > 0 {
+                        cmd = cmd.with_cgroup_cpu_quota(quota, period);
+                    }
+                }
+            }
+            if let Some(ref pids) = res.pids {
+                if let Some(limit) = pids.limit {
+                    if limit > 0 {
+                        cmd = cmd.with_cgroup_pids_limit(limit as u64);
+                    }
+                }
+            }
+        }
+
+        // linux.sysctl
+        for (key, value) in &linux.sysctl {
+            cmd = cmd.with_sysctl(key, value);
+        }
+
+        // linux.devices
+        for dev in &linux.devices {
+            let major = dev.major.unwrap_or(0);
+            let minor = dev.minor.unwrap_or(0);
+            let kind = dev.kind.chars().next().unwrap_or('c');
+            cmd = cmd.with_device(crate::container::DeviceNode {
+                path: PathBuf::from(&dev.path),
+                kind,
+                major,
+                minor,
+                mode: dev.file_mode,
+                uid: dev.uid,
+                gid: dev.gid,
+            });
+        }
+
+        // linux.seccomp → with_seccomp_program()
+        if let Some(ref seccomp) = linux.seccomp {
+            let prog = crate::seccomp::filter_from_oci(seccomp)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            cmd = cmd.with_seccomp_program(prog);
+        }
+    }
+
+    // process.rlimits
+    for rl in &config.process.rlimits {
+        let resource = match rl.type_.as_str() {
+            "RLIMIT_CORE"    => Some(libc::RLIMIT_CORE),
+            "RLIMIT_CPU"     => Some(libc::RLIMIT_CPU),
+            "RLIMIT_DATA"    => Some(libc::RLIMIT_DATA),
+            "RLIMIT_FSIZE"   => Some(libc::RLIMIT_FSIZE),
+            "RLIMIT_LOCKS"   => Some(libc::RLIMIT_LOCKS),
+            "RLIMIT_MEMLOCK" => Some(libc::RLIMIT_MEMLOCK),
+            "RLIMIT_MSGQUEUE" => Some(libc::RLIMIT_MSGQUEUE),
+            "RLIMIT_NICE"    => Some(libc::RLIMIT_NICE),
+            "RLIMIT_NOFILE"  => Some(libc::RLIMIT_NOFILE),
+            "RLIMIT_NPROC"   => Some(libc::RLIMIT_NPROC),
+            "RLIMIT_RSS"     => Some(libc::RLIMIT_RSS),
+            "RLIMIT_RTPRIO"  => Some(libc::RLIMIT_RTPRIO),
+            "RLIMIT_RTTIME"  => Some(libc::RLIMIT_RTTIME),
+            "RLIMIT_SIGPENDING" => Some(libc::RLIMIT_SIGPENDING),
+            "RLIMIT_STACK"   => Some(libc::RLIMIT_STACK),
+            "RLIMIT_AS"      => Some(libc::RLIMIT_AS),
+            _ => None,
+        };
+        if let Some(res) = resource {
+            cmd = cmd.with_rlimit(res, rl.soft as libc::rlim_t, rl.hard as libc::rlim_t);
         }
     }
 
@@ -448,6 +664,85 @@ fn connect_socket(path: &Path) -> io::Result<i32> {
 
         Ok(fd)
     }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Hook execution
+// ---------------------------------------------------------------------------
+
+/// Run a list of OCI hooks sequentially. Each hook is executed as a child
+/// process in the host namespace; the container state JSON is passed on stdin.
+/// Returns an error if any hook exits non-zero.
+fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
+    use std::io::Write;
+
+    let state_json = serde_json::to_vec(state)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    for hook in hooks {
+        let mut child = std::process::Command::new(&hook.path);
+
+        // args[0] is conventionally the program name; the rest are real args.
+        if hook.args.len() > 1 {
+            child.args(&hook.args[1..]);
+        }
+
+        for env_entry in &hook.env {
+            if let Some(eq) = env_entry.find('=') {
+                child.env(&env_entry[..eq], &env_entry[eq + 1..]);
+            }
+        }
+
+        child.stdin(std::process::Stdio::piped());
+
+        let mut proc = child.spawn()?;
+
+        // Write state JSON to the hook's stdin.
+        if let Some(mut stdin) = proc.stdin.take() {
+            let _ = stdin.write_all(&state_json);
+        }
+
+        let timeout = hook.timeout.map(|t| Duration::from_secs(t as u64));
+
+        if let Some(dur) = timeout {
+            // Poll for completion with timeout.
+            let deadline = std::time::Instant::now() + dur;
+            loop {
+                match proc.try_wait()? {
+                    Some(status) => {
+                        if !status.success() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("hook {} exited with status {}", hook.path, status),
+                            ));
+                        }
+                        break;
+                    }
+                    None => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = proc.kill();
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("hook {} timed out after {}s", hook.path, dur.as_secs()),
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        } else {
+            let status = proc.wait()?;
+            if !status.success() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("hook {} exited with status {}", hook.path, status),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +865,19 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
             };
             write_state(id, &state)?;
 
+            // Run prestart hooks (host namespace, after container is "created").
+            if let Some(ref hooks) = config.hooks {
+                if !hooks.prestart.is_empty() {
+                    run_hooks(&hooks.prestart, &state)?;
+                }
+                if !hooks.create_runtime.is_empty() {
+                    run_hooks(&hooks.create_runtime, &state)?;
+                }
+                if !hooks.create_container.is_empty() {
+                    run_hooks(&hooks.create_container, &state)?;
+                }
+            }
+
             // Parent exits; the shim (blocking in spawn()) is adopted by init.
             Ok(())
         }
@@ -605,6 +913,15 @@ pub fn cmd_start(id: &str) -> io::Result<()> {
 
     // Remove exec.sock — the container has exec'd and no longer listens.
     let _ = fs::remove_file(&sock_path);
+
+    // Run poststart hooks (best-effort — don't fail the start command if hooks fail).
+    if let Ok(config) = config_from_bundle(std::path::Path::new(&state.bundle)) {
+        if let Some(ref hooks) = config.hooks {
+            if !hooks.poststart.is_empty() {
+                let _ = run_hooks(&hooks.poststart, &state);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -669,6 +986,22 @@ pub fn cmd_delete(id: &str) -> io::Result<()> {
         ));
     }
 
+    // Load config before removing state dir so we can run poststop hooks.
+    let bundle_path = state.bundle.clone();
     fs::remove_dir_all(state_dir(id))?;
+
+    // Run poststop hooks (best-effort — state dir is already gone).
+    if let Ok(config) = config_from_bundle(std::path::Path::new(&bundle_path)) {
+        if let Some(ref hooks) = config.hooks {
+            if !hooks.poststop.is_empty() {
+                let stopped_state = OciState {
+                    status: "stopped".to_string(),
+                    ..state
+                };
+                let _ = run_hooks(&hooks.poststop, &stopped_state);
+            }
+        }
+    }
+
     Ok(())
 }

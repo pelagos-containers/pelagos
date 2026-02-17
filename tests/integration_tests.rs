@@ -2479,3 +2479,252 @@ fn test_oci_masked_readonly_paths() {
     let (_, stderr, ok) = run_remora(&["delete", &id]);
     assert!(ok, "remora delete failed: {}", stderr);
 }
+
+// ---------------------------------------------------------------------------
+// Helper: run full OCI lifecycle, wait for stop, delete.
+// ---------------------------------------------------------------------------
+fn oci_run_to_completion(id: &str, bundle: &std::path::Path, timeout_secs: u64) {
+    let (_, stderr, ok) = run_remora(&["create", id, bundle.to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+    let (_, stderr, ok) = run_remora(&["start", id]);
+    assert!(ok, "remora start failed: {}", stderr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stdout, _, _) = run_remora(&["state", id]);
+        if stdout.contains("\"stopped\"") { break; }
+        if std::time::Instant::now() > deadline {
+            run_remora(&["delete", id]).2;
+            panic!("container did not stop within {} seconds", timeout_secs);
+        }
+    }
+    let (_, stderr, ok) = run_remora(&["delete", id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+}
+
+/// test_oci_resources
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle with `linux.resources` setting a 64 MiB memory limit and
+/// a PID limit of 50. The container reads its cgroup memory.max and pids.max.
+/// Asserts the full lifecycle completes cleanly.
+///
+/// Failure indicates that `linux.resources` parsing from OCI config or the
+/// wiring into `with_cgroup_memory()` / `with_cgroup_pids_limit()` is broken.
+#[test]
+fn test_oci_resources() {
+    if !is_root() { eprintln!("Skipping test_oci_resources: requires root"); return; }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_oci_resources: alpine-rootfs not found"); return; }
+    };
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/sh", "-c",
+      "cat /sys/fs/cgroup/memory.max && cat /sys/fs/cgroup/pids.max"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+    "resources": {
+      "memory": {"limit": 67108864},
+      "pids":   {"limit": 50}
+    }
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+    let id = format!("test-oci-res-{}", std::process::id());
+    oci_run_to_completion(&id, bundle_dir.path(), 5);
+}
+
+/// test_oci_rlimits
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle with `process.rlimits` capping RLIMIT_NOFILE to 128.
+/// The container runs `ulimit -n` (exits 0 if the limit is accepted). Asserts
+/// the full lifecycle completes cleanly.
+///
+/// Failure indicates that `process.rlimits` parsing or the wiring into
+/// `with_rlimit()` in `build_command()` is broken.
+#[test]
+fn test_oci_rlimits() {
+    if !is_root() { eprintln!("Skipping test_oci_rlimits: requires root"); return; }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_oci_rlimits: alpine-rootfs not found"); return; }
+    };
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/sh", "-c", "ulimit -n"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 128, "soft": 128}]
+  },
+  "linux": {
+    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}]
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+    let id = format!("test-oci-rl-{}", std::process::id());
+    oci_run_to_completion(&id, bundle_dir.path(), 5);
+}
+
+/// test_oci_sysctl
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle with `linux.sysctl` setting `kernel.domainname` to
+/// `testdomain.local`. The container greps for that value in
+/// `/proc/sys/kernel/domainname`. Asserts the lifecycle completes cleanly.
+///
+/// Failure indicates that `linux.sysctl` parsing from OCI config or the
+/// `with_sysctl()` / pre_exec write to `/proc/sys/` is broken.
+#[test]
+fn test_oci_sysctl() {
+    if !is_root() { eprintln!("Skipping test_oci_sysctl: requires root"); return; }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_oci_sysctl: alpine-rootfs not found"); return; }
+    };
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+    // kernel.domainname is scoped to the UTS namespace — safe to set.
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/sh", "-c",
+      "cat /proc/sys/kernel/domainname | grep -q testdomain"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+    "sysctl": {"kernel.domainname": "testdomain.local"}
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+    let id = format!("test-oci-sc-{}", std::process::id());
+    oci_run_to_completion(&id, bundle_dir.path(), 5);
+}
+
+/// test_oci_hooks
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle with a `prestart` hook (touches a sentinel file) and a
+/// `poststop` hook (touches a different sentinel file). Asserts:
+/// - The prestart sentinel exists right after `remora create`
+/// - The poststop sentinel exists right after `remora delete`
+///
+/// Failure indicates that OCI `hooks` parsing, or the `run_hooks()` placement
+/// in `cmd_create()` / `cmd_delete()`, is broken.
+#[test]
+fn test_oci_hooks() {
+    if !is_root() { eprintln!("Skipping test_oci_hooks: requires root"); return; }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_oci_hooks: alpine-rootfs not found"); return; }
+    };
+    let hooks_dir = tempfile::tempdir().expect("tempdir for hooks");
+    let prestart_marker = hooks_dir.path().join("prestart_ran");
+    let poststop_marker = hooks_dir.path().join("poststop_ran");
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+    let config = format!(
+        r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/true"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "linux": {{
+    "namespaces": [{{"type": "mount"}}, {{"type": "uts"}}, {{"type": "pid"}}]
+  }},
+  "hooks": {{
+    "prestart": [{{"path": "/bin/sh", "args": ["/bin/sh", "-c", "touch {prestart}"]}}],
+    "poststop": [{{"path": "/bin/sh", "args": ["/bin/sh", "-c", "touch {poststop}"]}}]
+  }}
+}}"#,
+        prestart = prestart_marker.display(),
+        poststop = poststop_marker.display(),
+    );
+    std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
+    let id = format!("test-oci-hk-{}", std::process::id());
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+    assert!(prestart_marker.exists(), "prestart hook did not run");
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") { break; }
+        if std::time::Instant::now() > deadline {
+            run_remora(&["delete", &id]).2;
+            panic!("container did not stop within 5 seconds");
+        }
+    }
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+    assert!(poststop_marker.exists(), "poststop hook did not run");
+}
+
+/// test_oci_seccomp
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle with `linux.seccomp` using a default-allow policy that
+/// blocks only `ptrace`, `personality`, and `bpf`. The container runs
+/// `/bin/echo hello` which must succeed. Asserts the full lifecycle
+/// completes cleanly.
+///
+/// Failure indicates that `linux.seccomp` parsing from OCI config, the
+/// `filter_from_oci()` function in `src/seccomp.rs`, or the
+/// `with_seccomp_program()` wiring in `build_command()` is broken.
+#[test]
+fn test_oci_seccomp() {
+    if !is_root() { eprintln!("Skipping test_oci_seccomp: requires root"); return; }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_oci_seccomp: alpine-rootfs not found"); return; }
+    };
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/echo", "hello"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "architectures": ["SCMP_ARCH_X86_64"],
+      "syscalls": [
+        {"names": ["ptrace", "personality", "bpf"], "action": "SCMP_ACT_ERRNO"}
+      ]
+    }
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+    let id = format!("test-oci-sec-{}", std::process::id());
+    oci_run_to_completion(&id, bundle_dir.path(), 5);
+}

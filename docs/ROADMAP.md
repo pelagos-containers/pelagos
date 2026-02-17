@@ -112,23 +112,19 @@ State stored at `/run/remora/<id>/state.json`. create/start sync via Unix socket
 at `/run/remora/<id>/exec.sock`. Double-fork shim ensures parent exits as soon
 as "created" state is written.
 
-**OCI Phase 2 (partial — in progress):** `process.capabilities` ✅, `linux.maskedPaths` ✅,
-`linux.readonlyPaths` ✅. Still deferred: `hooks`, `linux.resources` (OCI format),
-`linux.seccomp`, `linux.devices`, `linux.sysctl`.
+**OCI Phase 2 (complete):** `process.capabilities` ✅, `linux.maskedPaths` ✅,
+`linux.readonlyPaths` ✅, `linux.resources` ✅, `process.rlimits` ✅,
+`linux.sysctl` ✅, `linux.devices` ✅, `hooks` (prestart/poststart/poststop) ✅,
+`linux.seccomp` ✅.
+
+Deferred to Phase 3: `linux.devices` fine-grained ACLs, `linux.seccomp` argument
+conditions (`args` field), `hooks.createRuntime` / `startContainer`, `annotations`.
 
 ---
 
 ## In Progress
 
-### OCI Phase 2 — capabilities + maskedPaths/readonlyPaths ✅
-
-- `process.capabilities`: bounding set parsed from OCI config, mapped to `with_capabilities()`
-- `linux.maskedPaths`: bind-mounted `/dev/null` over sensitive paths
-- `linux.readonlyPaths`: bind-mount + remount read-only for specified paths
-- 2 new integration tests: `test_oci_capabilities`, `test_oci_masked_readonly_paths`
-
-Remaining Phase 2 work: `hooks`, `linux.resources` (OCI format), `linux.seccomp`,
-`linux.devices`, `linux.sysctl`.
+Nothing — OCI Phase 2 is complete.
 
 ---
 

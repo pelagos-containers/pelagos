@@ -132,7 +132,7 @@ sudo -E cargo run --example seccomp_demo
 # Unit tests (no root required):
 cargo test --lib
 
-# Integration tests (55 tests, requires root + alpine-rootfs):
+# Integration tests (61 tests, requires root + alpine-rootfs):
 sudo -E cargo test --test integration_tests
 ```
 

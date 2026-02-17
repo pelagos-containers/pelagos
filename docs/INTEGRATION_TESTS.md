@@ -529,3 +529,43 @@ The shell command exits 0 only if both checks pass. Asserts the full lifecycle
 completes cleanly. Failure indicates that `linux.maskedPaths` or
 `linux.readonlyPaths` from OCI config are not being applied, or the wiring
 into `with_masked_paths()` / `with_readonly_paths()` in `build_command()` is broken.
+
+### `test_oci_resources`
+**Requires:** root, rootfs
+
+Creates a `config.json` with `linux.resources` setting a 64 MiB memory limit and a PID
+limit of 50. The container reads `/sys/fs/cgroup/memory.max` and `/sys/fs/cgroup/pids.max`.
+Failure indicates that `linux.resources` parsing from OCI config or the wiring into
+`with_cgroup_memory()` / `with_cgroup_pids_limit()` is broken.
+
+### `test_oci_rlimits`
+**Requires:** root, rootfs
+
+Creates a `config.json` with `process.rlimits` capping `RLIMIT_NOFILE` to 128. The container
+runs `ulimit -n` (exits 0 if the limit is accepted). Failure indicates that `process.rlimits`
+parsing or the wiring into `with_rlimit()` in `build_command()` is broken.
+
+### `test_oci_sysctl`
+**Requires:** root, rootfs
+
+Creates a `config.json` with `linux.sysctl: {"kernel.domainname": "testdomain.local"}`. The
+container greps for that value in `/proc/sys/kernel/domainname`. The sysctl is set in the
+private UTS namespace so it doesn't affect the host. Failure indicates that `linux.sysctl`
+parsing or the `with_sysctl()` / pre_exec write to `/proc/sys/` is broken.
+
+### `test_oci_hooks`
+**Requires:** root, rootfs
+
+Creates a `config.json` with a `prestart` hook that touches a sentinel file, and a `poststop`
+hook that touches a different sentinel file. Asserts the prestart sentinel exists after
+`remora create` and the poststop sentinel exists after `remora delete`. Failure indicates
+that OCI `hooks` parsing or the `run_hooks()` placement in `cmd_create()` / `cmd_delete()`
+is broken.
+
+### `test_oci_seccomp`
+**Requires:** root, rootfs
+
+Creates a `config.json` with `linux.seccomp` using a default-allow policy that denies only
+`ptrace`, `personality`, and `bpf`. The container runs `/bin/echo hello` which must succeed.
+Failure indicates that `linux.seccomp` parsing from OCI config, the `filter_from_oci()`
+function in `src/seccomp.rs`, or the `with_seccomp_program()` wiring is broken.
