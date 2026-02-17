@@ -412,6 +412,11 @@ pub struct Command {
     dns_servers: Vec<String>,
     // Overlay filesystem (upper + work dirs; lower = chroot_dir).
     overlay: Option<OverlayConfig>,
+    // OCI sync: (ready_write_fd, listen_fd). Used by cmd_create to block the container
+    // in pre_exec until "remora start" connects to exec.sock.
+    oci_sync: Option<(i32, i32)>,
+    // Container working directory (set after chroot; relative to new root).
+    container_cwd: Option<PathBuf>,
 }
 
 impl Command {
@@ -445,6 +450,8 @@ impl Command {
             port_forwards: Vec::new(),
             dns_servers: Vec::new(),
             overlay: None,
+            oci_sync: None,
+            container_cwd: None,
         }
     }
 
@@ -942,6 +949,35 @@ impl Command {
         self
     }
 
+    /// Clear the environment for the child process (inherit nothing from parent).
+    ///
+    /// After calling this, only environment variables set via [`env`](Self::env)
+    /// will be present in the container. Used by OCI `build_command` to apply
+    /// exactly the env specified in `config.json`.
+    pub fn env_clear(mut self) -> Self {
+        self.inner.env_clear();
+        self
+    }
+
+    /// Set the working directory inside the container (applied after chroot).
+    ///
+    /// Must be an absolute path relative to the new root. Defaults to `/`.
+    /// Used by OCI to apply `process.cwd` from `config.json`.
+    pub fn with_cwd<P: Into<PathBuf>>(mut self, path: P) -> Self {
+        self.container_cwd = Some(path.into());
+        self
+    }
+
+    /// Configure OCI create/start synchronization.
+    ///
+    /// Internal — used by `remora create`. The child's pre_exec writes its PID
+    /// to `ready_write_fd`, then blocks on `accept(listen_fd)` waiting for
+    /// `remora start` to connect and send a byte.
+    pub fn with_oci_sync(mut self, ready_write_fd: i32, listen_fd: i32) -> Self {
+        self.oci_sync = Some((ready_write_fd, listen_fd));
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -1253,6 +1289,10 @@ impl Command {
                 _ => None,
             };
 
+        // Collect OCI sync fds (captured by value — i32 is Copy).
+        let oci_sync = self.oci_sync;
+        let container_cwd = self.container_cwd.clone();
+
         // DNS: write nameservers to a per-container temp file; bind-mount into container.
         // Requires Namespace::MOUNT so the bind mount stays in the container's private namespace.
         if !self.dns_servers.is_empty() {
@@ -1545,8 +1585,9 @@ impl Command {
 
                     chroot(effective_root).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
-                    // Change working directory to / after chroot
-                    std::env::set_current_dir("/")?;
+                    // Change working directory after chroot (defaults to /).
+                    let cwd = container_cwd.as_deref().unwrap_or(std::path::Path::new("/"));
+                    std::env::set_current_dir(cwd)?;
                 }
 
                 // Step 4.5: Perform automatic mounts if requested
@@ -1723,11 +1764,32 @@ impl Command {
                     }
                 }
 
-                // Step 7 (FINAL): Apply seccomp filter if configured
-                // CRITICAL: This MUST be the last step! Once seccomp is applied, many syscalls
-                // are blocked, so all other setup must be complete.
+                // Step 7: Apply seccomp filter if configured.
+                // CRITICAL: This MUST be before the OCI sync! Once seccomp is applied, many syscalls
+                // are blocked. All setup must be complete before signalling "created".
                 if let Some(ref filter) = seccomp_filter {
                     crate::seccomp::apply_filter(filter)?;
+                }
+
+                // Step 8: OCI create/start synchronization.
+                // Signals the parent that setup is complete (writes PID to ready_write_fd),
+                // then blocks on accept(listen_fd) until "remora start" connects.
+                // After receiving the start byte, pre_exec returns → exec happens.
+                if let Some((ready_w, listen_fd)) = oci_sync {
+                    // Write our PID (4 bytes, native-endian) to signal "created".
+                    let pid: i32 = libc::getpid();
+                    let pid_bytes = pid.to_ne_bytes();
+                    libc::write(ready_w, pid_bytes.as_ptr() as *const libc::c_void, 4);
+                    libc::close(ready_w);
+
+                    // Block until "remora start" connects and sends one byte.
+                    let conn = libc::accept4(listen_fd, ptr::null_mut(), ptr::null_mut(), 0);
+                    if conn >= 0 {
+                        let mut buf = [0u8; 1];
+                        libc::read(conn, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                        libc::close(conn);
+                    }
+                    libc::close(listen_fd);
                 }
 
                 Ok(())
@@ -1888,6 +1950,10 @@ impl Command {
                 }
                 _ => None,
             };
+
+        // Collect OCI sync fds.
+        let oci_sync = self.oci_sync;
+        let container_cwd = self.container_cwd.clone();
 
         // DNS: write nameservers to a per-container temp file; bind-mount into container.
         if !self.dns_servers.is_empty() {
@@ -2127,7 +2193,8 @@ impl Command {
                     }
 
                     chroot(effective_root).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
-                    std::env::set_current_dir("/")?;
+                    let cwd = container_cwd.as_deref().unwrap_or(std::path::Path::new("/"));
+                    std::env::set_current_dir(cwd)?;
                 }
 
                 if mount_proc {
@@ -2248,6 +2315,21 @@ impl Command {
 
                 if let Some(ref filter) = seccomp_filter {
                     crate::seccomp::apply_filter(filter)?;
+                }
+
+                // Step 8: OCI sync (same as spawn()).
+                if let Some((ready_w, listen_fd)) = oci_sync {
+                    let pid: i32 = libc::getpid();
+                    let pid_bytes = pid.to_ne_bytes();
+                    libc::write(ready_w, pid_bytes.as_ptr() as *const libc::c_void, 4);
+                    libc::close(ready_w);
+                    let conn = libc::accept4(listen_fd, ptr::null_mut(), ptr::null_mut(), 0);
+                    if conn >= 0 {
+                        let mut buf = [0u8; 1];
+                        libc::read(conn, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                        libc::close(conn);
+                    }
+                    libc::close(listen_fd);
                 }
 
                 Ok(())

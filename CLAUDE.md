@@ -100,6 +100,16 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Automatic cleanup**: veth pair, netns, nftables rules cleaned up in `wait()` / `wait_with_output()`
 - **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
 
+**OCI Compliance (Phase 1 COMPLETE ✅):**
+- **`remora create <id> <bundle>`**: parse `config.json`, fork shim, block on `exec.sock` until `start`
+- **`remora start <id>`**: connect to `exec.sock`, send byte → container execs
+- **`remora state <id>`**: read `state.json`, check liveness via `kill(pid, 0)`, print JSON
+- **`remora kill <id> <sig>`**: send signal to container PID
+- **`remora delete <id>`**: remove `/run/remora/<id>/` after container is stopped
+- **`src/oci.rs`**: `OciConfig`, `OciState`, `build_command()`, all `cmd_*` functions
+- **Sync mechanism**: double-fork; grandchild pre_exec writes PID + blocks on `accept(exec.sock)`
+- **State persistence**: `/run/remora/<id>/state.json` (serde_json)
+
 **Advanced:**
 - UID/GID mapping for user namespaces
 - Namespace joining (attach to existing namespaces)
@@ -110,15 +120,16 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 ```
 src/
   lib.rs                  # Library entry point
-  main.rs                 # CLI binary
-  container.rs            # Main API (~2200 lines)
+  main.rs                 # CLI binary (OCI subcommands + legacy run)
+  container.rs            # Main API (~2250 lines)
+  oci.rs                  # OCI Runtime Spec implementation
   cgroup.rs               # Cgroups v2 resource management
   network.rs              # Native networking (N1 loopback, N2 bridge)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 49 integration tests (require root)
+  integration_tests.rs    # 53 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -149,6 +160,8 @@ thiserror = "2.0"
 bitflags = "2.6"
 cgroups-rs = "0.5.0"      # For future cgroup management
 seccompiler = "0.5.0"     # Pure Rust seccomp-BPF (Firecracker)
+serde = { version = "1", features = ["derive"] }  # OCI config.json / state.json
+serde_json = "1"          # JSON for OCI bundle config and state files
 ```
 
 **Removed dependencies:**

@@ -11,7 +11,7 @@
 - ✅ Focused on Linux namespaces, seccomp, cgroups, and native networking
 - ✅ Ergonomic Rust API for embedding containers in applications
 - ❌ Not a full container platform (no image management, no registry, no daemon)
-- ❌ Not OCI-compliant yet
+- ✅ OCI Runtime Spec v1.0.2 Phase 1 (create/start/state/kill/delete + config.json parsing)
 
 ---
 
@@ -69,14 +69,14 @@
 | Signal sending | ⚠️ | ✅ | ✅ | Via `std::process::Child::kill()` |
 | Exec into container | ❌ | ✅ | ✅ | Not planned near-term |
 | **OCI** |
-| OCI config.json | ❌ | ✅ | ✅ | Planned |
-| OCI bundle format | ❌ | ✅ | ✅ | Planned |
-| OCI lifecycle hooks | ❌ | ✅ | ✅ | Planned |
+| OCI config.json | ✅ | ✅ | ✅ | Phase 1 fields (see ROADMAP) |
+| OCI bundle format | ✅ | ✅ | ✅ | create/start/state/kill/delete |
+| OCI lifecycle hooks | ❌ | ✅ | ✅ | Phase 2 |
 | **Rootless** |
 | Unprivileged mode | ❌ | ✅ | ✅ | Planned |
 | Subuid/subgid | ❌ | ✅ | ✅ | Planned |
 | **Testing** |
-| Integration tests | ✅ | ✅ | ✅ | 49 tests, all passing |
+| Integration tests | ✅ | ✅ | ✅ | 53 tests, all passing |
 | Unit tests | ✅ | ✅ | ✅ | |
 
 ---
@@ -85,7 +85,7 @@
 
 | vs | Estimate |
 |----|----------|
-| runc | ~73% |
+| runc | ~85% |
 | Docker Engine | ~35% (Docker is a full platform, not a fair comparison) |
 
 ---

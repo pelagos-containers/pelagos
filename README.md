@@ -41,6 +41,13 @@ a daemon, without CNI plugins, and without image management.
 - **Port mapping:** `with_port_forward(host, container)` — TCP DNAT via nftables
 - **DNS:** `with_dns(&["1.1.1.1", "8.8.8.8"])` — bind-mounts a per-container resolv.conf; shared rootfs is never modified
 
+### OCI Runtime Compliance
+- **OCI bundles:** parse `config.json` — `ociVersion`, `root`, `process`, `linux.namespaces`, `mounts`
+- **Lifecycle:** `remora create <id> <bundle>` / `start` / `state` / `kill` / `delete`
+- **State machine:** creating → created → running → stopped
+- **Sync:** Unix socket at `/run/remora/<id>/exec.sock` suspends exec until `start`
+- **Phase 2 (planned):** hooks, `linux.resources`, seccomp, devices, capabilities
+
 ### Interactive Containers
 - **PTY:** `spawn_interactive()` allocates a PTY pair via `openpty()`
 - **SIGWINCH relay:** terminal resize forwarded to container via `TIOCSWINSZ`
@@ -125,7 +132,7 @@ sudo -E cargo run --example seccomp_demo
 # Unit tests (no root required):
 cargo test --lib
 
-# Integration tests (49 tests, requires root + alpine-rootfs):
+# Integration tests (53 tests, requires root + alpine-rootfs):
 sudo -E cargo test --test integration_tests
 ```
 
@@ -159,12 +166,12 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | NAT (MASQUERADE) | ✅ | ✅ | ✅ |
 | Port mapping | ✅ TCP | — | ✅ |
 | DNS | ✅ resolv.conf | ✅ | ✅ |
-| OCI compliant | ❌ planned | ✅ | ✅ |
+| OCI compliant | ✅ Phase 1 | ✅ | ✅ |
 | Rootless | ❌ planned | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 
-**Estimated runc parity: ~73%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
+**Estimated runc parity: ~85%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
 and `docs/ROADMAP.md` for what's next.
 
 ## Documentation

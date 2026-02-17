@@ -1,7 +1,7 @@
 # Remora Development Roadmap
 
 **Last Updated:** 2026-02-17
-**Current Status:** Overlay filesystem complete; next: OCI compliance
+**Current Status:** OCI compliance (Phase 1) complete — all five lifecycle commands implemented
 
 ---
 
@@ -90,35 +90,40 @@ Layered rootfs using `overlayfs` — lower (read-only base) + upper (writable pe
 
 ---
 
+### OCI Compliance (Phase 1) ✅
+
+Parse OCI `config.json` bundles and implement the standard container lifecycle.
+
+**OCI config parsing (first pass — required fields):**
+- `ociVersion`, `root.path`, `root.readonly`, `process.args/cwd/env/user/noNewPrivileges`
+- `linux.namespaces`, `linux.uidMappings`, `linux.gidMappings`, `mounts`
+
+**OCI lifecycle:**
+```bash
+remora create <id> <bundle>   # set up container, suspend before exec
+remora start <id>             # signal child to exec
+remora state <id>             # print JSON state to stdout
+remora kill <id> SIGTERM      # send signal to container process
+remora delete <id>            # tear down resources, remove state dir
+```
+
+**Implementation:** `src/oci.rs` — config/state types, path helpers, `cmd_*` functions.
+State stored at `/run/remora/<id>/state.json`. create/start sync via Unix socket
+at `/run/remora/<id>/exec.sock`. Double-fork shim ensures parent exits as soon
+as "created" state is written.
+
+**Phase 2 (deferred):** `hooks`, `linux.resources` (OCI format), `linux.seccomp`,
+`linux.devices`, `linux.sysctl`, `linux.maskedPaths`, `process.capabilities`.
+
+---
+
 ## In Progress
 
-Nothing — overlay filesystem is complete.
+Nothing — OCI Phase 1 is complete.
 
 ---
 
 ## Planned
-
-### OCI Compliance (Significant Work)
-
-Parse OCI `config.json` bundles and implement the standard container lifecycle.
-
-**OCI config parsing:**
-```rust
-let config = OciConfig::from_file("config.json")?;
-let child = Command::from_oci_config(&config)?.spawn()?;
-```
-
-**OCI lifecycle:**
-```bash
-remora create <id> <bundle>
-remora start <id>
-remora state <id>
-remora kill <id> TERM
-remora delete <id>
-```
-
-Enables interoperability with Kubernetes, containerd, and other OCI tooling.
-Requires `serde_json`; state persistence in `/run/remora/containers/<id>/`.
 
 ### Rootless Mode (Significant Work)
 
@@ -136,6 +141,6 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 
 | Milestone | Estimated runc parity |
 |-----------|----------------------|
-| Current (N1–N5 + overlay complete) | ~73% |
-| After OCI compliance | ~85% |
+| N1–N5 + overlay complete | ~73% |
+| OCI compliance (Phase 1) ✅ | ~85% |
 | After rootless | ~90% |

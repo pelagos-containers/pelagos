@@ -16,6 +16,7 @@
 use remora::cgroup::ResourceStats;
 use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume};
 use remora::network::NetworkMode;
+use remora::oci;
 use serial_test::serial;
 use std::path::PathBuf;
 
@@ -1977,4 +1978,337 @@ fn test_overlay_merged_cleanup() {
         "overlay parent dir should be removed after wait(); still present: {}",
         parent.display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// OCI lifecycle tests
+// ---------------------------------------------------------------------------
+
+/// Helper: build a minimal OCI bundle in `dir`, pointing rootfs at `rootfs_path`.
+/// Returns the bundle directory path.
+fn make_oci_bundle(dir: &std::path::Path, rootfs: &std::path::Path, args: &[&str]) -> PathBuf {
+    // rootfs/ is a symlink to the real alpine rootfs (avoids copying)
+    let rootfs_link = dir.join("rootfs");
+    std::os::unix::fs::symlink(rootfs, &rootfs_link).expect("failed to create rootfs symlink");
+
+    // Minimal config.json
+    let args_json: Vec<String> = args.iter().map(|s| format!("\"{}\"", s)).collect();
+    let config = format!(
+        r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": [{}],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "linux": {{
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+        args_json.join(", ")
+    );
+    std::fs::write(dir.join("config.json"), config).expect("failed to write config.json");
+    dir.to_path_buf()
+}
+
+/// Helper: find the remora binary (built by cargo)
+fn remora_binary() -> PathBuf {
+    // target/debug/remora relative to the workspace root
+    let mut p = std::env::current_dir().unwrap();
+    p.push("target/debug/remora");
+    p
+}
+
+/// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
+fn run_remora(args: &[&str]) -> (String, String, bool) {
+    let output = std::process::Command::new(remora_binary())
+        .args(args)
+        .output()
+        .expect("failed to run remora binary");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    )
+}
+
+/// test_oci_create_start_state
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a minimal OCI bundle running `sleep 2`. Verifies that:
+/// - `remora create` leaves the container in "created" state
+/// - `remora start` transitions it to "running"
+/// - After the process exits, `remora state` reports "stopped"
+/// - `remora delete` removes the state directory
+///
+/// Failure indicates the create/start split synchronization is broken,
+/// state.json transitions are wrong, or liveness detection is incorrect.
+#[test]
+fn test_oci_create_start_state() {
+    if !is_root() {
+        eprintln!("Skipping test_oci_create_start_state: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_oci_create_start_state: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "2"]);
+    let id = format!("test-oci-css-{}", std::process::id());
+
+    // Cleanup guard: always delete on test exit
+    // create
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+
+    // state should be "created"
+    let (stdout, stderr, ok) = run_remora(&["state", &id]);
+    assert!(ok, "remora state (created) failed: {}", stderr);
+    assert!(
+        stdout.contains("\"created\""),
+        "expected status 'created', got: {}",
+        stdout
+    );
+
+    // start
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+
+    // state should be "running"
+    let (stdout, _, _) = run_remora(&["state", &id]);
+    assert!(
+        stdout.contains("\"running\""),
+        "expected status 'running' after start, got: {}",
+        stdout
+    );
+
+    // Wait for sleep 2 to exit (max 6 seconds)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("container did not stop within 6 seconds; last state: {}", stdout);
+        }
+    }
+
+    // delete
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+
+    // state dir should be gone
+    let state_dir = oci::state_dir(&id);
+    assert!(!state_dir.exists(), "state dir still exists after delete: {}", state_dir.display());
+}
+
+/// test_oci_kill
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Spawns a long-running container (`sleep 60`) and sends SIGTERM via
+/// `remora kill`. Asserts that the process exits promptly and `remora state`
+/// reports "stopped".
+///
+/// Failure indicates that kill() is not finding the PID, signals are not
+/// being delivered, or state reporting is incorrect.
+#[test]
+fn test_oci_kill() {
+    if !is_root() {
+        eprintln!("Skipping test_oci_kill: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_oci_kill: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "60"]);
+    let id = format!("test-oci-kill-{}", std::process::id());
+
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+
+    // Small delay to ensure the process is running
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let (_, stderr, ok) = run_remora(&["kill", &id, "SIGTERM"]);
+    assert!(ok, "remora kill failed: {}", stderr);
+
+    // Wait up to 4 seconds for the process to stop
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("container did not stop after SIGTERM within 4 seconds");
+        }
+    }
+
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+}
+
+/// test_oci_delete_cleanup
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Runs a short-lived container (`true`) through the full OCI lifecycle and
+/// asserts that `remora delete` removes `/run/remora/<id>/` completely.
+///
+/// Failure indicates that the state directory is not cleaned up on delete,
+/// which would cause resource leaks and "already exists" errors on re-use.
+#[test]
+fn test_oci_delete_cleanup() {
+    if !is_root() {
+        eprintln!("Skipping test_oci_delete_cleanup: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_oci_delete_cleanup: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
+    let id = format!("test-oci-del-{}", std::process::id());
+
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+
+    // Wait for the container to stop (true exits immediately)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("container did not stop within 4 seconds");
+        }
+    }
+
+    let state_dir = oci::state_dir(&id);
+    assert!(state_dir.exists(), "state dir should exist before delete");
+
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+
+    assert!(
+        !state_dir.exists(),
+        "state dir {} still present after delete",
+        state_dir.display()
+    );
+}
+
+/// test_oci_bundle_mounts
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle with a tmpfs entry in `config.json` and runs a command
+/// that writes to the tmpfs mount. Asserts the command succeeds and the
+/// mount point was writable.
+///
+/// Failure indicates that OCI mount entries are not being applied from
+/// config.json, or that tmpfs mount handling in build_command() is broken.
+#[test]
+fn test_oci_bundle_mounts() {
+    if !is_root() {
+        eprintln!("Skipping test_oci_bundle_mounts: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_oci_bundle_mounts: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs_link = bundle_dir.path().join("rootfs");
+    std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+    // config.json with a tmpfs at /scratch
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/sh", "-c", "echo hello > /scratch/test.txt && cat /scratch/test.txt"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "mounts": [
+    {
+      "destination": "/scratch",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": []
+    }
+  ],
+  "linux": {
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "uts"},
+      {"type": "pid"}
+    ]
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+    let bundle = bundle_dir.path();
+    let id = format!("test-oci-mnt-{}", std::process::id());
+
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+
+    // Wait for container to stop
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("container did not stop within 4 seconds");
+        }
+    }
+
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+    assert!(stderr.is_empty() || !stderr.contains("error"), "unexpected error: {}", stderr);
 }

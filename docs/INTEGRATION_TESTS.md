@@ -466,3 +466,44 @@ parent (`/run/remora/overlay-{pid}-{n}/`) exist. Failure would indicate that `wa
 failed to call `remove_dir` on the merged directory and its parent, leaving stale
 directories on the host. The test checks the specific path rather than scanning the
 whole directory to avoid false failures from other overlay tests running in parallel.
+
+---
+
+## OCI Lifecycle Tests
+
+These tests exercise the five OCI Runtime Spec v1.0.2 subcommands (`create`, `start`,
+`state`, `kill`, `delete`) via the `remora` binary. They use minimal OCI bundles with
+`rootfs/` symlinked to the Alpine rootfs and inline `config.json`.
+
+### `test_oci_create_start_state`
+**Requires:** root, rootfs
+
+Writes a minimal `config.json` running `sleep 2`. Runs `remora create`, asserts
+`remora state` returns `"created"`. Runs `remora start`, asserts `"running"`. Polls
+until the process exits, asserts `"stopped"`. Runs `remora delete`, asserts the state
+dir is gone. Failure indicates broken create/start synchronization, incorrect
+state.json transitions, or wrong liveness detection via `kill(pid, 0)`.
+
+### `test_oci_kill`
+**Requires:** root, rootfs
+
+Spawns a long-running container (`sleep 60`), verifies it reaches `"running"` state,
+sends `SIGTERM` via `remora kill`, and polls until `remora state` reports `"stopped"`.
+Failure indicates that `cmd_kill` is not finding the correct PID, or that the process
+is not receiving the signal, or that liveness detection does not detect the exit.
+
+### `test_oci_delete_cleanup`
+**Requires:** root, rootfs
+
+Runs `/bin/true` through the full create→start→wait-for-stopped lifecycle, records
+the state dir path, runs `remora delete`, and asserts the directory is removed. Failure
+indicates `cmd_delete` is not calling `remove_dir_all`, or is checking liveness
+incorrectly and refusing to delete a stopped container.
+
+### `test_oci_bundle_mounts`
+**Requires:** root, rootfs
+
+Creates a `config.json` with a `tmpfs` mount at `/scratch` and a process that writes
+to `/scratch/test.txt`. Runs the full create→start→stopped lifecycle and asserts that
+`remora delete` succeeds. Failure indicates that OCI `mounts` entries are not being
+applied from `config.json`, or that tmpfs mount handling in `build_command()` is broken.

@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Current Task: OCI Compliance
+## Current Task: None — see Planned section
 
 ### Context
 
@@ -273,6 +273,29 @@ resource limit and seccomp tests require phase-2 work.
 ---
 
 ## Completed Tasks
+
+### OCI Compliance (Phase 1) ✅
+
+Implemented the five OCI Runtime Spec v1.0.2 lifecycle subcommands:
+
+- **`src/oci.rs`** (new): `OciConfig` / `OciState` serde types; path helpers; `build_command()`
+  translating `config.json` fields to `container::Command`; `cmd_create/start/state/kill/delete`
+- **`src/container.rs`**: added `oci_sync: Option<(i32, i32)>`, `container_cwd: Option<PathBuf>`,
+  `env_clear()`, `with_oci_sync()`, `with_cwd()` builders; Step 8 OCI sync block in pre_exec
+  (after seccomp: write PID → accept → read start byte → exec)
+- **`src/main.rs`**: restructured with `clap` subcommands — `create/start/state/kill/delete`
+  plus legacy `run` mode
+- **`Cargo.toml`**: added `serde = { version = "1", features = ["derive"] }` and `serde_json = "1"`
+- **4 integration tests**: `test_oci_create_start_state`, `test_oci_kill`,
+  `test_oci_delete_cleanup`, `test_oci_bundle_mounts`
+
+**create/start synchronization:** double-fork — parent forks shim → shim calls `command.spawn()`
+(forks grandchild) → grandchild pre_exec writes PID to ready pipe + blocks on `accept(exec.sock)`
+→ parent reads PID, writes `state.json`, exits → `remora start` connects to socket → grandchild
+unblocks, pre_exec returns, exec happens.
+
+---
+
 
 ### DNS Fix ✅
 

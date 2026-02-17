@@ -8,3 +8,4 @@ pub mod container;
 pub mod network;
 pub mod seccomp;
 pub mod pty;
+pub mod oci;
