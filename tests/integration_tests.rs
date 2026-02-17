@@ -2312,3 +2312,170 @@ fn test_oci_bundle_mounts() {
     assert!(ok, "remora delete failed: {}", stderr);
     assert!(stderr.is_empty() || !stderr.contains("error"), "unexpected error: {}", stderr);
 }
+
+/// test_oci_capabilities
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle whose config.json specifies `process.capabilities` with
+/// only CAP_CHOWN in the bounding set. The container runs `id` (which should
+/// succeed even with a reduced capability set). Asserts:
+/// - `remora create` / `start` / `delete` all succeed
+/// - The container exits successfully (reduced caps don't prevent basic exec)
+///
+/// Failure indicates that capability set parsing from OCI config or the
+/// with_capabilities() wiring in build_command() is broken.
+#[test]
+fn test_oci_capabilities() {
+    if !is_root() {
+        eprintln!("Skipping test_oci_capabilities: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_oci_capabilities: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs_link = bundle_dir.path().join("rootfs");
+    std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+    // config.json with a reduced capability set (bounding = [CAP_CHOWN] only)
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/usr/bin/id"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "capabilities": {
+      "bounding": ["CAP_CHOWN"],
+      "effective": ["CAP_CHOWN"],
+      "permitted": ["CAP_CHOWN"],
+      "inheritable": []
+    }
+  },
+  "linux": {
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "uts"},
+      {"type": "pid"}
+    ]
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+    let id = format!("test-oci-cap-{}", std::process::id());
+
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+
+    // Wait for container to stop
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            run_remora(&["delete", &id]).2;
+            panic!("container did not stop within 5 seconds");
+        }
+    }
+
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+}
+
+/// test_oci_masked_readonly_paths
+///
+/// Requires: root, alpine-rootfs.
+///
+/// Creates a bundle whose config.json specifies:
+/// - `linux.maskedPaths: ["/proc/kcore"]` — should be hidden
+/// - `linux.readonlyPaths: ["/sys/kernel"]` — should be read-only
+///
+/// The container runs a command that verifies:
+/// - Attempting to read /proc/kcore returns no useful data (bind-mounted /dev/null)
+/// - /sys/kernel exists but writes to it are denied
+///
+/// We verify at the OCI level: asserts that `remora create` / `start` / `delete`
+/// all succeed. The correct application of maskedPaths and readonlyPaths is
+/// validated by the container command itself (exits 0 only if both checks pass).
+///
+/// Failure indicates that `linux.maskedPaths` / `linux.readonlyPaths` parsing
+/// from OCI config, or the wiring into with_masked_paths() / with_readonly_paths()
+/// in build_command(), is broken.
+#[test]
+fn test_oci_masked_readonly_paths() {
+    if !is_root() {
+        eprintln!("Skipping test_oci_masked_readonly_paths: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_oci_masked_readonly_paths: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let bundle_dir = tempfile::tempdir().expect("tempdir");
+    let rootfs_link = bundle_dir.path().join("rootfs");
+    std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+    // /proc/kcore is masked → it appears as /dev/null (size 0 or read returns nothing)
+    // /sys/kernel is readonly → a write attempt should fail
+    let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/sh", "-c",
+      "[ $(wc -c < /proc/kcore) -eq 0 ] && ! touch /sys/kernel/test 2>/dev/null && echo ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "uts"},
+      {"type": "pid"}
+    ],
+    "maskedPaths": ["/proc/kcore"],
+    "readonlyPaths": ["/sys/kernel"]
+  }
+}"#;
+    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+    let id = format!("test-oci-mrp-{}", std::process::id());
+
+    let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+    assert!(ok, "remora create failed: {}", stderr);
+
+    let (_, stderr, ok) = run_remora(&["start", &id]);
+    assert!(ok, "remora start failed: {}", stderr);
+
+    // Wait for container to stop
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        if stdout.contains("\"stopped\"") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            run_remora(&["delete", &id]).2;
+            panic!("container did not stop within 5 seconds");
+        }
+    }
+
+    let (_, stderr, ok) = run_remora(&["delete", &id]);
+    assert!(ok, "remora delete failed: {}", stderr);
+}

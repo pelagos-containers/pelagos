@@ -395,6 +395,7 @@ pub struct Command {
     no_new_privileges: bool,          // Prevent privilege escalation via setuid
     readonly_rootfs: bool,            // Make rootfs read-only
     masked_paths: Vec<PathBuf>,       // Paths to mask with /dev/null
+    readonly_paths: Vec<PathBuf>,     // Paths to remount read-only
     // Filesystem mounts
     bind_mounts: Vec<BindMount>,
     tmpfs_mounts: Vec<TmpfsMount>,
@@ -441,6 +442,7 @@ impl Command {
             no_new_privileges: false,
             readonly_rootfs: false,
             masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             bind_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
             rlimits: Vec::new(),
@@ -1130,6 +1132,15 @@ impl Command {
         self
     }
 
+    /// Make specific paths inside the container read-only.
+    ///
+    /// Each path is bind-mounted to itself, then remounted with `MS_RDONLY`.
+    /// This is equivalent to `linux.readonlyPaths` in an OCI config.
+    pub fn with_readonly_paths(mut self, paths: &[&str]) -> Self {
+        self.readonly_paths = paths.iter().map(PathBuf::from).collect();
+        self
+    }
+
     /// Add a read-write bind mount from a host directory into the container.
     ///
     /// The `source` is an absolute path on the host; `target` is the absolute
@@ -1230,6 +1241,7 @@ impl Command {
         let no_new_privileges = self.no_new_privileges;
         let readonly_rootfs = self.readonly_rootfs;
         let masked_paths = self.masked_paths.clone();
+        let readonly_paths = self.readonly_paths.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         // Loopback mode: bring up lo inside pre_exec (after unshare(NEWNET)).
@@ -1710,6 +1722,34 @@ impl Command {
                     }
                 }
 
+                // Step 4.82: Make specific paths read-only (linux.readonlyPaths)
+                if !readonly_paths.is_empty() {
+                    for path in &readonly_paths {
+                        let path_c = match CString::new(path.as_os_str().as_encoded_bytes()) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        // First bind-mount the path to itself to create a separate mount point,
+                        // then remount it read-only.
+                        let r = libc::mount(
+                            path_c.as_ptr(),
+                            path_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 { continue; } // path may not exist; skip
+                        libc::mount(
+                            ptr::null(),
+                            path_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                            ptr::null(),
+                        );
+                        // Ignore remount errors (e.g. already read-only)
+                    }
+                }
+
                 // Step 4.85: Make rootfs read-only if requested
                 // MUST come after all mounts (/proc, /sys, /dev, masked paths)
                 // Note: We already did bind mount before chroot, so just remount readonly now
@@ -1898,6 +1938,7 @@ impl Command {
         let no_new_privileges = self.no_new_privileges;
         let readonly_rootfs = self.readonly_rootfs;
         let masked_paths = self.masked_paths.clone();
+        let readonly_paths = self.readonly_paths.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
@@ -2269,6 +2310,30 @@ impl Command {
                             Err(_) => continue,
                         };
                         libc::mount(dev_null.as_ptr(), path_c.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null());
+                    }
+                }
+
+                if !readonly_paths.is_empty() {
+                    for path in &readonly_paths {
+                        let path_c = match CString::new(path.as_os_str().as_encoded_bytes()) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let r = libc::mount(
+                            path_c.as_ptr(),
+                            path_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 { continue; }
+                        libc::mount(
+                            ptr::null(),
+                            path_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                            ptr::null(),
+                        );
                     }
                 }
 

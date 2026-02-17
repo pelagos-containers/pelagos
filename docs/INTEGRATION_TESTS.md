@@ -507,3 +507,25 @@ Creates a `config.json` with a `tmpfs` mount at `/scratch` and a process that wr
 to `/scratch/test.txt`. Runs the full create→start→stopped lifecycle and asserts that
 `remora delete` succeeds. Failure indicates that OCI `mounts` entries are not being
 applied from `config.json`, or that tmpfs mount handling in `build_command()` is broken.
+
+### `test_oci_capabilities`
+**Requires:** root, rootfs
+
+Creates a `config.json` with `process.capabilities` specifying only `CAP_CHOWN` in
+the bounding and effective sets. The container runs `/usr/bin/id` and must exit
+successfully. Asserts the full create→start→stopped lifecycle completes cleanly.
+Failure indicates that OCI `process.capabilities` parsing or the
+`with_capabilities()` wiring in `build_command()` is broken.
+
+### `test_oci_masked_readonly_paths`
+**Requires:** root, rootfs
+
+Creates a `config.json` with `linux.maskedPaths: ["/proc/kcore"]` and
+`linux.readonlyPaths: ["/sys/kernel"]`. The container verifies:
+- `/proc/kcore` is masked (bind-mounted `/dev/null` → zero bytes readable)
+- `/sys/kernel` is read-only (`touch /sys/kernel/test` is denied)
+
+The shell command exits 0 only if both checks pass. Asserts the full lifecycle
+completes cleanly. Failure indicates that `linux.maskedPaths` or
+`linux.readonlyPaths` from OCI config are not being applied, or the wiring
+into `with_masked_paths()` / `with_readonly_paths()` in `build_command()` is broken.

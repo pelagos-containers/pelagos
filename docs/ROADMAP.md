@@ -112,14 +112,23 @@ State stored at `/run/remora/<id>/state.json`. create/start sync via Unix socket
 at `/run/remora/<id>/exec.sock`. Double-fork shim ensures parent exits as soon
 as "created" state is written.
 
-**Phase 2 (deferred):** `hooks`, `linux.resources` (OCI format), `linux.seccomp`,
-`linux.devices`, `linux.sysctl`, `linux.maskedPaths`, `process.capabilities`.
+**OCI Phase 2 (partial — in progress):** `process.capabilities` ✅, `linux.maskedPaths` ✅,
+`linux.readonlyPaths` ✅. Still deferred: `hooks`, `linux.resources` (OCI format),
+`linux.seccomp`, `linux.devices`, `linux.sysctl`.
 
 ---
 
 ## In Progress
 
-Nothing — OCI Phase 1 is complete.
+### OCI Phase 2 — capabilities + maskedPaths/readonlyPaths ✅
+
+- `process.capabilities`: bounding set parsed from OCI config, mapped to `with_capabilities()`
+- `linux.maskedPaths`: bind-mounted `/dev/null` over sensitive paths
+- `linux.readonlyPaths`: bind-mount + remount read-only for specified paths
+- 2 new integration tests: `test_oci_capabilities`, `test_oci_masked_readonly_paths`
+
+Remaining Phase 2 work: `hooks`, `linux.resources` (OCI format), `linux.seccomp`,
+`linux.devices`, `linux.sysctl`.
 
 ---
 

@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Current Task: None — see Planned section
+## Current Task: OCI Phase 2 — capabilities + maskedPaths/readonlyPaths
 
 ### Context
 

@@ -44,6 +44,22 @@ pub struct OciProcess {
     pub no_new_privileges: bool,
     #[serde(default)]
     pub terminal: bool,
+    pub capabilities: Option<OciCapabilities>,
+}
+
+/// OCI capability sets — each is a list of capability names like "CAP_CHOWN".
+#[derive(Debug, Deserialize, Default)]
+pub struct OciCapabilities {
+    #[serde(default)]
+    pub bounding: Vec<String>,
+    #[serde(default)]
+    pub effective: Vec<String>,
+    #[serde(default)]
+    pub inheritable: Vec<String>,
+    #[serde(default)]
+    pub permitted: Vec<String>,
+    #[serde(default)]
+    pub ambient: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +80,10 @@ pub struct OciLinux {
     pub uid_mappings: Vec<OciIdMapping>,
     #[serde(default)]
     pub gid_mappings: Vec<OciIdMapping>,
+    #[serde(default)]
+    pub masked_paths: Vec<String>,
+    #[serde(default)]
+    pub readonly_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +167,33 @@ pub fn config_from_bundle(bundle: &Path) -> io::Result<OciConfig> {
     let content = fs::read(&config_path)?;
     serde_json::from_slice(&content)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+// ---------------------------------------------------------------------------
+// Capability name → Remora Capability flag
+// ---------------------------------------------------------------------------
+
+/// Convert an OCI capability name (e.g. "CAP_CHOWN") to the corresponding
+/// Remora `Capability` bitflag. Returns `None` for unknown names.
+fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
+    use crate::container::Capability;
+    // Strip optional "CAP_" prefix for case-insensitive matching.
+    let n = name.strip_prefix("CAP_").unwrap_or(name);
+    match n {
+        "CHOWN"           => Some(Capability::CHOWN),
+        "DAC_OVERRIDE"    => Some(Capability::DAC_OVERRIDE),
+        "FOWNER"          => Some(Capability::FOWNER),
+        "FSETID"          => Some(Capability::FSETID),
+        "KILL"            => Some(Capability::KILL),
+        "SETGID"          => Some(Capability::SETGID),
+        "SETUID"          => Some(Capability::SETUID),
+        "NET_BIND_SERVICE" => Some(Capability::NET_BIND_SERVICE),
+        "NET_RAW"         => Some(Capability::NET_RAW),
+        "SYS_CHROOT"      => Some(Capability::SYS_CHROOT),
+        "SYS_ADMIN"       => Some(Capability::SYS_ADMIN),
+        "SYS_PTRACE"      => Some(Capability::SYS_PTRACE),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +305,40 @@ pub fn build_command(
                 })
                 .collect();
             cmd = cmd.with_gid_maps(&maps);
+        }
+    }
+
+    // process.capabilities → with_capabilities()
+    if let Some(ref caps) = config.process.capabilities {
+        use crate::container::Capability;
+        // The OCI bounding set defines which capabilities can be in the effective set.
+        // We use it (falling back to effective) as the "keep" set for Remora's
+        // with_capabilities() which drops everything not in the set.
+        let source = if !caps.bounding.is_empty() {
+            &caps.bounding
+        } else {
+            &caps.effective
+        };
+        if !source.is_empty() {
+            let mut keep = Capability::empty();
+            for name in source {
+                if let Some(flag) = oci_cap_to_flag(name) {
+                    keep |= flag;
+                }
+            }
+            cmd = cmd.with_capabilities(keep);
+        }
+    }
+
+    // linux.maskedPaths / linux.readonlyPaths
+    if let Some(ref linux) = config.linux {
+        if !linux.masked_paths.is_empty() {
+            let paths: Vec<&str> = linux.masked_paths.iter().map(|s| s.as_str()).collect();
+            cmd = cmd.with_masked_paths(&paths);
+        }
+        if !linux.readonly_paths.is_empty() {
+            let paths: Vec<&str> = linux.readonly_paths.iter().map(|s| s.as_str()).collect();
+            cmd = cmd.with_readonly_paths(&paths);
         }
     }
 
