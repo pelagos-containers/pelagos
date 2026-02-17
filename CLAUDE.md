@@ -86,13 +86,15 @@ examples/
   seccomp_demo.rs         # Seccomp demonstration
 
 Documentation:
-  README.md                      # Project overview
-  CLAUDE.md                      # This file
-  ROADMAP.md                     # Development plan (NO time estimates!)
-  SECCOMP_DEEP_DIVE.md          # Seccomp implementation details
-  SECCOMP_IMPLEMENTATION.md      # What was implemented
-  CGROUPS.md                     # Cgroups v1 vs v2 analysis
-  RUNTIME_COMPARISON.md          # vs Docker/runc/Podman
+  README.md                             # Project overview
+  CLAUDE.md                             # This file
+  docs/ROADMAP.md                       # Development plan (NO time estimates!)
+  docs/SECCOMP_DEEP_DIVE.md            # Seccomp implementation details
+  docs/SECCOMP_IMPLEMENTATION.md        # What was implemented
+  docs/CGROUPS.md                       # Cgroups v1 vs v2 analysis
+  docs/RUNTIME_COMPARISON.md            # vs Docker/runc/Podman
+  docs/PTY_DEEP_DIVE.md                # PTY/interactive session design
+  docs/BUILD_ROOTFS.md                  # How to build the Alpine rootfs
 ```
 
 ## Dependencies
@@ -259,7 +261,7 @@ The spawn process has a carefully orchestrated setup:
 **Phase 3 - Networking:**
 - CNI integration (delegate to external tools)
 
-See ROADMAP.md for full plan (no time estimates!)
+See docs/ROADMAP.md for full plan (no time estimates!)
 
 ## Common Issues
 
