@@ -41,13 +41,12 @@ pub fn cmd_ps(all: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _started_w = 14usize;
 
     println!(
-        "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  {}",
+        "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  STARTED",
         "NAME",
         "STATUS",
         "PID",
         "ROOTFS",
         "COMMAND",
-        "STARTED",
         name_w = name_w,
         rootfs_w = rootfs_w,
         cmd_w = cmd_w,

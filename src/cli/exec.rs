@@ -122,10 +122,8 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     for e in &args.env {
         if let Some((k, v)) = e.split_once('=') {
             cmd = cmd.env(k, v);
-        } else {
-            if let Ok(v) = std::env::var(e) {
-                cmd = cmd.env(e, v);
-            }
+        } else if let Ok(v) = std::env::var(e) {
+            cmd = cmd.env(e, v);
         }
     }
 

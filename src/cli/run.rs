@@ -368,10 +368,8 @@ fn apply_cli_options(
     for e in &args.env {
         if let Some((k, v)) = e.split_once('=') {
             cmd = cmd.env(k, v);
-        } else {
-            if let Ok(v) = std::env::var(e) {
-                cmd = cmd.env(e, v);
-            }
+        } else if let Ok(v) = std::env::var(e) {
+            cmd = cmd.env(e, v);
         }
     }
     // Always set a sensible PATH

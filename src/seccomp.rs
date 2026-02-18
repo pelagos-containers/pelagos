@@ -316,7 +316,7 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         // We unconditionally add the entry; seccompiler handles the logic.
         for name in &rule.names {
             if let Ok(num) = syscall_number(name) {
-                rules.entry(num).or_insert_with(Vec::new);
+                rules.entry(num).or_default();
                 // An empty Vec<SeccompRule> means "match any args → match_action".
                 // We use the action as the match_action; but SeccompFilter only has
                 // one match_action. Work around this by building one filter per
@@ -355,7 +355,7 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         }
         for name in &rule.names {
             if let Ok(num) = syscall_number(name) {
-                filtered_rules.entry(num).or_insert_with(Vec::new);
+                filtered_rules.entry(num).or_default();
             }
         }
     }

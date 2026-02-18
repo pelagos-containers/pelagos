@@ -289,8 +289,7 @@ pub fn read_state(id: &str) -> io::Result<OciState> {
 }
 
 pub fn write_state(id: &str, state: &OciState) -> io::Result<()> {
-    let content =
-        serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
+    let content = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
     fs::write(state_path(id), content)
 }
 
@@ -686,8 +685,7 @@ fn connect_socket(path: &Path) -> io::Result<i32> {
 fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
     use std::io::Write;
 
-    let state_json =
-        serde_json::to_vec(state).map_err(io::Error::other)?;
+    let state_json = serde_json::to_vec(state).map_err(io::Error::other)?;
 
     for hook in hooks {
         let mut child = std::process::Command::new(&hook.path);
@@ -721,9 +719,10 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
                 match proc.try_wait()? {
                     Some(status) => {
                         if !status.success() {
-                            return Err(io::Error::other(
-                                format!("hook {} exited with status {}", hook.path, status),
-                            ));
+                            return Err(io::Error::other(format!(
+                                "hook {} exited with status {}",
+                                hook.path, status
+                            )));
                         }
                         break;
                     }
@@ -742,9 +741,10 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
         } else {
             let status = proc.wait()?;
             if !status.success() {
-                return Err(io::Error::other(
-                    format!("hook {} exited with status {}", hook.path, status),
-                ));
+                return Err(io::Error::other(format!(
+                    "hook {} exited with status {}",
+                    hook.path, status
+                )));
             }
         }
     }
@@ -851,11 +851,9 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
 
     // Listen socket: grandchild blocks on accept() until "remora start" connects.
     let sock_path = exec_sock_path(id);
-    let listen_fd = create_listen_socket(&sock_path).inspect_err(|_e| {
-        unsafe {
-            libc::close(ready_r);
-            libc::close(ready_w);
-        }
+    let listen_fd = create_listen_socket(&sock_path).inspect_err(|_e| unsafe {
+        libc::close(ready_r);
+        libc::close(ready_w);
     })?;
 
     // Build the container command with OCI sync hooks.
@@ -893,11 +891,7 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
             // causing `run_remora` to hang waiting for EOF.
             unsafe {
                 libc::close(ready_r);
-                let dev_null = libc::open(
-                    c"/dev/null".as_ptr(),
-                    libc::O_RDWR,
-                    0,
-                );
+                let dev_null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR, 0);
                 if dev_null >= 0 {
                     libc::dup2(dev_null, 0);
                     libc::dup2(dev_null, 1);
@@ -1039,8 +1033,7 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
         }
     }
 
-    let json = serde_json::to_string_pretty(&state)
-        .map_err(io::Error::other)?;
+    let json = serde_json::to_string_pretty(&state).map_err(io::Error::other)?;
     println!("{}", json);
     Ok(())
 }

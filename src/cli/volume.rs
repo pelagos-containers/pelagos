@@ -29,7 +29,7 @@ pub fn cmd_volume_ls() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{}", "NAME");
+    println!("NAME");
     for name in &names {
         println!("{}", name);
     }

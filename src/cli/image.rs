@@ -25,7 +25,7 @@ pub fn cmd_image_ls() -> Result<(), Box<dyn std::error::Error>> {
         println!("No images found. Use 'remora image pull <name>' to pull one.");
         return Ok(());
     }
-    println!("{:<30} {:<15} {}", "REFERENCE", "LAYERS", "DIGEST");
+    println!("{:<30} {:<15} DIGEST", "REFERENCE", "LAYERS");
     for img in &images {
         let short_digest = if img.digest.len() > 19 {
             &img.digest[7..19]
