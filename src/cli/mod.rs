@@ -323,3 +323,27 @@ fn iso8601_to_epoch(s: &str) -> Option<u64> {
     let epoch_days = days.checked_sub(719468)?;
     Some(epoch_days * 86400 + h * 3600 + mi * 60 + s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rootfs_path should accept an existing filesystem directory path and
+    /// return its canonicalized form, without requiring it to be registered
+    /// in the rootfs store.
+    #[test]
+    fn test_rootfs_path_accepts_filesystem_dir() {
+        // /tmp always exists on Linux.
+        let result = rootfs_path("/tmp").expect("rootfs_path should accept /tmp");
+        assert!(result.is_absolute(), "result should be absolute");
+        assert!(result.is_dir(), "result should point to a directory");
+    }
+
+    /// rootfs_path should fail for a name that is neither an existing directory
+    /// nor a registered rootfs.
+    #[test]
+    fn test_rootfs_path_rejects_nonexistent() {
+        let result = rootfs_path("nonexistent-rootfs-xyz-12345");
+        assert!(result.is_err(), "rootfs_path should fail for nonexistent name");
+    }
+}

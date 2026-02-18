@@ -1,37 +1,52 @@
 # Ongoing Tasks
 
+## Recent: New Integration Tests for NAT + TCP Linking — COMPLETE ✅
+
+### What was done
+
+Added 3 new tests to close gaps found during the web pipeline debugging session:
+
+1. **`test_container_link_tcp`** (linking module) — Cross-container TCP via nc,
+   proving TCP works over bridge links (not just ICMP/ping).
+2. **`test_nat_iptables_forward_rules`** (networking module) — Verifies iptables
+   FORWARD rules exist while NAT is active and are cleaned up afterwards. Catches
+   the UFW/Docker `FORWARD policy DROP` regression.
+3. **`test_rootfs_path_accepts_filesystem_dir`** + **`test_rootfs_path_rejects_nonexistent`**
+   (unit tests in `src/cli/mod.rs`) — Verify `rootfs_path()` accepts filesystem
+   directories and rejects nonexistent names.
+
+**Files changed:**
+- `tests/integration_tests.rs` — 2 new integration tests (now 76 total)
+- `src/cli/mod.rs` — 2 new unit tests
+- `docs/INTEGRATION_TESTS.md` — documentation for new tests
+
+---
+
 ## Recent: Multi-Container Web Pipeline Example — COMPLETE ✅
 
 ### What was done
 
 Created a 3-container web pipeline example demonstrating bridge networking,
-container linking, and multi-container orchestration.
+container linking, and multi-container orchestration. Fixed NAT to add iptables
+FORWARD rules for hosts with UFW/Docker.
 
 **Files changed:**
 - Moved `examples/seccomp_demo.rs` → `examples/seccomp_demo/main.rs`
 - Moved `examples/secure_container.rs` → `examples/secure_container/main.rs`
-- Created `examples/web_pipeline/main.rs` — 3-container pipeline demo
+- Created `examples/web_pipeline/main.rs` — 3-container pipeline demo (httpd-based)
 - Created `examples/net_debug/main.rs` — 2-container network diagnostic
-
-**Architecture:** store (nc :9000) → processor (nc :8080) → frontend (nc)
-All on `NetworkMode::Bridge` with `with_link()` for name resolution.
-Uses only `nc` for TCP (no `httpd` in Alpine rootfs).
+- Created `scripts/install-httpd.sh` — Install busybox-extras via remora
+- Fixed `src/network.rs` — Added iptables FORWARD rules for NAT
+- Fixed `src/cli/mod.rs` — `rootfs_path()` accepts filesystem paths
 
 **Key lessons:**
 - Bridge mode: do NOT pass `Namespace::NET` — the child joins a pre-configured
   named netns via `setns()`, not `unshare(CLONE_NEWNET)`
 - Always set `.env("PATH", ALPINE_PATH)` for containers using the Alpine rootfs
 - Use `Stdio::Null` for long-running containers to avoid pipe-hang on teardown
-- `httpd` is not available in the minimal Alpine rootfs; use `nc` instead
-
-**Verification:**
-```bash
-cargo build --examples                           # compiles clean
-sudo -E cargo run --example net_debug            # 2-container connectivity test
-sudo -E cargo run --example web_pipeline         # 3-container pipeline demo
-sudo -E cargo run --example seccomp_demo         # existing example still works
-sudo -E cargo run --example secure_container     # existing example still works
-```
+- Hosts with UFW/Docker have `iptables FORWARD policy DROP` — must add explicit
+  iptables ACCEPT rules in addition to nftables MASQUERADE
+- `httpd` requires `busybox-extras` package (not in minimal Alpine rootfs)
 
 ---
 

@@ -380,6 +380,22 @@ Failure would indicate the reference-counting logic in `enable_nat` /
 `disable_nat` is incorrect — either decrementing too eagerly (table gone while B
 runs) or not decrementing at all (table present after both exit).
 
+### `test_nat_iptables_forward_rules` — N3
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container running `sleep 3`. While it sleeps, runs
+`iptables -C FORWARD -s 172.19.0.0/24 -j ACCEPT` and
+`iptables -C FORWARD -d 172.19.0.0/24 -j ACCEPT` on the host, asserting both
+exit 0. After `wait()`, asserts the source rule is gone (exit non-zero).
+
+These iptables rules are critical on hosts with UFW or Docker, which set
+`iptables FORWARD policy DROP`. Without them, nftables MASQUERADE works for
+ICMP but TCP/UDP is silently dropped — DNS resolution, HTTP requests, and
+`apk add` all fail while ping succeeds. This was a real production bug.
+
+Failure indicates `enable_nat()` is not adding the iptables FORWARD rules,
+or `disable_nat()` is not cleaning them up.
+
 ---
 
 ## Phase 6 N4 — Port Mapping Tests
@@ -712,6 +728,21 @@ runs `ping -c1 -W2 link-ping-a`. Verifies the ping succeeds, proving both `/etc/
 name resolution and bridge network connectivity work end-to-end. Failure indicates that
 the hosts entry is incorrect, the bridge is misconfigured, or containers can't reach each
 other.
+
+### `test_container_link_tcp`
+**Requires:** root, rootfs
+
+Starts container A on bridge running `echo HELLO_FROM_A | nc -l -p 8080` (a one-shot TCP
+server). Registers A's state, then starts container B linked to A. B runs
+`nc -w 2 link-tcp-a 8080` to connect by name and capture the response.
+
+Unlike `test_container_link_ping` (ICMP only), this proves TCP connections work across
+linked containers — the same protocol used by real services. This test was motivated by
+a real bug where iptables `FORWARD policy DROP` (from UFW/Docker) blocked TCP/UDP while
+allowing ICMP, making ping succeed but all real traffic fail.
+
+Failure indicates TCP traffic cannot traverse the bridge between containers, possibly
+due to missing iptables FORWARD rules in `enable_nat()` or bridge forwarding issues.
 
 ### `test_container_link_missing`
 **Requires:** root, rootfs

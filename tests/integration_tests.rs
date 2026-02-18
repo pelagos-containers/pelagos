@@ -1807,6 +1807,81 @@ mod networking {
         );
     }
 
+    /// N3: iptables FORWARD rules must exist while a NAT container is running.
+    ///
+    /// On hosts with UFW or Docker, the iptables FORWARD chain has `policy DROP`
+    /// which blocks TCP/UDP traffic even when nftables MASQUERADE is set up.
+    /// `enable_nat()` adds `iptables -I FORWARD -s/-d 172.19.0.0/24 -j ACCEPT`
+    /// rules to work around this. This test verifies those rules exist.
+    ///
+    /// Failure indicates that `enable_nat()` is not adding the iptables FORWARD
+    /// rules, which would cause TCP/UDP to be blocked on hosts with UFW/Docker
+    /// while ICMP (ping) continues to work — a subtle and hard-to-debug issue.
+    #[test]
+    #[serial(nat)]
+    fn test_nat_iptables_forward_rules() {
+        if !is_root() {
+            eprintln!("Skipping test_nat_iptables_forward_rules: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_nat_iptables_forward_rules: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 3"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn NAT container");
+
+        // Check iptables FORWARD rule for source 172.19.0.0/24.
+        let status_src = std::process::Command::new("iptables")
+            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run iptables -C (source)");
+        assert!(
+            status_src.success(),
+            "iptables FORWARD rule for source 172.19.0.0/24 should exist while NAT container runs"
+        );
+
+        // Check iptables FORWARD rule for destination 172.19.0.0/24.
+        let status_dst = std::process::Command::new("iptables")
+            .args(["-C", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run iptables -C (dest)");
+        assert!(
+            status_dst.success(),
+            "iptables FORWARD rule for dest 172.19.0.0/24 should exist while NAT container runs"
+        );
+
+        child.wait().expect("Failed to wait for NAT container");
+
+        // After cleanup, the iptables FORWARD rules should be gone.
+        let status_after = std::process::Command::new("iptables")
+            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run iptables -C after cleanup");
+        assert!(
+            !status_after.success(),
+            "iptables FORWARD rule should be removed after NAT container exits"
+        );
+    }
+
     /// N4: A DNAT rule must exist in the prerouting chain while a port-forward
     /// container is running.
     ///
@@ -3289,6 +3364,98 @@ mod linking {
         assert!(
             status.success(),
             "ping from B to A by name should succeed.\nstdout: {}\nstderr: {}",
+            out, err
+        );
+    }
+
+    /// test_container_link_tcp
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts container A on bridge running a netcat TCP listener on port 8080
+    /// that echoes "HELLO_FROM_A". Starts container B linked to A, which connects
+    /// to A by name via `nc -w 2 link-tcp-a 8080` and captures the response.
+    ///
+    /// Unlike test_container_link_ping (which only tests ICMP), this proves that
+    /// TCP connections work across linked containers — the same protocol used by
+    /// real services (HTTP, databases, etc.).
+    ///
+    /// Failure indicates that TCP traffic cannot traverse the bridge between
+    /// containers, even though ICMP (ping) may work. This was a real bug:
+    /// iptables FORWARD policy DROP blocked TCP/UDP while allowing ICMP.
+    #[test]
+    #[serial]
+    fn test_container_link_tcp() {
+        if !is_root() {
+            eprintln!("Skipping test_container_link_tcp: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_container_link_tcp: alpine-rootfs not found");
+            return;
+        };
+
+        // Container A: listen on TCP 8080 and send a known string to the first client.
+        // The `echo ... | nc -l -p 8080` pattern sends the string then exits.
+        let mut child_a = Command::new("/bin/sh")
+            .args(&["-c", "echo HELLO_FROM_A | nc -l -p 8080"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container A");
+
+        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+
+        // Register A's state so B can resolve the link name.
+        let state_dir = std::path::Path::new("/run/remora/containers/link-tcp-a");
+        std::fs::create_dir_all(state_dir).unwrap();
+        let state_json = format!(
+            r#"{{"name":"link-tcp-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["/bin/sh"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
+            child_a.pid(), ip_a
+        );
+        std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
+
+        // Give A a moment to start listening.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Container B: connect to A by link name and read the response.
+        let child_b = Command::new("/bin/sh")
+            .args(&["-c", "nc -w 2 link-tcp-a 8080"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_link("link-tcp-a")
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container B");
+
+        let (status_b, stdout_b, stderr_b) = child_b.wait_with_output().expect("wait B");
+        let out = String::from_utf8_lossy(&stdout_b);
+        let err = String::from_utf8_lossy(&stderr_b);
+
+        // Clean up A (it should have exited after sending, but kill to be sure).
+        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        let _ = child_a.wait();
+        let _ = std::fs::remove_dir_all(state_dir);
+
+        assert!(
+            status_b.success(),
+            "Container B should connect to A via TCP successfully.\nstdout: {}\nstderr: {}",
+            out, err
+        );
+        assert!(
+            out.contains("HELLO_FROM_A"),
+            "B should receive 'HELLO_FROM_A' from A via TCP, got:\nstdout: {}\nstderr: {}",
             out, err
         );
     }
