@@ -8,6 +8,8 @@ Remora provides a safe, ergonomic API for creating containerized processes using
 Linux namespaces, seccomp filtering, cgroups v2, and native networking — without
 a daemon, without CNI plugins, and without image management.
 
+**[User Guide](docs/USER_GUIDE.md)** — get started with the CLI and API.
+
 ## Features
 
 ### Isolation
