@@ -1,6 +1,16 @@
 # Ongoing Tasks
 
-## Current: OCI Image Layers — COMPLETE ✅
+## Current: Rewrite USER_GUIDE.md — COMPLETE ✅
+
+Rewrote `docs/USER_GUIDE.md` to be CLI-first (like a podman/nerdctl quickstart).
+Added sections for OCI images, `remora exec`, networking, storage, security,
+resource limits, rootless mode, and full `run` flag reference. Moved Rust API
+to a secondary section. Updated `README.md` to link to the guide and fix
+outdated `--rootfs`/`--exe` CLI syntax.
+
+---
+
+## Previous: OCI Image Layers — COMPLETE ✅
 
 ### Goal
 

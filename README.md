@@ -127,8 +127,13 @@ See `docs/BUILD_ROOTFS.md` for details.
 ## Running
 
 ```bash
-# Interactive shell (requires root):
-sudo -E cargo run -- --rootfs alpine-rootfs --exe /bin/sh --uid 0 --gid 0
+# Pull an OCI image and run interactively (requires root):
+sudo remora image pull alpine
+sudo remora run -i --image alpine /bin/sh
+
+# Or import a local rootfs:
+sudo remora rootfs import alpine ./alpine-rootfs
+sudo remora run -i alpine /bin/sh
 
 # Seccomp demo:
 sudo -E cargo run --example seccomp_demo
@@ -188,6 +193,7 @@ and `docs/ROADMAP.md` for what's next.
 
 | File | Contents |
 |------|----------|
+| `docs/USER_GUIDE.md` | CLI and API user guide |
 | `docs/ROADMAP.md` | What's done and what's next |
 | `docs/RUNTIME_COMPARISON.md` | Full feature matrix vs runc/Docker |
 | `docs/INTEGRATION_TESTS.md` | Every integration test documented |
