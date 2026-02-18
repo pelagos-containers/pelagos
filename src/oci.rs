@@ -256,6 +256,9 @@ pub struct OciState {
     pub status: String,
     pub pid: i32,
     pub bundle: String,
+    /// Bridge IP address, populated when using bridge networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_ip: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +947,7 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
                 status: "created".to_string(),
                 pid: container_pid,
                 bundle: bundle.to_string_lossy().into_owned(),
+                bridge_ip: None,
             };
             write_state(id, &state)?;
 

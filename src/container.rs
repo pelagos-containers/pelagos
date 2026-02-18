@@ -109,8 +109,69 @@ static OVERLAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Counter for unique per-container DNS temp-dir names.
 static DNS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Counter for unique per-container hosts temp-dir names.
+static HOSTS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 // Re-export SeccompProfile for public API
 pub use crate::seccomp::SeccompProfile;
+
+/// Resolve a container's bridge IP by name.
+///
+/// Searches CLI state (`/run/remora/containers/{name}/state.json`) and OCI state
+/// (`/run/remora/{name}/state.json`). Returns the bridge IP string if the container
+/// is running and has bridge networking, or an error otherwise.
+pub fn resolve_container_ip(name: &str) -> io::Result<String> {
+    // Try CLI state first.
+    let cli_path = PathBuf::from(format!("/run/remora/containers/{}/state.json", name));
+    if let Ok(data) = std::fs::read_to_string(&cli_path) {
+        // Parse just the fields we need with serde_json::Value to avoid
+        // coupling to the CLI crate's ContainerState type.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(ip) = v.get("bridge_ip").and_then(|v| v.as_str()) {
+                if !ip.is_empty() {
+                    // Check liveness
+                    if let Some(pid) = v.get("pid").and_then(|v| v.as_i64()) {
+                        if pid > 0 && unsafe { libc::kill(pid as i32, 0) } == 0 {
+                            return Ok(ip.to_string());
+                        }
+                    }
+                    return Err(io::Error::other(format!(
+                        "linked container '{}' is not running", name
+                    )));
+                }
+            }
+            return Err(io::Error::other(format!(
+                "linked container '{}' has no bridge IP (is it using bridge networking?)", name
+            )));
+        }
+    }
+
+    // Try OCI state.
+    let oci_path = PathBuf::from(format!("/run/remora/{}/state.json", name));
+    if let Ok(data) = std::fs::read_to_string(&oci_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(ip) = v.get("bridge_ip").and_then(|v| v.as_str()) {
+                if !ip.is_empty() {
+                    if let Some(pid) = v.get("pid").and_then(|v| v.as_i64()) {
+                        if pid > 0 && unsafe { libc::kill(pid as i32, 0) } == 0 {
+                            return Ok(ip.to_string());
+                        }
+                    }
+                    return Err(io::Error::other(format!(
+                        "linked container '{}' is not running", name
+                    )));
+                }
+            }
+            return Err(io::Error::other(format!(
+                "linked container '{}' has no bridge IP (is it using bridge networking?)", name
+            )));
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "container '{}' not found (searched CLI and OCI state)", name
+    )))
+}
 
 bitflags! {
     /// Linux namespace types that can be unshared.
@@ -427,6 +488,8 @@ pub struct Command {
     seccomp_program: Option<seccompiler::BpfProgram>,
     // Hostname to set inside the container's UTS namespace.
     hostname: Option<String>,
+    // Container links: (container_name, alias) → resolved to /etc/hosts entries at spawn time.
+    links: Vec<(String, String)>,
 }
 
 impl Command {
@@ -467,6 +530,7 @@ impl Command {
             devices: Vec::new(),
             seccomp_program: None,
             hostname: None,
+            links: Vec::new(),
         }
     }
 
@@ -930,6 +994,27 @@ impl Command {
     /// ```
     pub fn with_dns<S: AsRef<str>>(mut self, servers: &[S]) -> Self {
         self.dns_servers = servers.iter().map(|s| s.as_ref().to_owned()).collect();
+        self
+    }
+
+    /// Link to another running container by name.
+    ///
+    /// At spawn time, the target container's bridge IP is looked up and an
+    /// `/etc/hosts` entry is injected via bind-mount. Requires both containers
+    /// to use bridge networking, and requires [`Namespace::MOUNT`] + [`with_chroot`](Self::with_chroot).
+    ///
+    /// The container name is used as the hostname alias.
+    pub fn with_link(mut self, container_name: &str) -> Self {
+        self.links.push((container_name.to_string(), container_name.to_string()));
+        self
+    }
+
+    /// Link to another running container with a custom alias.
+    ///
+    /// Like [`with_link`](Self::with_link), but the target is reachable by `alias`
+    /// in addition to its original name.
+    pub fn with_link_alias(mut self, container_name: &str, alias: &str) -> Self {
+        self.links.push((container_name.to_string(), alias.to_string()));
         self
     }
 
@@ -1436,6 +1521,39 @@ impl Command {
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
         });
 
+        // Links: resolve container names → IPs and write /etc/hosts temp file.
+        if !self.links.is_empty() {
+            if !self.namespaces.contains(Namespace::MOUNT) {
+                return Err(Error::Io(io::Error::other("with_link requires Namespace::MOUNT")));
+            }
+            if self.chroot_dir.is_none() {
+                return Err(Error::Io(io::Error::other("with_link requires with_chroot")));
+            }
+        }
+        let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
+            let pid = unsafe { libc::getpid() };
+            let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/run/remora/hosts-{}-{}", pid, n));
+            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+            let mut content = String::from("127.0.0.1\tlocalhost\n");
+            for (container_name, alias) in &self.links {
+                let ip = resolve_container_ip(container_name).map_err(Error::Io)?;
+                if alias == container_name {
+                    content.push_str(&format!("{}\t{}\n", ip, alias));
+                } else {
+                    content.push_str(&format!("{}\t{}\t{}\n", ip, alias, container_name));
+                }
+            }
+            std::fs::write(dir.join("hosts"), content).map_err(Error::Io)?;
+            Some(dir)
+        } else {
+            None
+        };
+        let hosts_temp_file_cstring: Option<std::ffi::CString> = hosts_temp_dir.as_ref().map(|dir| {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
+        });
+
         // Install our combined pre_exec hook
         unsafe {
             self.inner.pre_exec(move || {
@@ -1760,6 +1878,27 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "dns bind mount: {}", io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // Hosts: bind-mount the per-container hosts file over /etc/hosts.
+                    // Same mechanism as DNS — scoped to this container's mount namespace.
+                    if let Some(ref hosts_src) = hosts_temp_file_cstring {
+                        let etc_host = effective_root.join("etc");
+                        std::fs::create_dir_all(&etc_host)
+                            .map_err(|e| io::Error::other(format!("hosts mkdir /etc: {}", e)))?;
+                        let hosts_host = etc_host.join("hosts");
+                        let tgt_c = std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(tgt_c.as_ptr(),
+                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                            0o644u32);
+                        if fd >= 0 { libc::close(fd); }
+                        let r = libc::mount(hosts_src.as_ptr(), tgt_c.as_ptr(),
+                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "hosts bind mount: {}", io::Error::last_os_error()
                             )));
                         }
                     }
@@ -2147,7 +2286,7 @@ impl Command {
             None
         };
 
-        Ok(Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir })
+        Ok(Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir, hosts_temp_dir })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -2365,6 +2504,39 @@ impl Command {
         let dns_temp_file_cstring: Option<std::ffi::CString> = dns_temp_dir.as_ref().map(|dir| {
             use std::os::unix::ffi::OsStrExt as _;
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
+        });
+
+        // Links: resolve container names → IPs and write /etc/hosts temp file.
+        if !self.links.is_empty() {
+            if !self.namespaces.contains(Namespace::MOUNT) {
+                return Err(Error::Io(io::Error::other("with_link requires Namespace::MOUNT")));
+            }
+            if self.chroot_dir.is_none() {
+                return Err(Error::Io(io::Error::other("with_link requires with_chroot")));
+            }
+        }
+        let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
+            let pid = unsafe { libc::getpid() };
+            let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/run/remora/hosts-{}-{}", pid, n));
+            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+            let mut content = String::from("127.0.0.1\tlocalhost\n");
+            for (container_name, alias) in &self.links {
+                let ip = resolve_container_ip(container_name).map_err(Error::Io)?;
+                if alias == container_name {
+                    content.push_str(&format!("{}\t{}\n", ip, alias));
+                } else {
+                    content.push_str(&format!("{}\t{}\t{}\n", ip, alias, container_name));
+                }
+            }
+            std::fs::write(dir.join("hosts"), content).map_err(Error::Io)?;
+            Some(dir)
+        } else {
+            None
+        };
+        let hosts_temp_file_cstring: Option<std::ffi::CString> = hosts_temp_dir.as_ref().map(|dir| {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
         });
 
         unsafe {
@@ -2642,6 +2814,26 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "dns bind mount: {}", io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // Hosts: bind-mount the per-container hosts file over /etc/hosts.
+                    if let Some(ref hosts_src) = hosts_temp_file_cstring {
+                        let etc_host = effective_root.join("etc");
+                        std::fs::create_dir_all(&etc_host)
+                            .map_err(|e| io::Error::other(format!("hosts mkdir /etc: {}", e)))?;
+                        let hosts_host = etc_host.join("hosts");
+                        let tgt_c = std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(tgt_c.as_ptr(),
+                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                            0o644u32);
+                        if fd >= 0 { libc::close(fd); }
+                        let r = libc::mount(hosts_src.as_ptr(), tgt_c.as_ptr(),
+                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "hosts bind mount: {}", io::Error::last_os_error()
                             )));
                         }
                     }
@@ -2944,7 +3136,7 @@ impl Command {
 
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir },
+            child: Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir, hosts_temp_dir },
         })
     }
 }
@@ -2982,6 +3174,8 @@ pub struct Child {
     overlay_merged_dir: Option<PathBuf>,
     /// Per-container DNS temp dir (`/run/remora/dns-{pid}-{n}/`); removed after child exits.
     dns_temp_dir: Option<PathBuf>,
+    /// Per-container hosts temp dir (`/run/remora/hosts-{pid}-{n}/`); removed after child exits.
+    hosts_temp_dir: Option<PathBuf>,
 }
 
 impl Child {
@@ -2999,6 +3193,11 @@ impl Child {
     /// networking is active. Useful for verifying teardown in tests.
     pub fn netns_name(&self) -> Option<&str> {
         self.network.as_ref().map(|n| n.ns_name.as_str())
+    }
+
+    /// Returns the container's bridge IP (e.g. `172.19.0.5`) if bridge networking is active.
+    pub fn container_ip(&self) -> Option<String> {
+        self.network.as_ref().map(|n| n.container_ip.to_string())
     }
 
     /// Returns the overlay merged-dir path if an overlay filesystem was configured.
@@ -3049,6 +3248,9 @@ impl Child {
         if let Some(ref dir) = self.dns_temp_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
+        if let Some(ref dir) = self.hosts_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         Ok(ExitStatus { inner: status })
     }
 
@@ -3075,6 +3277,9 @@ impl Child {
             }
         }
         if let Some(ref dir) = self.dns_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(ref dir) = self.hosts_temp_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
         Ok((

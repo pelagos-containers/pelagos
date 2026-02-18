@@ -83,6 +83,9 @@ pub struct ContainerState {
     pub stdout_log: Option<String>,
     /// Path to captured stderr log (detached mode only).
     pub stderr_log: Option<String>,
+    /// Bridge IP address (e.g. "172.19.0.5"), populated when using bridge networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_ip: Option<String>,
 }
 
 pub fn now_iso8601() -> String {

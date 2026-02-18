@@ -682,3 +682,41 @@ subsequent `fork()` failed with ENOMEM — even with abundant system memory.
 Runs a shell loop that forks an external command (`sleep 0`) five times. All five forks must
 succeed and the container must print `FORKS_OK`. Failure indicates the double-fork mechanism
 in `pre_exec` (which makes the container process PID 1 in the new namespace) is broken.
+
+---
+
+## Container Linking Tests
+
+### `test_container_link_hosts`
+**Requires:** root, rootfs
+
+Starts container A on bridge networking, writes its state (including bridge IP) to
+`/run/remora/containers/link-test-a/state.json`, then starts container B with
+`with_link("link-test-a")`. Reads B's `/etc/hosts` and verifies it contains A's bridge
+IP and hostname. Failure indicates that link resolution, hosts file generation, or the
+`/etc/hosts` bind-mount injection is broken.
+
+### `test_container_link_alias`
+**Requires:** root, rootfs
+
+Same setup as `test_container_link_hosts`, but uses `with_link_alias("link-alias-a", "db")`.
+Verifies B's `/etc/hosts` contains both the alias "db" and the original container name
+"link-alias-a" on the same line. Failure indicates alias handling in the hosts file
+generation is broken.
+
+### `test_container_link_ping`
+**Requires:** root, rootfs
+
+Starts container A on bridge (running `sleep`), then starts container B linked to A and
+runs `ping -c1 -W2 link-ping-a`. Verifies the ping succeeds, proving both `/etc/hosts`
+name resolution and bridge network connectivity work end-to-end. Failure indicates that
+the hosts entry is incorrect, the bridge is misconfigured, or containers can't reach each
+other.
+
+### `test_container_link_missing`
+**Requires:** root, rootfs
+
+Attempts to spawn a container with `with_link("nonexistent-container-xyz")`. Verifies
+that spawn fails with an error message that mentions the missing container name. Failure
+indicates that link resolution doesn't properly validate the target container exists before
+proceeding with the spawn.

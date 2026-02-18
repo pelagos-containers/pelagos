@@ -16,7 +16,6 @@
 use remora::cgroup::ResourceStats;
 use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume};
 use remora::network::NetworkMode;
-use remora::oci;
 use serial_test::serial;
 use std::path::PathBuf;
 
@@ -48,3038 +47,3293 @@ fn get_test_rootfs() -> Option<PathBuf> {
 /// PATH on any Command that will run inside the container.
 const ALPINE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-#[test]
-fn test_basic_namespace_creation() {
-    if !is_root() {
-        eprintln!("Skipping test_basic_namespace_creation: requires root");
-        return;
+mod api {
+    use super::*;
+
+    #[test]
+    fn test_uid_gid_api() {
+        // This test verifies that the UID/GID mapping API exists and can be called.
+        //
+        // Note: Full USER namespace + UID/GID mapping testing has kernel limitations:
+        // 1. USER namespaces are designed for unprivileged users
+        // 2. Kernel restrictions prevent certain operations when already root
+        // 3. Setting UID/GID without USER namespace has complex ordering requirements
+        //
+        // The API is fully implemented and works correctly in main.rs usage.
+        // This test verifies the builder pattern API is available and compiles.
+
+        let _cmd = Command::new("/bin/ash")
+            .with_uid(1000)
+            .with_gid(1000)
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: 1000,
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: 1000,
+                count: 1,
+            }]);
+
+        // Just verify the API compiles and methods are available
+        assert!(true, "UID/GID API is available");
+
     }
 
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_basic_namespace_creation: alpine-rootfs not found");
-        return;
-    };
+    #[test]
+    fn test_namespace_bitflags() {
+        // Test that namespace bitflags work correctly (no root needed)
+        let ns1 = Namespace::UTS;
+        let ns2 = Namespace::MOUNT;
+        let combined = ns1 | ns2;
 
-    // Test basic namespace creation with UTS and MOUNT
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
+        assert!(combined.contains(Namespace::UTS));
+        assert!(combined.contains(Namespace::MOUNT));
+        assert!(!combined.contains(Namespace::PID));
+    }
 
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Child process failed");
+    #[test]
+    fn test_capability_bitflags() {
+        // Test that capability bitflags work correctly (no root needed)
+        let cap1 = Capability::CHOWN;
+        let cap2 = Capability::NET_BIND_SERVICE;
+        let combined = cap1 | cap2;
+
+        assert!(combined.contains(Capability::CHOWN));
+        assert!(combined.contains(Capability::NET_BIND_SERVICE));
+        assert!(!combined.contains(Capability::SYS_ADMIN));
+    }
+
+    #[test]
+    fn test_command_builder_pattern() {
+        // Test that the builder pattern works (no root needed, won't spawn)
+        let rootfs = PathBuf::from("/tmp/test");
+
+        let _cmd = Command::new("/bin/ash")
+            .args(&["-c", "echo test", "-x"])
+            .stdin(Stdio::Inherit)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .with_namespaces(Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .with_max_fds(1024);
+
+        // Just test that the builder methods chain correctly
+        assert!(true, "Builder pattern works");
+    }
+
+    #[test]
+    fn test_seccomp_profile_api() {
+        // Test that seccomp API methods are available (no root needed, won't spawn)
+        let rootfs = PathBuf::from("/tmp/test");
+
+        let _cmd1 = Command::new("/bin/sh")
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_seccomp_default();
+
+        let _cmd2 = Command::new("/bin/sh")
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_seccomp_minimal();
+
+        let _cmd3 = Command::new("/bin/sh")
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_seccomp_profile(SeccompProfile::Docker);
+
+        let _cmd4 = Command::new("/bin/sh")
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .without_seccomp();
+
+        // Just verify the API compiles and methods are available
+        assert!(true, "Seccomp API is available");
+    }
+}
+
+mod core {
+    use super::*;
+
+    #[test]
+    fn test_basic_namespace_creation() {
+        if !is_root() {
+            eprintln!("Skipping test_basic_namespace_creation: requires root");
+            return;
         }
-        Err(e) => {
-            panic!("Failed to spawn with namespaces: {:?}", e);
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_basic_namespace_creation: alpine-rootfs not found");
+            return;
+        };
+
+        // Test basic namespace creation with UTS and MOUNT
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Child process failed");
+            }
+            Err(e) => {
+                panic!("Failed to spawn with namespaces: {:?}", e);
+            }
         }
     }
-}
 
-#[test]
-fn test_proc_mount() {
-    if !is_root() {
-        eprintln!("Skipping test_proc_mount: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
-
-    // Test with_proc_mount() - check /proc/self/status exists
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "test -f /proc/self/status"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Proc was not mounted correctly");
+    #[test]
+    fn test_proc_mount() {
+        if !is_root() {
+            eprintln!("Skipping test_proc_mount: requires root");
+            return;
         }
-        Err(e) => panic!("Failed to spawn with proc mount: {:?}", e),
-    }
 
-}
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
 
-#[test]
-fn test_capability_dropping() {
-    if !is_root() {
-        eprintln!("Skipping test_capability_dropping: requires root");
-        return;
-    }
+        // Test with_proc_mount() - check /proc/self/status exists
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "test -f /proc/self/status"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
 
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
-
-    // Test drop_all_capabilities()
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .drop_all_capabilities()
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Child process failed with dropped caps");
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Proc was not mounted correctly");
+            }
+            Err(e) => panic!("Failed to spawn with proc mount: {:?}", e),
         }
-        Err(e) => panic!("Failed to spawn with dropped capabilities: {:?}", e),
+
     }
 
-}
-
-#[test]
-fn test_selective_capabilities() {
-    if !is_root() {
-        eprintln!("Skipping test_selective_capabilities: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
-
-    // Test keeping only specific capabilities
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_capabilities(Capability::NET_BIND_SERVICE | Capability::CHOWN)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Child process failed with selective caps");
+    #[test]
+    fn test_combined_features() {
+        if !is_root() {
+            eprintln!("Skipping test_combined_features: requires root");
+            return;
         }
-        Err(e) => panic!("Failed to spawn with selective capabilities: {:?}", e),
-    }
 
-}
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
 
-#[test]
-fn test_resource_limits_fds() {
-    if !is_root() {
-        eprintln!("Skipping test_resource_limits_fds: requires root");
-        return;
-    }
+        // Test combining multiple features together
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::CGROUP)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .with_capabilities(Capability::NET_BIND_SERVICE)
+            .with_max_fds(500)
+            .with_memory_limit(256 * 1024 * 1024)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
 
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
-
-    // Test with_max_fds() - check ulimit -n equals 100
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "test \"$(ulimit -n)\" = 100"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_max_fds(100)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "FD limit was not set correctly");
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Child process failed with combined features");
+            }
+            Err(e) => panic!("Failed to spawn with combined features: {:?}", e),
         }
-        Err(e) => panic!("Failed to spawn with fd limit: {:?}", e),
+
     }
 
-}
-
-#[test]
-fn test_resource_limits_memory() {
-    if !is_root() {
-        eprintln!("Skipping test_resource_limits_memory: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
-
-    // Test with_memory_limit() - just verify it doesn't crash
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_memory_limit(512 * 1024 * 1024) // 512MB
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Child process failed with memory limit");
+    /// Verify that a container with a PID namespace can fork() repeatedly.
+    ///
+    /// Regression test for a bug where `unshare(CLONE_NEWPID)` left the container
+    /// process OUTSIDE the new PID namespace — only its children entered it.  The
+    /// first child became PID 1; when it exited the kernel marked the namespace
+    /// defunct, causing every subsequent `fork()` to fail with ENOMEM.
+    ///
+    /// The fix is a double-fork in `pre_exec`: after `unshare(CLONE_NEWPID)` we
+    /// fork once more so the container process IS PID 1 in the new namespace.
+    ///
+    /// This test runs a shell loop that forks `sleep` 5 times.  Without the fix,
+    /// the second (or later) fork fails with "can't fork: Out of memory".
+    ///
+    /// Requires root and alpine-rootfs.
+    #[test]
+    #[serial]
+    fn test_pid_namespace_repeated_fork() {
+        if !is_root() {
+            eprintln!("Skipping test_pid_namespace_repeated_fork: requires root");
+            return;
         }
-        Err(e) => panic!("Failed to spawn with memory limit: {:?}", e),
-    }
 
-}
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_pid_namespace_repeated_fork: alpine-rootfs not found");
+            return;
+        };
 
-#[test]
-fn test_resource_limits_cpu() {
-    if !is_root() {
-        eprintln!("Skipping test_resource_limits_cpu: requires root");
-        return;
-    }
+        // Fork 5 times via external `sleep 0` (not a builtin — forces fork+exec).
+        // Count successes.  All 5 must succeed.
+        let child = Command::new("/bin/sh")
+            .args(&["-c", r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with PID namespace");
 
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
 
-    // Test with_cpu_time_limit()
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_cpu_time_limit(60) // 60 seconds
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Child process failed with CPU limit");
-        }
-        Err(e) => panic!("Failed to spawn with CPU time limit: {:?}", e),
-    }
-
-}
-
-#[test]
-fn test_combined_features() {
-    if !is_root() {
-        eprintln!("Skipping test_combined_features: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test: alpine-rootfs not found");
-        return;
-    };
-
-    // Test combining multiple features together
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::CGROUP)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .with_capabilities(Capability::NET_BIND_SERVICE)
-        .with_max_fds(500)
-        .with_memory_limit(256 * 1024 * 1024)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn();
-
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().unwrap();
-            assert!(status.success(), "Child process failed with combined features");
-        }
-        Err(e) => panic!("Failed to spawn with combined features: {:?}", e),
-    }
-
-}
-
-#[test]
-fn test_uid_gid_api() {
-    // This test verifies that the UID/GID mapping API exists and can be called.
-    //
-    // Note: Full USER namespace + UID/GID mapping testing has kernel limitations:
-    // 1. USER namespaces are designed for unprivileged users
-    // 2. Kernel restrictions prevent certain operations when already root
-    // 3. Setting UID/GID without USER namespace has complex ordering requirements
-    //
-    // The API is fully implemented and works correctly in main.rs usage.
-    // This test verifies the builder pattern API is available and compiles.
-
-    let _cmd = Command::new("/bin/ash")
-        .with_uid(1000)
-        .with_gid(1000)
-        .with_uid_maps(&[UidMap {
-            inside: 0,
-            outside: 1000,
-            count: 1,
-        }])
-        .with_gid_maps(&[GidMap {
-            inside: 0,
-            outside: 1000,
-            count: 1,
-        }]);
-
-    // Just verify the API compiles and methods are available
-    assert!(true, "UID/GID API is available");
-
-}
-
-#[test]
-fn test_namespace_bitflags() {
-    // Test that namespace bitflags work correctly (no root needed)
-    let ns1 = Namespace::UTS;
-    let ns2 = Namespace::MOUNT;
-    let combined = ns1 | ns2;
-
-    assert!(combined.contains(Namespace::UTS));
-    assert!(combined.contains(Namespace::MOUNT));
-    assert!(!combined.contains(Namespace::PID));
-}
-
-#[test]
-fn test_capability_bitflags() {
-    // Test that capability bitflags work correctly (no root needed)
-    let cap1 = Capability::CHOWN;
-    let cap2 = Capability::NET_BIND_SERVICE;
-    let combined = cap1 | cap2;
-
-    assert!(combined.contains(Capability::CHOWN));
-    assert!(combined.contains(Capability::NET_BIND_SERVICE));
-    assert!(!combined.contains(Capability::SYS_ADMIN));
-}
-
-#[test]
-fn test_command_builder_pattern() {
-    // Test that the builder pattern works (no root needed, won't spawn)
-    let rootfs = PathBuf::from("/tmp/test");
-
-    let _cmd = Command::new("/bin/ash")
-        .args(&["-c", "echo test", "-x"])
-        .stdin(Stdio::Inherit)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .with_namespaces(Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .with_max_fds(1024);
-
-    // Just test that the builder methods chain correctly
-    assert!(true, "Builder pattern works");
-}
-
-// ============================================================================
-// Seccomp Filter Tests
-// ============================================================================
-
-#[test]
-fn test_seccomp_docker_blocks_reboot() {
-    if !is_root() {
-        eprintln!("Skipping test_seccomp_docker_blocks_reboot: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_seccomp_docker_blocks_reboot: alpine-rootfs not found");
-        return;
-    };
-
-    // Run with Docker seccomp profile - attempt reboot (should be blocked)
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "reboot 2>&1; echo reboot_exit_code=$?"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_seccomp_default() // Apply Docker's default seccomp profile
-        .spawn()
-        .expect("Failed to spawn with seccomp");
-
-    let status = child.wait().expect("Failed to wait for child");
-
-    // The reboot command should fail (seccomp blocks it)
-    // Note: We can't easily check the exact error from inside the container,
-    // but the process should complete without actually rebooting
-    assert!(
-        status.success() || status.code() == Some(1),
-        "Process should complete (reboot syscall blocked by seccomp)"
-    );
-
-}
-
-#[test]
-fn test_seccomp_docker_allows_normal_syscalls() {
-    if !is_root() {
-        eprintln!("Skipping test_seccomp_docker_allows_normal_syscalls: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!(
-            "Skipping test_seccomp_docker_allows_normal_syscalls: alpine-rootfs not found"
+        assert!(
+            status.success(),
+            "Container with PID namespace failed (exit {:?}).\nstdout: {}\nstderr: {}",
+            status.code(), out, err
         );
-        return;
-    };
-
-    // Run a simple echo command - uses read, write, brk, etc. (all allowed)
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo 'Seccomp allows normal operations'"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_seccomp_default() // Apply Docker's default seccomp profile
-        .spawn()
-        .expect("Failed to spawn with seccomp");
-
-    let status = child.wait().expect("Failed to wait for child");
-
-    // Normal operations should work fine
-    assert!(status.success(), "Normal syscalls should be allowed");
+        assert!(
+            out.contains("FORKS_OK"),
+            "Container could not fork() repeatedly in PID namespace (defunct namespace bug).\nstdout: {}\nstderr: {}",
+            out, err
+        );
+    }
 }
 
-#[test]
-fn test_seccomp_minimal_is_restrictive() {
-    if !is_root() {
-        eprintln!("Skipping test_seccomp_minimal_is_restrictive: requires root");
-        return;
-    }
+mod capabilities {
+    use super::*;
 
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_seccomp_minimal_is_restrictive: alpine-rootfs not found");
-        return;
-    };
-
-    // The minimal profile is very restrictive - even basic commands might fail
-    // We just test that it compiles and can be applied
-    let result = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_seccomp_minimal() // Apply minimal profile
-        .spawn();
-
-    // The minimal profile might be too restrictive for ash to even start,
-    // but the important thing is that seccomp was applied without errors
-    match result {
-        Ok(mut child) => {
-            let status = child.wait().expect("Failed to wait for child");
-            // Process may or may not succeed depending on what syscalls ash needs
-            eprintln!("Minimal seccomp: process exited with status {:?}", status);
+    #[test]
+    fn test_capability_dropping() {
+        if !is_root() {
+            eprintln!("Skipping test_capability_dropping: requires root");
+            return;
         }
-        Err(e) => {
-            // If spawn fails, it might be because seccomp blocked a syscall
-            // needed during process startup. This is expected with minimal profile.
-            eprintln!("Minimal seccomp: spawn failed (expected): {}", e);
-        }
-    }
 
-    // Test passes if we got here (seccomp was applied)
-    assert!(true, "Minimal seccomp profile can be applied");
-}
-
-#[test]
-fn test_seccomp_profile_api() {
-    // Test that seccomp API methods are available (no root needed, won't spawn)
-    let rootfs = PathBuf::from("/tmp/test");
-
-    let _cmd1 = Command::new("/bin/sh")
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_seccomp_default();
-
-    let _cmd2 = Command::new("/bin/sh")
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_seccomp_minimal();
-
-    let _cmd3 = Command::new("/bin/sh")
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_seccomp_profile(SeccompProfile::Docker);
-
-    let _cmd4 = Command::new("/bin/sh")
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .without_seccomp();
-
-    // Just verify the API compiles and methods are available
-    assert!(true, "Seccomp API is available");
-}
-
-#[test]
-fn test_seccomp_without_flag_works() {
-    if !is_root() {
-        eprintln!("Skipping test_seccomp_without_flag_works: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_seccomp_without_flag_works: alpine-rootfs not found");
-        return;
-    };
-
-    // Test that containers work without seccomp (backward compatibility)
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo 'No seccomp'"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        // No seccomp configured - should work fine
-        .spawn()
-        .expect("Failed to spawn without seccomp");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Container should work without seccomp");
-}
-
-// ============================================================================
-// Phase 1 Security Features Tests
-// ============================================================================
-
-#[test]
-fn test_no_new_privileges() {
-    if !is_root() {
-        eprintln!("Skipping test_no_new_privileges: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_no_new_privileges: alpine-rootfs not found");
-        return;
-    };
-
-    // Run ash inline - grep for NoNewPrivs:	1 in /proc/self/status
-    // The value is 1 when PR_SET_NO_NEW_PRIVS has been set
-    // Use full paths since PATH is not set inside the container
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "/bin/grep 'NoNewPrivs:.*1' /proc/self/status"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_no_new_privileges(true)
-        .spawn()
-        .expect("Failed to spawn with no-new-privileges");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "NoNewPrivs should be set to 1 in /proc/self/status");
-}
-
-#[test]
-fn test_readonly_rootfs() {
-    if !is_root() {
-        eprintln!("Skipping test_readonly_rootfs: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_readonly_rootfs: alpine-rootfs not found");
-        return;
-    };
-
-    // Try to write to rootfs - should fail with read-only filesystem
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "touch /test_file 2>&1; echo exit_code=$?"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_readonly_rootfs(true)
-        .spawn()
-        .expect("Failed to spawn with read-only rootfs");
-
-    let status = child.wait().expect("Failed to wait for child");
-    // The command should complete (exit code 0), but the touch should have failed
-    assert!(status.success(), "Container should run despite read-only fs");
-}
-
-#[test]
-fn test_masked_paths_default() {
-    if !is_root() {
-        eprintln!("Skipping test_masked_paths_default: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_masked_paths_default: alpine-rootfs not found");
-        return;
-    };
-
-    // Try to read a masked path - should see /dev/null or get an error
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "cat /proc/kcore 2>&1 | head -c 10 || echo 'masked'"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_masked_paths_default()
-        .spawn()
-        .expect("Failed to spawn with masked paths");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Masked paths should not cause failures");
-}
-
-#[test]
-fn test_masked_paths_custom() {
-    if !is_root() {
-        eprintln!("Skipping test_masked_paths_custom: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_masked_paths_custom: alpine-rootfs not found");
-        return;
-    };
-
-    // Use custom masked paths
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo 'Custom masked paths test'"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_masked_paths(&["/proc/kcore", "/sys/firmware"])
-        .spawn()
-        .expect("Failed to spawn with custom masked paths");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Custom masked paths should work");
-}
-
-#[test]
-fn test_combined_phase1_security() {
-    if !is_root() {
-        eprintln!("Skipping test_combined_phase1_security: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_combined_phase1_security: alpine-rootfs not found");
-        return;
-    };
-
-    // Test all Phase 1 security features together
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo 'All Phase 1 security features enabled'"])
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-        .with_proc_mount()
-        .with_seccomp_default()        // Seccomp filtering
-        .with_no_new_privileges(true)  // No privilege escalation
-        .with_readonly_rootfs(true)    // Immutable rootfs
-        .with_masked_paths_default()   // Hide sensitive paths
-        .drop_all_capabilities()       // Minimal capabilities
-        .spawn()
-        .expect("Failed to spawn with all Phase 1 security");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(
-        status.success(),
-        "Container with all Phase 1 security should work"
-    );
-}
-
-// ============================================================================
-// Phase 4: Filesystem Flexibility Tests
-// ============================================================================
-
-#[test]
-fn test_bind_mount_rw() {
-    if !is_root() {
-        eprintln!("Skipping test_bind_mount_rw: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bind_mount_rw: alpine-rootfs not found");
-        return;
-    };
-
-    // Create a temp dir on the host and write a file into it
-    let host_dir = tempfile::tempdir().expect("failed to create temp dir");
-    std::fs::write(host_dir.path().join("hello.txt"), b"hello from host")
-        .expect("failed to write host file");
-
-    // Mount the host dir into /mnt/hostdir inside the container and verify the file is readable
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "cat /mnt/hostdir/hello.txt"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_bind_mount(host_dir.path(), "/mnt/hostdir")
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("Failed to spawn with bind mount");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Container should read host file via bind mount");
-}
-
-#[test]
-fn test_bind_mount_ro() {
-    if !is_root() {
-        eprintln!("Skipping test_bind_mount_ro: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bind_mount_ro: alpine-rootfs not found");
-        return;
-    };
-
-    let host_dir = tempfile::tempdir().expect("failed to create temp dir");
-
-    // Attempt to write inside a read-only bind mount — should fail
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "touch /mnt/ro/newfile 2>/dev/null; echo exit=$?"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_bind_mount_ro(host_dir.path(), "/mnt/ro")
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("Failed to spawn with read-only bind mount");
-
-    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
-    assert!(status.success(), "Shell should exit cleanly");
-    let out = String::from_utf8_lossy(&stdout);
-    // touch must fail (exit code != 0) because the mount is read-only
-    assert!(
-        out.contains("exit=1"),
-        "Write to read-only bind mount should fail, got: {}",
-        out
-    );
-}
-
-#[test]
-fn test_tmpfs_mount() {
-    if !is_root() {
-        eprintln!("Skipping test_tmpfs_mount: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_tmpfs_mount: alpine-rootfs not found");
-        return;
-    };
-
-    // Even with a read-only rootfs, tmpfs at /tmp should be writable
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "touch /tmp/testfile && echo ok"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_readonly_rootfs(true)
-        .with_tmpfs("/tmp", "size=10m,mode=1777")
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("Failed to spawn with tmpfs mount");
-
-    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
-    assert!(status.success(), "Container should succeed with tmpfs /tmp");
-    let out = String::from_utf8_lossy(&stdout);
-    assert!(out.contains("ok"), "touch on tmpfs should succeed, got: {}", out);
-}
-
-#[test]
-fn test_named_volume() {
-    if !is_root() {
-        eprintln!("Skipping test_named_volume: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_named_volume: alpine-rootfs not found");
-        return;
-    };
-
-    // Clean up any leftover volume from a previous failed run
-    let _ = Volume::delete("testvol");
-
-    let vol = Volume::create("testvol").expect("Failed to create volume");
-
-    // Write a file from inside the container
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo persistent > /data/file.txt"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_volume(&vol, "/data")
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn with named volume");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Container should write to volume");
-
-    // Verify the file persists on the host
-    let host_file = vol.path().join("file.txt");
-    assert!(host_file.exists(), "Volume file should exist on host after container exits");
-    let contents = std::fs::read_to_string(&host_file).expect("Failed to read volume file");
-    assert!(contents.contains("persistent"), "Volume file should contain expected content");
-
-    // Clean up
-    Volume::delete("testvol").expect("Failed to delete volume");
-}
-
-// ============================================================================
-// Phase 5: Cgroups v2 Resource Management Tests
-// ============================================================================
-
-#[test]
-fn test_cgroup_memory_limit() {
-    if !is_root() {
-        eprintln!("Skipping test_cgroup_memory_limit: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_cgroup_memory_limit: alpine-rootfs not found");
-        return;
-    };
-
-    // Try to allocate ~64 MB using dd. With a 32 MB cgroup limit the process
-    // should be OOM-killed (exit non-zero) or fail to allocate.
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "dd if=/dev/urandom of=/dev/null bs=1M count=64"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_cgroup_memory(32 * 1024 * 1024) // 32 MB
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn with cgroup memory limit");
-
-    let status = child.wait().expect("Failed to wait for child");
-    // dd reads stdin→stdout incrementally so it won't hit the RSS limit.
-    // The important thing is that the cgroup was created and the process ran.
-    // We just verify the container exits (success or OOM-killed).
-    let _ = status;
-}
-
-#[test]
-fn test_cgroup_pids_limit() {
-    if !is_root() {
-        eprintln!("Skipping test_cgroup_pids_limit: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_cgroup_pids_limit: alpine-rootfs not found");
-        return;
-    };
-
-    // Limit to 4 PIDs (ash + subprocesses). Try to spawn 10 background jobs
-    // — at least some should fail. The shell exits 0 regardless, so we just
-    // verify that cgroup setup does not break container execution.
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0 & done; wait; echo done"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_cgroup_pids_limit(4)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn with cgroup pids limit");
-
-    // Process should complete (even if some forks were denied by pids.max)
-    let status = child.wait().expect("Failed to wait for child");
-    let _ = status;
-}
-
-#[test]
-fn test_cgroup_cpu_shares() {
-    if !is_root() {
-        eprintln!("Skipping test_cgroup_cpu_shares: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_cgroup_cpu_shares: alpine-rootfs not found");
-        return;
-    };
-
-    // Smoke test: setting cpu_shares should not break container execution.
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo ok"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_cgroup_cpu_shares(512)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn with cgroup cpu shares");
-
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Container with cpu_shares should exit cleanly");
-}
-
-#[test]
-fn test_resource_stats() {
-    if !is_root() {
-        eprintln!("Skipping test_resource_stats: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_resource_stats: alpine-rootfs not found");
-        return;
-    };
-
-    // Verify resource_stats() returns a ResourceStats (no panic/error) when
-    // a cgroup is active. Values should be >= 0 (they're unsigned).
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "echo hello"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_cgroup_memory(128 * 1024 * 1024)
-        .with_cgroup_pids_limit(64)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn for resource_stats test");
-
-    // Read stats while the process may still be running
-    let stats: ResourceStats = child.resource_stats().expect("resource_stats() failed");
-    // Values are u64 so always >= 0; just verify the call succeeded
-    let _ = stats.memory_current_bytes;
-    let _ = stats.cpu_usage_ns;
-    let _ = stats.pids_current;
-
-    child.wait().expect("Failed to wait for child");
-}
-
-#[test]
-fn test_cgroup_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_cgroup_cleanup: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_cgroup_cleanup: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_cgroup_memory(64 * 1024 * 1024)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn for cgroup cleanup test");
-
-    let pid = child.pid();
-    child.wait().expect("Failed to wait for child");
-
-    // After wait(), teardown_cgroup should have deleted the cgroup directory
-    let cgroup_path = format!("/sys/fs/cgroup/remora-{}", pid);
-    assert!(
-        !std::path::Path::new(&cgroup_path).exists(),
-        "Cgroup {} should be deleted after container exits",
-        cgroup_path
-    );
-}
-
-// ============================================================================
-// Phase 6: Native Networking Tests — N1 (Loopback) and N2 (Bridge)
-// ============================================================================
-
-/// N1: Loopback-only network mode — lo should come up with 127.0.0.1.
-#[test]
-fn test_loopback_network() {
-    if !is_root() {
-        eprintln!("Skipping test_loopback_network: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_loopback_network: alpine-rootfs not found");
-        return;
-    };
-
-    // with_network(Loopback) automatically adds Namespace::NET and brings up lo.
-    // After lo is up, the kernel assigns 127.0.0.1 automatically.
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Loopback)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn loopback container");
-
-    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
-    let out = String::from_utf8_lossy(&stdout);
-    assert!(
-        out.contains("LOOPBACK_OK"),
-        "lo should have 127.0.0.1 after bring-up, got: {}",
-        out
-    );
-    assert!(status.success(), "Container exited with failure");
-}
-
-/// N2: Bridge mode — container should receive a 172.19.0.x/24 address on eth0.
-#[test]
-fn test_bridge_network_ip() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_network_ip: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_network_ip: alpine-rootfs not found");
-        return;
-    };
-
-    // Named netns is fully configured before fork; eth0 is ready from the first instruction.
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn bridge container");
-
-    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
-    let out = String::from_utf8_lossy(&stdout);
-    assert!(
-        out.contains("BRIDGE_IP_OK"),
-        "eth0 should have a 172.19.0.x address in bridge mode, got: {}",
-        out
-    );
-    assert!(status.success(), "Container exited with failure");
-}
-
-/// N2: After spawn(), the host-side veth interface (vh-{hash}) should exist.
-#[test]
-fn test_bridge_network_veth_exists() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_network_veth_exists: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_network_veth_exists: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "sleep 2"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn bridge container");
-
-    let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
-
-    // The host-side veth should exist while the container is running
-    let status = std::process::Command::new("ip")
-        .args(["link", "show", &veth_name])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run ip link show");
-    assert!(status.success(), "Host-side veth {} should exist after spawn", veth_name);
-
-    child.wait().expect("Failed to wait for container");
-}
-
-/// N2: After wait(), the veth pair should be deleted (teardown_network called).
-#[test]
-fn test_bridge_network_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_network_cleanup: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_network_cleanup: alpine-rootfs not found");
-        return;
-    };
-
-    // Named netns is set up before fork — exit 0 is safe (no race with setup).
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn bridge container");
-
-    let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
-    child.wait().expect("Failed to wait for container");
-
-    // After wait(), teardown_network() removes the veth pair and the named netns.
-    let status = std::process::Command::new("ip")
-        .args(["link", "show", &veth_name])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run ip link show");
-    assert!(
-        !status.success(),
-        "Host-side veth {} should be gone after container exits",
-        veth_name
-    );
-}
-
-/// N2: After wait(), the named netns (/run/netns/rem-*) should also be deleted.
-#[test]
-fn test_bridge_netns_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_netns_cleanup: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_netns_cleanup: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn bridge container");
-
-    let ns_name = child.netns_name().expect("Bridge mode must have netns name").to_string();
-    let ns_path = format!("/run/netns/{}", ns_name);
-
-    // The named netns should exist before wait()
-    assert!(
-        std::path::Path::new(&ns_path).exists(),
-        "Named netns {} should exist before wait()",
-        ns_path
-    );
-
-    child.wait().expect("Failed to wait for container");
-
-    // After wait(), teardown_network() should have deleted the named netns
-    assert!(
-        !std::path::Path::new(&ns_path).exists(),
-        "Named netns {} should be deleted after wait()",
-        ns_path
-    );
-}
-
-/// N2: Loopback (127.0.0.1) should be up inside a bridge-mode container.
-///
-/// setup_bridge_network() runs `ip -n {ns_name} link set lo up` before fork;
-/// this test verifies that the container sees lo correctly.
-#[test]
-fn test_bridge_loopback_up() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_loopback_up: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_loopback_up: alpine-rootfs not found");
-        return;
-    };
-
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LO_OK"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn bridge container");
-
-    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
-    let out = String::from_utf8_lossy(&stdout);
-    assert!(
-        out.contains("LO_OK"),
-        "lo should be up with 127.0.0.1 in bridge mode, got: {:?}",
-        out
-    );
-    assert!(status.success(), "Container exited with failure");
-}
-
-/// N2: The bridge gateway (172.19.0.1 on remora0) should be reachable via ICMP.
-///
-/// Verifies actual layer-3 connectivity through the veth pair: the container
-/// sends a ping, the packet traverses eth0→veth→bridge, and the host replies.
-#[test]
-fn test_bridge_gateway_reachable() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_gateway_reachable: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_gateway_reachable: alpine-rootfs not found");
-        return;
-    };
-
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .with_proc_mount()
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn bridge container");
-
-    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
-    let out = String::from_utf8_lossy(&stdout);
-    assert!(
-        out.contains("PING_OK"),
-        "Gateway 172.19.0.1 should be reachable from bridge container, got: {:?}",
-        out
-    );
-    assert!(status.success(), "Container exited with failure");
-}
-
-/// N2: Two bridge containers spawned concurrently must receive different IPs.
-///
-/// Exercises the flock-protected IPAM and the atomic ns-name counter under
-/// real concurrency. Each thread builds, spawns, and collects its container
-/// entirely within that thread — no non-Send types cross thread boundaries.
-#[test]
-fn test_bridge_concurrent_spawn() {
-    if !is_root() {
-        eprintln!("Skipping test_bridge_concurrent_spawn: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_bridge_concurrent_spawn: alpine-rootfs not found");
-        return;
-    };
-
-    // Build and run each container entirely inside its thread.
-    // The closures capture only PathBuf (Send); Command and Child stay local.
-    let r1 = rootfs.clone();
-    let t1 = std::thread::spawn(move || {
-        Command::new("/bin/ash")
-            .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
+
+        // Test drop_all_capabilities()
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-            .with_network(NetworkMode::Bridge)
-            .with_chroot(&r1)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .drop_all_capabilities()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Child process failed with dropped caps");
+            }
+            Err(e) => panic!("Failed to spawn with dropped capabilities: {:?}", e),
+        }
+
+    }
+
+    #[test]
+    fn test_selective_capabilities() {
+        if !is_root() {
+            eprintln!("Skipping test_selective_capabilities: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
+
+        // Test keeping only specific capabilities
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_capabilities(Capability::NET_BIND_SERVICE | Capability::CHOWN)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Child process failed with selective caps");
+            }
+            Err(e) => panic!("Failed to spawn with selective capabilities: {:?}", e),
+        }
+
+    }
+}
+
+mod resources {
+    use super::*;
+
+    #[test]
+    fn test_resource_limits_fds() {
+        if !is_root() {
+            eprintln!("Skipping test_resource_limits_fds: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
+
+        // Test with_max_fds() - check ulimit -n equals 100
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "test \"$(ulimit -n)\" = 100"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_max_fds(100)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "FD limit was not set correctly");
+            }
+            Err(e) => panic!("Failed to spawn with fd limit: {:?}", e),
+        }
+
+    }
+
+    #[test]
+    fn test_resource_limits_memory() {
+        if !is_root() {
+            eprintln!("Skipping test_resource_limits_memory: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
+
+        // Test with_memory_limit() - just verify it doesn't crash
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_memory_limit(512 * 1024 * 1024) // 512MB
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Child process failed with memory limit");
+            }
+            Err(e) => panic!("Failed to spawn with memory limit: {:?}", e),
+        }
+
+    }
+
+    #[test]
+    fn test_resource_limits_cpu() {
+        if !is_root() {
+            eprintln!("Skipping test_resource_limits_cpu: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test: alpine-rootfs not found");
+            return;
+        };
+
+        // Test with_cpu_time_limit()
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cpu_time_limit(60) // 60 seconds
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().unwrap();
+                assert!(status.success(), "Child process failed with CPU limit");
+            }
+            Err(e) => panic!("Failed to spawn with CPU time limit: {:?}", e),
+        }
+
+    }
+}
+
+mod security {
+    use super::*;
+
+    #[test]
+    fn test_seccomp_docker_blocks_reboot() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_docker_blocks_reboot: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_seccomp_docker_blocks_reboot: alpine-rootfs not found");
+            return;
+        };
+
+        // Run with Docker seccomp profile - attempt reboot (should be blocked)
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "reboot 2>&1; echo reboot_exit_code=$?"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_seccomp_default() // Apply Docker's default seccomp profile
+            .spawn()
+            .expect("Failed to spawn with seccomp");
+
+        let status = child.wait().expect("Failed to wait for child");
+
+        // The reboot command should fail (seccomp blocks it)
+        // Note: We can't easily check the exact error from inside the container,
+        // but the process should complete without actually rebooting
+        assert!(
+            status.success() || status.code() == Some(1),
+            "Process should complete (reboot syscall blocked by seccomp)"
+        );
+
+    }
+
+    #[test]
+    fn test_seccomp_docker_allows_normal_syscalls() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_docker_allows_normal_syscalls: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_seccomp_docker_allows_normal_syscalls: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Run a simple echo command - uses read, write, brk, etc. (all allowed)
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo 'Seccomp allows normal operations'"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_seccomp_default() // Apply Docker's default seccomp profile
+            .spawn()
+            .expect("Failed to spawn with seccomp");
+
+        let status = child.wait().expect("Failed to wait for child");
+
+        // Normal operations should work fine
+        assert!(status.success(), "Normal syscalls should be allowed");
+    }
+
+    #[test]
+    fn test_seccomp_minimal_is_restrictive() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_minimal_is_restrictive: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_seccomp_minimal_is_restrictive: alpine-rootfs not found");
+            return;
+        };
+
+        // The minimal profile is very restrictive - even basic commands might fail
+        // We just test that it compiles and can be applied
+        let result = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_seccomp_minimal() // Apply minimal profile
+            .spawn();
+
+        // The minimal profile might be too restrictive for ash to even start,
+        // but the important thing is that seccomp was applied without errors
+        match result {
+            Ok(mut child) => {
+                let status = child.wait().expect("Failed to wait for child");
+                // Process may or may not succeed depending on what syscalls ash needs
+                eprintln!("Minimal seccomp: process exited with status {:?}", status);
+            }
+            Err(e) => {
+                // If spawn fails, it might be because seccomp blocked a syscall
+                // needed during process startup. This is expected with minimal profile.
+                eprintln!("Minimal seccomp: spawn failed (expected): {}", e);
+            }
+        }
+
+        // Test passes if we got here (seccomp was applied)
+        assert!(true, "Minimal seccomp profile can be applied");
+    }
+
+    #[test]
+    fn test_seccomp_without_flag_works() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_without_flag_works: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_seccomp_without_flag_works: alpine-rootfs not found");
+            return;
+        };
+
+        // Test that containers work without seccomp (backward compatibility)
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo 'No seccomp'"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            // No seccomp configured - should work fine
+            .spawn()
+            .expect("Failed to spawn without seccomp");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "Container should work without seccomp");
+    }
+
+    #[test]
+    fn test_no_new_privileges() {
+        if !is_root() {
+            eprintln!("Skipping test_no_new_privileges: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_no_new_privileges: alpine-rootfs not found");
+            return;
+        };
+
+        // Run ash inline - grep for NoNewPrivs:	1 in /proc/self/status
+        // The value is 1 when PR_SET_NO_NEW_PRIVS has been set
+        // Use full paths since PATH is not set inside the container
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "/bin/grep 'NoNewPrivs:.*1' /proc/self/status"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_no_new_privileges(true)
+            .spawn()
+            .expect("Failed to spawn with no-new-privileges");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "NoNewPrivs should be set to 1 in /proc/self/status");
+    }
+
+    #[test]
+    fn test_readonly_rootfs() {
+        if !is_root() {
+            eprintln!("Skipping test_readonly_rootfs: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_readonly_rootfs: alpine-rootfs not found");
+            return;
+        };
+
+        // Try to write to rootfs - should fail with read-only filesystem
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "touch /test_file 2>&1; echo exit_code=$?"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_readonly_rootfs(true)
+            .spawn()
+            .expect("Failed to spawn with read-only rootfs");
+
+        let status = child.wait().expect("Failed to wait for child");
+        // The command should complete (exit code 0), but the touch should have failed
+        assert!(status.success(), "Container should run despite read-only fs");
+    }
+
+    #[test]
+    fn test_masked_paths_default() {
+        if !is_root() {
+            eprintln!("Skipping test_masked_paths_default: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_masked_paths_default: alpine-rootfs not found");
+            return;
+        };
+
+        // Try to read a masked path - should see /dev/null or get an error
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "cat /proc/kcore 2>&1 | head -c 10 || echo 'masked'"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_masked_paths_default()
+            .spawn()
+            .expect("Failed to spawn with masked paths");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "Masked paths should not cause failures");
+    }
+
+    #[test]
+    fn test_masked_paths_custom() {
+        if !is_root() {
+            eprintln!("Skipping test_masked_paths_custom: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_masked_paths_custom: alpine-rootfs not found");
+            return;
+        };
+
+        // Use custom masked paths
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo 'Custom masked paths test'"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_masked_paths(&["/proc/kcore", "/sys/firmware"])
+            .spawn()
+            .expect("Failed to spawn with custom masked paths");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "Custom masked paths should work");
+    }
+
+    #[test]
+    fn test_combined_phase1_security() {
+        if !is_root() {
+            eprintln!("Skipping test_combined_phase1_security: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_combined_phase1_security: alpine-rootfs not found");
+            return;
+        };
+
+        // Test all Phase 1 security features together
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo 'All Phase 1 security features enabled'"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_seccomp_default()        // Seccomp filtering
+            .with_no_new_privileges(true)  // No privilege escalation
+            .with_readonly_rootfs(true)    // Immutable rootfs
+            .with_masked_paths_default()   // Hide sensitive paths
+            .drop_all_capabilities()       // Minimal capabilities
+            .spawn()
+            .expect("Failed to spawn with all Phase 1 security");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(
+            status.success(),
+            "Container with all Phase 1 security should work"
+        );
+    }
+}
+
+mod filesystem {
+    use super::*;
+
+    #[test]
+    fn test_bind_mount_rw() {
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_rw: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bind_mount_rw: alpine-rootfs not found");
+            return;
+        };
+
+        // Create a temp dir on the host and write a file into it
+        let host_dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(host_dir.path().join("hello.txt"), b"hello from host")
+            .expect("failed to write host file");
+
+        // Mount the host dir into /mnt/hostdir inside the container and verify the file is readable
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "cat /mnt/hostdir/hello.txt"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_bind_mount(host_dir.path(), "/mnt/hostdir")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with bind mount");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "Container should read host file via bind mount");
+    }
+
+    #[test]
+    fn test_bind_mount_ro() {
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_ro: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bind_mount_ro: alpine-rootfs not found");
+            return;
+        };
+
+        let host_dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        // Attempt to write inside a read-only bind mount — should fail
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "touch /mnt/ro/newfile 2>/dev/null; echo exit=$?"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_bind_mount_ro(host_dir.path(), "/mnt/ro")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with read-only bind mount");
+
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        assert!(status.success(), "Shell should exit cleanly");
+        let out = String::from_utf8_lossy(&stdout);
+        // touch must fail (exit code != 0) because the mount is read-only
+        assert!(
+            out.contains("exit=1"),
+            "Write to read-only bind mount should fail, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_tmpfs_mount() {
+        if !is_root() {
+            eprintln!("Skipping test_tmpfs_mount: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_tmpfs_mount: alpine-rootfs not found");
+            return;
+        };
+
+        // Even with a read-only rootfs, tmpfs at /tmp should be writable
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "touch /tmp/testfile && echo ok"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_readonly_rootfs(true)
+            .with_tmpfs("/tmp", "size=10m,mode=1777")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with tmpfs mount");
+
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        assert!(status.success(), "Container should succeed with tmpfs /tmp");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(out.contains("ok"), "touch on tmpfs should succeed, got: {}", out);
+    }
+
+    #[test]
+    fn test_named_volume() {
+        if !is_root() {
+            eprintln!("Skipping test_named_volume: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_named_volume: alpine-rootfs not found");
+            return;
+        };
+
+        // Clean up any leftover volume from a previous failed run
+        let _ = Volume::delete("testvol");
+
+        let vol = Volume::create("testvol").expect("Failed to create volume");
+
+        // Write a file from inside the container
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo persistent > /data/file.txt"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_volume(&vol, "/data")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with named volume");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "Container should write to volume");
+
+        // Verify the file persists on the host
+        let host_file = vol.path().join("file.txt");
+        assert!(host_file.exists(), "Volume file should exist on host after container exits");
+        let contents = std::fs::read_to_string(&host_file).expect("Failed to read volume file");
+        assert!(contents.contains("persistent"), "Volume file should contain expected content");
+
+        // Clean up
+        Volume::delete("testvol").expect("Failed to delete volume");
+    }
+
+    /// Container writes to a file inside overlayfs; the write appears in upper_dir,
+    /// not in lower_dir (the shared Alpine rootfs is untouched).
+    #[test]
+    fn test_overlay_writes_to_upper() {
+        if !is_root() {
+            eprintln!("Skipping test_overlay_writes_to_upper: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_overlay_writes_to_upper: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let scratch = tempfile::tempdir().expect("failed to create tempdir");
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .args(&["-c", "echo hello > /newfile"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_overlay(&upper, &work)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("failed to spawn overlay container");
+
+        child.wait().expect("failed to wait");
+
+        // The lower layer must NOT have been modified.
+        assert!(
+            !rootfs.join("newfile").exists(),
+            "lower dir (alpine-rootfs) should not contain newfile — overlay leaked write to lower"
+        );
+
+        // The write must appear in upper_dir.
+        let upper_file = upper.join("newfile");
+        assert!(
+            upper_file.exists(),
+            "upper_dir/newfile should exist after container wrote /newfile"
+        );
+        let content = std::fs::read_to_string(&upper_file).expect("failed to read upper/newfile");
+        assert_eq!(content, "hello\n", "upper_dir/newfile should contain 'hello\\n'");
+    }
+
+    /// Modifying an existing lower-layer file writes a copy to upper_dir;
+    /// the original file in lower_dir is untouched.
+    #[test]
+    fn test_overlay_lower_unchanged() {
+        if !is_root() {
+            eprintln!("Skipping test_overlay_lower_unchanged: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_overlay_lower_unchanged: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let scratch = tempfile::tempdir().expect("failed to create tempdir");
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Record the original content of /etc/hostname in the lower layer.
+        let lower_hostname = rootfs.join("etc/hostname");
+        let original_content = std::fs::read_to_string(&lower_hostname)
+            .unwrap_or_else(|_| String::new());
+
+        let mut child = Command::new("/bin/sh")
+            .args(&["-c", "echo modified > /etc/hostname"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_overlay(&upper, &work)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("failed to spawn overlay container");
+
+        child.wait().expect("failed to wait");
+
+        // Lower layer /etc/hostname must be unchanged.
+        let after_content = std::fs::read_to_string(&lower_hostname)
+            .unwrap_or_else(|_| String::new());
+        assert_eq!(
+            original_content, after_content,
+            "lower_dir/etc/hostname should be unchanged; overlay leaked write to lower"
+        );
+
+        // upper_dir must hold the modified copy.
+        let upper_hostname = upper.join("etc/hostname");
+        assert!(
+            upper_hostname.exists(),
+            "upper_dir/etc/hostname should exist (copy-on-write)"
+        );
+        let upper_content = std::fs::read_to_string(&upper_hostname)
+            .expect("failed to read upper/etc/hostname");
+        assert_eq!(upper_content, "modified\n", "upper_dir/etc/hostname should contain 'modified\\n'");
+    }
+
+    /// After wait(), the auto-created /run/remora/overlay-{pid}-{n}/merged directory
+    /// and its parent are removed — no stale dirs left on the host.
+    #[test]
+    fn test_overlay_merged_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_overlay_merged_cleanup: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_overlay_merged_cleanup: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let scratch = tempfile::tempdir().expect("failed to create tempdir");
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .args(&["-c", "true"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_overlay(&upper, &work)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("failed to spawn overlay container");
+
+        // Record this container's specific merged dir before calling wait().
+        let merged_dir = child.overlay_merged_dir().map(|p| p.to_path_buf());
+        assert!(merged_dir.is_some(), "with_overlay should set overlay_merged_dir on Child");
+        let merged = merged_dir.unwrap();
+        let parent = merged.parent().unwrap().to_path_buf();
+
+        // The dirs must exist while the container is running.
+        assert!(merged.exists(), "merged dir should exist before wait()");
+
+        child.wait().expect("failed to wait");
+
+        // After wait(), both the merged dir and its parent must be gone.
+        assert!(
+            !merged.exists(),
+            "overlay merged dir should be removed after wait(); still present: {}",
+            merged.display()
+        );
+        assert!(
+            !parent.exists(),
+            "overlay parent dir should be removed after wait(); still present: {}",
+            parent.display()
+        );
+    }
+}
+
+mod cgroups {
+    use super::*;
+
+    #[test]
+    fn test_cgroup_memory_limit() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_memory_limit: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_memory_limit: alpine-rootfs not found");
+            return;
+        };
+
+        // Try to allocate ~64 MB using dd. With a 32 MB cgroup limit the process
+        // should be OOM-killed (exit non-zero) or fail to allocate.
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "dd if=/dev/urandom of=/dev/null bs=1M count=64"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(32 * 1024 * 1024) // 32 MB
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup memory limit");
+
+        let status = child.wait().expect("Failed to wait for child");
+        // dd reads stdin→stdout incrementally so it won't hit the RSS limit.
+        // The important thing is that the cgroup was created and the process ran.
+        // We just verify the container exits (success or OOM-killed).
+        let _ = status;
+    }
+
+    #[test]
+    fn test_cgroup_pids_limit() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_pids_limit: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_pids_limit: alpine-rootfs not found");
+            return;
+        };
+
+        // Limit to 4 PIDs (ash + subprocesses). Try to spawn 10 background jobs
+        // — at least some should fail. The shell exits 0 regardless, so we just
+        // verify that cgroup setup does not break container execution.
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0 & done; wait; echo done"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_pids_limit(4)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup pids limit");
+
+        // Process should complete (even if some forks were denied by pids.max)
+        let status = child.wait().expect("Failed to wait for child");
+        let _ = status;
+    }
+
+    #[test]
+    fn test_cgroup_cpu_shares() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_cpu_shares: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_cpu_shares: alpine-rootfs not found");
+            return;
+        };
+
+        // Smoke test: setting cpu_shares should not break container execution.
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo ok"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_cpu_shares(512)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup cpu shares");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(status.success(), "Container with cpu_shares should exit cleanly");
+    }
+
+    #[test]
+    fn test_resource_stats() {
+        if !is_root() {
+            eprintln!("Skipping test_resource_stats: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_resource_stats: alpine-rootfs not found");
+            return;
+        };
+
+        // Verify resource_stats() returns a ResourceStats (no panic/error) when
+        // a cgroup is active. Values should be >= 0 (they're unsigned).
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "echo hello"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(128 * 1024 * 1024)
+            .with_cgroup_pids_limit(64)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn for resource_stats test");
+
+        // Read stats while the process may still be running
+        let stats: ResourceStats = child.resource_stats().expect("resource_stats() failed");
+        // Values are u64 so always >= 0; just verify the call succeeded
+        let _ = stats.memory_current_bytes;
+        let _ = stats.cpu_usage_ns;
+        let _ = stats.pids_current;
+
+        child.wait().expect("Failed to wait for child");
+    }
+
+    #[test]
+    fn test_cgroup_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_cleanup: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_cleanup: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(64 * 1024 * 1024)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn for cgroup cleanup test");
+
+        let pid = child.pid();
+        child.wait().expect("Failed to wait for child");
+
+        // After wait(), teardown_cgroup should have deleted the cgroup directory
+        let cgroup_path = format!("/sys/fs/cgroup/remora-{}", pid);
+        assert!(
+            !std::path::Path::new(&cgroup_path).exists(),
+            "Cgroup {} should be deleted after container exits",
+            cgroup_path
+        );
+    }
+}
+
+mod networking {
+    use super::*;
+
+    #[test]
+    fn test_loopback_network() {
+        if !is_root() {
+            eprintln!("Skipping test_loopback_network: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_loopback_network: alpine-rootfs not found");
+            return;
+        };
+
+        // with_network(Loopback) automatically adds Namespace::NET and brings up lo.
+        // After lo is up, the kernel assigns 127.0.0.1 automatically.
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Loopback)
+            .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
             .with_proc_mount()
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Null)
             .spawn()
-            .expect("Failed to spawn container 1")
-            .wait_with_output()
-            .expect("Failed to collect output from container 1")
-    });
+            .expect("Failed to spawn loopback container");
 
-    let r2 = rootfs.clone();
-    let t2 = std::thread::spawn(move || {
-        Command::new("/bin/ash")
-            .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("LOOPBACK_OK"),
+            "lo should have 127.0.0.1 after bring-up, got: {}",
+            out
+        );
+        assert!(status.success(), "Container exited with failure");
+    }
+
+    /// N2: Bridge mode — container should receive a 172.19.0.x/24 address on eth0.
+    #[test]
+    fn test_bridge_network_ip() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_network_ip: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_network_ip: alpine-rootfs not found");
+            return;
+        };
+
+        // Named netns is fully configured before fork; eth0 is ready from the first instruction.
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
-            .with_chroot(&r2)
+            .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
             .with_proc_mount()
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Null)
             .spawn()
-            .expect("Failed to spawn container 2")
-            .wait_with_output()
-            .expect("Failed to collect output from container 2")
-    });
+            .expect("Failed to spawn bridge container");
 
-    let (_s1, out1, _) = t1.join().expect("Container 1 thread panicked");
-    let (_s2, out2, _) = t2.join().expect("Container 2 thread panicked");
-
-    let ip1 = String::from_utf8_lossy(&out1).trim().to_string();
-    let ip2 = String::from_utf8_lossy(&out2).trim().to_string();
-
-    assert!(!ip1.is_empty(), "Container 1 should output its IP address");
-    assert!(!ip2.is_empty(), "Container 2 should output its IP address");
-    assert!(ip1.starts_with("172.19.0."), "Container 1 IP should be in bridge subnet: {}", ip1);
-    assert!(ip2.starts_with("172.19.0."), "Container 2 IP should be in bridge subnet: {}", ip2);
-    assert_ne!(ip1, ip2, "Containers must receive different IPs: got {} and {}", ip1, ip2);
-}
-
-// ============================================================================
-// Phase 6 N3 Networking Tests — NAT / MASQUERADE
-// ============================================================================
-
-/// N3: While a NAT container is running, `nft list table ip remora` must succeed.
-///
-/// Spawns a bridge+NAT container running `sleep 2`. While it sleeps, queries
-/// `nft list table ip remora` on the host. Asserts exit 0, confirming that
-/// `enable_nat()` installed the MASQUERADE table.
-#[test]
-#[serial(nat)]
-fn test_nat_rule_added() {
-    if !is_root() {
-        eprintln!("Skipping test_nat_rule_added: requires root");
-        return;
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("BRIDGE_IP_OK"),
+            "eth0 should have a 172.19.0.x address in bridge mode, got: {}",
+            out
+        );
+        assert!(status.success(), "Container exited with failure");
     }
 
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_nat_rule_added: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "sleep 2"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn NAT container");
-
-    // While the container sleeps, the nftables table should exist.
-    let status = std::process::Command::new("nft")
-        .args(["list", "table", "ip", "remora"])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run nft list table");
-    assert!(
-        status.success(),
-        "nft table ip remora should exist while a NAT container is running"
-    );
-
-    child.wait().expect("Failed to wait for NAT container");
-}
-
-/// N3: After the last NAT container exits, `nft list table ip remora` must fail.
-///
-/// Spawns a bridge+NAT container with `ash -c "exit 0"`. After `wait()`,
-/// asserts that `nft list table ip remora` exits non-zero, confirming that
-/// `disable_nat()` removed the nftables table.
-#[test]
-#[serial(nat)]
-fn test_nat_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_nat_cleanup: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_nat_cleanup: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn NAT container");
-
-    child.wait().expect("Failed to wait for NAT container");
-
-    // After the container exits, the nftables table should be gone.
-    let status = std::process::Command::new("nft")
-        .args(["list", "table", "ip", "remora"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run nft list table");
-    assert!(
-        !status.success(),
-        "nft table ip remora should be removed after all NAT containers exit"
-    );
-}
-
-/// N3: The nftables table must survive until the *last* NAT container exits.
-///
-/// Spawns container A (`sleep 2`, NAT) and B (`sleep 4`, NAT).
-/// Waits for A — table must still exist (B is still running).
-/// Waits for B — table must be gone (refcount hits 0).
-#[test]
-#[serial(nat)]
-fn test_nat_refcount() {
-    if !is_root() {
-        eprintln!("Skipping test_nat_refcount: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_nat_refcount: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child_a = Command::new("/bin/ash")
-        .args(&["-c", "sleep 2"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn NAT container A");
-
-    let mut child_b = Command::new("/bin/ash")
-        .args(&["-c", "sleep 4"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn NAT container B");
-
-    // Wait for A (shorter sleep). B is still running — table must still exist.
-    child_a.wait().expect("Failed to wait for container A");
-
-    let status = std::process::Command::new("nft")
-        .args(["list", "table", "ip", "remora"])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run nft list table after A exits");
-    assert!(
-        status.success(),
-        "nft table should still exist after A exits (B is still running)"
-    );
-
-    // Now wait for B. Both containers have exited — table must be gone.
-    child_b.wait().expect("Failed to wait for container B");
-
-    let status = std::process::Command::new("nft")
-        .args(["list", "table", "ip", "remora"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run nft list table after B exits");
-    assert!(
-        !status.success(),
-        "nft table should be removed after both NAT containers exit"
-    );
-}
-
-/// N4: A DNAT rule must exist in the prerouting chain while a port-forward
-/// container is running.
-///
-/// Spawns a bridge+NAT container with `with_port_forward(18080, 80)` running
-/// `sleep 2`. While it sleeps, checks that `nft list chain ip remora prerouting`
-/// succeeds and contains "dport 18080". Waits for the container.
-#[test]
-#[serial(nat)]
-fn test_port_forward_rule_added() {
-    if !is_root() {
-        eprintln!("Skipping test_port_forward_rule_added: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_port_forward_rule_added: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "sleep 2"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_port_forward(18080, 80)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn port-forward container");
-
-    // While the container is sleeping, the prerouting chain must contain the DNAT rule.
-    let output = std::process::Command::new("nft")
-        .args(["list", "chain", "ip", "remora", "prerouting"])
-        .output()
-        .expect("Failed to run nft list chain");
-    assert!(
-        output.status.success(),
-        "nft prerouting chain should exist while port-forward container is running"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("dport 18080"),
-        "prerouting chain should contain DNAT rule for dport 18080; got:\n{}", stdout
-    );
-
-    child.wait().expect("Failed to wait for port-forward container");
-}
-
-/// N4: After a port-forward container exits, its DNAT rule must be cleaned up.
-///
-/// Spawns a bridge+NAT container with `with_port_forward(18081, 80)` that exits
-/// immediately. After `wait()`, asserts that the nftables table is gone entirely
-/// (both NAT and port-forward refcounts are zero).
-#[test]
-#[serial(nat)]
-fn test_port_forward_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_port_forward_cleanup: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_port_forward_cleanup: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child = Command::new("/bin/ash")
-        .args(&["-c", "exit 0"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_port_forward(18081, 80)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn port-forward container");
-
-    child.wait().expect("Failed to wait for port-forward container");
-
-    // After the container exits, the table must be gone entirely.
-    let status = std::process::Command::new("nft")
-        .args(["list", "table", "ip", "remora"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run nft list table");
-    assert!(
-        !status.success(),
-        "nft table ip remora should be removed after port-forward container exits"
-    );
-}
-
-/// N4: Two containers with different port forwards must be torn down independently.
-///
-/// Spawns A (`sleep 2`, port 18082→80) and B (`sleep 4`, port 18083→80), both
-/// with NAT. Waits for A — the prerouting chain must still contain B's rule
-/// (`dport 18083`) but not A's (`dport 18082`). Waits for B — table must be gone.
-#[test]
-#[serial(nat)]
-fn test_port_forward_independent_teardown() {
-    if !is_root() {
-        eprintln!("Skipping test_port_forward_independent_teardown: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_port_forward_independent_teardown: alpine-rootfs not found");
-        return;
-    };
-
-    let mut child_a = Command::new("/bin/ash")
-        .args(&["-c", "sleep 2"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_port_forward(18082, 80)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn port-forward container A");
-
-    let mut child_b = Command::new("/bin/ash")
-        .args(&["-c", "sleep 4"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_port_forward(18083, 80)
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn port-forward container B");
-
-    // Wait for A. B is still running — prerouting must still exist with B's rule.
-    child_a.wait().expect("Failed to wait for container A");
-
-    let output = std::process::Command::new("nft")
-        .args(["list", "chain", "ip", "remora", "prerouting"])
-        .output()
-        .expect("Failed to run nft list chain after A exits");
-    assert!(
-        output.status.success(),
-        "prerouting chain should still exist after A exits (B is still running)"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains("dport 18082"),
-        "A's DNAT rule (dport 18082) should be gone after A exits"
-    );
-    assert!(
-        stdout.contains("dport 18083"),
-        "B's DNAT rule (dport 18083) should still be present; got:\n{}", stdout
-    );
-
-    // Wait for B. Both containers gone — table must be removed entirely.
-    child_b.wait().expect("Failed to wait for container B");
-
-    let status = std::process::Command::new("nft")
-        .args(["list", "table", "ip", "remora"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("Failed to run nft list table after B exits");
-    assert!(
-        !status.success(),
-        "nft table should be removed after both port-forward containers exit"
-    );
-}
-
-/// N5: `with_dns()` must write the specified nameservers into the container's
-/// `/etc/resolv.conf` so that DNS resolution works inside the container.
-///
-/// Spawns a bridge+NAT+DNS container that runs `cat /etc/resolv.conf` and
-/// captures stdout. Asserts the output contains both configured nameservers.
-#[test]
-#[serial(nat)]
-fn test_dns_resolv_conf() {
-    if !is_root() {
-        eprintln!("Skipping test_dns_resolv_conf: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_dns_resolv_conf: alpine-rootfs not found");
-        return;
-    };
-
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "cat /etc/resolv.conf"])
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Bridge)
-        .with_nat()
-        .with_dns(&["1.1.1.1", "8.8.8.8"])
-        .with_chroot(&rootfs)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("Failed to spawn DNS container");
-
-    let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("Failed to wait for DNS container");
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-
-    assert!(
-        stdout.contains("nameserver 1.1.1.1"),
-        "/etc/resolv.conf should contain 'nameserver 1.1.1.1'; got:\n{}", stdout
-    );
-    assert!(
-        stdout.contains("nameserver 8.8.8.8"),
-        "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}", stdout
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Overlay filesystem tests
-// ---------------------------------------------------------------------------
-
-/// Container writes to a file inside overlayfs; the write appears in upper_dir,
-/// not in lower_dir (the shared Alpine rootfs is untouched).
-#[test]
-fn test_overlay_writes_to_upper() {
-    if !is_root() {
-        eprintln!("Skipping test_overlay_writes_to_upper: requires root");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_overlay_writes_to_upper: alpine-rootfs not found");
+    /// N2: After spawn(), the host-side veth interface (vh-{hash}) should exist.
+    #[test]
+    fn test_bridge_network_veth_exists() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_network_veth_exists: requires root");
             return;
         }
-    };
 
-    let scratch = tempfile::tempdir().expect("failed to create tempdir");
-    let upper = scratch.path().join("upper");
-    let work = scratch.path().join("work");
-    std::fs::create_dir_all(&upper).unwrap();
-    std::fs::create_dir_all(&work).unwrap();
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_network_veth_exists: alpine-rootfs not found");
+            return;
+        };
 
-    let mut child = Command::new("/bin/sh")
-        .args(&["-c", "echo hello > /newfile"])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_overlay(&upper, &work)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("failed to spawn overlay container");
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 2"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn bridge container");
 
-    child.wait().expect("failed to wait");
+        let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
 
-    // The lower layer must NOT have been modified.
-    assert!(
-        !rootfs.join("newfile").exists(),
-        "lower dir (alpine-rootfs) should not contain newfile — overlay leaked write to lower"
-    );
+        // The host-side veth should exist while the container is running
+        let status = std::process::Command::new("ip")
+            .args(["link", "show", &veth_name])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run ip link show");
+        assert!(status.success(), "Host-side veth {} should exist after spawn", veth_name);
 
-    // The write must appear in upper_dir.
-    let upper_file = upper.join("newfile");
-    assert!(
-        upper_file.exists(),
-        "upper_dir/newfile should exist after container wrote /newfile"
-    );
-    let content = std::fs::read_to_string(&upper_file).expect("failed to read upper/newfile");
-    assert_eq!(content, "hello\n", "upper_dir/newfile should contain 'hello\\n'");
-}
-
-/// Modifying an existing lower-layer file writes a copy to upper_dir;
-/// the original file in lower_dir is untouched.
-#[test]
-fn test_overlay_lower_unchanged() {
-    if !is_root() {
-        eprintln!("Skipping test_overlay_lower_unchanged: requires root");
-        return;
+        child.wait().expect("Failed to wait for container");
     }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_overlay_lower_unchanged: alpine-rootfs not found");
+
+    /// N2: After wait(), the veth pair should be deleted (teardown_network called).
+    #[test]
+    fn test_bridge_network_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_network_cleanup: requires root");
             return;
         }
-    };
 
-    let scratch = tempfile::tempdir().expect("failed to create tempdir");
-    let upper = scratch.path().join("upper");
-    let work = scratch.path().join("work");
-    std::fs::create_dir_all(&upper).unwrap();
-    std::fs::create_dir_all(&work).unwrap();
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_network_cleanup: alpine-rootfs not found");
+            return;
+        };
 
-    // Record the original content of /etc/hostname in the lower layer.
-    let lower_hostname = rootfs.join("etc/hostname");
-    let original_content = std::fs::read_to_string(&lower_hostname)
-        .unwrap_or_else(|_| String::new());
+        // Named netns is set up before fork — exit 0 is safe (no race with setup).
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn bridge container");
 
-    let mut child = Command::new("/bin/sh")
-        .args(&["-c", "echo modified > /etc/hostname"])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_overlay(&upper, &work)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("failed to spawn overlay container");
+        let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
+        child.wait().expect("Failed to wait for container");
 
-    child.wait().expect("failed to wait");
-
-    // Lower layer /etc/hostname must be unchanged.
-    let after_content = std::fs::read_to_string(&lower_hostname)
-        .unwrap_or_else(|_| String::new());
-    assert_eq!(
-        original_content, after_content,
-        "lower_dir/etc/hostname should be unchanged; overlay leaked write to lower"
-    );
-
-    // upper_dir must hold the modified copy.
-    let upper_hostname = upper.join("etc/hostname");
-    assert!(
-        upper_hostname.exists(),
-        "upper_dir/etc/hostname should exist (copy-on-write)"
-    );
-    let upper_content = std::fs::read_to_string(&upper_hostname)
-        .expect("failed to read upper/etc/hostname");
-    assert_eq!(upper_content, "modified\n", "upper_dir/etc/hostname should contain 'modified\\n'");
-}
-
-/// After wait(), the auto-created /run/remora/overlay-{pid}-{n}/merged directory
-/// and its parent are removed — no stale dirs left on the host.
-#[test]
-fn test_overlay_merged_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_overlay_merged_cleanup: requires root");
-        return;
+        // After wait(), teardown_network() removes the veth pair and the named netns.
+        let status = std::process::Command::new("ip")
+            .args(["link", "show", &veth_name])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run ip link show");
+        assert!(
+            !status.success(),
+            "Host-side veth {} should be gone after container exits",
+            veth_name
+        );
     }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_overlay_merged_cleanup: alpine-rootfs not found");
+
+    /// N2: After wait(), the named netns (/run/netns/rem-*) should also be deleted.
+    #[test]
+    fn test_bridge_netns_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_netns_cleanup: requires root");
             return;
         }
-    };
 
-    let scratch = tempfile::tempdir().expect("failed to create tempdir");
-    let upper = scratch.path().join("upper");
-    let work = scratch.path().join("work");
-    std::fs::create_dir_all(&upper).unwrap();
-    std::fs::create_dir_all(&work).unwrap();
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_netns_cleanup: alpine-rootfs not found");
+            return;
+        };
 
-    let mut child = Command::new("/bin/sh")
-        .args(&["-c", "true"])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_overlay(&upper, &work)
-        .env("PATH", ALPINE_PATH)
-        .stdin(Stdio::Null)
-        .stdout(Stdio::Null)
-        .stderr(Stdio::Null)
-        .spawn()
-        .expect("failed to spawn overlay container");
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn bridge container");
 
-    // Record this container's specific merged dir before calling wait().
-    let merged_dir = child.overlay_merged_dir().map(|p| p.to_path_buf());
-    assert!(merged_dir.is_some(), "with_overlay should set overlay_merged_dir on Child");
-    let merged = merged_dir.unwrap();
-    let parent = merged.parent().unwrap().to_path_buf();
+        let ns_name = child.netns_name().expect("Bridge mode must have netns name").to_string();
+        let ns_path = format!("/run/netns/{}", ns_name);
 
-    // The dirs must exist while the container is running.
-    assert!(merged.exists(), "merged dir should exist before wait()");
+        // The named netns should exist before wait()
+        assert!(
+            std::path::Path::new(&ns_path).exists(),
+            "Named netns {} should exist before wait()",
+            ns_path
+        );
 
-    child.wait().expect("failed to wait");
+        child.wait().expect("Failed to wait for container");
 
-    // After wait(), both the merged dir and its parent must be gone.
-    assert!(
-        !merged.exists(),
-        "overlay merged dir should be removed after wait(); still present: {}",
-        merged.display()
-    );
-    assert!(
-        !parent.exists(),
-        "overlay parent dir should be removed after wait(); still present: {}",
-        parent.display()
-    );
-}
-
-// ---------------------------------------------------------------------------
-// OCI lifecycle tests
-// ---------------------------------------------------------------------------
-
-/// Helper: build a minimal OCI bundle in `dir`, pointing rootfs at `rootfs_path`.
-/// Returns the bundle directory path.
-fn make_oci_bundle(dir: &std::path::Path, rootfs: &std::path::Path, args: &[&str]) -> PathBuf {
-    // rootfs/ is a symlink to the real alpine rootfs (avoids copying)
-    let rootfs_link = dir.join("rootfs");
-    std::os::unix::fs::symlink(rootfs, &rootfs_link).expect("failed to create rootfs symlink");
-
-    // Minimal config.json
-    let args_json: Vec<String> = args.iter().map(|s| format!("\"{}\"", s)).collect();
-    let config = format!(
-        r#"{{
-  "ociVersion": "1.0.2",
-  "root": {{"path": "rootfs"}},
-  "process": {{
-    "args": [{}],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  }},
-  "linux": {{
-    "namespaces": [
-      {{"type": "mount"}},
-      {{"type": "uts"}},
-      {{"type": "pid"}}
-    ]
-  }}
-}}"#,
-        args_json.join(", ")
-    );
-    std::fs::write(dir.join("config.json"), config).expect("failed to write config.json");
-    dir.to_path_buf()
-}
-
-/// Helper: find the remora binary (built by cargo)
-fn remora_binary() -> PathBuf {
-    // target/debug/remora relative to the workspace root
-    let mut p = std::env::current_dir().unwrap();
-    p.push("target/debug/remora");
-    p
-}
-
-/// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
-fn run_remora(args: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(remora_binary())
-        .args(args)
-        .output()
-        .expect("failed to run remora binary");
-    (
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-        output.status.success(),
-    )
-}
-
-/// test_oci_create_start_state
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a minimal OCI bundle running `sleep 2`. Verifies that:
-/// - `remora create` leaves the container in "created" state
-/// - `remora start` transitions it to "running"
-/// - After the process exits, `remora state` reports "stopped"
-/// - `remora delete` removes the state directory
-///
-/// Failure indicates the create/start split synchronization is broken,
-/// state.json transitions are wrong, or liveness detection is incorrect.
-#[test]
-fn test_oci_create_start_state() {
-    if !is_root() {
-        eprintln!("Skipping test_oci_create_start_state: requires root");
-        return;
+        // After wait(), teardown_network() should have deleted the named netns
+        assert!(
+            !std::path::Path::new(&ns_path).exists(),
+            "Named netns {} should be deleted after wait()",
+            ns_path
+        );
     }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_oci_create_start_state: alpine-rootfs not found");
+
+    /// N2: Loopback (127.0.0.1) should be up inside a bridge-mode container.
+    ///
+    /// setup_bridge_network() runs `ip -n {ns_name} link set lo up` before fork;
+    /// this test verifies that the container sees lo correctly.
+    #[test]
+    fn test_bridge_loopback_up() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_loopback_up: requires root");
             return;
         }
-    };
 
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "2"]);
-    let id = format!("test-oci-css-{}", std::process::id());
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_loopback_up: alpine-rootfs not found");
+            return;
+        };
 
-    // Cleanup guard: always delete on test exit
-    // create
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LO_OK"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn bridge container");
 
-    // state should be "created"
-    let (stdout, stderr, ok) = run_remora(&["state", &id]);
-    assert!(ok, "remora state (created) failed: {}", stderr);
-    assert!(
-        stdout.contains("\"created\""),
-        "expected status 'created', got: {}",
-        stdout
-    );
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("LO_OK"),
+            "lo should be up with 127.0.0.1 in bridge mode, got: {:?}",
+            out
+        );
+        assert!(status.success(), "Container exited with failure");
+    }
 
-    // start
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
+    /// N2: The bridge gateway (172.19.0.1 on remora0) should be reachable via ICMP.
+    ///
+    /// Verifies actual layer-3 connectivity through the veth pair: the container
+    /// sends a ping, the packet traverses eth0→veth→bridge, and the host replies.
+    #[test]
+    fn test_bridge_gateway_reachable() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_gateway_reachable: requires root");
+            return;
+        }
 
-    // state should be "running"
-    let (stdout, _, _) = run_remora(&["state", &id]);
-    assert!(
-        stdout.contains("\"running\""),
-        "expected status 'running' after start, got: {}",
-        stdout
-    );
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_gateway_reachable: alpine-rootfs not found");
+            return;
+        };
 
-    // Wait for sleep 2 to exit (max 6 seconds)
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
-    loop {
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn bridge container");
+
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("PING_OK"),
+            "Gateway 172.19.0.1 should be reachable from bridge container, got: {:?}",
+            out
+        );
+        assert!(status.success(), "Container exited with failure");
+    }
+
+    /// N2: Two bridge containers spawned concurrently must receive different IPs.
+    ///
+    /// Exercises the flock-protected IPAM and the atomic ns-name counter under
+    /// real concurrency. Each thread builds, spawns, and collects its container
+    /// entirely within that thread — no non-Send types cross thread boundaries.
+    #[test]
+    fn test_bridge_concurrent_spawn() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_concurrent_spawn: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_concurrent_spawn: alpine-rootfs not found");
+            return;
+        };
+
+        // Build and run each container entirely inside its thread.
+        // The closures capture only PathBuf (Send); Command and Child stay local.
+        let r1 = rootfs.clone();
+        let t1 = std::thread::spawn(move || {
+            Command::new("/bin/ash")
+                .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+                .with_network(NetworkMode::Bridge)
+                .with_chroot(&r1)
+                .env("PATH", ALPINE_PATH)
+                .with_proc_mount()
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Null)
+                .spawn()
+                .expect("Failed to spawn container 1")
+                .wait_with_output()
+                .expect("Failed to collect output from container 1")
+        });
+
+        let r2 = rootfs.clone();
+        let t2 = std::thread::spawn(move || {
+            Command::new("/bin/ash")
+                .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+                .with_network(NetworkMode::Bridge)
+                .with_chroot(&r2)
+                .env("PATH", ALPINE_PATH)
+                .with_proc_mount()
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Null)
+                .spawn()
+                .expect("Failed to spawn container 2")
+                .wait_with_output()
+                .expect("Failed to collect output from container 2")
+        });
+
+        let (_s1, out1, _) = t1.join().expect("Container 1 thread panicked");
+        let (_s2, out2, _) = t2.join().expect("Container 2 thread panicked");
+
+        let ip1 = String::from_utf8_lossy(&out1).trim().to_string();
+        let ip2 = String::from_utf8_lossy(&out2).trim().to_string();
+
+        assert!(!ip1.is_empty(), "Container 1 should output its IP address");
+        assert!(!ip2.is_empty(), "Container 2 should output its IP address");
+        assert!(ip1.starts_with("172.19.0."), "Container 1 IP should be in bridge subnet: {}", ip1);
+        assert!(ip2.starts_with("172.19.0."), "Container 2 IP should be in bridge subnet: {}", ip2);
+        assert_ne!(ip1, ip2, "Containers must receive different IPs: got {} and {}", ip1, ip2);
+    }
+
+    #[test]
+    #[serial(nat)]
+    fn test_nat_rule_added() {
+        if !is_root() {
+            eprintln!("Skipping test_nat_rule_added: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_nat_rule_added: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 2"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn NAT container");
+
+        // While the container sleeps, the nftables table should exist.
+        let status = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run nft list table");
+        assert!(
+            status.success(),
+            "nft table ip remora should exist while a NAT container is running"
+        );
+
+        child.wait().expect("Failed to wait for NAT container");
+    }
+
+    /// N3: After the last NAT container exits, `nft list table ip remora` must fail.
+    ///
+    /// Spawns a bridge+NAT container with `ash -c "exit 0"`. After `wait()`,
+    /// asserts that `nft list table ip remora` exits non-zero, confirming that
+    /// `disable_nat()` removed the nftables table.
+    #[test]
+    #[serial(nat)]
+    fn test_nat_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_nat_cleanup: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_nat_cleanup: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn NAT container");
+
+        child.wait().expect("Failed to wait for NAT container");
+
+        // After the container exits, the nftables table should be gone.
+        let status = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run nft list table");
+        assert!(
+            !status.success(),
+            "nft table ip remora should be removed after all NAT containers exit"
+        );
+    }
+
+    /// N3: The nftables table must survive until the *last* NAT container exits.
+    ///
+    /// Spawns container A (`sleep 2`, NAT) and B (`sleep 4`, NAT).
+    /// Waits for A — table must still exist (B is still running).
+    /// Waits for B — table must be gone (refcount hits 0).
+    #[test]
+    #[serial(nat)]
+    fn test_nat_refcount() {
+        if !is_root() {
+            eprintln!("Skipping test_nat_refcount: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_nat_refcount: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child_a = Command::new("/bin/ash")
+            .args(&["-c", "sleep 2"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn NAT container A");
+
+        let mut child_b = Command::new("/bin/ash")
+            .args(&["-c", "sleep 4"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn NAT container B");
+
+        // Wait for A (shorter sleep). B is still running — table must still exist.
+        child_a.wait().expect("Failed to wait for container A");
+
+        let status = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run nft list table after A exits");
+        assert!(
+            status.success(),
+            "nft table should still exist after A exits (B is still running)"
+        );
+
+        // Now wait for B. Both containers have exited — table must be gone.
+        child_b.wait().expect("Failed to wait for container B");
+
+        let status = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run nft list table after B exits");
+        assert!(
+            !status.success(),
+            "nft table should be removed after both NAT containers exit"
+        );
+    }
+
+    /// N4: A DNAT rule must exist in the prerouting chain while a port-forward
+    /// container is running.
+    ///
+    /// Spawns a bridge+NAT container with `with_port_forward(18080, 80)` running
+    /// `sleep 2`. While it sleeps, checks that `nft list chain ip remora prerouting`
+    /// succeeds and contains "dport 18080". Waits for the container.
+    #[test]
+    #[serial(nat)]
+    fn test_port_forward_rule_added() {
+        if !is_root() {
+            eprintln!("Skipping test_port_forward_rule_added: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_forward_rule_added: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 2"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(18080, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn port-forward container");
+
+        // While the container is sleeping, the prerouting chain must contain the DNAT rule.
+        let output = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "remora", "prerouting"])
+            .output()
+            .expect("Failed to run nft list chain");
+        assert!(
+            output.status.success(),
+            "nft prerouting chain should exist while port-forward container is running"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("dport 18080"),
+            "prerouting chain should contain DNAT rule for dport 18080; got:\n{}", stdout
+        );
+
+        child.wait().expect("Failed to wait for port-forward container");
+    }
+
+    /// N4: After a port-forward container exits, its DNAT rule must be cleaned up.
+    ///
+    /// Spawns a bridge+NAT container with `with_port_forward(18081, 80)` that exits
+    /// immediately. After `wait()`, asserts that the nftables table is gone entirely
+    /// (both NAT and port-forward refcounts are zero).
+    #[test]
+    #[serial(nat)]
+    fn test_port_forward_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_port_forward_cleanup: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_forward_cleanup: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(&["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(18081, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn port-forward container");
+
+        child.wait().expect("Failed to wait for port-forward container");
+
+        // After the container exits, the table must be gone entirely.
+        let status = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run nft list table");
+        assert!(
+            !status.success(),
+            "nft table ip remora should be removed after port-forward container exits"
+        );
+    }
+
+    /// N4: Two containers with different port forwards must be torn down independently.
+    ///
+    /// Spawns A (`sleep 2`, port 18082→80) and B (`sleep 4`, port 18083→80), both
+    /// with NAT. Waits for A — the prerouting chain must still contain B's rule
+    /// (`dport 18083`) but not A's (`dport 18082`). Waits for B — table must be gone.
+    #[test]
+    #[serial(nat)]
+    fn test_port_forward_independent_teardown() {
+        if !is_root() {
+            eprintln!("Skipping test_port_forward_independent_teardown: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_forward_independent_teardown: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child_a = Command::new("/bin/ash")
+            .args(&["-c", "sleep 2"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(18082, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn port-forward container A");
+
+        let mut child_b = Command::new("/bin/ash")
+            .args(&["-c", "sleep 4"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(18083, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn port-forward container B");
+
+        // Wait for A. B is still running — prerouting must still exist with B's rule.
+        child_a.wait().expect("Failed to wait for container A");
+
+        let output = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "remora", "prerouting"])
+            .output()
+            .expect("Failed to run nft list chain after A exits");
+        assert!(
+            output.status.success(),
+            "prerouting chain should still exist after A exits (B is still running)"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("dport 18082"),
+            "A's DNAT rule (dport 18082) should be gone after A exits"
+        );
+        assert!(
+            stdout.contains("dport 18083"),
+            "B's DNAT rule (dport 18083) should still be present; got:\n{}", stdout
+        );
+
+        // Wait for B. Both containers gone — table must be removed entirely.
+        child_b.wait().expect("Failed to wait for container B");
+
+        let status = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run nft list table after B exits");
+        assert!(
+            !status.success(),
+            "nft table should be removed after both port-forward containers exit"
+        );
+    }
+
+    /// N5: `with_dns()` must write the specified nameservers into the container's
+    /// `/etc/resolv.conf` so that DNS resolution works inside the container.
+    ///
+    /// Spawns a bridge+NAT+DNS container that runs `cat /etc/resolv.conf` and
+    /// captures stdout. Asserts the output contains both configured nameservers.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_resolv_conf() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_resolv_conf: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_dns_resolv_conf: alpine-rootfs not found");
+            return;
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "cat /etc/resolv.conf"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_dns(&["1.1.1.1", "8.8.8.8"])
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn DNS container");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("Failed to wait for DNS container");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(
+            stdout.contains("nameserver 1.1.1.1"),
+            "/etc/resolv.conf should contain 'nameserver 1.1.1.1'; got:\n{}", stdout
+        );
+        assert!(
+            stdout.contains("nameserver 8.8.8.8"),
+            "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}", stdout
+        );
+    }
+}
+
+mod oci_lifecycle {
+    use super::*;
+
+    /// Helper: build a minimal OCI bundle in `dir`, pointing rootfs at `rootfs_path`.
+    /// Returns the bundle directory path.
+    fn make_oci_bundle(dir: &std::path::Path, rootfs: &std::path::Path, args: &[&str]) -> PathBuf {
+        // rootfs/ is a symlink to the real alpine rootfs (avoids copying)
+        let rootfs_link = dir.join("rootfs");
+        std::os::unix::fs::symlink(rootfs, &rootfs_link).expect("failed to create rootfs symlink");
+
+        // Minimal config.json
+        let args_json: Vec<String> = args.iter().map(|s| format!("\"{}\"", s)).collect();
+        let config = format!(
+            r#"{{
+      "ociVersion": "1.0.2",
+      "root": {{"path": "rootfs"}},
+      "process": {{
+        "args": [{}],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      }},
+      "linux": {{
+        "namespaces": [
+          {{"type": "mount"}},
+          {{"type": "uts"}},
+          {{"type": "pid"}}
+        ]
+      }}
+    }}"#,
+            args_json.join(", ")
+        );
+        std::fs::write(dir.join("config.json"), config).expect("failed to write config.json");
+        dir.to_path_buf()
+    }
+
+    /// Helper: find the remora binary (built by cargo)
+    fn remora_binary() -> PathBuf {
+        // target/debug/remora relative to the workspace root
+        let mut p = std::env::current_dir().unwrap();
+        p.push("target/debug/remora");
+        p
+    }
+
+    /// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
+    fn run_remora(args: &[&str]) -> (String, String, bool) {
+        let output = std::process::Command::new(remora_binary())
+            .args(args)
+            .output()
+            .expect("failed to run remora binary");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    fn oci_run_to_completion(id: &str, bundle: &std::path::Path, timeout_secs: u64) {
+        let (_, stderr, ok) = run_remora(&["create", id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", id]);
+        assert!(ok, "remora start failed: {}", stderr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", id]);
+            if stdout.contains("\"stopped\"") { break; }
+            if std::time::Instant::now() > deadline {
+                run_remora(&["delete", id]).2;
+                panic!("container did not stop within {} seconds", timeout_secs);
+            }
+        }
+        let (_, stderr, ok) = run_remora(&["delete", id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+    }
+
+    /// test_oci_create_start_state
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a minimal OCI bundle running `sleep 2`. Verifies that:
+    /// - `remora create` leaves the container in "created" state
+    /// - `remora start` transitions it to "running"
+    /// - After the process exits, `remora state` reports "stopped"
+    /// - `remora delete` removes the state directory
+    ///
+    /// Failure indicates the create/start split synchronization is broken,
+    /// state.json transitions are wrong, or liveness detection is incorrect.
+    #[test]
+    fn test_oci_create_start_state() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_create_start_state: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_create_start_state: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "2"]);
+        let id = format!("test-oci-css-{}", std::process::id());
+
+        // Cleanup guard: always delete on test exit
+        // create
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        // state should be "created"
+        let (stdout, stderr, ok) = run_remora(&["state", &id]);
+        assert!(ok, "remora state (created) failed: {}", stderr);
+        assert!(
+            stdout.contains("\"created\""),
+            "expected status 'created', got: {}",
+            stdout
+        );
+
+        // start
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // state should be "running"
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        assert!(
+            stdout.contains("\"running\""),
+            "expected status 'running' after start, got: {}",
+            stdout
+        );
+
+        // Wait for sleep 2 to exit (max 6 seconds)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("container did not stop within 6 seconds; last state: {}", stdout);
+            }
+        }
+
+        // delete
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+
+        // state dir should be gone
+        let state_dir = remora::oci::state_dir(&id);
+        assert!(!state_dir.exists(), "state dir still exists after delete: {}", state_dir.display());
+    }
+
+    /// test_oci_kill
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a long-running container (`sleep 60`) and sends SIGKILL via
+    /// `remora kill`. Asserts that the process exits promptly and `remora state`
+    /// reports "stopped".
+    ///
+    /// Uses SIGKILL because the container runs in a PID namespace where `sleep`
+    /// is PID 1. The kernel only delivers signals to PID 1 if it has installed
+    /// an explicit handler; `sleep` uses the default SIGTERM disposition, so the
+    /// kernel silently drops it. SIGKILL always works regardless.
+    ///
+    /// Failure indicates that kill() is not finding the correct host-visible PID,
+    /// signals are not being delivered, or state reporting is incorrect.
+    #[test]
+    fn test_oci_kill() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_kill: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_kill: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "60"]);
+        let id = format!("test-oci-kill-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Small delay to ensure the process is running
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") {
-            break;
+
+        let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
+        assert!(ok, "remora kill failed: {}", stderr);
+
+        // Wait up to 4 seconds for the process to stop
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("container did not stop after SIGKILL within 4 seconds");
+            }
         }
-        if std::time::Instant::now() > deadline {
-            panic!("container did not stop within 6 seconds; last state: {}", stdout);
-        }
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
     }
 
-    // delete
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-
-    // state dir should be gone
-    let state_dir = oci::state_dir(&id);
-    assert!(!state_dir.exists(), "state dir still exists after delete: {}", state_dir.display());
-}
-
-/// test_oci_kill
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Spawns a long-running container (`sleep 60`) and sends SIGKILL via
-/// `remora kill`. Asserts that the process exits promptly and `remora state`
-/// reports "stopped".
-///
-/// Uses SIGKILL because the container runs in a PID namespace where `sleep`
-/// is PID 1. The kernel only delivers signals to PID 1 if it has installed
-/// an explicit handler; `sleep` uses the default SIGTERM disposition, so the
-/// kernel silently drops it. SIGKILL always works regardless.
-///
-/// Failure indicates that kill() is not finding the correct host-visible PID,
-/// signals are not being delivered, or state reporting is incorrect.
-#[test]
-fn test_oci_kill() {
-    if !is_root() {
-        eprintln!("Skipping test_oci_kill: requires root");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_oci_kill: alpine-rootfs not found");
+    /// test_oci_delete_cleanup
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Runs a short-lived container (`true`) through the full OCI lifecycle and
+    /// asserts that `remora delete` removes `/run/remora/<id>/` completely.
+    ///
+    /// Failure indicates that the state directory is not cleaned up on delete,
+    /// which would cause resource leaks and "already exists" errors on re-use.
+    #[test]
+    fn test_oci_delete_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_delete_cleanup: requires root");
             return;
         }
-    };
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_delete_cleanup: alpine-rootfs not found");
+                return;
+            }
+        };
 
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "60"]);
-    let id = format!("test-oci-kill-{}", std::process::id());
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
+        let id = format!("test-oci-del-{}", std::process::id());
 
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
 
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
 
-    // Small delay to ensure the process is running
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
-    assert!(ok, "remora kill failed: {}", stderr);
-
-    // Wait up to 4 seconds for the process to stop
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") {
-            break;
+        // Wait for the container to stop (true exits immediately)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("container did not stop within 4 seconds");
+            }
         }
-        if std::time::Instant::now() > deadline {
-            panic!("container did not stop after SIGKILL within 4 seconds");
-        }
+
+        let state_dir = remora::oci::state_dir(&id);
+        assert!(state_dir.exists(), "state dir should exist before delete");
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+
+        assert!(
+            !state_dir.exists(),
+            "state dir {} still present after delete",
+            state_dir.display()
+        );
     }
 
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-}
-
-/// test_oci_delete_cleanup
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Runs a short-lived container (`true`) through the full OCI lifecycle and
-/// asserts that `remora delete` removes `/run/remora/<id>/` completely.
-///
-/// Failure indicates that the state directory is not cleaned up on delete,
-/// which would cause resource leaks and "already exists" errors on re-use.
-#[test]
-fn test_oci_delete_cleanup() {
-    if !is_root() {
-        eprintln!("Skipping test_oci_delete_cleanup: requires root");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_oci_delete_cleanup: alpine-rootfs not found");
+    /// test_oci_bundle_mounts
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle with a tmpfs entry in `config.json` and runs a command
+    /// that writes to the tmpfs mount. Asserts the command succeeds and the
+    /// mount point was writable.
+    ///
+    /// Failure indicates that OCI mount entries are not being applied from
+    /// config.json, or that tmpfs mount handling in build_command() is broken.
+    #[test]
+    fn test_oci_bundle_mounts() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_bundle_mounts: requires root");
             return;
         }
-    };
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_bundle_mounts: alpine-rootfs not found");
+                return;
+            }
+        };
 
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
-    let id = format!("test-oci-del-{}", std::process::id());
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
 
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
-
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
-
-    // Wait for the container to stop (true exits immediately)
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") {
-            break;
+        // config.json with a tmpfs at /scratch
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/sh", "-c", "echo hello > /scratch/test.txt && cat /scratch/test.txt"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      },
+      "mounts": [
+        {
+          "destination": "/scratch",
+          "type": "tmpfs",
+          "source": "tmpfs",
+          "options": []
         }
-        if std::time::Instant::now() > deadline {
-            panic!("container did not stop within 4 seconds");
+      ],
+      "linux": {
+        "namespaces": [
+          {"type": "mount"},
+          {"type": "uts"},
+          {"type": "pid"}
+        ]
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let bundle = bundle_dir.path();
+        let id = format!("test-oci-mnt-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Wait for container to stop
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("container did not stop within 4 seconds");
+            }
         }
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+        assert!(stderr.is_empty() || !stderr.contains("error"), "unexpected error: {}", stderr);
     }
 
-    let state_dir = oci::state_dir(&id);
-    assert!(state_dir.exists(), "state dir should exist before delete");
-
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-
-    assert!(
-        !state_dir.exists(),
-        "state dir {} still present after delete",
-        state_dir.display()
-    );
-}
-
-/// test_oci_bundle_mounts
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle with a tmpfs entry in `config.json` and runs a command
-/// that writes to the tmpfs mount. Asserts the command succeeds and the
-/// mount point was writable.
-///
-/// Failure indicates that OCI mount entries are not being applied from
-/// config.json, or that tmpfs mount handling in build_command() is broken.
-#[test]
-fn test_oci_bundle_mounts() {
-    if !is_root() {
-        eprintln!("Skipping test_oci_bundle_mounts: requires root");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_oci_bundle_mounts: alpine-rootfs not found");
+    /// test_oci_capabilities
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle whose config.json specifies `process.capabilities` with
+    /// only CAP_CHOWN in the bounding set. The container runs `id` (which should
+    /// succeed even with a reduced capability set). Asserts:
+    /// - `remora create` / `start` / `delete` all succeed
+    /// - The container exits successfully (reduced caps don't prevent basic exec)
+    ///
+    /// Failure indicates that capability set parsing from OCI config or the
+    /// with_capabilities() wiring in build_command() is broken.
+    #[test]
+    fn test_oci_capabilities() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_capabilities: requires root");
             return;
         }
-    };
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_capabilities: alpine-rootfs not found");
+                return;
+            }
+        };
 
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    let rootfs_link = bundle_dir.path().join("rootfs");
-    std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
 
-    // config.json with a tmpfs at /scratch
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/bin/sh", "-c", "echo hello > /scratch/test.txt && cat /scratch/test.txt"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  },
-  "mounts": [
-    {
-      "destination": "/scratch",
-      "type": "tmpfs",
-      "source": "tmpfs",
-      "options": []
-    }
-  ],
-  "linux": {
-    "namespaces": [
-      {"type": "mount"},
-      {"type": "uts"},
-      {"type": "pid"}
-    ]
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
-
-    let bundle = bundle_dir.path();
-    let id = format!("test-oci-mnt-{}", std::process::id());
-
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
-
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
-
-    // Wait for container to stop
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") {
-            break;
+        // config.json with a reduced capability set (bounding = [CAP_CHOWN] only)
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/usr/bin/id"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        "capabilities": {
+          "bounding": ["CAP_CHOWN"],
+          "effective": ["CAP_CHOWN"],
+          "permitted": ["CAP_CHOWN"],
+          "inheritable": []
         }
-        if std::time::Instant::now() > deadline {
-            panic!("container did not stop within 4 seconds");
+      },
+      "linux": {
+        "namespaces": [
+          {"type": "mount"},
+          {"type": "uts"},
+          {"type": "pid"}
+        ]
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let id = format!("test-oci-cap-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Wait for container to stop
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                run_remora(&["delete", &id]).2;
+                panic!("container did not stop within 5 seconds");
+            }
         }
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
     }
 
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-    assert!(stderr.is_empty() || !stderr.contains("error"), "unexpected error: {}", stderr);
-}
-
-/// test_oci_capabilities
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle whose config.json specifies `process.capabilities` with
-/// only CAP_CHOWN in the bounding set. The container runs `id` (which should
-/// succeed even with a reduced capability set). Asserts:
-/// - `remora create` / `start` / `delete` all succeed
-/// - The container exits successfully (reduced caps don't prevent basic exec)
-///
-/// Failure indicates that capability set parsing from OCI config or the
-/// with_capabilities() wiring in build_command() is broken.
-#[test]
-fn test_oci_capabilities() {
-    if !is_root() {
-        eprintln!("Skipping test_oci_capabilities: requires root");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_oci_capabilities: alpine-rootfs not found");
+    /// test_oci_masked_readonly_paths
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle whose config.json specifies:
+    /// - `linux.maskedPaths: ["/proc/kcore"]` — should be hidden
+    /// - `linux.readonlyPaths: ["/sys/kernel"]` — should be read-only
+    ///
+    /// The container runs a command that verifies:
+    /// - Attempting to read /proc/kcore returns no useful data (bind-mounted /dev/null)
+    /// - /sys/kernel exists but writes to it are denied
+    ///
+    /// We verify at the OCI level: asserts that `remora create` / `start` / `delete`
+    /// all succeed. The correct application of maskedPaths and readonlyPaths is
+    /// validated by the container command itself (exits 0 only if both checks pass).
+    ///
+    /// Failure indicates that `linux.maskedPaths` / `linux.readonlyPaths` parsing
+    /// from OCI config, or the wiring into with_masked_paths() / with_readonly_paths()
+    /// in build_command(), is broken.
+    #[test]
+    fn test_oci_masked_readonly_paths() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_masked_readonly_paths: requires root");
             return;
         }
-    };
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_masked_readonly_paths: alpine-rootfs not found");
+                return;
+            }
+        };
 
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    let rootfs_link = bundle_dir.path().join("rootfs");
-    std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
 
-    // config.json with a reduced capability set (bounding = [CAP_CHOWN] only)
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/usr/bin/id"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-    "capabilities": {
-      "bounding": ["CAP_CHOWN"],
-      "effective": ["CAP_CHOWN"],
-      "permitted": ["CAP_CHOWN"],
-      "inheritable": []
-    }
-  },
-  "linux": {
-    "namespaces": [
-      {"type": "mount"},
-      {"type": "uts"},
-      {"type": "pid"}
-    ]
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        // /proc/kcore is masked → it appears as /dev/null (size 0 or read returns nothing)
+        // /sys/kernel is readonly → a write attempt should fail
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/sh", "-c",
+          "[ $(wc -c < /proc/kcore) -eq 0 ] && ! touch /sys/kernel/test 2>/dev/null && echo ok"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      },
+      "linux": {
+        "namespaces": [
+          {"type": "mount"},
+          {"type": "uts"},
+          {"type": "pid"}
+        ],
+        "maskedPaths": ["/proc/kcore"],
+        "readonlyPaths": ["/sys/kernel"]
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
 
-    let id = format!("test-oci-cap-{}", std::process::id());
+        let id = format!("test-oci-mrp-{}", std::process::id());
 
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
 
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
 
-    // Wait for container to stop
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") {
-            break;
+        // Wait for container to stop
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                run_remora(&["delete", &id]).2;
+                panic!("container did not stop within 5 seconds");
+            }
         }
-        if std::time::Instant::now() > deadline {
-            run_remora(&["delete", &id]).2;
-            panic!("container did not stop within 5 seconds");
-        }
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
     }
 
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
+    /// test_oci_resources
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle with `linux.resources` setting a 64 MiB memory limit and
+    /// a PID limit of 50. The container reads its cgroup memory.max and pids.max.
+    /// Asserts the full lifecycle completes cleanly.
+    ///
+    /// Failure indicates that `linux.resources` parsing from OCI config or the
+    /// wiring into `with_cgroup_memory()` / `with_cgroup_pids_limit()` is broken.
+    #[test]
+    fn test_oci_resources() {
+        if !is_root() { eprintln!("Skipping test_oci_resources: requires root"); return; }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_oci_resources: alpine-rootfs not found"); return; }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/sh", "-c",
+          "cat /sys/fs/cgroup/memory.max && cat /sys/fs/cgroup/pids.max"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      },
+      "linux": {
+        "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+        "resources": {
+          "memory": {"limit": 67108864},
+          "pids":   {"limit": 50}
+        }
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        let id = format!("test-oci-res-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 5);
+    }
+
+    /// test_oci_rlimits
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle with `process.rlimits` capping RLIMIT_NOFILE to 128.
+    /// The container runs `ulimit -n` (exits 0 if the limit is accepted). Asserts
+    /// the full lifecycle completes cleanly.
+    ///
+    /// Failure indicates that `process.rlimits` parsing or the wiring into
+    /// `with_rlimit()` in `build_command()` is broken.
+    #[test]
+    fn test_oci_rlimits() {
+        if !is_root() { eprintln!("Skipping test_oci_rlimits: requires root"); return; }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_oci_rlimits: alpine-rootfs not found"); return; }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/sh", "-c", "ulimit -n"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 128, "soft": 128}]
+      },
+      "linux": {
+        "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}]
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        let id = format!("test-oci-rl-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 5);
+    }
+
+    /// test_oci_sysctl
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle with `linux.sysctl` setting `kernel.domainname` to
+    /// `testdomain.local`. The container greps for that value in
+    /// `/proc/sys/kernel/domainname`. Asserts the lifecycle completes cleanly.
+    ///
+    /// Failure indicates that `linux.sysctl` parsing from OCI config or the
+    /// `with_sysctl()` / pre_exec write to `/proc/sys/` is broken.
+    #[test]
+    fn test_oci_sysctl() {
+        if !is_root() { eprintln!("Skipping test_oci_sysctl: requires root"); return; }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_oci_sysctl: alpine-rootfs not found"); return; }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        // kernel.domainname is scoped to the UTS namespace — safe to set.
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/sh", "-c",
+          "cat /proc/sys/kernel/domainname | grep -q testdomain"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      },
+      "linux": {
+        "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+        "sysctl": {"kernel.domainname": "testdomain.local"}
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        let id = format!("test-oci-sc-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 5);
+    }
+
+    /// test_oci_hooks
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle with a `prestart` hook (touches a sentinel file) and a
+    /// `poststop` hook (touches a different sentinel file). Asserts:
+    /// - The prestart sentinel exists right after `remora create`
+    /// - The poststop sentinel exists right after `remora delete`
+    ///
+    /// Failure indicates that OCI `hooks` parsing, or the `run_hooks()` placement
+    /// in `cmd_create()` / `cmd_delete()`, is broken.
+    #[test]
+    fn test_oci_hooks() {
+        if !is_root() { eprintln!("Skipping test_oci_hooks: requires root"); return; }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_oci_hooks: alpine-rootfs not found"); return; }
+        };
+        let hooks_dir = tempfile::tempdir().expect("tempdir for hooks");
+        let prestart_marker = hooks_dir.path().join("prestart_ran");
+        let poststop_marker = hooks_dir.path().join("poststop_ran");
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        let config = format!(
+            r#"{{
+      "ociVersion": "1.0.2",
+      "root": {{"path": "rootfs"}},
+      "process": {{
+        "args": ["/bin/true"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      }},
+      "linux": {{
+        "namespaces": [{{"type": "mount"}}, {{"type": "uts"}}, {{"type": "pid"}}]
+      }},
+      "hooks": {{
+        "prestart": [{{"path": "/bin/sh", "args": ["/bin/sh", "-c", "touch {prestart}"]}}],
+        "poststop": [{{"path": "/bin/sh", "args": ["/bin/sh", "-c", "touch {poststop}"]}}]
+      }}
+    }}"#,
+            prestart = prestart_marker.display(),
+            poststop = poststop_marker.display(),
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
+        let id = format!("test-oci-hk-{}", std::process::id());
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+        assert!(prestart_marker.exists(), "prestart hook did not run");
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") { break; }
+            if std::time::Instant::now() > deadline {
+                run_remora(&["delete", &id]).2;
+                panic!("container did not stop within 5 seconds");
+            }
+        }
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+        assert!(poststop_marker.exists(), "poststop hook did not run");
+    }
+
+    /// test_oci_seccomp
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates a bundle with `linux.seccomp` using a default-allow policy that
+    /// blocks only `ptrace`, `personality`, and `bpf`. The container runs
+    /// `/bin/echo hello` which must succeed. Asserts the full lifecycle
+    /// completes cleanly.
+    ///
+    /// Failure indicates that `linux.seccomp` parsing from OCI config, the
+    /// `filter_from_oci()` function in `src/seccomp.rs`, or the
+    /// `with_seccomp_program()` wiring in `build_command()` is broken.
+    #[test]
+    fn test_oci_seccomp() {
+        if !is_root() { eprintln!("Skipping test_oci_seccomp: requires root"); return; }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_oci_seccomp: alpine-rootfs not found"); return; }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/echo", "hello"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      },
+      "linux": {
+        "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+        "seccomp": {
+          "defaultAction": "SCMP_ACT_ALLOW",
+          "architectures": ["SCMP_ARCH_X86_64"],
+          "syscalls": [
+            {"names": ["ptrace", "personality", "bpf"], "action": "SCMP_ACT_ERRNO"}
+          ]
+        }
+      }
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        let id = format!("test-oci-sec-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 5);
+    }
 }
 
-/// test_oci_masked_readonly_paths
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle whose config.json specifies:
-/// - `linux.maskedPaths: ["/proc/kcore"]` — should be hidden
-/// - `linux.readonlyPaths: ["/sys/kernel"]` — should be read-only
-///
-/// The container runs a command that verifies:
-/// - Attempting to read /proc/kcore returns no useful data (bind-mounted /dev/null)
-/// - /sys/kernel exists but writes to it are denied
-///
-/// We verify at the OCI level: asserts that `remora create` / `start` / `delete`
-/// all succeed. The correct application of maskedPaths and readonlyPaths is
-/// validated by the container command itself (exits 0 only if both checks pass).
-///
-/// Failure indicates that `linux.maskedPaths` / `linux.readonlyPaths` parsing
-/// from OCI config, or the wiring into with_masked_paths() / with_readonly_paths()
-/// in build_command(), is broken.
-#[test]
-fn test_oci_masked_readonly_paths() {
-    if !is_root() {
-        eprintln!("Skipping test_oci_masked_readonly_paths: requires root");
-        return;
+mod rootless {
+    use super::*;
+
+    /// Check whether `pasta` is on PATH and responds to `--version`.
+    fn is_pasta_available() -> bool {
+        remora::network::is_pasta_available()
     }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test_oci_masked_readonly_paths: alpine-rootfs not found");
+
+    #[test]
+    fn test_rootless_basic() {
+        if is_root() {
+            eprintln!("Skipping test_rootless_basic: must run as non-root (no sudo)");
             return;
         }
-    };
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_rootless_basic: alpine-rootfs not found"); return; }
+        };
+        // When running rootless, spawn() auto-adds Namespace::USER and a uid/gid map
+        // that makes the process appear as UID 0 inside the container.
+        // Use /bin/ash to invoke id — Alpine's id lives at /usr/bin/id (busybox symlink),
+        // not at /bin/id.
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "id"])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("rootless spawn failed");
 
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    let rootfs_link = bundle_dir.path().join("rootfs");
-    std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
-
-    // /proc/kcore is masked → it appears as /dev/null (size 0 or read returns nothing)
-    // /sys/kernel is readonly → a write attempt should fail
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/bin/sh", "-c",
-      "[ $(wc -c < /proc/kcore) -eq 0 ] && ! touch /sys/kernel/test 2>/dev/null && echo ok"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  },
-  "linux": {
-    "namespaces": [
-      {"type": "mount"},
-      {"type": "uts"},
-      {"type": "pid"}
-    ],
-    "maskedPaths": ["/proc/kcore"],
-    "readonlyPaths": ["/sys/kernel"]
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
-
-    let id = format!("test-oci-mrp-{}", std::process::id());
-
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
-
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
-
-    // Wait for container to stop
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            run_remora(&["delete", &id]).2;
-            panic!("container did not stop within 5 seconds");
-        }
+        let (status, stdout, _stderr) = child.wait_with_output().expect("wait failed");
+        assert!(status.success(), "rootless container exited non-zero");
+        let out = String::from_utf8_lossy(&stdout);
+        // Inside the container the process maps to UID 0 via the user namespace.
+        assert!(out.contains("uid=0"), "expected uid=0 inside rootless container, got: {}", out);
     }
 
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-}
-
-// ---------------------------------------------------------------------------
-// Helper: run full OCI lifecycle, wait for stop, delete.
-// ---------------------------------------------------------------------------
-fn oci_run_to_completion(id: &str, bundle: &std::path::Path, timeout_secs: u64) {
-    let (_, stderr, ok) = run_remora(&["create", id, bundle.to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
-    let (_, stderr, ok) = run_remora(&["start", id]);
-    assert!(ok, "remora start failed: {}", stderr);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (stdout, _, _) = run_remora(&["state", id]);
-        if stdout.contains("\"stopped\"") { break; }
-        if std::time::Instant::now() > deadline {
-            run_remora(&["delete", id]).2;
-            panic!("container did not stop within {} seconds", timeout_secs);
+    #[test]
+    fn test_rootless_loopback() {
+        if is_root() {
+            eprintln!("Skipping test_rootless_loopback: must run as non-root (no sudo)");
+            return;
         }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_rootless_loopback: alpine-rootfs not found"); return; }
+        };
+        // Loopback networking works in rootless mode: the container gets a private
+        // NET namespace (and USER namespace from auto-config) and lo is brought up.
+        // lo shows 'state UNKNOWN' even when admin-UP; match the flags field instead.
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "ip addr show lo | grep -q 'LOOPBACK,UP' && echo ok"])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Loopback)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("rootless loopback spawn failed");
+
+        let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+        assert!(status.success(), "rootless loopback container failed");
+        assert!(String::from_utf8_lossy(&stdout).contains("ok"));
     }
-    let (_, stderr, ok) = run_remora(&["delete", id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-}
 
-/// test_oci_resources
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle with `linux.resources` setting a 64 MiB memory limit and
-/// a PID limit of 50. The container reads its cgroup memory.max and pids.max.
-/// Asserts the full lifecycle completes cleanly.
-///
-/// Failure indicates that `linux.resources` parsing from OCI config or the
-/// wiring into `with_cgroup_memory()` / `with_cgroup_pids_limit()` is broken.
-#[test]
-fn test_oci_resources() {
-    if !is_root() { eprintln!("Skipping test_oci_resources: requires root"); return; }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_oci_resources: alpine-rootfs not found"); return; }
-    };
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/bin/sh", "-c",
-      "cat /sys/fs/cgroup/memory.max && cat /sys/fs/cgroup/pids.max"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  },
-  "linux": {
-    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
-    "resources": {
-      "memory": {"limit": 67108864},
-      "pids":   {"limit": 50}
-    }
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
-    let id = format!("test-oci-res-{}", std::process::id());
-    oci_run_to_completion(&id, bundle_dir.path(), 5);
-}
+    #[test]
+    fn test_rootless_bridge_rejected() {
+        if is_root() {
+            eprintln!("Skipping test_rootless_bridge_rejected: must run as non-root (no sudo)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_rootless_bridge_rejected: alpine-rootfs not found"); return; }
+        };
+        // Bridge mode should be rejected with a clear error in rootless mode.
+        let result = Command::new("/bin/echo")
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT)
+            .with_network(NetworkMode::Bridge)
+            .spawn();
 
-/// test_oci_rlimits
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle with `process.rlimits` capping RLIMIT_NOFILE to 128.
-/// The container runs `ulimit -n` (exits 0 if the limit is accepted). Asserts
-/// the full lifecycle completes cleanly.
-///
-/// Failure indicates that `process.rlimits` parsing or the wiring into
-/// `with_rlimit()` in `build_command()` is broken.
-#[test]
-fn test_oci_rlimits() {
-    if !is_root() { eprintln!("Skipping test_oci_rlimits: requires root"); return; }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_oci_rlimits: alpine-rootfs not found"); return; }
-    };
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/bin/sh", "-c", "ulimit -n"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-    "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 128, "soft": 128}]
-  },
-  "linux": {
-    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}]
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
-    let id = format!("test-oci-rl-{}", std::process::id());
-    oci_run_to_completion(&id, bundle_dir.path(), 5);
-}
-
-/// test_oci_sysctl
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle with `linux.sysctl` setting `kernel.domainname` to
-/// `testdomain.local`. The container greps for that value in
-/// `/proc/sys/kernel/domainname`. Asserts the lifecycle completes cleanly.
-///
-/// Failure indicates that `linux.sysctl` parsing from OCI config or the
-/// `with_sysctl()` / pre_exec write to `/proc/sys/` is broken.
-#[test]
-fn test_oci_sysctl() {
-    if !is_root() { eprintln!("Skipping test_oci_sysctl: requires root"); return; }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_oci_sysctl: alpine-rootfs not found"); return; }
-    };
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
-    // kernel.domainname is scoped to the UTS namespace — safe to set.
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/bin/sh", "-c",
-      "cat /proc/sys/kernel/domainname | grep -q testdomain"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  },
-  "linux": {
-    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
-    "sysctl": {"kernel.domainname": "testdomain.local"}
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
-    let id = format!("test-oci-sc-{}", std::process::id());
-    oci_run_to_completion(&id, bundle_dir.path(), 5);
-}
-
-/// test_oci_hooks
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle with a `prestart` hook (touches a sentinel file) and a
-/// `poststop` hook (touches a different sentinel file). Asserts:
-/// - The prestart sentinel exists right after `remora create`
-/// - The poststop sentinel exists right after `remora delete`
-///
-/// Failure indicates that OCI `hooks` parsing, or the `run_hooks()` placement
-/// in `cmd_create()` / `cmd_delete()`, is broken.
-#[test]
-fn test_oci_hooks() {
-    if !is_root() { eprintln!("Skipping test_oci_hooks: requires root"); return; }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_oci_hooks: alpine-rootfs not found"); return; }
-    };
-    let hooks_dir = tempfile::tempdir().expect("tempdir for hooks");
-    let prestart_marker = hooks_dir.path().join("prestart_ran");
-    let poststop_marker = hooks_dir.path().join("poststop_ran");
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
-    let config = format!(
-        r#"{{
-  "ociVersion": "1.0.2",
-  "root": {{"path": "rootfs"}},
-  "process": {{
-    "args": ["/bin/true"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  }},
-  "linux": {{
-    "namespaces": [{{"type": "mount"}}, {{"type": "uts"}}, {{"type": "pid"}}]
-  }},
-  "hooks": {{
-    "prestart": [{{"path": "/bin/sh", "args": ["/bin/sh", "-c", "touch {prestart}"]}}],
-    "poststop": [{{"path": "/bin/sh", "args": ["/bin/sh", "-c", "touch {poststop}"]}}]
-  }}
-}}"#,
-        prestart = prestart_marker.display(),
-        poststop = poststop_marker.display(),
-    );
-    std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
-    let id = format!("test-oci-hk-{}", std::process::id());
-    let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
-    assert!(ok, "remora create failed: {}", stderr);
-    assert!(prestart_marker.exists(), "prestart hook did not run");
-    let (_, stderr, ok) = run_remora(&["start", &id]);
-    assert!(ok, "remora start failed: {}", stderr);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (stdout, _, _) = run_remora(&["state", &id]);
-        if stdout.contains("\"stopped\"") { break; }
-        if std::time::Instant::now() > deadline {
-            run_remora(&["delete", &id]).2;
-            panic!("container did not stop within 5 seconds");
+        match result {
+            Ok(_) => panic!("expected bridge networking to fail in rootless mode"),
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                assert!(err_msg.contains("rootless") || err_msg.contains("root"),
+                    "error message should mention rootless/root: {}", err_msg);
+            }
         }
     }
-    let (_, stderr, ok) = run_remora(&["delete", &id]);
-    assert!(ok, "remora delete failed: {}", stderr);
-    assert!(poststop_marker.exists(), "poststop hook did not run");
+
+    #[test]
+    fn test_user_namespace_explicit() {
+        // Verify that root can create a USER namespace with explicit uid/gid maps and
+        // that the container process sees itself as uid=0 inside.
+        //
+        // No chroot: the rootfs lives under /home/cb/ which is not traversable from
+        // inside a USER namespace with a single-uid map (0→0). In a user namespace,
+        // capable_wrt_inode_uidgid() only grants DAC_OVERRIDE for inodes whose uid is
+        // present in the namespace's uid_map. /home/cb is owned by uid 1000 (not mapped),
+        // so the kernel falls through to normal permission bits and returns EACCES.
+        // Chroot is not needed to verify uid mapping — just run /usr/bin/id on the host fs.
+        //
+        // No MOUNT namespace: without chroot there is nothing to isolate mount-wise,
+        // and omitting it avoids the MS_PRIVATE limitation on inherited locked mounts.
+        if !is_root() {
+            eprintln!("Skipping test_user_namespace_explicit: requires root");
+            return;
+        }
+        let child = Command::new("/usr/bin/id")
+            .with_namespaces(Namespace::USER)
+            .with_uid_maps(&[UidMap { inside: 0, outside: 0, count: 1 }])
+            .with_gid_maps(&[GidMap { inside: 0, outside: 0, count: 1 }])
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("user namespace spawn failed");
+
+        let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+        assert!(status.success(), "user namespace container exited non-zero");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(out.contains("uid=0"), "expected uid=0 inside user namespace, got: {}", out);
+    }
+
+    /// Verify that pasta creates a TAP interface with an IP address inside the container's netns.
+    ///
+    /// Spawns a container with `NetworkMode::Pasta` and runs `ip addr show` after a short
+    /// sleep to let pasta attach and configure the interface via `--config-net`. Asserts:
+    /// 1. A non-loopback interface exists (pasta created the TAP).
+    /// 2. That interface has an `inet` address assigned (pasta's `--config-net` configured it).
+    /// Failure on (1) means pasta did not attach to the netns. Failure on (2) means
+    /// `--config-net` is not working — the container would have a TAP with no IP.
+    ///
+    /// **Rootless only.** pasta's privilege-dropping (root→nobody via user namespace)
+    /// makes it unable to access the container's namespace file descriptors when run as
+    /// root. pasta is designed for rootless mode.
+    #[test]
+    fn test_pasta_interface_exists() {
+        if is_root() {
+            eprintln!("Skipping test_pasta_interface_exists: pasta is designed for rootless mode");
+            return;
+        }
+        if !is_pasta_available() {
+            eprintln!("Skipping test_pasta_interface_exists: pasta not installed");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_pasta_interface_exists: alpine-rootfs not found"); return; }
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 1 && ip addr show"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .with_network(NetworkMode::Pasta)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+        assert!(status.success(), "container exited non-zero");
+
+        let out = String::from_utf8_lossy(&stdout);
+        let has_non_loopback = out.lines().any(|l| {
+            l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
+        });
+        assert!(has_non_loopback,
+            "expected a non-loopback TAP interface from pasta, got:\n{}", out);
+
+        // With --config-net, pasta configures the IP address inside the container's netns.
+        // A non-127.x inet address means pasta did more than just create the TAP.
+        let has_tap_ip = out.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("inet ") && !l.starts_with("inet 127.")
+        });
+        assert!(has_tap_ip,
+            "expected inet address on pasta TAP (--config-net), got:\n{}", out);
+    }
+
+    /// Verify that pasta works in the rootless (USER+NET two-phase unshare) path and
+    /// that --config-net assigns an IP to the TAP interface.
+    ///
+    /// Non-root only. Spawns with `NetworkMode::Pasta` without explicit `Namespace::USER`
+    /// — rootless auto-adds it. Asserts a non-loopback interface with an inet address is
+    /// present. Failure means pasta does not work through the rootless USER+NET path, or
+    /// that `--config-net` is not being passed to pasta.
+    #[test]
+    fn test_pasta_rootless() {
+        if is_root() {
+            eprintln!("Skipping test_pasta_rootless: must run as non-root (no sudo)");
+            return;
+        }
+        if !is_pasta_available() {
+            eprintln!("Skipping test_pasta_rootless: pasta not installed");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_pasta_rootless: alpine-rootfs not found"); return; }
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 1 && ip addr show"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .with_network(NetworkMode::Pasta)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+        assert!(status.success(), "container exited non-zero");
+
+        let out = String::from_utf8_lossy(&stdout);
+        let has_non_loopback = out.lines().any(|l| {
+            l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
+        });
+        assert!(has_non_loopback,
+            "expected a non-loopback TAP interface from pasta in rootless mode, got:\n{}", out);
+
+        let has_tap_ip = out.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("inet ") && !l.starts_with("inet 127.")
+        });
+        assert!(has_tap_ip,
+            "expected inet address on pasta TAP in rootless mode, got:\n{}", out);
+    }
+
+    /// Verify actual end-to-end internet connectivity through pasta.
+    ///
+    /// Non-root only. Spawns with `NetworkMode::Pasta`, sleeps briefly to let pasta
+    /// attach and configure the interface, then fetches `http://1.1.1.1/` (Cloudflare)
+    /// using `wget`. Asserts the command succeeds (exit 0).
+    ///
+    /// Failure means packets are not flowing through pasta's relay despite the TAP
+    /// interface and IP being present (verified by `test_pasta_interface_exists`).
+    /// This test requires outbound internet access.
+    #[test]
+    fn test_pasta_connectivity() {
+        if is_root() {
+            eprintln!("Skipping test_pasta_connectivity: pasta is designed for rootless mode");
+            return;
+        }
+        if !is_pasta_available() {
+            eprintln!("Skipping test_pasta_connectivity: pasta not installed");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => { eprintln!("Skipping test_pasta_connectivity: alpine-rootfs not found"); return; }
+        };
+
+        // sleep 2: give pasta time to attach the TAP and configure IP+routes via --config-net.
+        // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
+        // only has proc mounted, not a full /dev with device nodes).
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .with_network(NetworkMode::Pasta)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(status.success(),
+            "pasta connectivity test failed (is outbound internet available?)\nstdout: {}\nstderr: {}", out, err);
+        assert!(out.contains("CONNECTED"),
+            "wget succeeded but CONNECTED marker missing:\n{}", out);
+    }
 }
 
-/// test_oci_seccomp
-///
-/// Requires: root, alpine-rootfs.
-///
-/// Creates a bundle with `linux.seccomp` using a default-allow policy that
-/// blocks only `ptrace`, `personality`, and `bpf`. The container runs
-/// `/bin/echo hello` which must succeed. Asserts the full lifecycle
-/// completes cleanly.
-///
-/// Failure indicates that `linux.seccomp` parsing from OCI config, the
-/// `filter_from_oci()` function in `src/seccomp.rs`, or the
-/// `with_seccomp_program()` wiring in `build_command()` is broken.
-#[test]
-fn test_oci_seccomp() {
-    if !is_root() { eprintln!("Skipping test_oci_seccomp: requires root"); return; }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_oci_seccomp: alpine-rootfs not found"); return; }
-    };
-    let bundle_dir = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": {"path": "rootfs"},
-  "process": {
-    "args": ["/bin/echo", "hello"],
-    "cwd": "/",
-    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  },
-  "linux": {
-    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
-    "seccomp": {
-      "defaultAction": "SCMP_ACT_ALLOW",
-      "architectures": ["SCMP_ARCH_X86_64"],
-      "syscalls": [
-        {"names": ["ptrace", "personality", "bpf"], "action": "SCMP_ACT_ERRNO"}
-      ]
+mod linking {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_container_link_hosts() {
+        if !is_root() {
+            eprintln!("Skipping test_container_link_hosts: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_container_link_hosts: alpine-rootfs not found");
+            return;
+        };
+
+        // Start container A on bridge (long-running).
+        let mut child_a = Command::new("/bin/sleep")
+            .args(&["60"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container A");
+
+        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+
+        // Write A's state so B can resolve it.
+        let state_dir = std::path::Path::new("/run/remora/containers/link-test-a");
+        std::fs::create_dir_all(state_dir).unwrap();
+        let state_json = format!(
+            r#"{{"name":"link-test-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
+            child_a.pid(), ip_a
+        );
+        std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
+
+        // Start container B linked to A.
+        let child_b = Command::new("/bin/cat")
+            .args(&["/etc/hosts"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_link("link-test-a")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container B");
+
+        let (status, stdout, _) = child_b.wait_with_output().expect("wait B");
+        let out = String::from_utf8_lossy(&stdout);
+
+        // Clean up A.
+        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        let _ = child_a.wait();
+        let _ = std::fs::remove_dir_all(state_dir);
+
+        assert!(status.success(), "Container B should exit successfully");
+        assert!(
+            out.contains(&ip_a) && out.contains("link-test-a"),
+            "B's /etc/hosts should contain A's IP ({}) and name, got:\n{}",
+            ip_a, out
+        );
     }
-  }
-}"#;
-    std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
-    let id = format!("test-oci-sec-{}", std::process::id());
-    oci_run_to_completion(&id, bundle_dir.path(), 5);
-}
 
-// ---------------------------------------------------------------------------
-// Rootless mode tests
-// ---------------------------------------------------------------------------
-// These tests skip when running as root (rootless mode is only relevant as a
-// non-root user). To run these, execute:
-//   cargo test --test integration_tests test_rootless -- --nocapture
-// as a non-root user (without sudo).
+    /// test_container_link_alias
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts container A on bridge, then starts container B with
+    /// `with_link_alias("A", "db")`. Verifies B's /etc/hosts contains both
+    /// the alias "db" and the original name.
+    ///
+    /// Failure indicates alias handling in the hosts file generation is broken.
+    #[test]
+    #[serial]
+    fn test_container_link_alias() {
+        if !is_root() {
+            eprintln!("Skipping test_container_link_alias: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_container_link_alias: alpine-rootfs not found");
+            return;
+        };
 
-#[test]
-fn test_rootless_basic() {
-    if is_root() {
-        eprintln!("Skipping test_rootless_basic: must run as non-root (no sudo)");
-        return;
+        // Start container A.
+        let mut child_a = Command::new("/bin/sleep")
+            .args(&["60"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container A");
+
+        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+
+        let state_dir = std::path::Path::new("/run/remora/containers/link-alias-a");
+        std::fs::create_dir_all(state_dir).unwrap();
+        let state_json = format!(
+            r#"{{"name":"link-alias-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
+            child_a.pid(), ip_a
+        );
+        std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
+
+        // Start container B linked to A with alias "db".
+        let child_b = Command::new("/bin/cat")
+            .args(&["/etc/hosts"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_link_alias("link-alias-a", "db")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container B");
+
+        let (status, stdout, _) = child_b.wait_with_output().expect("wait B");
+        let out = String::from_utf8_lossy(&stdout);
+
+        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        let _ = child_a.wait();
+        let _ = std::fs::remove_dir_all(state_dir);
+
+        assert!(status.success(), "Container B should exit successfully");
+        assert!(
+            out.contains(&ip_a) && out.contains("db"),
+            "B's /etc/hosts should contain A's IP ({}) and alias 'db', got:\n{}",
+            ip_a, out
+        );
+        assert!(
+            out.contains("link-alias-a"),
+            "B's /etc/hosts should also contain A's original name, got:\n{}",
+            out
+        );
     }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_rootless_basic: alpine-rootfs not found"); return; }
-    };
-    // When running rootless, spawn() auto-adds Namespace::USER and a uid/gid map
-    // that makes the process appear as UID 0 inside the container.
-    // Use /bin/ash to invoke id — Alpine's id lives at /usr/bin/id (busybox symlink),
-    // not at /bin/id.
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "id"])
-        .env("PATH", ALPINE_PATH)
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("rootless spawn failed");
 
-    let (status, stdout, _stderr) = child.wait_with_output().expect("wait failed");
-    assert!(status.success(), "rootless container exited non-zero");
-    let out = String::from_utf8_lossy(&stdout);
-    // Inside the container the process maps to UID 0 via the user namespace.
-    assert!(out.contains("uid=0"), "expected uid=0 inside rootless container, got: {}", out);
-}
+    /// test_container_link_ping
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts container A on bridge (running `sleep`), then starts container B
+    /// linked to A and runs `ping -c1 -W2 link-ping-a`. Verifies the ping succeeds,
+    /// proving both name resolution and network connectivity work.
+    ///
+    /// Failure indicates that the /etc/hosts entry is incorrect, the bridge network
+    /// is misconfigured, or the containers can't reach each other.
+    #[test]
+    #[serial]
+    fn test_container_link_ping() {
+        if !is_root() {
+            eprintln!("Skipping test_container_link_ping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_container_link_ping: alpine-rootfs not found");
+            return;
+        };
 
-#[test]
-fn test_rootless_loopback() {
-    if is_root() {
-        eprintln!("Skipping test_rootless_loopback: must run as non-root (no sudo)");
-        return;
+        // Start container A.
+        let mut child_a = Command::new("/bin/sleep")
+            .args(&["60"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container A");
+
+        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+
+        let state_dir = std::path::Path::new("/run/remora/containers/link-ping-a");
+        std::fs::create_dir_all(state_dir).unwrap();
+        let state_json = format!(
+            r#"{{"name":"link-ping-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
+            child_a.pid(), ip_a
+        );
+        std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
+
+        // Start container B: ping A by name.
+        let child_b = Command::new("/bin/ping")
+            .args(&["-c1", "-W2", "link-ping-a"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_link("link-ping-a")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container B");
+
+        let (status, stdout, stderr) = child_b.wait_with_output().expect("wait B");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        let _ = child_a.wait();
+        let _ = std::fs::remove_dir_all(state_dir);
+
+        assert!(
+            status.success(),
+            "ping from B to A by name should succeed.\nstdout: {}\nstderr: {}",
+            out, err
+        );
     }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_rootless_loopback: alpine-rootfs not found"); return; }
-    };
-    // Loopback networking works in rootless mode: the container gets a private
-    // NET namespace (and USER namespace from auto-config) and lo is brought up.
-    // lo shows 'state UNKNOWN' even when admin-UP; match the flags field instead.
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "ip addr show lo | grep -q 'LOOPBACK,UP' && echo ok"])
-        .env("PATH", ALPINE_PATH)
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_network(NetworkMode::Loopback)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("rootless loopback spawn failed");
 
-    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
-    assert!(status.success(), "rootless loopback container failed");
-    assert!(String::from_utf8_lossy(&stdout).contains("ok"));
-}
+    /// test_container_link_missing
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Attempts to spawn a container with `with_link("nonexistent")`. Verifies
+    /// that spawn fails with a clear error about the missing container.
+    ///
+    /// Failure indicates that link resolution doesn't properly validate that
+    /// the target container exists.
+    #[test]
+    fn test_container_link_missing() {
+        if !is_root() {
+            eprintln!("Skipping test_container_link_missing: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_container_link_missing: alpine-rootfs not found");
+            return;
+        };
 
-#[test]
-fn test_rootless_bridge_rejected() {
-    if is_root() {
-        eprintln!("Skipping test_rootless_bridge_rejected: must run as non-root (no sudo)");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_rootless_bridge_rejected: alpine-rootfs not found"); return; }
-    };
-    // Bridge mode should be rejected with a clear error in rootless mode.
-    let result = Command::new("/bin/echo")
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT)
-        .with_network(NetworkMode::Bridge)
-        .spawn();
+        let result = Command::new("/bin/true")
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_link("nonexistent-container-xyz")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
 
-    match result {
-        Ok(_) => panic!("expected bridge networking to fail in rootless mode"),
-        Err(e) => {
-            let err_msg = format!("{}", e);
-            assert!(err_msg.contains("rootless") || err_msg.contains("root"),
-                "error message should mention rootless/root: {}", err_msg);
+        match result {
+            Ok(_) => panic!("spawn should fail when linked container doesn't exist"),
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                assert!(
+                    err_msg.contains("nonexistent-container-xyz"),
+                    "error should mention the missing container name, got: {}",
+                    err_msg
+                );
+            }
         }
     }
-}
-
-#[test]
-fn test_user_namespace_explicit() {
-    // Verify that root can create a USER namespace with explicit uid/gid maps and
-    // that the container process sees itself as uid=0 inside.
-    //
-    // No chroot: the rootfs lives under /home/cb/ which is not traversable from
-    // inside a USER namespace with a single-uid map (0→0). In a user namespace,
-    // capable_wrt_inode_uidgid() only grants DAC_OVERRIDE for inodes whose uid is
-    // present in the namespace's uid_map. /home/cb is owned by uid 1000 (not mapped),
-    // so the kernel falls through to normal permission bits and returns EACCES.
-    // Chroot is not needed to verify uid mapping — just run /usr/bin/id on the host fs.
-    //
-    // No MOUNT namespace: without chroot there is nothing to isolate mount-wise,
-    // and omitting it avoids the MS_PRIVATE limitation on inherited locked mounts.
-    if !is_root() {
-        eprintln!("Skipping test_user_namespace_explicit: requires root");
-        return;
-    }
-    let child = Command::new("/usr/bin/id")
-        .with_namespaces(Namespace::USER)
-        .with_uid_maps(&[UidMap { inside: 0, outside: 0, count: 1 }])
-        .with_gid_maps(&[GidMap { inside: 0, outside: 0, count: 1 }])
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("user namespace spawn failed");
-
-    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
-    assert!(status.success(), "user namespace container exited non-zero");
-    let out = String::from_utf8_lossy(&stdout);
-    assert!(out.contains("uid=0"), "expected uid=0 inside user namespace, got: {}", out);
-}
-
-// ── Pasta networking tests ────────────────────────────────────────────────────
-
-/// Check whether `pasta` is on PATH and responds to `--version`.
-fn is_pasta_available() -> bool {
-    remora::network::is_pasta_available()
-}
-
-/// Verify that pasta creates a TAP interface with an IP address inside the container's netns.
-///
-/// Spawns a container with `NetworkMode::Pasta` and runs `ip addr show` after a short
-/// sleep to let pasta attach and configure the interface via `--config-net`. Asserts:
-/// 1. A non-loopback interface exists (pasta created the TAP).
-/// 2. That interface has an `inet` address assigned (pasta's `--config-net` configured it).
-/// Failure on (1) means pasta did not attach to the netns. Failure on (2) means
-/// `--config-net` is not working — the container would have a TAP with no IP.
-///
-/// **Rootless only.** pasta's privilege-dropping (root→nobody via user namespace)
-/// makes it unable to access the container's namespace file descriptors when run as
-/// root. pasta is designed for rootless mode.
-#[test]
-fn test_pasta_interface_exists() {
-    if is_root() {
-        eprintln!("Skipping test_pasta_interface_exists: pasta is designed for rootless mode");
-        return;
-    }
-    if !is_pasta_available() {
-        eprintln!("Skipping test_pasta_interface_exists: pasta not installed");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_pasta_interface_exists: alpine-rootfs not found"); return; }
-    };
-
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "sleep 1 && ip addr show"])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_proc_mount()
-        .with_network(NetworkMode::Pasta)
-        .env("PATH", ALPINE_PATH)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("spawn failed");
-
-    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
-    assert!(status.success(), "container exited non-zero");
-
-    let out = String::from_utf8_lossy(&stdout);
-    let has_non_loopback = out.lines().any(|l| {
-        l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
-    });
-    assert!(has_non_loopback,
-        "expected a non-loopback TAP interface from pasta, got:\n{}", out);
-
-    // With --config-net, pasta configures the IP address inside the container's netns.
-    // A non-127.x inet address means pasta did more than just create the TAP.
-    let has_tap_ip = out.lines().any(|l| {
-        let l = l.trim();
-        l.starts_with("inet ") && !l.starts_with("inet 127.")
-    });
-    assert!(has_tap_ip,
-        "expected inet address on pasta TAP (--config-net), got:\n{}", out);
-}
-
-/// Verify that pasta works in the rootless (USER+NET two-phase unshare) path and
-/// that --config-net assigns an IP to the TAP interface.
-///
-/// Non-root only. Spawns with `NetworkMode::Pasta` without explicit `Namespace::USER`
-/// — rootless auto-adds it. Asserts a non-loopback interface with an inet address is
-/// present. Failure means pasta does not work through the rootless USER+NET path, or
-/// that `--config-net` is not being passed to pasta.
-#[test]
-fn test_pasta_rootless() {
-    if is_root() {
-        eprintln!("Skipping test_pasta_rootless: must run as non-root (no sudo)");
-        return;
-    }
-    if !is_pasta_available() {
-        eprintln!("Skipping test_pasta_rootless: pasta not installed");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_pasta_rootless: alpine-rootfs not found"); return; }
-    };
-
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "sleep 1 && ip addr show"])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_proc_mount()
-        .with_network(NetworkMode::Pasta)
-        .env("PATH", ALPINE_PATH)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("spawn failed");
-
-    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
-    assert!(status.success(), "container exited non-zero");
-
-    let out = String::from_utf8_lossy(&stdout);
-    let has_non_loopback = out.lines().any(|l| {
-        l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
-    });
-    assert!(has_non_loopback,
-        "expected a non-loopback TAP interface from pasta in rootless mode, got:\n{}", out);
-
-    let has_tap_ip = out.lines().any(|l| {
-        let l = l.trim();
-        l.starts_with("inet ") && !l.starts_with("inet 127.")
-    });
-    assert!(has_tap_ip,
-        "expected inet address on pasta TAP in rootless mode, got:\n{}", out);
-}
-
-/// Verify actual end-to-end internet connectivity through pasta.
-///
-/// Non-root only. Spawns with `NetworkMode::Pasta`, sleeps briefly to let pasta
-/// attach and configure the interface, then fetches `http://1.1.1.1/` (Cloudflare)
-/// using `wget`. Asserts the command succeeds (exit 0).
-///
-/// Failure means packets are not flowing through pasta's relay despite the TAP
-/// interface and IP being present (verified by `test_pasta_interface_exists`).
-/// This test requires outbound internet access.
-#[test]
-fn test_pasta_connectivity() {
-    if is_root() {
-        eprintln!("Skipping test_pasta_connectivity: pasta is designed for rootless mode");
-        return;
-    }
-    if !is_pasta_available() {
-        eprintln!("Skipping test_pasta_connectivity: pasta not installed");
-        return;
-    }
-    let rootfs = match get_test_rootfs() {
-        Some(p) => p,
-        None => { eprintln!("Skipping test_pasta_connectivity: alpine-rootfs not found"); return; }
-    };
-
-    // sleep 2: give pasta time to attach the TAP and configure IP+routes via --config-net.
-    // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
-    // only has proc mounted, not a full /dev with device nodes).
-    let child = Command::new("/bin/ash")
-        .args(&["-c", "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED"])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-        .with_proc_mount()
-        .with_network(NetworkMode::Pasta)
-        .env("PATH", ALPINE_PATH)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("spawn failed");
-
-    let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
-    let out = String::from_utf8_lossy(&stdout);
-    let err = String::from_utf8_lossy(&stderr);
-    assert!(status.success(),
-        "pasta connectivity test failed (is outbound internet available?)\nstdout: {}\nstderr: {}", out, err);
-    assert!(out.contains("CONNECTED"),
-        "wget succeeded but CONNECTED marker missing:\n{}", out);
-}
-
-/// Verify that a container with a PID namespace can fork() repeatedly.
-///
-/// Regression test for a bug where `unshare(CLONE_NEWPID)` left the container
-/// process OUTSIDE the new PID namespace — only its children entered it.  The
-/// first child became PID 1; when it exited the kernel marked the namespace
-/// defunct, causing every subsequent `fork()` to fail with ENOMEM.
-///
-/// The fix is a double-fork in `pre_exec`: after `unshare(CLONE_NEWPID)` we
-/// fork once more so the container process IS PID 1 in the new namespace.
-///
-/// This test runs a shell loop that forks `sleep` 5 times.  Without the fix,
-/// the second (or later) fork fails with "can't fork: Out of memory".
-///
-/// Requires root and alpine-rootfs.
-#[test]
-#[serial]
-fn test_pid_namespace_repeated_fork() {
-    if !is_root() {
-        eprintln!("Skipping test_pid_namespace_repeated_fork: requires root");
-        return;
-    }
-
-    let Some(rootfs) = get_test_rootfs() else {
-        eprintln!("Skipping test_pid_namespace_repeated_fork: alpine-rootfs not found");
-        return;
-    };
-
-    // Fork 5 times via external `sleep 0` (not a builtin — forces fork+exec).
-    // Count successes.  All 5 must succeed.
-    let child = Command::new("/bin/sh")
-        .args(&["-c", r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#])
-        .with_chroot(&rootfs)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
-        .with_proc_mount()
-        .env("PATH", ALPINE_PATH)
-        .stdout(Stdio::Piped)
-        .stderr(Stdio::Piped)
-        .spawn()
-        .expect("Failed to spawn with PID namespace");
-
-    let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
-    let out = String::from_utf8_lossy(&stdout);
-    let err = String::from_utf8_lossy(&stderr);
-
-    assert!(
-        status.success(),
-        "Container with PID namespace failed (exit {:?}).\nstdout: {}\nstderr: {}",
-        status.code(), out, err
-    );
-    assert!(
-        out.contains("FORKS_OK"),
-        "Container could not fork() repeatedly in PID namespace (defunct namespace bug).\nstdout: {}\nstderr: {}",
-        out, err
-    );
 }

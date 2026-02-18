@@ -112,6 +112,11 @@ pub struct RunArgs {
     #[clap(long = "security-opt")]
     pub security_opt: Vec<String>,
 
+    /// Link to another container for /etc/hosts name resolution (repeatable).
+    /// Format: NAME or NAME:ALIAS
+    #[clap(long = "link")]
+    pub link: Vec<String>,
+
     /// Kernel parameter KEY=VALUE (repeatable)
     #[clap(long = "sysctl")]
     pub sysctl: Vec<String>,
@@ -206,6 +211,13 @@ fn build_command(
     }
     if !args.dns.is_empty() {
         cmd = cmd.with_dns(&args.dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    }
+    for link_spec in &args.link {
+        if let Some((name, alias)) = link_spec.split_once(':') {
+            cmd = cmd.with_link_alias(name, alias);
+        } else {
+            cmd = cmd.with_link(link_spec);
+        }
     }
 
     // Filesystem
@@ -408,15 +420,17 @@ fn run_foreground(
         command: command.clone(),
         stdout_log: None,
         stderr_log: None,
+        bridge_ip: None,
     };
     write_state(&state)?;
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
     let pid = child.pid();
 
-    // Update state with real PID
+    // Update state with real PID and bridge IP (if bridge networking).
     let mut state2 = state;
     state2.pid = pid;
+    state2.bridge_ip = child.container_ip();
     write_state(&state2)?;
 
     let exit = child.wait().map_err(|e| format!("wait failed: {}", e))?;
@@ -474,6 +488,7 @@ fn run_detached(
         command: command.clone(),
         stdout_log: Some(stdout_log.to_string_lossy().into_owned()),
         stderr_log: Some(stderr_log.to_string_lossy().into_owned()),
+        bridge_ip: None,
     };
     write_state(&state)?;
 
@@ -504,10 +519,11 @@ fn run_detached(
             let pid = child.pid();
             let watcher_pid = unsafe { libc::getpid() };
 
-            // Update state with real PIDs.
+            // Update state with real PIDs and bridge IP.
             let mut updated = state;
             updated.pid = pid;
             updated.watcher_pid = watcher_pid;
+            updated.bridge_ip = child.container_ip();
             let _ = write_state(&updated);
 
             // Relay stdout and stderr to log files concurrently.
