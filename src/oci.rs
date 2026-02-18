@@ -749,6 +749,70 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
 // OCI subcommand implementations
 // ---------------------------------------------------------------------------
 
+/// Walk `/proc` to find the deepest descendant of `ancestor_pid`.
+///
+/// After the PID-namespace double-fork the process tree looks like:
+///   shim (ancestor) → spawn child (intermediate/waitpid) → container
+///
+/// Scans `/proc/[pid]/status` PPid fields to build the chain.
+/// Returns the leaf PID, or `None` if the tree can't be walked.
+fn find_descendant_pid(ancestor_pid: i32) -> Option<i32> {
+    // Retry a few times in case /proc is momentarily inconsistent.
+    for _ in 0..5 {
+        if let Some(pid) = find_descendant_pid_once(ancestor_pid) {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+fn find_descendant_pid_once(ancestor_pid: i32) -> Option<i32> {
+    let mut current = ancestor_pid;
+    loop {
+        let child = find_child_of(current)?;
+        // If this child has no further children, it's the leaf (container).
+        if find_child_of(child).is_none() {
+            return Some(child);
+        }
+        current = child;
+    }
+}
+
+/// Find a child process of the given `parent_pid` by scanning `/proc`.
+fn find_child_of(parent_pid: i32) -> Option<i32> {
+    let parent_str = parent_pid.to_string();
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries {
+        // Skip entries that vanish mid-scan (process exited).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Only look at numeric (PID) directories.
+        if !name_str.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let status_path = entry.path().join("status");
+        if let Ok(content) = fs::read_to_string(&status_path) {
+            for line in content.lines() {
+                if let Some(ppid) = line.strip_prefix("PPid:\t") {
+                    if ppid.trim() == parent_str {
+                        return name_str.parse().ok();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
 /// `remora create <id> <bundle>` — set up container, suspend before exec.
 ///
 /// Forks a shim that calls `command.spawn()`. The container's pre_exec writes
@@ -834,12 +898,16 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
             child.wait().ok();
             unsafe { libc::_exit(0) };
         }
-        _ => {
+        shim_pid => {
             // PARENT: close the write ends (child has them).
             unsafe { libc::close(ready_w) };
             unsafe { libc::close(listen_fd) };
 
-            // Read container PID (4 bytes) written by the grandchild's pre_exec.
+            // Wait for the ready signal (4 bytes) written by the container's pre_exec.
+            // The bytes carry a PID, but after the PID-namespace double-fork the
+            // container sees itself as PID 1 (namespace-local), which is useless on
+            // the host.  We only use the read as a "setup complete" gate; the actual
+            // host-visible PID comes from the shim's child.pid() below.
             let mut pid_buf = [0u8; 4];
             let n = unsafe {
                 libc::read(ready_r, pid_buf.as_mut_ptr() as *mut libc::c_void, 4)
@@ -853,7 +921,21 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
                     "container setup failed (ready pipe closed before PID was written)",
                 ));
             }
-            let container_pid = i32::from_ne_bytes(pid_buf);
+
+            // The pre_exec pipe carries `getpid()` from inside the container.
+            // Without a PID namespace this is the host-visible PID (correct).
+            // With a PID namespace + double-fork, the container sees itself as
+            // PID 1 (namespace-local), which is useless on the host.
+            //
+            // When the pipe PID looks namespace-local (<=1), walk the shim's
+            // process tree via /proc to find the real host-visible PID.
+            // Process tree: shim → intermediate (waitpid loop) → container.
+            let pipe_pid = i32::from_ne_bytes(pid_buf);
+            let container_pid = if pipe_pid <= 1 {
+                find_descendant_pid(shim_pid).unwrap_or(pipe_pid)
+            } else {
+                pipe_pid
+            };
 
             // Write state.json with status=created.
             let state = OciState {

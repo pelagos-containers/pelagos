@@ -487,10 +487,11 @@ state.json transitions, or wrong liveness detection via `kill(pid, 0)`.
 ### `test_oci_kill`
 **Requires:** root, rootfs
 
-Spawns a long-running container (`sleep 60`), verifies it reaches `"running"` state,
-sends `SIGTERM` via `remora kill`, and polls until `remora state` reports `"stopped"`.
-Failure indicates that `cmd_kill` is not finding the correct PID, or that the process
-is not receiving the signal, or that liveness detection does not detect the exit.
+Spawns a long-running container (`sleep 60`), starts it, then sends `SIGKILL` via
+`remora kill` and polls until `remora state` reports `"stopped"`. Uses SIGKILL because
+the container is PID 1 in a PID namespace — the kernel drops unhandled signals (like
+SIGTERM) for namespace-init processes. Failure indicates that `cmd_kill` is not finding
+the correct host-visible PID, or that liveness detection does not detect the exit.
 
 ### `test_oci_delete_cleanup`
 **Requires:** root, rootfs

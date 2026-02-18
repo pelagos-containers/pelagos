@@ -2119,12 +2119,17 @@ fn test_oci_create_start_state() {
 ///
 /// Requires: root, alpine-rootfs.
 ///
-/// Spawns a long-running container (`sleep 60`) and sends SIGTERM via
+/// Spawns a long-running container (`sleep 60`) and sends SIGKILL via
 /// `remora kill`. Asserts that the process exits promptly and `remora state`
 /// reports "stopped".
 ///
-/// Failure indicates that kill() is not finding the PID, signals are not
-/// being delivered, or state reporting is incorrect.
+/// Uses SIGKILL because the container runs in a PID namespace where `sleep`
+/// is PID 1. The kernel only delivers signals to PID 1 if it has installed
+/// an explicit handler; `sleep` uses the default SIGTERM disposition, so the
+/// kernel silently drops it. SIGKILL always works regardless.
+///
+/// Failure indicates that kill() is not finding the correct host-visible PID,
+/// signals are not being delivered, or state reporting is incorrect.
 #[test]
 fn test_oci_kill() {
     if !is_root() {
@@ -2152,7 +2157,7 @@ fn test_oci_kill() {
     // Small delay to ensure the process is running
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let (_, stderr, ok) = run_remora(&["kill", &id, "SIGTERM"]);
+    let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
     assert!(ok, "remora kill failed: {}", stderr);
 
     // Wait up to 4 seconds for the process to stop
@@ -2164,7 +2169,7 @@ fn test_oci_kill() {
             break;
         }
         if std::time::Instant::now() > deadline {
-            panic!("container did not stop after SIGTERM within 4 seconds");
+            panic!("container did not stop after SIGKILL within 4 seconds");
         }
     }
 
