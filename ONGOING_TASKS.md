@@ -211,18 +211,144 @@ sudo -E cargo run -- image rm alpine
 
 ---
 
-## Planned Feature 2: `remora exec` — Attach to Running Container
+## Current: `remora exec` — Run a Command in a Running Container — COMPLETE ✅
 
-**Priority:** Medium — quality-of-life for debugging running containers
-**Effort:** Moderate
+### Goal
 
-Run a new process inside an already-running container's namespaces, similar to
-`docker exec`. See git history for full design notes.
+Enable `remora exec <name> <command>` to run a new process inside a running
+container's namespaces. Analogous to `docker exec`. Supports interactive mode
+(`-i`) with PTY.
+
+### How It Works
+
+1. Look up container by name → get PID from `/run/remora/containers/{name}/state.json`
+2. Discover which namespaces the container has by comparing `/proc/{pid}/ns/{type}`
+   inodes against `/proc/1/ns/{type}` (same approach as `nsenter`)
+3. Read the container's environment from `/proc/{pid}/environ`
+4. Build a `Command` with:
+   - `with_chroot("/proc/{pid}/root")` — enters the container's root filesystem
+   - `with_namespace_join("/proc/{pid}/ns/X", Namespace::X)` for each discovered ns
+   - No `with_proc_mount()`, no `with_namespaces()`, no overlay/cgroup/network config
+5. Spawn (interactive with PTY or foreground with inherited stdio)
+
+**No changes to `container.rs` needed.** The existing pre_exec order (chroot at
+step 4, setns at step 6) works for exec: `chroot("/proc/{pid}/root")` resolves the
+container's root via procfs while still in the host mount namespace, then
+`setns(CLONE_NEWNS)` switches the mount table.
+
+**No resource teardown.** The exec'd process is ephemeral — the `Child` has no
+cgroup, network, or overlay state, so `wait()` won't clean up the container.
+
+### New File: `src/cli/exec.rs` (~120 lines)
+
+```rust
+#[derive(Debug, clap::Args)]
+pub struct ExecArgs {
+    pub name: String,                              // container name
+    #[clap(long, short = 'i')]
+    pub interactive: bool,                         // allocate PTY
+    #[clap(long = "env", short = 'e')]
+    pub env: Vec<String>,                          // KEY=VALUE overrides
+    #[clap(long = "workdir", short = 'w')]
+    pub workdir: Option<String>,                   // cwd inside container
+    #[clap(long = "user", short = 'u')]
+    pub user: Option<String>,                      // UID[:GID]
+    #[clap(multiple_values = true, required = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,                         // command + args
+}
+
+pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>>
+fn discover_namespaces(pid: i32) -> Result<Vec<(PathBuf, Namespace)>, ...>
+fn read_proc_environ(pid: i32) -> Vec<(String, String)>
+```
+
+`discover_namespaces()`: compares inodes of `/proc/{pid}/ns/{type}` vs
+`/proc/1/ns/{type}` for: mnt, uts, ipc, net, pid, user, cgroup. Returns
+only those that differ.
+
+`read_proc_environ()`: reads `/proc/{pid}/environ` (NUL-separated KEY=VALUE).
+
+`cmd_exec()` flow:
+1. `read_state(name)` + `check_liveness(pid)` — validate container is running
+2. `discover_namespaces(pid)` — find which namespaces to join
+3. `read_proc_environ(pid)` — get container's environment as base
+4. Build `Command::new(exe).args(rest)`:
+   - `.with_chroot(format!("/proc/{}/root", pid))`
+   - `.with_namespace_join(path, ns)` for each discovered namespace
+   - `.env(k, v)` for container env, then CLI `-e` overrides
+   - `.with_cwd(workdir)` if specified
+   - `.with_uid(uid)` / `.with_gid(gid)` if specified
+5. If `--interactive`: `cmd.spawn_interactive()?.run()` → exit with status
+6. Else: `cmd.stdin/stdout/stderr(Inherit).spawn()?.wait()` → exit with status
+
+### Modify: `src/cli/mod.rs`
+
+Add `pub mod exec;`
+
+### Modify: `src/main.rs`
+
+Add to `CliCommand` enum (after `Run`):
+```rust
+/// Run a command in a running container
+Exec(cli::exec::ExecArgs),
+```
+Add dispatch: `CliCommand::Exec(args) => cli::exec::cmd_exec(args),`
+
+### Implementation Order
+
+1. `src/cli/exec.rs` — new file
+2. `src/cli/mod.rs` — add module
+3. `src/main.rs` — add subcommand + dispatch
+4. Integration tests
+5. Docs (INTEGRATION_TESTS.md, ONGOING_TASKS.md, CLAUDE.md)
+
+### Integration Tests (new `exec` module)
+
+**`test_exec_basic`** — root + rootfs. Start `sleep 30` container, exec
+`/bin/cat /etc/hostname` inside it. Verify output and exit code 0.
+
+**`test_exec_sees_container_filesystem`** — root + rootfs. Start container that
+creates `/tmp/exec-marker`, then exec `/bin/cat /tmp/exec-marker`. Confirms
+the exec'd process sees the container's mount namespace.
+
+**`test_exec_environment`** — root + rootfs. Start container with env `FOO=bar`,
+exec `/bin/sh -c 'echo $FOO'`. Verify output is "bar". Also test `-e` override.
+
+**`test_exec_nonrunning_container_fails`** — root. Try to exec into a stopped
+container. Verify error message.
+
+Document all new tests in `docs/INTEGRATION_TESTS.md`.
+
+### Manual Verification (user runs)
+
+```bash
+# Terminal 1: start a long-running container
+sudo -E cargo run -- run --name test-exec --detach alpine-rootfs /bin/sleep 300
+
+# Terminal 2: exec into it
+sudo -E cargo run -- exec test-exec /bin/sh -c "echo hello from exec"
+sudo -E cargo run -- exec -i test-exec /bin/sh
+
+# Cleanup
+sudo -E cargo run -- stop test-exec
+sudo -E cargo run -- rm test-exec
+```
+
+### Notes / Risks
+
+- **PID namespace**: `setns(CLONE_NEWPID)` affects children only — the exec'd
+  process (child of fork) will be in the container's PID namespace. Correct.
+- **Race condition**: If container exits between liveness check and spawn,
+  `/proc/{pid}/ns/*` disappears and spawn fails. Acceptable (same as `docker exec`).
+- **No /proc remount**: Container already has `/proc` mounted. Must NOT set
+  `with_proc_mount()`.
+- **No new namespaces**: We join existing namespaces, not create new ones.
 
 ---
 
 ## Previous Tasks — COMPLETE
 
+- `5477cd0` — OCI image layers: `remora image pull` + `remora run --image`
 - `4abfa6d` — Integration tests for cross-container TCP and NAT iptables rules
 - `7ecbc40` — Fix NAT forwarding for UFW/Docker hosts, upgrade web pipeline to httpd
 - `ce4a8cf` — Multi-container web pipeline and net debug examples

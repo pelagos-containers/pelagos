@@ -28,6 +28,9 @@ enum CliCommand {
     /// Create and start a container
     Run(cli::run::RunArgs),
 
+    /// Run a command in a running container
+    Exec(cli::exec::ExecArgs),
+
     /// List containers
     Ps {
         /// Show all containers (default: only running)
@@ -172,6 +175,7 @@ fn main() {
     let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         // Container lifecycle
         CliCommand::Run(args) => cli::run::cmd_run(args),
+        CliCommand::Exec(args) => cli::exec::cmd_exec(args),
         CliCommand::Ps { all } => cli::ps::cmd_ps(all),
         CliCommand::Stop { name } => cli::stop::cmd_stop(&name),
         CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),

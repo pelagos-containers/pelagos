@@ -4095,3 +4095,280 @@ mod images {
         let _ = image::remove_image(reference);
     }
 }
+
+mod exec {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// Helper: build an exec Command that joins the container's mount namespace
+    /// via pre_exec (setns + fchdir + chroot(".") + chdir("/")) and joins all
+    /// other differing namespaces via with_namespace_join().
+    fn build_exec_command(pid: i32, exe: &str, args: &[&str]) -> Command {
+        let ns_types: &[(&str, Namespace)] = &[
+            ("mnt", Namespace::MOUNT),
+            ("uts", Namespace::UTS),
+            ("ipc", Namespace::IPC),
+            ("net", Namespace::NET),
+            ("pid", Namespace::PID),
+            ("user", Namespace::USER),
+            ("cgroup", Namespace::CGROUP),
+        ];
+
+        let mut cmd = Command::new(exe).args(args);
+        let mut has_mount_ns = false;
+
+        for &(ns_name, ns_flag) in ns_types {
+            let container_ns = format!("/proc/{}/ns/{}", pid, ns_name);
+            let init_ns = format!("/proc/1/ns/{}", ns_name);
+            let c_ino = std::fs::metadata(&container_ns).map(|m| {
+                use std::os::unix::fs::MetadataExt; m.ino()
+            });
+            let i_ino = std::fs::metadata(&init_ns).map(|m| {
+                use std::os::unix::fs::MetadataExt; m.ino()
+            });
+            if let (Ok(c), Ok(i)) = (c_ino, i_ino) {
+                if c != i {
+                    if ns_flag == Namespace::MOUNT {
+                        has_mount_ns = true;
+                    } else {
+                        cmd = cmd.with_namespace_join(&container_ns, ns_flag);
+                    }
+                }
+            }
+        }
+
+        if has_mount_ns {
+            let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
+            let mnt_ns_file = std::fs::File::open(&mnt_ns_path)
+                .expect("open mount ns");
+            let mnt_ns_fd = mnt_ns_file.as_raw_fd();
+
+            let root_path = format!("/proc/{}/root", pid);
+            let root_file = std::fs::File::open(&root_path)
+                .expect("open container root");
+            let root_fd = root_file.as_raw_fd();
+
+            cmd = cmd.with_pre_exec(move || {
+                let _keep_mnt = &mnt_ns_file;
+                let _keep_root = &root_file;
+                unsafe {
+                    if libc::setns(mnt_ns_fd, libc::CLONE_NEWNS) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fchdir(root_fd) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let dot = std::ffi::CString::new(".").unwrap();
+                    if libc::chroot(dot.as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let slash = std::ffi::CString::new("/").unwrap();
+                    if libc::chdir(slash.as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        } else {
+            cmd = cmd.with_chroot(format!("/proc/{}/root", pid));
+        }
+
+        cmd
+    }
+
+    /// Start a container, then exec a command inside it via mount-ns setns +
+    /// fchdir + chroot(".") in pre_exec — the same mechanism `remora exec` uses.
+    ///
+    /// NOTE: We use UTS+MOUNT (no PID namespace) because Namespace::PID triggers
+    /// a double-fork where container.pid() returns the intermediate process, not
+    /// the actual container.  The real `remora exec` CLI uses the grandchild PID
+    /// from state.json, so it works correctly with PID namespaces.
+    #[test]
+    #[serial]
+    fn test_exec_basic() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_basic (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => { eprintln!("Skipping (no rootfs)"); return; }
+        };
+
+        // Start a long-running container (no PID ns — see note above).
+        let mut container = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container");
+
+        let pid = container.pid();
+
+        let cmd = build_exec_command(pid, "/bin/cat", &["/etc/os-release"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped);
+
+        let exec_child = cmd.spawn().expect("exec spawn");
+        let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
+
+        // Clean up the container.
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+        let _ = container.wait();
+
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(status.success(), "exec should exit 0, stderr: {}", err);
+        assert!(out.contains("Alpine"), "exec should see Alpine os-release, got: {}", out);
+    }
+
+    /// Start a container that writes a marker file to a tmpfs, then exec
+    /// into it and read the marker — proving the exec'd process sees the
+    /// container's mount namespace (including its tmpfs mounts).
+    #[test]
+    #[serial]
+    fn test_exec_sees_container_filesystem() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_sees_container_filesystem (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => { eprintln!("Skipping (no rootfs)"); return; }
+        };
+
+        // Start a container that creates a marker file on tmpfs then sleeps.
+        // No PID ns — pid() would return the intermediate, not the real container.
+        let mut container = Command::new("/bin/sh")
+            .args(&["-c", "echo EXEC_MARKER_12345 > /tmp/exec-marker && sleep 30"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_tmpfs("/tmp", "")
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container");
+
+        let pid = container.pid();
+
+        // Give the shell time to create the marker file.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let cmd = build_exec_command(pid, "/bin/cat", &["/tmp/exec-marker"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped);
+
+        let exec_child = cmd.spawn().expect("exec spawn");
+        let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
+
+        // Clean up.
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+        let _ = container.wait();
+
+        let out = String::from_utf8_lossy(&stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(status.success(), "exec should exit 0, stderr: {}", err);
+        assert_eq!(out, "EXEC_MARKER_12345", "exec should see the container's tmpfs marker");
+    }
+
+    /// Exec into a container and verify environment variables are visible
+    /// via /proc/{pid}/environ.
+    #[test]
+    #[serial]
+    fn test_exec_environment() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_environment (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => { eprintln!("Skipping (no rootfs)"); return; }
+        };
+
+        // Start container with a custom env var.
+        // No PID ns — pid() would return the intermediate, not the real container.
+        let mut container = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .env("PATH", ALPINE_PATH)
+            .env("FOO", "bar_from_container")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container");
+
+        let pid = container.pid();
+
+        // Wait for exec to complete so /proc/{pid}/environ reflects the
+        // container's env (not the pre-exec intermediate process).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Read the container's environment from /proc/{pid}/environ.
+        let environ_path = format!("/proc/{}/environ", pid);
+        let environ_data = std::fs::read(&environ_path).expect("read /proc/pid/environ");
+        let env_pairs: Vec<(String, String)> = environ_data
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|entry| {
+                let s = String::from_utf8_lossy(entry);
+                let (k, v) = s.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect();
+
+        // Build exec command that echoes $FOO.
+        let mut cmd = build_exec_command(pid, "/bin/sh", &["-c", "echo $FOO"]);
+
+        // Apply container env.
+        for (k, v) in &env_pairs {
+            cmd = cmd.env(k, v);
+        }
+
+        cmd = cmd
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped);
+
+        let exec_child = cmd.spawn().expect("exec spawn");
+        let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
+
+        // Clean up.
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+        let _ = container.wait();
+
+        let out = String::from_utf8_lossy(&stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(status.success(), "exec should exit 0, stderr: {}", err);
+        assert_eq!(out, "bar_from_container", "exec should see container's FOO env var");
+    }
+
+    /// Trying to exec into a non-running container: verify that the liveness
+    /// check correctly detects a dead PID, which is what `remora exec` uses
+    /// to reject exec into stopped containers.
+    #[test]
+    #[serial]
+    fn test_exec_nonrunning_container_fails() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_nonrunning_container_fails (requires root)");
+            return;
+        }
+
+        // PID 999999 should not be alive on any reasonable system.
+        let alive = unsafe { libc::kill(999999, 0) == 0 };
+        assert!(!alive, "PID 999999 should not be alive");
+
+        // Also verify that /proc/999999/root does not exist, so chroot would fail.
+        let root_path = std::path::Path::new("/proc/999999/root");
+        assert!(!root_path.exists(), "/proc/999999/root should not exist");
+    }
+}

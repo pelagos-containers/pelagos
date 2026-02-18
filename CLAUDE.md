@@ -110,6 +110,14 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay cleaned up in `wait()` / `wait_with_output()`
 - **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
 
+**Container Exec (COMPLETE ✅):**
+- **`remora exec <name> <command>`**: run a command inside a running container
+- **Namespace discovery**: compares `/proc/{pid}/ns/*` inodes against `/proc/1/ns/*` to find container namespaces
+- **Environment inheritance**: reads `/proc/{pid}/environ` as base, CLI `-e` overrides
+- **Interactive mode**: `remora exec -i <name> /bin/sh` allocates a PTY
+- **User/workdir**: `--user UID[:GID]`, `--workdir /path` options
+- **`src/cli/exec.rs`**: `ExecArgs`, `cmd_exec()`, `discover_namespaces()`, `read_proc_environ()`
+
 **OCI Compliance (Phase 1 COMPLETE ✅):**
 - **`remora create <id> <bundle>`**: parse `config.json`, fork shim, block on `exec.sock` until `start`
 - **`remora start <id>`**: connect to `exec.sock`, send byte → container execs
@@ -130,7 +138,7 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 ```
 src/
   lib.rs                  # Library entry point
-  main.rs                 # CLI binary (run/ps/stop/rm/logs + OCI lifecycle)
+  main.rs                 # CLI binary (run/exec/ps/stop/rm/logs + OCI lifecycle)
   container.rs            # Main API (~2270 lines)
   oci.rs                  # OCI Runtime Spec implementation
   cgroup.rs               # Cgroups v2 resource management
@@ -140,6 +148,7 @@ src/
   image.rs                # OCI image store: layer extraction, manifest persistence
   cli/
     mod.rs                # Shared types: ContainerState, helpers, parsers
+    exec.rs               # remora exec — run command in running container
     run.rs                # remora run — build + launch containers
     ps.rs                 # remora ps — list containers
     stop.rs               # remora stop — SIGTERM a container
@@ -383,6 +392,7 @@ Many features require root or CAP_SYS_ADMIN
 | Networking | ✅ N1–N5 + pasta (Loopback/Bridge/NAT/Ports/DNS/Pasta) | ✅ Native libnetwork |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
 | OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
+| Container exec | ✅ `remora exec` (ns join + PTY) | ✅ |
 | OCI Compatible | 🔄 Partial | ✅ |
 
 **Current parity: ~90% of runc features**

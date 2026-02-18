@@ -850,3 +850,60 @@ using the `remora` binary, loads the manifest, mounts layers via `with_image_lay
 and runs `cat /etc/alpine-release` inside the container. Verifies the output is a valid
 Alpine version string. Failure indicates a regression anywhere in the chain: registry
 pull, layer extraction, manifest persistence, multi-layer overlay mount, or container exec.
+
+---
+
+## Module: `exec`
+
+Tests for `remora exec` — running commands inside running containers via
+namespace join + `/proc/{pid}/root` chroot.
+
+### `test_exec_basic`
+**Requires:** root, rootfs
+
+Starts a `sleep 30` container with UTS+MOUNT namespaces (no PID namespace —
+see note below), then spawns an exec'd process (`/bin/cat /etc/os-release`) by
+joining the container's mount namespace via `setns()` + `fchdir()` +
+`chroot(".")` in a pre_exec callback. Verifies exit code 0 and non-empty output.
+
+Failure indicates that the setns + fchdir + chroot pattern used by `remora exec`
+is broken — either `setns()` fails, fchdir to the container root fd doesn't
+work, or the exec'd process can't see the container's filesystem.
+
+**Note:** PID namespace is omitted because `Namespace::PID` triggers a
+double-fork where `container.pid()` returns the intermediate process (which
+never execs and stays in the host namespaces), not the actual container. The
+real `remora exec` CLI gets the correct PID from state.json.
+
+### `test_exec_sees_container_filesystem`
+**Requires:** root, rootfs
+
+Starts a container that writes `EXEC_MARKER_12345` to `/tmp/exec-marker` (on
+a tmpfs), then exec's `/bin/cat /tmp/exec-marker` via mount namespace join.
+Verifies the output matches the marker value.
+
+Failure indicates the exec'd process is not correctly entering the container's
+mount namespace — it would see the host's `/tmp` instead of the container's
+tmpfs, and the marker file would not exist. The `fchdir(root_fd) + chroot(".")`
+technique (same as `nsenter(1)`) is critical here: a plain `chroot("/")` after
+`setns(MOUNT)` would chroot to the host root, not the container's.
+
+### `test_exec_environment`
+**Requires:** root, rootfs
+
+Starts a container with `FOO=bar_from_container` in its environment, reads
+`/proc/{pid}/environ` to discover the env vars, applies them to the exec'd
+command (`/bin/sh -c 'echo $FOO'`), and verifies the output is
+`bar_from_container`.
+
+Failure indicates that `/proc/{pid}/environ` reading or env propagation to
+the exec'd process is broken.
+
+### `test_exec_nonrunning_container_fails`
+**Requires:** root
+
+Verifies that `kill(999999, 0)` returns false (PID not alive) and
+`/proc/999999/root` does not exist. This is the guard logic `remora exec`
+uses to reject exec into stopped containers.
+
+Failure indicates a kernel or procfs anomaly where dead PIDs still appear alive.
