@@ -4023,4 +4023,75 @@ mod images {
         assert!(status.success(), "container should exit 0");
         assert!(!overlay_base.exists(), "overlay base dir should be cleaned up after wait: {:?}", overlay_base);
     }
+
+    /// test_pull_and_run_real_image
+    ///
+    /// Requires: root, network access.
+    ///
+    /// Pulls `alpine:latest` from Docker Hub via `image::extract_layer()` and
+    /// the `cli::image` pull pipeline, then runs `/bin/sh -c "cat /etc/alpine-release"`
+    /// using `with_image_layers()`. Verifies the output is a valid Alpine version string.
+    ///
+    /// This is a full end-to-end test of the OCI image pipeline: registry pull →
+    /// layer extraction → multi-layer overlay mount → container exec. Failure
+    /// indicates a regression anywhere in that chain.
+    ///
+    /// Ignored by default because it requires network access and is slower than
+    /// the synthetic-layer tests. Run with:
+    /// ```bash
+    /// sudo -E cargo test --test integration_tests test_pull_and_run_real_image -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    #[serial]
+    fn test_pull_and_run_real_image() {
+        if !is_root() {
+            eprintln!("Skipping test_pull_and_run_real_image: requires root");
+            return;
+        }
+
+        use remora::image;
+
+        let reference = "docker.io/library/alpine:latest";
+
+        // Pull the image using the remora binary (true E2E).
+        let pull_status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            .args(&["image", "pull", "alpine"])
+            .status()
+            .expect("failed to run remora image pull");
+        assert!(pull_status.success(), "remora image pull should succeed");
+
+        // Load manifest and resolve layers.
+        let manifest = image::load_image(reference)
+            .expect("image manifest should be loadable after pull");
+        let layers = image::layer_dirs(&manifest);
+        assert!(!layers.is_empty(), "alpine should have at least one layer");
+
+        // Run a command inside the image.
+        let child = Command::new("/bin/sh")
+            .args(&["-c", "cat /etc/alpine-release"])
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn from real image");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(status.success(), "container should exit 0, stderr: {}", err);
+        // Alpine release is a version like "3.19.1" or "3.23.3".
+        assert!(
+            out.chars().next().map_or(false, |c| c.is_ascii_digit()) && out.contains('.'),
+            "expected Alpine version string, got: '{}'", out
+        );
+        println!("Alpine version from real image: {}", out);
+
+        // Clean up the pulled image metadata (layers stay cached).
+        let _ = image::remove_image(reference);
+    }
 }

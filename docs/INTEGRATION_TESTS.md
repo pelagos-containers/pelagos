@@ -840,3 +840,13 @@ Spawns a container with `with_image_layers()`, captures the overlay merged-dir p
 waits for exit, then verifies the ephemeral overlay directory (merged + upper + work)
 was cleaned up by `wait()`. Failure indicates the cleanup logic for image-layer overlay
 dirs is broken.
+
+### `test_pull_and_run_real_image`
+**Requires:** root, network access
+**Ignored by default** — run with `--ignored`
+
+End-to-end test of the full OCI image pipeline. Pulls `alpine:latest` from Docker Hub
+using the `remora` binary, loads the manifest, mounts layers via `with_image_layers()`,
+and runs `cat /etc/alpine-release` inside the container. Verifies the output is a valid
+Alpine version string. Failure indicates a regression anywhere in the chain: registry
+pull, layer extraction, manifest persistence, multi-layer overlay mount, or container exec.
