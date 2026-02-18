@@ -1,7 +1,7 @@
 # Remora Development Roadmap
 
-**Last Updated:** 2026-02-17
-**Current Status:** OCI compliance (Phase 1) complete — all five lifecycle commands implemented
+**Last Updated:** 2026-02-18
+**Current Status:** OCI image layers complete — `remora image pull` + `remora run --image`
 
 ---
 
@@ -12,7 +12,7 @@
 3. **Native over delegated** — implement directly rather than shelling out to CNI
 4. **Test everything** — every feature has integration tests
 
-**Out of scope:** image management, registry operations, orchestration, GUI
+**Out of scope:** orchestration, GUI
 
 ---
 
@@ -86,7 +86,24 @@ Layered rootfs using `overlayfs` — lower (read-only base) + upper (writable pe
 - Lower layer (shared Alpine rootfs) is never modified — writes land in `upper_dir`
 - Merged mount point auto-created at `/run/remora/overlay-{pid}-{n}/merged/`; removed in `wait()`
 - Compatible with `with_readonly_rootfs(true)`, bind mounts, and tmpfs
-- Foundation for image-layer-style workflows without full image management
+- Foundation for image-layer-style workflows
+
+---
+
+### OCI Image Layers ✅
+
+Pull OCI images from registries and run containers directly from them.
+
+- `remora image pull <ref>`: native OCI registry pulls via `oci-client` (anonymous auth)
+- `remora image ls` / `remora image rm <ref>`: list and remove locally stored images
+- `remora run --image <ref> [cmd]`: run a container from a pulled image
+- Layers cached content-addressably at `/var/lib/remora/layers/<sha256>/`
+- Image metadata at `/var/lib/remora/images/<name>_<tag>/manifest.json`
+- Multi-layer overlayfs: `with_image_layers(layer_dirs)` API — multiple lower layers,
+  ephemeral upper/work auto-created and cleaned up in `wait()`
+- Image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults; CLI overrides
+- OCI whiteout handling: `.wh.*` → overlayfs char device (0,0); `.wh..wh..opq` → xattr
+- Dependencies: `oci-client`, `tokio` (current-thread), `flate2`, `tar`, `tempfile`
 
 ---
 
@@ -176,3 +193,4 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 | N1–N5 + overlay complete | ~73% |
 | OCI compliance (Phase 1) ✅ | ~85% |
 | Rootless Phase 1 + Phase 2 (pasta) ✅ | ~90% |
+| OCI image layers ✅ | ~93% |
