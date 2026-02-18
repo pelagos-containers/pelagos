@@ -38,6 +38,6 @@ rm -rf /run/remora && echo "  done" || true
 echo "=== Unmounting any stale overlays ==="
 grep -o '/run/remora/overlay-[^ ]*' /proc/mounts 2>/dev/null | while read -r mnt; do
     umount -l "$mnt" 2>/dev/null && echo "  unmounted $mnt" || true
-done
+done || true
 
 echo "=== Clean ==="

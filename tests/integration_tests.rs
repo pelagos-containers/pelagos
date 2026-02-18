@@ -14,7 +14,9 @@
 //! ```
 
 use remora::cgroup::ResourceStats;
-use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume};
+use remora::container::{
+    Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume,
+};
 use remora::network::NetworkMode;
 use serial_test::serial;
 use std::path::PathBuf;
@@ -78,7 +80,6 @@ mod api {
 
         // Just verify the API compiles and methods are available
         assert!(true, "UID/GID API is available");
-
     }
 
     #[test]
@@ -223,7 +224,6 @@ mod core {
             }
             Err(e) => panic!("Failed to spawn with proc mount: {:?}", e),
         }
-
     }
 
     #[test]
@@ -256,11 +256,13 @@ mod core {
         match result {
             Ok(mut child) => {
                 let status = child.wait().unwrap();
-                assert!(status.success(), "Child process failed with combined features");
+                assert!(
+                    status.success(),
+                    "Child process failed with combined features"
+                );
             }
             Err(e) => panic!("Failed to spawn with combined features: {:?}", e),
         }
-
     }
 
     /// Verify that a container with a PID namespace can fork() repeatedly.
@@ -293,7 +295,10 @@ mod core {
         // Fork 5 times via external `sleep 0` (not a builtin — forces fork+exec).
         // Count successes.  All 5 must succeed.
         let child = Command::new("/bin/sh")
-            .args(&["-c", r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#])
+            .args(&[
+                "-c",
+                r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#,
+            ])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
             .with_proc_mount()
@@ -310,7 +315,9 @@ mod core {
         assert!(
             status.success(),
             "Container with PID namespace failed (exit {:?}).\nstdout: {}\nstderr: {}",
-            status.code(), out, err
+            status.code(),
+            out,
+            err
         );
         assert!(
             out.contains("FORKS_OK"),
@@ -354,7 +361,6 @@ mod capabilities {
             }
             Err(e) => panic!("Failed to spawn with dropped capabilities: {:?}", e),
         }
-
     }
 
     #[test]
@@ -388,7 +394,6 @@ mod capabilities {
             }
             Err(e) => panic!("Failed to spawn with selective capabilities: {:?}", e),
         }
-
     }
 }
 
@@ -426,7 +431,6 @@ mod resources {
             }
             Err(e) => panic!("Failed to spawn with fd limit: {:?}", e),
         }
-
     }
 
     #[test]
@@ -460,7 +464,6 @@ mod resources {
             }
             Err(e) => panic!("Failed to spawn with memory limit: {:?}", e),
         }
-
     }
 
     #[test]
@@ -494,7 +497,6 @@ mod resources {
             }
             Err(e) => panic!("Failed to spawn with CPU time limit: {:?}", e),
         }
-
     }
 }
 
@@ -536,7 +538,6 @@ mod security {
             status.success() || status.code() == Some(1),
             "Process should complete (reboot syscall blocked by seccomp)"
         );
-
     }
 
     #[test]
@@ -677,7 +678,10 @@ mod security {
             .expect("Failed to spawn with no-new-privileges");
 
         let status = child.wait().expect("Failed to wait for child");
-        assert!(status.success(), "NoNewPrivs should be set to 1 in /proc/self/status");
+        assert!(
+            status.success(),
+            "NoNewPrivs should be set to 1 in /proc/self/status"
+        );
     }
 
     #[test]
@@ -708,7 +712,10 @@ mod security {
 
         let status = child.wait().expect("Failed to wait for child");
         // The command should complete (exit code 0), but the touch should have failed
-        assert!(status.success(), "Container should run despite read-only fs");
+        assert!(
+            status.success(),
+            "Container should run despite read-only fs"
+        );
     }
 
     #[test]
@@ -793,11 +800,11 @@ mod security {
             .env("PATH", ALPINE_PATH)
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
-            .with_seccomp_default()        // Seccomp filtering
-            .with_no_new_privileges(true)  // No privilege escalation
-            .with_readonly_rootfs(true)    // Immutable rootfs
-            .with_masked_paths_default()   // Hide sensitive paths
-            .drop_all_capabilities()       // Minimal capabilities
+            .with_seccomp_default() // Seccomp filtering
+            .with_no_new_privileges(true) // No privilege escalation
+            .with_readonly_rootfs(true) // Immutable rootfs
+            .with_masked_paths_default() // Hide sensitive paths
+            .drop_all_capabilities() // Minimal capabilities
             .spawn()
             .expect("Failed to spawn with all Phase 1 security");
 
@@ -843,7 +850,10 @@ mod filesystem {
             .expect("Failed to spawn with bind mount");
 
         let status = child.wait().expect("Failed to wait for child");
-        assert!(status.success(), "Container should read host file via bind mount");
+        assert!(
+            status.success(),
+            "Container should read host file via bind mount"
+        );
     }
 
     #[test]
@@ -913,7 +923,11 @@ mod filesystem {
         let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
         assert!(status.success(), "Container should succeed with tmpfs /tmp");
         let out = String::from_utf8_lossy(&stdout);
-        assert!(out.contains("ok"), "touch on tmpfs should succeed, got: {}", out);
+        assert!(
+            out.contains("ok"),
+            "touch on tmpfs should succeed, got: {}",
+            out
+        );
     }
 
     #[test]
@@ -951,9 +965,15 @@ mod filesystem {
 
         // Verify the file persists on the host
         let host_file = vol.path().join("file.txt");
-        assert!(host_file.exists(), "Volume file should exist on host after container exits");
+        assert!(
+            host_file.exists(),
+            "Volume file should exist on host after container exits"
+        );
         let contents = std::fs::read_to_string(&host_file).expect("Failed to read volume file");
-        assert!(contents.contains("persistent"), "Volume file should contain expected content");
+        assert!(
+            contents.contains("persistent"),
+            "Volume file should contain expected content"
+        );
 
         // Clean up
         Volume::delete("testvol").expect("Failed to delete volume");
@@ -1008,7 +1028,10 @@ mod filesystem {
             "upper_dir/newfile should exist after container wrote /newfile"
         );
         let content = std::fs::read_to_string(&upper_file).expect("failed to read upper/newfile");
-        assert_eq!(content, "hello\n", "upper_dir/newfile should contain 'hello\\n'");
+        assert_eq!(
+            content, "hello\n",
+            "upper_dir/newfile should contain 'hello\\n'"
+        );
     }
 
     /// Modifying an existing lower-layer file writes a copy to upper_dir;
@@ -1035,8 +1058,8 @@ mod filesystem {
 
         // Record the original content of /etc/hostname in the lower layer.
         let lower_hostname = rootfs.join("etc/hostname");
-        let original_content = std::fs::read_to_string(&lower_hostname)
-            .unwrap_or_else(|_| String::new());
+        let original_content =
+            std::fs::read_to_string(&lower_hostname).unwrap_or_else(|_| String::new());
 
         let mut child = Command::new("/bin/sh")
             .args(&["-c", "echo modified > /etc/hostname"])
@@ -1053,8 +1076,8 @@ mod filesystem {
         child.wait().expect("failed to wait");
 
         // Lower layer /etc/hostname must be unchanged.
-        let after_content = std::fs::read_to_string(&lower_hostname)
-            .unwrap_or_else(|_| String::new());
+        let after_content =
+            std::fs::read_to_string(&lower_hostname).unwrap_or_else(|_| String::new());
         assert_eq!(
             original_content, after_content,
             "lower_dir/etc/hostname should be unchanged; overlay leaked write to lower"
@@ -1066,9 +1089,12 @@ mod filesystem {
             upper_hostname.exists(),
             "upper_dir/etc/hostname should exist (copy-on-write)"
         );
-        let upper_content = std::fs::read_to_string(&upper_hostname)
-            .expect("failed to read upper/etc/hostname");
-        assert_eq!(upper_content, "modified\n", "upper_dir/etc/hostname should contain 'modified\\n'");
+        let upper_content =
+            std::fs::read_to_string(&upper_hostname).expect("failed to read upper/etc/hostname");
+        assert_eq!(
+            upper_content, "modified\n",
+            "upper_dir/etc/hostname should contain 'modified\\n'"
+        );
     }
 
     /// After wait(), the auto-created /run/remora/overlay-{pid}-{n}/merged directory
@@ -1107,7 +1133,10 @@ mod filesystem {
 
         // Record this container's specific merged dir before calling wait().
         let merged_dir = child.overlay_merged_dir().map(|p| p.to_path_buf());
-        assert!(merged_dir.is_some(), "with_overlay should set overlay_merged_dir on Child");
+        assert!(
+            merged_dir.is_some(),
+            "with_overlay should set overlay_merged_dir on Child"
+        );
         let merged = merged_dir.unwrap();
         let parent = merged.parent().unwrap().to_path_buf();
 
@@ -1182,7 +1211,10 @@ mod cgroups {
         // — at least some should fail. The shell exits 0 regardless, so we just
         // verify that cgroup setup does not break container execution.
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0 & done; wait; echo done"])
+            .args(&[
+                "-c",
+                "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0 & done; wait; echo done",
+            ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -1224,7 +1256,10 @@ mod cgroups {
             .expect("Failed to spawn with cgroup cpu shares");
 
         let status = child.wait().expect("Failed to wait for child");
-        assert!(status.success(), "Container with cpu_shares should exit cleanly");
+        assert!(
+            status.success(),
+            "Container with cpu_shares should exit cleanly"
+        );
     }
 
     #[test]
@@ -1319,7 +1354,10 @@ mod networking {
         // with_network(Loopback) automatically adds Namespace::NET and brings up lo.
         // After lo is up, the kernel assigns 127.0.0.1 automatically.
         let child = Command::new("/bin/ash")
-            .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK"])
+            .args(&[
+                "-c",
+                "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK",
+            ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Loopback)
             .with_chroot(&rootfs)
@@ -1356,7 +1394,10 @@ mod networking {
 
         // Named netns is fully configured before fork; eth0 is ready from the first instruction.
         let child = Command::new("/bin/ash")
-            .args(&["-c", "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK"])
+            .args(&[
+                "-c",
+                "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK",
+            ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -1403,7 +1444,10 @@ mod networking {
             .spawn()
             .expect("Failed to spawn bridge container");
 
-        let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
+        let veth_name = child
+            .veth_name()
+            .expect("Bridge mode must have a veth name")
+            .to_string();
 
         // The host-side veth should exist while the container is running
         let status = std::process::Command::new("ip")
@@ -1411,7 +1455,11 @@ mod networking {
             .stdout(std::process::Stdio::null())
             .status()
             .expect("Failed to run ip link show");
-        assert!(status.success(), "Host-side veth {} should exist after spawn", veth_name);
+        assert!(
+            status.success(),
+            "Host-side veth {} should exist after spawn",
+            veth_name
+        );
 
         child.wait().expect("Failed to wait for container");
     }
@@ -1442,7 +1490,10 @@ mod networking {
             .spawn()
             .expect("Failed to spawn bridge container");
 
-        let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
+        let veth_name = child
+            .veth_name()
+            .expect("Bridge mode must have a veth name")
+            .to_string();
         child.wait().expect("Failed to wait for container");
 
         // After wait(), teardown_network() removes the veth pair and the named netns.
@@ -1483,7 +1534,10 @@ mod networking {
             .spawn()
             .expect("Failed to spawn bridge container");
 
-        let ns_name = child.netns_name().expect("Bridge mode must have netns name").to_string();
+        let ns_name = child
+            .netns_name()
+            .expect("Bridge mode must have netns name")
+            .to_string();
         let ns_path = format!("/run/netns/{}", ns_name);
 
         // The named netns should exist before wait()
@@ -1559,7 +1613,10 @@ mod networking {
         };
 
         let child = Command::new("/bin/ash")
-            .args(&["-c", "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK"])
+            .args(&[
+                "-c",
+                "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK",
+            ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -1603,7 +1660,10 @@ mod networking {
         let r1 = rootfs.clone();
         let t1 = std::thread::spawn(move || {
             Command::new("/bin/ash")
-                .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+                .args(&[
+                    "-c",
+                    "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'",
+                ])
                 .with_namespaces(Namespace::MOUNT | Namespace::UTS)
                 .with_network(NetworkMode::Bridge)
                 .with_chroot(&r1)
@@ -1621,7 +1681,10 @@ mod networking {
         let r2 = rootfs.clone();
         let t2 = std::thread::spawn(move || {
             Command::new("/bin/ash")
-                .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+                .args(&[
+                    "-c",
+                    "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'",
+                ])
                 .with_namespaces(Namespace::MOUNT | Namespace::UTS)
                 .with_network(NetworkMode::Bridge)
                 .with_chroot(&r2)
@@ -1644,9 +1707,21 @@ mod networking {
 
         assert!(!ip1.is_empty(), "Container 1 should output its IP address");
         assert!(!ip2.is_empty(), "Container 2 should output its IP address");
-        assert!(ip1.starts_with("172.19.0."), "Container 1 IP should be in bridge subnet: {}", ip1);
-        assert!(ip2.starts_with("172.19.0."), "Container 2 IP should be in bridge subnet: {}", ip2);
-        assert_ne!(ip1, ip2, "Containers must receive different IPs: got {} and {}", ip1, ip2);
+        assert!(
+            ip1.starts_with("172.19.0."),
+            "Container 1 IP should be in bridge subnet: {}",
+            ip1
+        );
+        assert!(
+            ip2.starts_with("172.19.0."),
+            "Container 2 IP should be in bridge subnet: {}",
+            ip2
+        );
+        assert_ne!(
+            ip1, ip2,
+            "Containers must receive different IPs: got {} and {}",
+            ip1, ip2
+        );
     }
 
     #[test]
@@ -1927,10 +2002,13 @@ mod networking {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("dport 18080"),
-            "prerouting chain should contain DNAT rule for dport 18080; got:\n{}", stdout
+            "prerouting chain should contain DNAT rule for dport 18080; got:\n{}",
+            stdout
         );
 
-        child.wait().expect("Failed to wait for port-forward container");
+        child
+            .wait()
+            .expect("Failed to wait for port-forward container");
     }
 
     /// N4: After a port-forward container exits, its DNAT rule must be cleaned up.
@@ -1965,7 +2043,9 @@ mod networking {
             .spawn()
             .expect("Failed to spawn port-forward container");
 
-        child.wait().expect("Failed to wait for port-forward container");
+        child
+            .wait()
+            .expect("Failed to wait for port-forward container");
 
         // After the container exits, the table must be gone entirely.
         let status = std::process::Command::new("nft")
@@ -2044,7 +2124,8 @@ mod networking {
         );
         assert!(
             stdout.contains("dport 18083"),
-            "B's DNAT rule (dport 18083) should still be present; got:\n{}", stdout
+            "B's DNAT rule (dport 18083) should still be present; got:\n{}",
+            stdout
         );
 
         // Wait for B. Both containers gone — table must be removed entirely.
@@ -2094,16 +2175,20 @@ mod networking {
             .spawn()
             .expect("Failed to spawn DNS container");
 
-        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("Failed to wait for DNS container");
+        let (_status, stdout_bytes, _stderr) = child
+            .wait_with_output()
+            .expect("Failed to wait for DNS container");
         let stdout = String::from_utf8_lossy(&stdout_bytes);
 
         assert!(
             stdout.contains("nameserver 1.1.1.1"),
-            "/etc/resolv.conf should contain 'nameserver 1.1.1.1'; got:\n{}", stdout
+            "/etc/resolv.conf should contain 'nameserver 1.1.1.1'; got:\n{}",
+            stdout
         );
         assert!(
             stdout.contains("nameserver 8.8.8.8"),
-            "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}", stdout
+            "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}",
+            stdout
         );
     }
 
@@ -2169,7 +2254,9 @@ mod networking {
         // on the pf-test-h veth, goes through PREROUTING (DNAT → container
         // IP:80), then FORWARD to the container via the bridge.
         let setup_ok = std::process::Command::new("sh")
-            .args(["-c", "\
+            .args([
+                "-c",
+                "\
                 ip netns add pf-test-client && \
                 ip link add pf-test-h type veth peer name pf-test-c && \
                 ip link set pf-test-c netns pf-test-client && \
@@ -2178,7 +2265,8 @@ mod networking {
                 ip netns exec pf-test-client ip addr add 10.99.0.2/24 dev pf-test-c && \
                 ip netns exec pf-test-client ip link set pf-test-c up && \
                 ip netns exec pf-test-client ip route add default via 10.99.0.1\
-            "])
+            ",
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -2187,7 +2275,9 @@ mod networking {
 
         if !setup_ok {
             // Clean up container and skip.
-            unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+            unsafe {
+                libc::kill(child_a.pid(), libc::SIGKILL);
+            }
             let _ = child_a.wait();
             eprintln!("Skipping test_port_forward_end_to_end: failed to set up test netns");
             return;
@@ -2195,7 +2285,16 @@ mod networking {
 
         // Connect from the external namespace to the host on the forwarded port.
         let output = std::process::Command::new("ip")
-            .args(["netns", "exec", "pf-test-client", "nc", "-w", "2", "10.99.0.1", "19090"])
+            .args([
+                "netns",
+                "exec",
+                "pf-test-client",
+                "nc",
+                "-w",
+                "2",
+                "10.99.0.1",
+                "19090",
+            ])
             .output()
             .expect("nc from test netns");
         let out = String::from_utf8_lossy(&output.stdout);
@@ -2208,7 +2307,9 @@ mod networking {
         let _ = std::process::Command::new("ip")
             .args(["link", "del", "pf-test-h"])
             .status();
-        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        unsafe {
+            libc::kill(child_a.pid(), libc::SIGKILL);
+        }
         let _ = child_a.wait();
 
         assert!(
@@ -2276,10 +2377,15 @@ mod networking {
             .status()
             .expect("iptables -C")
             .success();
-        assert!(iptables_exists, "iptables FORWARD rule should exist before kill");
+        assert!(
+            iptables_exists,
+            "iptables FORWARD rule should exist before kill"
+        );
 
         // SIGKILL the container.
-        unsafe { libc::kill(child.pid(), libc::SIGKILL); }
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
 
         // wait() should still run teardown.
         let _ = child.wait();
@@ -2292,12 +2398,17 @@ mod networking {
             .status()
             .expect("ip link show after kill")
             .success();
-        assert!(!veth_after, "veth {} should be gone after SIGKILL + wait()", veth);
+        assert!(
+            !veth_after,
+            "veth {} should be gone after SIGKILL + wait()",
+            veth
+        );
 
         let netns_path = format!("/run/netns/{}", netns);
         assert!(
             !std::path::Path::new(&netns_path).exists(),
-            "netns {} should be gone after SIGKILL + wait()", netns
+            "netns {} should be gone after SIGKILL + wait()",
+            netns
         );
 
         let nft_after = std::process::Command::new("nft")
@@ -2307,7 +2418,10 @@ mod networking {
             .status()
             .expect("nft list table after kill")
             .success();
-        assert!(!nft_after, "nftables table should be gone after SIGKILL + wait()");
+        assert!(
+            !nft_after,
+            "nftables table should be gone after SIGKILL + wait()"
+        );
 
         let iptables_after = std::process::Command::new("iptables")
             .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
@@ -2316,7 +2430,10 @@ mod networking {
             .status()
             .expect("iptables -C after kill")
             .success();
-        assert!(!iptables_after, "iptables FORWARD rule should be gone after SIGKILL + wait()");
+        assert!(
+            !iptables_after,
+            "iptables FORWARD rule should be gone after SIGKILL + wait()"
+        );
     }
 
     /// N3: NAT must actually allow outbound TCP traffic, not just have rules.
@@ -2376,7 +2493,8 @@ mod networking {
         assert!(
             status.success(),
             "wget through NAT should succeed (TCP to 1.1.1.1).\nstdout: {}\nstderr: {}",
-            out, err
+            out,
+            err
         );
     }
 }
@@ -2446,7 +2564,9 @@ mod oci_lifecycle {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let (stdout, _, _) = run_remora(&["state", id]);
-            if stdout.contains("\"stopped\"") { break; }
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
             if std::time::Instant::now() > deadline {
                 run_remora(&["delete", id]).2;
                 panic!("container did not stop within {} seconds", timeout_secs);
@@ -2521,7 +2641,10 @@ mod oci_lifecycle {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                panic!("container did not stop within 6 seconds; last state: {}", stdout);
+                panic!(
+                    "container did not stop within 6 seconds; last state: {}",
+                    stdout
+                );
             }
         }
 
@@ -2531,7 +2654,11 @@ mod oci_lifecycle {
 
         // state dir should be gone
         let state_dir = remora::oci::state_dir(&id);
-        assert!(!state_dir.exists(), "state dir still exists after delete: {}", state_dir.display());
+        assert!(
+            !state_dir.exists(),
+            "state dir still exists after delete: {}",
+            state_dir.display()
+        );
     }
 
     /// test_oci_kill
@@ -2734,7 +2861,11 @@ mod oci_lifecycle {
 
         let (_, stderr, ok) = run_remora(&["delete", &id]);
         assert!(ok, "remora delete failed: {}", stderr);
-        assert!(stderr.is_empty() || !stderr.contains("error"), "unexpected error: {}", stderr);
+        assert!(
+            stderr.is_empty() || !stderr.contains("error"),
+            "unexpected error: {}",
+            stderr
+        );
     }
 
     /// test_oci_capabilities
@@ -2916,10 +3047,16 @@ mod oci_lifecycle {
     /// wiring into `with_cgroup_memory()` / `with_cgroup_pids_limit()` is broken.
     #[test]
     fn test_oci_resources() {
-        if !is_root() { eprintln!("Skipping test_oci_resources: requires root"); return; }
+        if !is_root() {
+            eprintln!("Skipping test_oci_resources: requires root");
+            return;
+        }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_oci_resources: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_oci_resources: alpine-rootfs not found");
+                return;
+            }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
@@ -2957,10 +3094,16 @@ mod oci_lifecycle {
     /// `with_rlimit()` in `build_command()` is broken.
     #[test]
     fn test_oci_rlimits() {
-        if !is_root() { eprintln!("Skipping test_oci_rlimits: requires root"); return; }
+        if !is_root() {
+            eprintln!("Skipping test_oci_rlimits: requires root");
+            return;
+        }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_oci_rlimits: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_oci_rlimits: alpine-rootfs not found");
+                return;
+            }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
@@ -2994,10 +3137,16 @@ mod oci_lifecycle {
     /// `with_sysctl()` / pre_exec write to `/proc/sys/` is broken.
     #[test]
     fn test_oci_sysctl() {
-        if !is_root() { eprintln!("Skipping test_oci_sysctl: requires root"); return; }
+        if !is_root() {
+            eprintln!("Skipping test_oci_sysctl: requires root");
+            return;
+        }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_oci_sysctl: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_oci_sysctl: alpine-rootfs not found");
+                return;
+            }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
@@ -3034,10 +3183,16 @@ mod oci_lifecycle {
     /// in `cmd_create()` / `cmd_delete()`, is broken.
     #[test]
     fn test_oci_hooks() {
-        if !is_root() { eprintln!("Skipping test_oci_hooks: requires root"); return; }
+        if !is_root() {
+            eprintln!("Skipping test_oci_hooks: requires root");
+            return;
+        }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_oci_hooks: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_oci_hooks: alpine-rootfs not found");
+                return;
+            }
         };
         let hooks_dir = tempfile::tempdir().expect("tempdir for hooks");
         let prestart_marker = hooks_dir.path().join("prestart_ran");
@@ -3075,7 +3230,9 @@ mod oci_lifecycle {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let (stdout, _, _) = run_remora(&["state", &id]);
-            if stdout.contains("\"stopped\"") { break; }
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
             if std::time::Instant::now() > deadline {
                 run_remora(&["delete", &id]).2;
                 panic!("container did not stop within 5 seconds");
@@ -3100,10 +3257,16 @@ mod oci_lifecycle {
     /// `with_seccomp_program()` wiring in `build_command()` is broken.
     #[test]
     fn test_oci_seccomp() {
-        if !is_root() { eprintln!("Skipping test_oci_seccomp: requires root"); return; }
+        if !is_root() {
+            eprintln!("Skipping test_oci_seccomp: requires root");
+            return;
+        }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_oci_seccomp: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_oci_seccomp: alpine-rootfs not found");
+                return;
+            }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
@@ -3148,7 +3311,10 @@ mod rootless {
         }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_rootless_basic: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_rootless_basic: alpine-rootfs not found");
+                return;
+            }
         };
         // When running rootless, spawn() auto-adds Namespace::USER and a uid/gid map
         // that makes the process appear as UID 0 inside the container.
@@ -3168,7 +3334,11 @@ mod rootless {
         assert!(status.success(), "rootless container exited non-zero");
         let out = String::from_utf8_lossy(&stdout);
         // Inside the container the process maps to UID 0 via the user namespace.
-        assert!(out.contains("uid=0"), "expected uid=0 inside rootless container, got: {}", out);
+        assert!(
+            out.contains("uid=0"),
+            "expected uid=0 inside rootless container, got: {}",
+            out
+        );
     }
 
     #[test]
@@ -3179,7 +3349,10 @@ mod rootless {
         }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_rootless_loopback: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_rootless_loopback: alpine-rootfs not found");
+                return;
+            }
         };
         // Loopback networking works in rootless mode: the container gets a private
         // NET namespace (and USER namespace from auto-config) and lo is brought up.
@@ -3208,7 +3381,10 @@ mod rootless {
         }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_rootless_bridge_rejected: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_rootless_bridge_rejected: alpine-rootfs not found");
+                return;
+            }
         };
         // Bridge mode should be rejected with a clear error in rootless mode.
         let result = Command::new("/bin/echo")
@@ -3221,8 +3397,11 @@ mod rootless {
             Ok(_) => panic!("expected bridge networking to fail in rootless mode"),
             Err(e) => {
                 let err_msg = format!("{}", e);
-                assert!(err_msg.contains("rootless") || err_msg.contains("root"),
-                    "error message should mention rootless/root: {}", err_msg);
+                assert!(
+                    err_msg.contains("rootless") || err_msg.contains("root"),
+                    "error message should mention rootless/root: {}",
+                    err_msg
+                );
             }
         }
     }
@@ -3247,8 +3426,16 @@ mod rootless {
         }
         let child = Command::new("/usr/bin/id")
             .with_namespaces(Namespace::USER)
-            .with_uid_maps(&[UidMap { inside: 0, outside: 0, count: 1 }])
-            .with_gid_maps(&[GidMap { inside: 0, outside: 0, count: 1 }])
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: 0,
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: 0,
+                count: 1,
+            }])
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
             .spawn()
@@ -3257,7 +3444,11 @@ mod rootless {
         let (status, stdout, _) = child.wait_with_output().expect("wait failed");
         assert!(status.success(), "user namespace container exited non-zero");
         let out = String::from_utf8_lossy(&stdout);
-        assert!(out.contains("uid=0"), "expected uid=0 inside user namespace, got: {}", out);
+        assert!(
+            out.contains("uid=0"),
+            "expected uid=0 inside user namespace, got: {}",
+            out
+        );
     }
 
     /// Verify that pasta creates a TAP interface with an IP address inside the container's netns.
@@ -3284,7 +3475,10 @@ mod rootless {
         }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_pasta_interface_exists: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_pasta_interface_exists: alpine-rootfs not found");
+                return;
+            }
         };
 
         let child = Command::new("/bin/ash")
@@ -3303,11 +3497,14 @@ mod rootless {
         assert!(status.success(), "container exited non-zero");
 
         let out = String::from_utf8_lossy(&stdout);
-        let has_non_loopback = out.lines().any(|l| {
-            l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
-        });
-        assert!(has_non_loopback,
-            "expected a non-loopback TAP interface from pasta, got:\n{}", out);
+        let has_non_loopback = out
+            .lines()
+            .any(|l| l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@"));
+        assert!(
+            has_non_loopback,
+            "expected a non-loopback TAP interface from pasta, got:\n{}",
+            out
+        );
 
         // With --config-net, pasta configures the IP address inside the container's netns.
         // A non-127.x inet address means pasta did more than just create the TAP.
@@ -3315,8 +3512,11 @@ mod rootless {
             let l = l.trim();
             l.starts_with("inet ") && !l.starts_with("inet 127.")
         });
-        assert!(has_tap_ip,
-            "expected inet address on pasta TAP (--config-net), got:\n{}", out);
+        assert!(
+            has_tap_ip,
+            "expected inet address on pasta TAP (--config-net), got:\n{}",
+            out
+        );
     }
 
     /// Verify that pasta works in the rootless (USER+NET two-phase unshare) path and
@@ -3338,7 +3538,10 @@ mod rootless {
         }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_pasta_rootless: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_pasta_rootless: alpine-rootfs not found");
+                return;
+            }
         };
 
         let child = Command::new("/bin/ash")
@@ -3357,18 +3560,24 @@ mod rootless {
         assert!(status.success(), "container exited non-zero");
 
         let out = String::from_utf8_lossy(&stdout);
-        let has_non_loopback = out.lines().any(|l| {
-            l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
-        });
-        assert!(has_non_loopback,
-            "expected a non-loopback TAP interface from pasta in rootless mode, got:\n{}", out);
+        let has_non_loopback = out
+            .lines()
+            .any(|l| l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@"));
+        assert!(
+            has_non_loopback,
+            "expected a non-loopback TAP interface from pasta in rootless mode, got:\n{}",
+            out
+        );
 
         let has_tap_ip = out.lines().any(|l| {
             let l = l.trim();
             l.starts_with("inet ") && !l.starts_with("inet 127.")
         });
-        assert!(has_tap_ip,
-            "expected inet address on pasta TAP in rootless mode, got:\n{}", out);
+        assert!(
+            has_tap_ip,
+            "expected inet address on pasta TAP in rootless mode, got:\n{}",
+            out
+        );
     }
 
     /// Verify actual end-to-end internet connectivity through pasta.
@@ -3392,14 +3601,20 @@ mod rootless {
         }
         let rootfs = match get_test_rootfs() {
             Some(p) => p,
-            None => { eprintln!("Skipping test_pasta_connectivity: alpine-rootfs not found"); return; }
+            None => {
+                eprintln!("Skipping test_pasta_connectivity: alpine-rootfs not found");
+                return;
+            }
         };
 
         // sleep 2: give pasta time to attach the TAP and configure IP+routes via --config-net.
         // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
         // only has proc mounted, not a full /dev with device nodes).
         let child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED"])
+            .args(&[
+                "-c",
+                "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED",
+            ])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_proc_mount()
@@ -3415,8 +3630,11 @@ mod rootless {
         let err = String::from_utf8_lossy(&stderr);
         assert!(status.success(),
             "pasta connectivity test failed (is outbound internet available?)\nstdout: {}\nstderr: {}", out, err);
-        assert!(out.contains("CONNECTED"),
-            "wget succeeded but CONNECTED marker missing:\n{}", out);
+        assert!(
+            out.contains("CONNECTED"),
+            "wget succeeded but CONNECTED marker missing:\n{}",
+            out
+        );
     }
 }
 
@@ -3448,14 +3666,17 @@ mod linking {
             .spawn()
             .expect("Failed to spawn container A");
 
-        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+        let ip_a = child_a
+            .container_ip()
+            .expect("container A should have bridge IP");
 
         // Write A's state so B can resolve it.
         let state_dir = std::path::Path::new("/run/remora/containers/link-test-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-test-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
-            child_a.pid(), ip_a
+            child_a.pid(),
+            ip_a
         );
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
@@ -3477,7 +3698,9 @@ mod linking {
         let out = String::from_utf8_lossy(&stdout);
 
         // Clean up A.
-        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        unsafe {
+            libc::kill(child_a.pid(), libc::SIGKILL);
+        }
         let _ = child_a.wait();
         let _ = std::fs::remove_dir_all(state_dir);
 
@@ -3485,7 +3708,8 @@ mod linking {
         assert!(
             out.contains(&ip_a) && out.contains("link-test-a"),
             "B's /etc/hosts should contain A's IP ({}) and name, got:\n{}",
-            ip_a, out
+            ip_a,
+            out
         );
     }
 
@@ -3523,13 +3747,16 @@ mod linking {
             .spawn()
             .expect("Failed to spawn container A");
 
-        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+        let ip_a = child_a
+            .container_ip()
+            .expect("container A should have bridge IP");
 
         let state_dir = std::path::Path::new("/run/remora/containers/link-alias-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-alias-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
-            child_a.pid(), ip_a
+            child_a.pid(),
+            ip_a
         );
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
@@ -3550,7 +3777,9 @@ mod linking {
         let (status, stdout, _) = child_b.wait_with_output().expect("wait B");
         let out = String::from_utf8_lossy(&stdout);
 
-        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        unsafe {
+            libc::kill(child_a.pid(), libc::SIGKILL);
+        }
         let _ = child_a.wait();
         let _ = std::fs::remove_dir_all(state_dir);
 
@@ -3558,7 +3787,8 @@ mod linking {
         assert!(
             out.contains(&ip_a) && out.contains("db"),
             "B's /etc/hosts should contain A's IP ({}) and alias 'db', got:\n{}",
-            ip_a, out
+            ip_a,
+            out
         );
         assert!(
             out.contains("link-alias-a"),
@@ -3602,13 +3832,16 @@ mod linking {
             .spawn()
             .expect("Failed to spawn container A");
 
-        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+        let ip_a = child_a
+            .container_ip()
+            .expect("container A should have bridge IP");
 
         let state_dir = std::path::Path::new("/run/remora/containers/link-ping-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-ping-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
-            child_a.pid(), ip_a
+            child_a.pid(),
+            ip_a
         );
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
@@ -3630,14 +3863,17 @@ mod linking {
         let out = String::from_utf8_lossy(&stdout);
         let err = String::from_utf8_lossy(&stderr);
 
-        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        unsafe {
+            libc::kill(child_a.pid(), libc::SIGKILL);
+        }
         let _ = child_a.wait();
         let _ = std::fs::remove_dir_all(state_dir);
 
         assert!(
             status.success(),
             "ping from B to A by name should succeed.\nstdout: {}\nstderr: {}",
-            out, err
+            out,
+            err
         );
     }
 
@@ -3683,14 +3919,17 @@ mod linking {
             .spawn()
             .expect("Failed to spawn container A");
 
-        let ip_a = child_a.container_ip().expect("container A should have bridge IP");
+        let ip_a = child_a
+            .container_ip()
+            .expect("container A should have bridge IP");
 
         // Register A's state so B can resolve the link name.
         let state_dir = std::path::Path::new("/run/remora/containers/link-tcp-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-tcp-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["/bin/sh"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
-            child_a.pid(), ip_a
+            child_a.pid(),
+            ip_a
         );
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
@@ -3717,19 +3956,23 @@ mod linking {
         let err = String::from_utf8_lossy(&stderr_b);
 
         // Clean up A (it should have exited after sending, but kill to be sure).
-        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        unsafe {
+            libc::kill(child_a.pid(), libc::SIGKILL);
+        }
         let _ = child_a.wait();
         let _ = std::fs::remove_dir_all(state_dir);
 
         assert!(
             status_b.success(),
             "Container B should connect to A via TCP successfully.\nstdout: {}\nstderr: {}",
-            out, err
+            out,
+            err
         );
         assert!(
             out.contains("HELLO_FROM_A"),
             "B should receive 'HELLO_FROM_A' from A via TCP, got:\nstdout: {}\nstderr: {}",
-            out, err
+            out,
+            err
         );
     }
 
@@ -3786,12 +4029,7 @@ mod images {
     /// Re-creates the empty mount-point directories afterward.
     fn copy_rootfs(rootfs: &std::path::Path, dest: &std::path::Path) {
         let status = std::process::Command::new("rsync")
-            .args(&[
-                "-a",
-                "--exclude=/sys",
-                "--exclude=/proc",
-                "--exclude=/dev",
-            ])
+            .args(&["-a", "--exclude=/sys", "--exclude=/proc", "--exclude=/dev"])
             .arg(rootfs.to_str().unwrap().to_string() + "/")
             .arg(dest.to_str().unwrap().to_string() + "/")
             .status()
@@ -3835,7 +4073,9 @@ mod images {
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, "test-file.txt", &data[..]).unwrap();
+            builder
+                .append_data(&mut header, "test-file.txt", &data[..])
+                .unwrap();
 
             // Add a file in a subdirectory.
             let data2 = b"nested content";
@@ -3843,7 +4083,9 @@ mod images {
             header2.set_size(data2.len() as u64);
             header2.set_mode(0o644);
             header2.set_cksum();
-            builder.append_data(&mut header2, "subdir/nested.txt", &data2[..]).unwrap();
+            builder
+                .append_data(&mut header2, "subdir/nested.txt", &data2[..])
+                .unwrap();
 
             builder.finish().unwrap();
         }
@@ -3855,14 +4097,24 @@ mod images {
         let _ = std::fs::remove_dir_all(&layer_path);
 
         let result = image::extract_layer(digest, &tar_gz_path);
-        assert!(result.is_ok(), "extract_layer should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "extract_layer should succeed: {:?}",
+            result.err()
+        );
         let extracted = result.unwrap();
-        assert!(extracted.join("test-file.txt").exists(), "test-file.txt should exist");
+        assert!(
+            extracted.join("test-file.txt").exists(),
+            "test-file.txt should exist"
+        );
         assert_eq!(
             std::fs::read_to_string(extracted.join("test-file.txt")).unwrap(),
             "hello from layer"
         );
-        assert!(extracted.join("subdir/nested.txt").exists(), "subdir/nested.txt should exist");
+        assert!(
+            extracted.join("subdir/nested.txt").exists(),
+            "subdir/nested.txt should exist"
+        );
         assert_eq!(
             std::fs::read_to_string(extracted.join("subdir/nested.txt")).unwrap(),
             "nested content"
@@ -3924,8 +4176,16 @@ mod images {
         let err = String::from_utf8_lossy(&stderr);
 
         assert!(status.success(), "container should exit 0, stderr: {}", err);
-        assert!(out.contains("bottom"), "should see bottom layer file, got: {}", out);
-        assert!(out.contains("top"), "should see top layer file, got: {}", out);
+        assert!(
+            out.contains("bottom"),
+            "should see bottom layer file, got: {}",
+            out
+        );
+        assert!(
+            out.contains("top"),
+            "should see top layer file, got: {}",
+            out
+        );
     }
 
     /// test_multi_layer_overlay_shadow
@@ -3977,7 +4237,12 @@ mod images {
         let err = String::from_utf8_lossy(&stderr);
 
         assert!(status.success(), "container should exit 0, stderr: {}", err);
-        assert_eq!(out.trim(), "top-value", "top layer should shadow bottom, got: {}", out);
+        assert_eq!(
+            out.trim(),
+            "top-value",
+            "top layer should shadow bottom, got: {}",
+            out
+        );
     }
 
     /// test_image_layers_cleanup
@@ -4016,13 +4281,26 @@ mod images {
             .spawn()
             .expect("spawn");
 
-        let merged = child.overlay_merged_dir().expect("should have merged dir").to_path_buf();
-        let overlay_base = merged.parent().expect("merged should have parent").to_path_buf();
-        assert!(overlay_base.exists(), "overlay base dir should exist before wait");
+        let merged = child
+            .overlay_merged_dir()
+            .expect("should have merged dir")
+            .to_path_buf();
+        let overlay_base = merged
+            .parent()
+            .expect("merged should have parent")
+            .to_path_buf();
+        assert!(
+            overlay_base.exists(),
+            "overlay base dir should exist before wait"
+        );
 
         let status = child.wait().expect("wait");
         assert!(status.success(), "container should exit 0");
-        assert!(!overlay_base.exists(), "overlay base dir should be cleaned up after wait: {:?}", overlay_base);
+        assert!(
+            !overlay_base.exists(),
+            "overlay base dir should be cleaned up after wait: {:?}",
+            overlay_base
+        );
     }
 
     /// test_pull_and_run_real_image
@@ -4063,8 +4341,8 @@ mod images {
         assert!(pull_status.success(), "remora image pull should succeed");
 
         // Load manifest and resolve layers.
-        let manifest = image::load_image(reference)
-            .expect("image manifest should be loadable after pull");
+        let manifest =
+            image::load_image(reference).expect("image manifest should be loadable after pull");
         let layers = image::layer_dirs(&manifest);
         assert!(!layers.is_empty(), "alpine should have at least one layer");
 
@@ -4088,7 +4366,8 @@ mod images {
         // Alpine release is a version like "3.19.1" or "3.23.3".
         assert!(
             out.chars().next().map_or(false, |c| c.is_ascii_digit()) && out.contains('.'),
-            "expected Alpine version string, got: '{}'", out
+            "expected Alpine version string, got: '{}'",
+            out
         );
         println!("Alpine version from real image: {}", out);
 
@@ -4122,10 +4401,12 @@ mod exec {
             let container_ns = format!("/proc/{}/ns/{}", pid, ns_name);
             let init_ns = format!("/proc/1/ns/{}", ns_name);
             let c_ino = std::fs::metadata(&container_ns).map(|m| {
-                use std::os::unix::fs::MetadataExt; m.ino()
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
             });
             let i_ino = std::fs::metadata(&init_ns).map(|m| {
-                use std::os::unix::fs::MetadataExt; m.ino()
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
             });
             if let (Ok(c), Ok(i)) = (c_ino, i_ino) {
                 if c != i {
@@ -4140,13 +4421,11 @@ mod exec {
 
         if has_mount_ns {
             let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
-            let mnt_ns_file = std::fs::File::open(&mnt_ns_path)
-                .expect("open mount ns");
+            let mnt_ns_file = std::fs::File::open(&mnt_ns_path).expect("open mount ns");
             let mnt_ns_fd = mnt_ns_file.as_raw_fd();
 
             let root_path = format!("/proc/{}/root", pid);
-            let root_file = std::fs::File::open(&root_path)
-                .expect("open container root");
+            let root_file = std::fs::File::open(&root_path).expect("open container root");
             let root_fd = root_file.as_raw_fd();
 
             cmd = cmd.with_pre_exec(move || {
@@ -4193,7 +4472,10 @@ mod exec {
         }
         let rootfs = match get_test_rootfs() {
             Some(r) => r,
-            None => { eprintln!("Skipping (no rootfs)"); return; }
+            None => {
+                eprintln!("Skipping (no rootfs)");
+                return;
+            }
         };
 
         // Start a long-running container (no PID ns — see note above).
@@ -4219,13 +4501,19 @@ mod exec {
         let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
 
         // Clean up the container.
-        unsafe { libc::kill(pid, libc::SIGKILL); }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
         let _ = container.wait();
 
         let out = String::from_utf8_lossy(&stdout);
         let err = String::from_utf8_lossy(&stderr);
         assert!(status.success(), "exec should exit 0, stderr: {}", err);
-        assert!(out.contains("Alpine"), "exec should see Alpine os-release, got: {}", out);
+        assert!(
+            out.contains("Alpine"),
+            "exec should see Alpine os-release, got: {}",
+            out
+        );
     }
 
     /// Start a container that writes a marker file to a tmpfs, then exec
@@ -4240,13 +4528,19 @@ mod exec {
         }
         let rootfs = match get_test_rootfs() {
             Some(r) => r,
-            None => { eprintln!("Skipping (no rootfs)"); return; }
+            None => {
+                eprintln!("Skipping (no rootfs)");
+                return;
+            }
         };
 
         // Start a container that creates a marker file on tmpfs then sleeps.
         // No PID ns — pid() would return the intermediate, not the real container.
         let mut container = Command::new("/bin/sh")
-            .args(&["-c", "echo EXEC_MARKER_12345 > /tmp/exec-marker && sleep 30"])
+            .args(&[
+                "-c",
+                "echo EXEC_MARKER_12345 > /tmp/exec-marker && sleep 30",
+            ])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_tmpfs("/tmp", "")
@@ -4271,13 +4565,18 @@ mod exec {
         let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
 
         // Clean up.
-        unsafe { libc::kill(pid, libc::SIGKILL); }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
         let _ = container.wait();
 
         let out = String::from_utf8_lossy(&stdout).trim().to_string();
         let err = String::from_utf8_lossy(&stderr);
         assert!(status.success(), "exec should exit 0, stderr: {}", err);
-        assert_eq!(out, "EXEC_MARKER_12345", "exec should see the container's tmpfs marker");
+        assert_eq!(
+            out, "EXEC_MARKER_12345",
+            "exec should see the container's tmpfs marker"
+        );
     }
 
     /// Exec into a container and verify environment variables are visible
@@ -4291,7 +4590,10 @@ mod exec {
         }
         let rootfs = match get_test_rootfs() {
             Some(r) => r,
-            None => { eprintln!("Skipping (no rootfs)"); return; }
+            None => {
+                eprintln!("Skipping (no rootfs)");
+                return;
+            }
         };
 
         // Start container with a custom env var.
@@ -4344,13 +4646,18 @@ mod exec {
         let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
 
         // Clean up.
-        unsafe { libc::kill(pid, libc::SIGKILL); }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
         let _ = container.wait();
 
         let out = String::from_utf8_lossy(&stdout).trim().to_string();
         let err = String::from_utf8_lossy(&stderr);
         assert!(status.success(), "exec should exit 0, stderr: {}", err);
-        assert_eq!(out, "bar_from_container", "exec should see container's FOO env var");
+        assert_eq!(
+            out, "bar_from_container",
+            "exec should see container's FOO env var"
+        );
     }
 
     /// Trying to exec into a non-running container: verify that the liveness

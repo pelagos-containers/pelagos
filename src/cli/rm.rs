@@ -3,8 +3,7 @@
 use super::{check_liveness, container_dir, read_state, ContainerStatus};
 
 pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let state = read_state(name)
-        .map_err(|_| format!("no container named '{}'", name))?;
+    let state = read_state(name).map_err(|_| format!("no container named '{}'", name))?;
 
     if state.status == ContainerStatus::Running && check_liveness(state.pid) {
         if force {
@@ -27,13 +26,13 @@ pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>>
             return Err(format!(
                 "container '{}' is running; use --force to remove it or `remora stop {}` first",
                 name, name
-            ).into());
+            )
+            .into());
         }
     }
 
     let dir = container_dir(name);
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| format!("remove {}: {}", dir.display(), e))?;
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {}", dir.display(), e))?;
 
     Ok(())
 }

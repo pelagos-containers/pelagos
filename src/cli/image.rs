@@ -15,9 +15,7 @@ pub fn cmd_image_pull(reference: &str) -> Result<(), Box<dyn std::error::Error>>
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async {
-        pull_image(&full_ref).await
-    })
+    rt.block_on(async { pull_image(&full_ref).await })
 }
 
 /// List all locally stored images.
@@ -34,7 +32,12 @@ pub fn cmd_image_ls() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &img.digest
         };
-        println!("{:<30} {:<15} {}", img.reference, img.layers.len(), short_digest);
+        println!(
+            "{:<30} {:<15} {}",
+            img.reference,
+            img.layers.len(),
+            short_digest
+        );
     }
     Ok(())
 }
@@ -69,7 +72,8 @@ async fn pull_image(reference: &str) -> Result<(), Box<dyn std::error::Error>> {
     use oci_client::secrets::RegistryAuth;
     use oci_client::{Client, Reference as OciRef};
 
-    let oci_ref: OciRef = reference.parse()
+    let oci_ref: OciRef = reference
+        .parse()
         .map_err(|e| format!("invalid image reference '{}': {:?}", reference, e))?;
 
     let client = Client::new(ClientConfig::default());
@@ -81,7 +85,11 @@ async fn pull_image(reference: &str) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("failed to pull manifest: {}", e))?;
 
-    println!("  Manifest: {} ({} layers)", &digest[..19.min(digest.len())], manifest.layers.len());
+    println!(
+        "  Manifest: {} ({} layers)",
+        &digest[..19.min(digest.len())],
+        manifest.layers.len()
+    );
 
     // Parse the image config from the raw JSON.
     let config = parse_image_config(&config_json)?;
@@ -93,11 +101,21 @@ async fn pull_image(reference: &str) -> Result<(), Box<dyn std::error::Error>> {
         let layer_digest = &layer_desc.digest;
         if layer_exists(layer_digest) {
             cached += 1;
-            println!("  Layer {}/{}: {} (cached)", i + 1, manifest.layers.len(), &layer_digest[7..19.min(layer_digest.len())]);
+            println!(
+                "  Layer {}/{}: {} (cached)",
+                i + 1,
+                manifest.layers.len(),
+                &layer_digest[7..19.min(layer_digest.len())]
+            );
             continue;
         }
 
-        println!("  Layer {}/{}: {} (downloading...)", i + 1, manifest.layers.len(), &layer_digest[7..19.min(layer_digest.len())]);
+        println!(
+            "  Layer {}/{}: {} (downloading...)",
+            i + 1,
+            manifest.layers.len(),
+            &layer_digest[7..19.min(layer_digest.len())]
+        );
 
         // Download to a tempfile, then extract.
         let mut tmp = tempfile::NamedTempFile::new()?;
@@ -134,24 +152,38 @@ fn parse_image_config(config_json: &str) -> Result<ImageConfig, Box<dyn std::err
     let value: serde_json::Value = serde_json::from_str(config_json)
         .map_err(|e| format!("invalid image config JSON: {}", e))?;
 
-    let container_config = value.get("config").or_else(|| value.get("container_config"));
+    let container_config = value
+        .get("config")
+        .or_else(|| value.get("container_config"));
 
     let env = container_config
         .and_then(|c| c.get("Env"))
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let cmd = container_config
         .and_then(|c| c.get("Cmd"))
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let entrypoint = container_config
         .and_then(|c| c.get("Entrypoint"))
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let working_dir = container_config

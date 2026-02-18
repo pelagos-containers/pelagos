@@ -174,7 +174,10 @@ fn main() {
         .container_ip()
         .expect("server should have a bridge IP");
     let server_pid = server.pid() as i32;
-    println!("[main] server running — PID {} — IP {}", server_pid, server_ip);
+    println!(
+        "[main] server running — PID {} — IP {}",
+        server_pid, server_ip
+    );
 
     register_container("smoke-server", server_pid, &server_ip, rootfs_str);
 

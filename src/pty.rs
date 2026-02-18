@@ -88,7 +88,9 @@ impl InteractiveSession {
 
         relay_loop(self.master.as_raw_fd())?;
 
-        self.child.wait().map_err(|e| io::Error::other(e.to_string()))
+        self.child
+            .wait()
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 
@@ -140,9 +142,7 @@ fn relay_loop(master_fd: RawFd) -> io::Result<()> {
         // master → stdout (container output comes to the user's screen)
         if let Some(revents) = fds[1].revents() {
             if revents.contains(PollFlags::POLLIN) {
-                let n = unsafe {
-                    libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len())
-                };
+                let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n > 0 {
                     unsafe {
                         libc::write(libc::STDOUT_FILENO, buf.as_ptr() as *const _, n as usize);

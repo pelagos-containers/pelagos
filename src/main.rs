@@ -24,7 +24,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum CliCommand {
     // ── Container lifecycle ────────────────────────────────────────────────
-
     /// Create and start a container
     Run(cli::run::RunArgs),
 
@@ -63,7 +62,6 @@ enum CliCommand {
     },
 
     // ── Rootfs management ─────────────────────────────────────────────────
-
     /// Manage the rootfs image store
     Rootfs {
         #[clap(subcommand)]
@@ -71,7 +69,6 @@ enum CliCommand {
     },
 
     // ── Volume management ─────────────────────────────────────────────────
-
     /// Manage named volumes
     Volume {
         #[clap(subcommand)]
@@ -79,7 +76,6 @@ enum CliCommand {
     },
 
     // ── Image management ─────────────────────────────────────────────────
-
     /// Manage OCI images
     Image {
         #[clap(subcommand)]
@@ -87,20 +83,15 @@ enum CliCommand {
     },
 
     // ── OCI lifecycle (unchanged) ─────────────────────────────────────────
-
     /// OCI lifecycle: create a container (machine interface)
     Create {
         id: String,
         bundle: std::path::PathBuf,
     },
     /// OCI lifecycle: start a created container
-    Start {
-        id: String,
-    },
+    Start { id: String },
     /// OCI lifecycle: print container state as JSON
-    State {
-        id: String,
-    },
+    State { id: String },
     /// OCI lifecycle: send a signal to a container
     Kill {
         id: String,
@@ -108,9 +99,7 @@ enum CliCommand {
         signal: String,
     },
     /// OCI lifecycle: delete a stopped container's state directory
-    Delete {
-        id: String,
-    },
+    Delete { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -206,18 +195,12 @@ fn main() {
         CliCommand::Create { id, bundle } => {
             remora::oci::cmd_create(&id, &bundle).map_err(|e| e.to_string().into())
         }
-        CliCommand::Start { id } => {
-            remora::oci::cmd_start(&id).map_err(|e| e.to_string().into())
-        }
-        CliCommand::State { id } => {
-            remora::oci::cmd_state(&id).map_err(|e| e.to_string().into())
-        }
+        CliCommand::Start { id } => remora::oci::cmd_start(&id).map_err(|e| e.to_string().into()),
+        CliCommand::State { id } => remora::oci::cmd_state(&id).map_err(|e| e.to_string().into()),
         CliCommand::Kill { id, signal } => {
             remora::oci::cmd_kill(&id, &signal).map_err(|e| e.to_string().into())
         }
-        CliCommand::Delete { id } => {
-            remora::oci::cmd_delete(&id).map_err(|e| e.to_string().into())
-        }
+        CliCommand::Delete { id } => remora::oci::cmd_delete(&id).map_err(|e| e.to_string().into()),
     };
 
     if let Err(e) = result {

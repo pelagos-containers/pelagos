@@ -92,8 +92,8 @@
 
 use bitflags::bitflags;
 use nix::sched::{unshare, CloneFlags};
-pub use seccompiler::BpfProgram;
 use nix::unistd::chroot;
+pub use seccompiler::BpfProgram;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
@@ -136,12 +136,14 @@ pub fn resolve_container_ip(name: &str) -> io::Result<String> {
                         }
                     }
                     return Err(io::Error::other(format!(
-                        "linked container '{}' is not running", name
+                        "linked container '{}' is not running",
+                        name
                     )));
                 }
             }
             return Err(io::Error::other(format!(
-                "linked container '{}' has no bridge IP (is it using bridge networking?)", name
+                "linked container '{}' has no bridge IP (is it using bridge networking?)",
+                name
             )));
         }
     }
@@ -158,18 +160,21 @@ pub fn resolve_container_ip(name: &str) -> io::Result<String> {
                         }
                     }
                     return Err(io::Error::other(format!(
-                        "linked container '{}' is not running", name
+                        "linked container '{}' is not running",
+                        name
                     )));
                 }
             }
             return Err(io::Error::other(format!(
-                "linked container '{}' has no bridge IP (is it using bridge networking?)", name
+                "linked container '{}' has no bridge IP (is it using bridge networking?)",
+                name
             )));
         }
     }
 
     Err(io::Error::other(format!(
-        "container '{}' not found (searched CLI and OCI state)", name
+        "container '{}' not found (searched CLI and OCI state)",
+        name
     )))
 }
 
@@ -379,7 +384,10 @@ impl Volume {
     pub fn create(name: &str) -> io::Result<Self> {
         let path = Self::volumes_dir().join(name);
         std::fs::create_dir_all(&path)?;
-        Ok(Self { name: name.to_string(), path })
+        Ok(Self {
+            name: name.to_string(),
+            path,
+        })
     }
 
     /// Open an existing named volume, returning an error if it does not exist.
@@ -391,7 +399,10 @@ impl Volume {
                 format!("volume '{}' not found at {}", name, path.display()),
             ));
         }
-        Ok(Self { name: name.to_string(), path })
+        Ok(Self {
+            name: name.to_string(),
+            path,
+        })
     }
 
     /// Delete a named volume and its contents.
@@ -610,7 +621,9 @@ impl Command {
     where
         I: IntoIterator<Item = &'a Namespace>,
     {
-        self.namespaces = namespaces.into_iter().fold(Namespace::empty(), |acc, &ns| acc | ns);
+        self.namespaces = namespaces
+            .into_iter()
+            .fold(Namespace::empty(), |acc, &ns| acc | ns);
         self
     }
 
@@ -824,7 +837,11 @@ impl Command {
         soft: libc::rlim_t,
         hard: libc::rlim_t,
     ) -> Self {
-        self.rlimits.push(ResourceLimit { resource, soft, hard });
+        self.rlimits.push(ResourceLimit {
+            resource,
+            soft,
+            hard,
+        });
         self
     }
 
@@ -869,7 +886,9 @@ impl Command {
     ///
     /// Requires root or `CAP_SYS_ADMIN`.
     pub fn with_cgroup_memory(mut self, bytes: i64) -> Self {
-        self.cgroup_config.get_or_insert_with(Default::default).memory_limit = Some(bytes);
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .memory_limit = Some(bytes);
         self
     }
 
@@ -878,7 +897,9 @@ impl Command {
     /// Maps to `cpu.weight` in cgroups v2 (range 1–10000; default 100) and
     /// `cpu.shares` in v1. Higher values receive proportionally more CPU time.
     pub fn with_cgroup_cpu_shares(mut self, shares: u64) -> Self {
-        self.cgroup_config.get_or_insert_with(Default::default).cpu_shares = Some(shares);
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .cpu_shares = Some(shares);
         self
     }
 
@@ -887,7 +908,9 @@ impl Command {
     /// `quota_us` is the maximum CPU time (in microseconds) the container may
     /// use per `period_us`. Example: `(50_000, 100_000)` = 50% of one CPU core.
     pub fn with_cgroup_cpu_quota(mut self, quota_us: i64, period_us: u64) -> Self {
-        self.cgroup_config.get_or_insert_with(Default::default).cpu_quota = Some((quota_us, period_us));
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .cpu_quota = Some((quota_us, period_us));
         self
     }
 
@@ -895,7 +918,9 @@ impl Command {
     ///
     /// Maps to `pids.max`. Forks beyond this limit will fail with `EAGAIN`.
     pub fn with_cgroup_pids_limit(mut self, max: u64) -> Self {
-        self.cgroup_config.get_or_insert_with(Default::default).pids_limit = Some(max);
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .pids_limit = Some(max);
         self
     }
 
@@ -1008,7 +1033,8 @@ impl Command {
     ///
     /// The container name is used as the hostname alias.
     pub fn with_link(mut self, container_name: &str) -> Self {
-        self.links.push((container_name.to_string(), container_name.to_string()));
+        self.links
+            .push((container_name.to_string(), container_name.to_string()));
         self
     }
 
@@ -1017,7 +1043,8 @@ impl Command {
     /// Like [`with_link`](Self::with_link), but the target is reachable by `alias`
     /// in addition to its original name.
     pub fn with_link_alias(mut self, container_name: &str, alias: &str) -> Self {
-        self.links.push((container_name.to_string(), alias.to_string()));
+        self.links
+            .push((container_name.to_string(), alias.to_string()));
         self
     }
 
@@ -1043,7 +1070,9 @@ impl Command {
     ///     .spawn()?;
     /// ```
     pub fn with_overlay<P1: Into<PathBuf>, P2: Into<PathBuf>>(
-        mut self, upper_dir: P1, work_dir: P2,
+        mut self,
+        upper_dir: P1,
+        work_dir: P2,
     ) -> Self {
         self.overlay = Some(OverlayConfig {
             upper_dir: upper_dir.into(),
@@ -1064,12 +1093,15 @@ impl Command {
     ///
     /// Do not combine with `with_chroot()` or `with_overlay()` — this method sets both.
     pub fn with_image_layers(mut self, layer_dirs: Vec<PathBuf>) -> Self {
-        assert!(!layer_dirs.is_empty(), "with_image_layers requires at least one layer");
+        assert!(
+            !layer_dirs.is_empty(),
+            "with_image_layers requires at least one layer"
+        );
         // Bottom layer (last element) serves as the chroot anchor.
         self.chroot_dir = Some(layer_dirs.last().unwrap().clone());
         self.overlay = Some(OverlayConfig {
-            upper_dir: PathBuf::new(),  // placeholder — auto-created by spawn
-            work_dir: PathBuf::new(),   // placeholder — auto-created by spawn
+            upper_dir: PathBuf::new(), // placeholder — auto-created by spawn
+            work_dir: PathBuf::new(),  // placeholder — auto-created by spawn
             lower_dirs: layer_dirs,
         });
         self.namespaces |= Namespace::MOUNT;
@@ -1315,7 +1347,11 @@ impl Command {
         P1: Into<PathBuf>,
         P2: Into<PathBuf>,
     {
-        self.bind_mounts.push(BindMount { source: source.into(), target: target.into(), readonly: false });
+        self.bind_mounts.push(BindMount {
+            source: source.into(),
+            target: target.into(),
+            readonly: false,
+        });
         self
     }
 
@@ -1327,7 +1363,11 @@ impl Command {
         P1: Into<PathBuf>,
         P2: Into<PathBuf>,
     {
-        self.bind_mounts.push(BindMount { source: source.into(), target: target.into(), readonly: true });
+        self.bind_mounts.push(BindMount {
+            source: source.into(),
+            target: target.into(),
+            readonly: true,
+        });
         self
     }
 
@@ -1341,7 +1381,10 @@ impl Command {
     ///
     /// Requires `Namespace::MOUNT` to be set.
     pub fn with_tmpfs<P: Into<PathBuf>>(mut self, target: P, options: &str) -> Self {
-        self.tmpfs_mounts.push(TmpfsMount { target: target.into(), options: options.to_string() });
+        self.tmpfs_mounts.push(TmpfsMount {
+            target: target.into(),
+            options: options.to_string(),
+        });
         self
     }
 
@@ -1363,10 +1406,12 @@ impl Command {
                 Some(prog)
             } else if let Some(profile) = &self.seccomp_profile {
                 match profile {
-                    SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
-                        .map_err(Error::Seccomp)?),
-                    SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
-                        .map_err(Error::Seccomp)?),
+                    SeccompProfile::Docker => {
+                        Some(crate::seccomp::docker_default_filter().map_err(Error::Seccomp)?)
+                    }
+                    SeccompProfile::Minimal => {
+                        Some(crate::seccomp::minimal_filter().map_err(Error::Seccomp)?)
+                    }
                     SeccompProfile::None => None,
                 }
             } else {
@@ -1375,13 +1420,10 @@ impl Command {
 
         // Open namespace files in parent process (can't safely open files in pre_exec)
         // Keep File objects alive so their fds remain valid through spawn
-        let join_ns_files: Vec<(File, Namespace)> = self.join_namespaces
+        let join_ns_files: Vec<(File, Namespace)> = self
+            .join_namespaces
             .iter()
-            .map(|(path, ns)| {
-                File::open(path)
-                    .map(|f| (f, *ns))
-                    .map_err(Error::Io)
-            })
+            .map(|(path, ns)| File::open(path).map(|f| (f, *ns)).map_err(Error::Io))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Extract raw fds for use in pre_exec
@@ -1411,7 +1453,9 @@ impl Command {
                 });
             }
             // Bridge networking requires root-level capabilities on the host network.
-            if self.network_config.as_ref()
+            if self
+                .network_config
+                .as_ref()
                 .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
             {
                 return Err(Error::Io(io::Error::other(
@@ -1421,12 +1465,14 @@ impl Command {
         }
 
         // Pasta mode: validate pasta is available and auto-add NET namespace.
-        let is_pasta = self.network_config.as_ref()
+        let is_pasta = self
+            .network_config
+            .as_ref()
             .map_or(false, |c| c.mode == crate::network::NetworkMode::Pasta);
         if is_pasta {
             if !crate::network::is_pasta_available() {
                 return Err(Error::Io(io::Error::other(
-                    "NetworkMode::Pasta requires pasta — install from https://passt.top"
+                    "NetworkMode::Pasta requires pasta — install from https://passt.top",
                 )));
             }
             self.namespaces |= Namespace::NET;
@@ -1461,28 +1507,41 @@ impl Command {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
         });
-        let is_bridge = self.network_config.as_ref().map_or(false, |c| {
-            c.mode == crate::network::NetworkMode::Bridge
-        });
+        let is_bridge = self
+            .network_config
+            .as_ref()
+            .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge);
 
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         // The child's pre_exec will join it via setns — no race whatsoever.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
             let ns_name = crate::network::generate_ns_name();
-            Some(crate::network::setup_bridge_network(&ns_name, self.nat, self.port_forwards.clone()).map_err(Error::Io)?)
+            Some(
+                crate::network::setup_bridge_network(
+                    &ns_name,
+                    self.nat,
+                    self.port_forwards.clone(),
+                )
+                .map_err(Error::Io)?,
+            )
         } else {
             None
         };
         // Pre-allocate the netns path CString so pre_exec can open it without allocating.
-        let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
+        let bridge_ns_path: Option<std::ffi::CString> = bridge_network
+            .as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
         // Validate overlay prerequisites before fork.
         if self.overlay.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
-            return Err(Error::Io(io::Error::other("with_overlay requires Namespace::MOUNT")));
+            return Err(Error::Io(io::Error::other(
+                "with_overlay requires Namespace::MOUNT",
+            )));
         }
         if self.overlay.is_some() && self.chroot_dir.is_none() {
-            return Err(Error::Io(io::Error::other("with_overlay requires with_chroot")));
+            return Err(Error::Io(io::Error::other(
+                "with_overlay requires with_chroot",
+            )));
         }
 
         // Create the overlay merged dir before fork. The actual mount happens in
@@ -1510,28 +1569,37 @@ impl Command {
 
         // Pre-allocate CStrings for the overlay mount (lower, upper, work, merged).
         // Must be done in the parent — no allocation allowed in pre_exec.
-        let overlay_cstrings: Option<(std::ffi::CString, std::ffi::CString, std::ffi::CString, std::ffi::CString)> =
-            match (&self.overlay, &overlay_merged_dir) {
-                (Some(ov), Some(merged)) => {
-                    use std::os::unix::ffi::OsStrExt as _;
-                    // Build lowerdir: use lower_dirs if present, else chroot_dir.
-                    let lower_str = if !ov.lower_dirs.is_empty() {
-                        ov.lower_dirs.iter()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join(":")
-                    } else {
-                        self.chroot_dir.as_ref().unwrap().to_string_lossy().into_owned()
-                    };
-                    Some((
-                        std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
-                        std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
-                        std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
-                        std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
-                    ))
-                }
-                _ => None,
-            };
+        let overlay_cstrings: Option<(
+            std::ffi::CString,
+            std::ffi::CString,
+            std::ffi::CString,
+            std::ffi::CString,
+        )> = match (&self.overlay, &overlay_merged_dir) {
+            (Some(ov), Some(merged)) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                // Build lowerdir: use lower_dirs if present, else chroot_dir.
+                let lower_str = if !ov.lower_dirs.is_empty() {
+                    ov.lower_dirs
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(":")
+                } else {
+                    self.chroot_dir
+                        .as_ref()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                Some((
+                    std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
+                    std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
+                    std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
+                    std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
+                ))
+            }
+            _ => None,
+        };
 
         // Collect OCI sync fds (captured by value — i32 is Copy).
         let oci_sync = self.oci_sync;
@@ -1541,7 +1609,9 @@ impl Command {
         // Requires Namespace::MOUNT so the bind mount stays in the container's private namespace.
         if !self.dns_servers.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
-                return Err(Error::Io(io::Error::other("with_dns requires Namespace::MOUNT")));
+                return Err(Error::Io(io::Error::other(
+                    "with_dns requires Namespace::MOUNT",
+                )));
             }
             if self.chroot_dir.is_none() {
                 return Err(Error::Io(io::Error::other("with_dns requires with_chroot")));
@@ -1572,10 +1642,14 @@ impl Command {
         // Links: resolve container names → IPs and write /etc/hosts temp file.
         if !self.links.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
-                return Err(Error::Io(io::Error::other("with_link requires Namespace::MOUNT")));
+                return Err(Error::Io(io::Error::other(
+                    "with_link requires Namespace::MOUNT",
+                )));
             }
             if self.chroot_dir.is_none() {
-                return Err(Error::Io(io::Error::other("with_link requires with_chroot")));
+                return Err(Error::Io(io::Error::other(
+                    "with_link requires with_chroot",
+                )));
             }
         }
         let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
@@ -1597,16 +1671,17 @@ impl Command {
         } else {
             None
         };
-        let hosts_temp_file_cstring: Option<std::ffi::CString> = hosts_temp_dir.as_ref().map(|dir| {
-            use std::os::unix::ffi::OsStrExt as _;
-            std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
-        });
+        let hosts_temp_file_cstring: Option<std::ffi::CString> =
+            hosts_temp_dir.as_ref().map(|dir| {
+                use std::os::unix::ffi::OsStrExt as _;
+                std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
+            });
 
         // Install our combined pre_exec hook
         unsafe {
             self.inner.pre_exec(move || {
-                use std::ptr;
                 use std::ffi::CString;
+                use std::ptr;
 
                 // Step 1: Unshare namespaces.
                 if !namespaces.is_empty() {
@@ -1625,33 +1700,45 @@ impl Command {
                             // fail with EINVAL because the map is committed on the first write.
                             // Pre-format the entire content as a single String, then write_all().
                             if !gid_maps.is_empty() {
-                                let mut sg = std::fs::OpenOptions::new().write(true)
+                                let mut sg = std::fs::OpenOptions::new()
+                                    .write(true)
                                     .open("/proc/self/setgroups")
                                     .map_err(|e| io::Error::other(format!("setgroups: {}", e)))?;
-                                sg.write_all(b"deny\n")
-                                    .map_err(|e| io::Error::other(format!("setgroups write: {}", e)))?;
+                                sg.write_all(b"deny\n").map_err(|e| {
+                                    io::Error::other(format!("setgroups write: {}", e))
+                                })?;
                             }
                             if !uid_maps.is_empty() {
                                 let mut content = String::new();
                                 for map in &uid_maps {
-                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                    content.push_str(&format!(
+                                        "{} {} {}\n",
+                                        map.inside, map.outside, map.count
+                                    ));
                                 }
-                                let mut f = std::fs::OpenOptions::new().write(true)
+                                let mut f = std::fs::OpenOptions::new()
+                                    .write(true)
                                     .open("/proc/self/uid_map")
                                     .map_err(|e| io::Error::other(format!("uid_map: {}", e)))?;
-                                f.write_all(content.as_bytes())
-                                    .map_err(|e| io::Error::other(format!("uid_map write: {}", e)))?;
+                                f.write_all(content.as_bytes()).map_err(|e| {
+                                    io::Error::other(format!("uid_map write: {}", e))
+                                })?;
                             }
                             if !gid_maps.is_empty() {
                                 let mut content = String::new();
                                 for map in &gid_maps {
-                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                    content.push_str(&format!(
+                                        "{} {} {}\n",
+                                        map.inside, map.outside, map.count
+                                    ));
                                 }
-                                let mut f = std::fs::OpenOptions::new().write(true)
+                                let mut f = std::fs::OpenOptions::new()
+                                    .write(true)
                                     .open("/proc/self/gid_map")
                                     .map_err(|e| io::Error::other(format!("gid_map: {}", e)))?;
-                                f.write_all(content.as_bytes())
-                                    .map_err(|e| io::Error::other(format!("gid_map write: {}", e)))?;
+                                f.write_all(content.as_bytes()).map_err(|e| {
+                                    io::Error::other(format!("gid_map write: {}", e))
+                                })?;
                             }
                         }
                         // 1c. Unshare remaining namespaces — now with proper uid/gid mapping
@@ -1675,11 +1762,11 @@ impl Command {
 
                         let root = CStr::from_bytes_with_nul(b"/\0").unwrap();
                         let result = libc::mount(
-                            ptr::null(),                          // source: NULL (remount)
-                            root.as_ptr(),                        // target: root
-                            ptr::null(),                          // fstype: NULL (remount)
-                            libc::MS_REC | libc::MS_PRIVATE,      // flags: recursive + private
-                            ptr::null(),                          // data: NULL
+                            ptr::null(),                     // source: NULL (remount)
+                            root.as_ptr(),                   // target: root
+                            ptr::null(),                     // fstype: NULL (remount)
+                            libc::MS_REC | libc::MS_PRIVATE, // flags: recursive + private
+                            ptr::null(),                     // data: NULL
                         );
 
                         if result != 0 {
@@ -1703,10 +1790,7 @@ impl Command {
 
                     // Step 1.61: Set container hostname in the UTS namespace.
                     if let Some(ref name) = hostname {
-                        let r = libc::sethostname(
-                            name.as_ptr() as *const libc::c_char,
-                            name.len(),
-                        );
+                        let r = libc::sethostname(name.as_ptr() as *const libc::c_char, name.len());
                         if r != 0 {
                             return Err(io::Error::last_os_error());
                         }
@@ -1794,7 +1878,8 @@ impl Command {
                             .write(true)
                             .open("/proc/self/setgroups")
                             .map_err(|e| io::Error::other(format!("open setgroups: {}", e)))?;
-                        setgroups.write_all(b"deny\n")
+                        setgroups
+                            .write_all(b"deny\n")
                             .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
                     }
 
@@ -1803,13 +1888,17 @@ impl Command {
                         use std::io::Write as _;
                         let mut content = String::new();
                         for map in &uid_maps {
-                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                            content.push_str(&format!(
+                                "{} {} {}\n",
+                                map.inside, map.outside, map.count
+                            ));
                         }
                         let mut uid_map_file = fs::OpenOptions::new()
                             .write(true)
                             .open("/proc/self/uid_map")
                             .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
-                        uid_map_file.write_all(content.as_bytes())
+                        uid_map_file
+                            .write_all(content.as_bytes())
                             .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
                     }
 
@@ -1818,13 +1907,17 @@ impl Command {
                         use std::io::Write as _;
                         let mut content = String::new();
                         for map in &gid_maps {
-                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                            content.push_str(&format!(
+                                "{} {} {}\n",
+                                map.inside, map.outside, map.count
+                            ));
                         }
                         let mut gid_map_file = fs::OpenOptions::new()
                             .write(true)
                             .open("/proc/self/gid_map")
                             .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
-                        gid_map_file.write_all(content.as_bytes())
+                        gid_map_file
+                            .write_all(content.as_bytes())
                             .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
                     }
                 }
@@ -1833,31 +1926,48 @@ impl Command {
                 if let Some(gid_val) = gid {
                     let result = libc::setgid(gid_val);
                     if result != 0 {
-                        return Err(io::Error::other(format!("setgid: {}", io::Error::last_os_error())));
+                        return Err(io::Error::other(format!(
+                            "setgid: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
                 if let Some(uid_val) = uid {
                     let result = libc::setuid(uid_val);
                     if result != 0 {
-                        return Err(io::Error::other(format!("setuid: {}", io::Error::last_os_error())));
+                        return Err(io::Error::other(format!(
+                            "setuid: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
                 // Step 3.5: Mount overlayfs (if configured).
                 // The merged dir becomes the effective root for chroot and bind mounts.
-                let overlay_merged: Option<&std::ffi::CString> = if let Some((lower, upper, work, merged)) = &overlay_cstrings {
-                    let opts = std::ffi::CString::new(format!(
-                        "lowerdir={},upperdir={},workdir={}",
-                        lower.to_string_lossy(), upper.to_string_lossy(), work.to_string_lossy()
-                    )).unwrap();
-                    let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
-                    let ret = libc::mount(ov_type, merged.as_ptr(), ov_type, 0,
-                                         opts.as_ptr() as *const libc::c_void);
-                    if ret != 0 { return Err(io::Error::last_os_error()); }
-                    Some(merged)
-                } else {
-                    None
-                };
+                let overlay_merged: Option<&std::ffi::CString> =
+                    if let Some((lower, upper, work, merged)) = &overlay_cstrings {
+                        let opts = std::ffi::CString::new(format!(
+                            "lowerdir={},upperdir={},workdir={}",
+                            lower.to_string_lossy(),
+                            upper.to_string_lossy(),
+                            work.to_string_lossy()
+                        ))
+                        .unwrap();
+                        let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
+                        let ret = libc::mount(
+                            ov_type,
+                            merged.as_ptr(),
+                            ov_type,
+                            0,
+                            opts.as_ptr() as *const libc::c_void,
+                        );
+                        if ret != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Some(merged)
+                    } else {
+                        None
+                    };
 
                 // Step 4: Change root if specified
                 if let Some((ref new_root, ref put_old)) = pivot_root {
@@ -1874,11 +1984,8 @@ impl Command {
                     #[cfg(target_arch = "aarch64")]
                     const SYS_PIVOT_ROOT: i64 = 41;
 
-                    let result = libc::syscall(
-                        SYS_PIVOT_ROOT,
-                        new_root_c.as_ptr(),
-                        put_old_c.as_ptr(),
-                    );
+                    let result =
+                        libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
 
                     if result != 0 {
                         return Err(io::Error::last_os_error());
@@ -1888,7 +1995,8 @@ impl Command {
                     std::env::set_current_dir("/")?;
 
                     // Unmount old root
-                    let put_old_rel = put_old.strip_prefix(new_root)
+                    let put_old_rel = put_old
+                        .strip_prefix(new_root)
                         .map_err(|_| io::Error::other("put_old must be inside new_root"))?;
                     let put_old_rel_c = CString::new(put_old_rel.as_os_str().as_bytes()).unwrap();
 
@@ -1902,7 +2010,8 @@ impl Command {
 
                     // When overlay is active, the merged dir is the effective root.
                     // Otherwise the chroot dir itself is the effective root.
-                    let effective_root: &std::path::Path = overlay_merged.as_ref()
+                    let effective_root: &std::path::Path = overlay_merged
+                        .as_ref()
                         .map(|m| std::path::Path::new(m.to_str().unwrap()))
                         .unwrap_or(dir.as_path());
 
@@ -1915,17 +2024,28 @@ impl Command {
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| io::Error::other(format!("dns mkdir /etc: {}", e)))?;
                         let resolv_host = etc_host.join("resolv.conf");
-                        let tgt_c = std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
+                        let tgt_c =
+                            std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
                         // Ensure target file exists — bind mount requires the target to exist.
-                        let fd = libc::open(tgt_c.as_ptr(),
-                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-                                            0o644u32);
-                        if fd >= 0 { libc::close(fd); }
-                        let r = libc::mount(dns_src.as_ptr(), tgt_c.as_ptr(),
-                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            dns_src.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
                         if r != 0 {
                             return Err(io::Error::other(format!(
-                                "dns bind mount: {}", io::Error::last_os_error()
+                                "dns bind mount: {}",
+                                io::Error::last_os_error()
                             )));
                         }
                     }
@@ -1937,16 +2057,27 @@ impl Command {
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| io::Error::other(format!("hosts mkdir /etc: {}", e)))?;
                         let hosts_host = etc_host.join("hosts");
-                        let tgt_c = std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
-                        let fd = libc::open(tgt_c.as_ptr(),
-                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-                                            0o644u32);
-                        if fd >= 0 { libc::close(fd); }
-                        let r = libc::mount(hosts_src.as_ptr(), tgt_c.as_ptr(),
-                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        let tgt_c =
+                            std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            hosts_src.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
                         if r != 0 {
                             return Err(io::Error::other(format!(
-                                "hosts bind mount: {}", io::Error::last_os_error()
+                                "hosts bind mount: {}",
+                                io::Error::last_os_error()
                             )));
                         }
                     }
@@ -1958,11 +2089,11 @@ impl Command {
                     if readonly_rootfs && overlay_merged.is_none() {
                         let dir_c = CString::new(dir.as_os_str().as_bytes()).unwrap();
                         let result = libc::mount(
-                            dir_c.as_ptr(),          // source: chroot dir
-                            dir_c.as_ptr(),          // target: same dir
-                            ptr::null(),             // fstype: NULL
+                            dir_c.as_ptr(),               // source: chroot dir
+                            dir_c.as_ptr(),               // target: same dir
+                            ptr::null(),                  // fstype: NULL
                             libc::MS_BIND | libc::MS_REC, // recursive bind mount
-                            ptr::null(),             // data: NULL
+                            ptr::null(),                  // data: NULL
                         );
                         if result != 0 {
                             return Err(io::Error::last_os_error());
@@ -1991,7 +2122,8 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "bind mount {} -> {}: {}",
-                                bm.source.display(), host_target.display(),
+                                bm.source.display(),
+                                host_target.display(),
                                 io::Error::last_os_error()
                             )));
                         }
@@ -2007,17 +2139,22 @@ impl Command {
                             if r2 != 0 {
                                 return Err(io::Error::other(format!(
                                     "bind mount remount ro {}: {}",
-                                    host_target.display(), io::Error::last_os_error()
+                                    host_target.display(),
+                                    io::Error::last_os_error()
                                 )));
                             }
                         }
                     }
 
-                    chroot(effective_root).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    chroot(effective_root)
+                        .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
                     // Change working directory after chroot (defaults to /).
-                    let cwd = container_cwd.as_deref().unwrap_or(std::path::Path::new("/"));
-                    std::env::set_current_dir(cwd).map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
+                    let cwd = container_cwd
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("/"));
+                    std::env::set_current_dir(cwd)
+                        .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
                 }
 
                 // Step 4.5: Perform automatic mounts if requested
@@ -2025,11 +2162,11 @@ impl Command {
                     // Mount new proc filesystem at /proc
                     let proc = CString::new("proc").unwrap();
                     let result = libc::mount(
-                        proc.as_ptr(),      // source
-                        proc.as_ptr(),      // target (/proc)
-                        proc.as_ptr(),      // fstype (proc)
-                        0,                  // flags
-                        ptr::null(),        // data
+                        proc.as_ptr(), // source
+                        proc.as_ptr(), // target (/proc)
+                        proc.as_ptr(), // fstype (proc)
+                        0,             // flags
+                        ptr::null(),   // data
                     );
                     // In rootless mode OR with a USER namespace, proc mount fails (EPERM or
                     // EINVAL) because the PID namespace is not owned by our user namespace.
@@ -2046,11 +2183,11 @@ impl Command {
                     let sys = CString::new("/sys").unwrap();
                     let sysfs = CString::new("sysfs").unwrap();
                     let result = libc::mount(
-                        sys.as_ptr(),       // source
-                        sys.as_ptr(),       // target
-                        sysfs.as_ptr(),     // fstype
-                        libc::MS_BIND,      // flags
-                        ptr::null(),        // data
+                        sys.as_ptr(),   // source
+                        sys.as_ptr(),   // target
+                        sysfs.as_ptr(), // fstype
+                        libc::MS_BIND,  // flags
+                        ptr::null(),    // data
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
                     if result != 0 && !is_rootless {
@@ -2062,11 +2199,11 @@ impl Command {
                     // Bind mount /dev (from host) to /dev (in container)
                     let dev = CString::new("/dev").unwrap();
                     let result = libc::mount(
-                        dev.as_ptr(),       // source
-                        dev.as_ptr(),       // target
-                        ptr::null(),        // fstype (NULL for bind mount)
+                        dev.as_ptr(),                 // source
+                        dev.as_ptr(),                 // target
+                        ptr::null(),                  // fstype (NULL for bind mount)
                         libc::MS_BIND | libc::MS_REC, // recursive bind
-                        ptr::null(),        // data
+                        ptr::null(),                  // data
                     );
                     // Rootless: /dev bind may fail on locked mounts; inherited /dev is still usable.
                     if result != 0 && !is_rootless {
@@ -2081,18 +2218,23 @@ impl Command {
                     let tgt_c = CString::new(tm.target.as_os_str().as_encoded_bytes()).unwrap();
                     let tmpfs_c = CString::new("tmpfs").unwrap();
                     let opts_c = CString::new(tm.options.as_bytes()).unwrap();
-                    let opts_ptr = if tm.options.is_empty() { ptr::null() } else { opts_c.as_ptr() as *const libc::c_void };
+                    let opts_ptr = if tm.options.is_empty() {
+                        ptr::null()
+                    } else {
+                        opts_c.as_ptr() as *const libc::c_void
+                    };
                     let result = libc::mount(
-                        tmpfs_c.as_ptr(),   // source: "tmpfs"
-                        tgt_c.as_ptr(),     // target
-                        tmpfs_c.as_ptr(),   // fstype: "tmpfs"
+                        tmpfs_c.as_ptr(),                 // source: "tmpfs"
+                        tgt_c.as_ptr(),                   // target
+                        tmpfs_c.as_ptr(),                 // fstype: "tmpfs"
                         libc::MS_NOSUID | libc::MS_NODEV, // flags
-                        opts_ptr,           // data: mount options
+                        opts_ptr,                         // data: mount options
                     );
                     if result != 0 {
                         return Err(io::Error::other(format!(
                             "tmpfs mount {}: {}",
-                            tm.target.display(), io::Error::last_os_error()
+                            tm.target.display(),
+                            io::Error::last_os_error()
                         )));
                     }
                 }
@@ -2118,17 +2260,23 @@ impl Command {
                 // Step 4.72: Create device nodes
                 if !devices.is_empty() {
                     for dev in &devices {
-                        let path_c = match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
+                        let path_c =
+                            match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
                         let type_bits: libc::mode_t = match dev.kind {
                             'b' => libc::S_IFBLK,
                             'p' => libc::S_IFIFO,
                             _ => libc::S_IFCHR, // 'c' and default
                         };
-                        let devnum = libc::makedev(dev.major as libc::c_uint, dev.minor as libc::c_uint);
-                        let r = libc::mknod(path_c.as_ptr(), type_bits | (dev.mode as libc::mode_t), devnum);
+                        let devnum =
+                            libc::makedev(dev.major as libc::c_uint, dev.minor as libc::c_uint);
+                        let r = libc::mknod(
+                            path_c.as_ptr(),
+                            type_bits | (dev.mode as libc::mode_t),
+                            devnum,
+                        );
                         if r == 0 && (dev.uid != 0 || dev.gid != 0) {
                             libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
                         }
@@ -2172,11 +2320,11 @@ impl Command {
 
                         // Bind mount /dev/null over the path to mask it
                         let result = libc::mount(
-                            dev_null.as_ptr(),           // source: /dev/null
-                            path_c.as_ptr(),             // target: path to mask
-                            ptr::null(),                 // fstype: NULL
-                            libc::MS_BIND,               // bind mount
-                            ptr::null(),                 // data: NULL
+                            dev_null.as_ptr(), // source: /dev/null
+                            path_c.as_ptr(),   // target: path to mask
+                            ptr::null(),       // fstype: NULL
+                            libc::MS_BIND,     // bind mount
+                            ptr::null(),       // data: NULL
                         );
 
                         // Ignore errors - path might not exist, which is fine
@@ -2202,7 +2350,9 @@ impl Command {
                             libc::MS_BIND,
                             ptr::null(),
                         );
-                        if r != 0 { continue; } // path may not exist; skip
+                        if r != 0 {
+                            continue;
+                        } // path may not exist; skip
                         libc::mount(
                             ptr::null(),
                             path_c.as_ptr(),
@@ -2220,11 +2370,11 @@ impl Command {
                 if readonly_rootfs {
                     let root = CString::new("/").unwrap();
                     let result = libc::mount(
-                        ptr::null(),             // source: NULL (remount)
-                        root.as_ptr(),           // target: /
-                        ptr::null(),             // fstype: NULL (remount)
+                        ptr::null(),                                        // source: NULL (remount)
+                        root.as_ptr(),                                      // target: /
+                        ptr::null(), // fstype: NULL (remount)
                         libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_BIND, // remount readonly
-                        ptr::null(),             // data: NULL
+                        ptr::null(), // data: NULL
                     );
                     if result != 0 {
                         return Err(io::Error::last_os_error());
@@ -2326,15 +2476,23 @@ impl Command {
 
         // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
         let pasta: Option<crate::network::PastaSetup> = if is_pasta {
-            Some(crate::network::setup_pasta_network(
-                child_inner.id(),
-                &self.port_forwards,
-            ).map_err(Error::Io)?)
+            Some(
+                crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
+                    .map_err(Error::Io)?,
+            )
         } else {
             None
         };
 
-        Ok(Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir, hosts_temp_dir })
+        Ok(Child {
+            inner: child_inner,
+            cgroup,
+            network,
+            pasta,
+            overlay_merged_dir,
+            dns_temp_dir,
+            hosts_temp_dir,
+        })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -2383,23 +2541,22 @@ impl Command {
                 Some(prog)
             } else if let Some(profile) = &self.seccomp_profile {
                 match profile {
-                    SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
-                        .map_err(Error::Seccomp)?),
-                    SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
-                        .map_err(Error::Seccomp)?),
+                    SeccompProfile::Docker => {
+                        Some(crate::seccomp::docker_default_filter().map_err(Error::Seccomp)?)
+                    }
+                    SeccompProfile::Minimal => {
+                        Some(crate::seccomp::minimal_filter().map_err(Error::Seccomp)?)
+                    }
                     SeccompProfile::None => None,
                 }
             } else {
                 None
             };
 
-        let join_ns_files: Vec<(File, Namespace)> = self.join_namespaces
+        let join_ns_files: Vec<(File, Namespace)> = self
+            .join_namespaces
             .iter()
-            .map(|(path, ns)| {
-                File::open(path)
-                    .map(|f| (f, *ns))
-                    .map_err(Error::Io)
-            })
+            .map(|(path, ns)| File::open(path).map(|f| (f, *ns)).map_err(Error::Io))
             .collect::<Result<Vec<_>, _>>()?;
 
         let join_ns_fds: Vec<(i32, Namespace)> = join_ns_files
@@ -2425,7 +2582,9 @@ impl Command {
                     count: 1,
                 });
             }
-            if self.network_config.as_ref()
+            if self
+                .network_config
+                .as_ref()
                 .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
             {
                 return Err(Error::Io(io::Error::other(
@@ -2435,12 +2594,14 @@ impl Command {
         }
 
         // Pasta mode: validate pasta is available and auto-add NET namespace.
-        let is_pasta = self.network_config.as_ref()
+        let is_pasta = self
+            .network_config
+            .as_ref()
             .map_or(false, |c| c.mode == crate::network::NetworkMode::Pasta);
         if is_pasta {
             if !crate::network::is_pasta_available() {
                 return Err(Error::Io(io::Error::other(
-                    "NetworkMode::Pasta requires pasta — install from https://passt.top"
+                    "NetworkMode::Pasta requires pasta — install from https://passt.top",
                 )));
             }
             self.namespaces |= Namespace::NET;
@@ -2472,26 +2633,39 @@ impl Command {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
         });
-        let is_bridge = self.network_config.as_ref().map_or(false, |c| {
-            c.mode == crate::network::NetworkMode::Bridge
-        });
+        let is_bridge = self
+            .network_config
+            .as_ref()
+            .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge);
 
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
             let ns_name = crate::network::generate_ns_name();
-            Some(crate::network::setup_bridge_network(&ns_name, self.nat, self.port_forwards.clone()).map_err(Error::Io)?)
+            Some(
+                crate::network::setup_bridge_network(
+                    &ns_name,
+                    self.nat,
+                    self.port_forwards.clone(),
+                )
+                .map_err(Error::Io)?,
+            )
         } else {
             None
         };
-        let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
+        let bridge_ns_path: Option<std::ffi::CString> = bridge_network
+            .as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
         // Validate overlay prerequisites before fork.
         if self.overlay.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
-            return Err(Error::Io(io::Error::other("with_overlay requires Namespace::MOUNT")));
+            return Err(Error::Io(io::Error::other(
+                "with_overlay requires Namespace::MOUNT",
+            )));
         }
         if self.overlay.is_some() && self.chroot_dir.is_none() {
-            return Err(Error::Io(io::Error::other("with_overlay requires with_chroot")));
+            return Err(Error::Io(io::Error::other(
+                "with_overlay requires with_chroot",
+            )));
         }
 
         // Create the overlay merged dir before fork.
@@ -2516,27 +2690,36 @@ impl Command {
         };
 
         // Pre-allocate CStrings for the overlay mount (lower, upper, work, merged).
-        let overlay_cstrings: Option<(std::ffi::CString, std::ffi::CString, std::ffi::CString, std::ffi::CString)> =
-            match (&self.overlay, &overlay_merged_dir) {
-                (Some(ov), Some(merged)) => {
-                    use std::os::unix::ffi::OsStrExt as _;
-                    let lower_str = if !ov.lower_dirs.is_empty() {
-                        ov.lower_dirs.iter()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join(":")
-                    } else {
-                        self.chroot_dir.as_ref().unwrap().to_string_lossy().into_owned()
-                    };
-                    Some((
-                        std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
-                        std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
-                        std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
-                        std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
-                    ))
-                }
-                _ => None,
-            };
+        let overlay_cstrings: Option<(
+            std::ffi::CString,
+            std::ffi::CString,
+            std::ffi::CString,
+            std::ffi::CString,
+        )> = match (&self.overlay, &overlay_merged_dir) {
+            (Some(ov), Some(merged)) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let lower_str = if !ov.lower_dirs.is_empty() {
+                    ov.lower_dirs
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(":")
+                } else {
+                    self.chroot_dir
+                        .as_ref()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                Some((
+                    std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
+                    std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
+                    std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
+                    std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
+                ))
+            }
+            _ => None,
+        };
 
         // Collect OCI sync fds.
         let oci_sync = self.oci_sync;
@@ -2545,7 +2728,9 @@ impl Command {
         // DNS: write nameservers to a per-container temp file; bind-mount into container.
         if !self.dns_servers.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
-                return Err(Error::Io(io::Error::other("with_dns requires Namespace::MOUNT")));
+                return Err(Error::Io(io::Error::other(
+                    "with_dns requires Namespace::MOUNT",
+                )));
             }
             if self.chroot_dir.is_none() {
                 return Err(Error::Io(io::Error::other("with_dns requires with_chroot")));
@@ -2575,10 +2760,14 @@ impl Command {
         // Links: resolve container names → IPs and write /etc/hosts temp file.
         if !self.links.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
-                return Err(Error::Io(io::Error::other("with_link requires Namespace::MOUNT")));
+                return Err(Error::Io(io::Error::other(
+                    "with_link requires Namespace::MOUNT",
+                )));
             }
             if self.chroot_dir.is_none() {
-                return Err(Error::Io(io::Error::other("with_link requires with_chroot")));
+                return Err(Error::Io(io::Error::other(
+                    "with_link requires with_chroot",
+                )));
             }
         }
         let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
@@ -2600,15 +2789,16 @@ impl Command {
         } else {
             None
         };
-        let hosts_temp_file_cstring: Option<std::ffi::CString> = hosts_temp_dir.as_ref().map(|dir| {
-            use std::os::unix::ffi::OsStrExt as _;
-            std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
-        });
+        let hosts_temp_file_cstring: Option<std::ffi::CString> =
+            hosts_temp_dir.as_ref().map(|dir| {
+                use std::os::unix::ffi::OsStrExt as _;
+                std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
+            });
 
         unsafe {
             self.inner.pre_exec(move || {
-                use std::ptr;
                 use std::ffi::CString;
+                use std::ptr;
 
                 // Step 0: PTY slave setup — runs before everything else.
                 // Create a new session so the container is isolated from the
@@ -2646,33 +2836,45 @@ impl Command {
                             use std::io::Write;
                             // uid_map and gid_map MUST be written in a single write() syscall.
                             if !gid_maps.is_empty() {
-                                let mut sg = std::fs::OpenOptions::new().write(true)
+                                let mut sg = std::fs::OpenOptions::new()
+                                    .write(true)
                                     .open("/proc/self/setgroups")
                                     .map_err(|e| io::Error::other(format!("setgroups: {}", e)))?;
-                                sg.write_all(b"deny\n")
-                                    .map_err(|e| io::Error::other(format!("setgroups write: {}", e)))?;
+                                sg.write_all(b"deny\n").map_err(|e| {
+                                    io::Error::other(format!("setgroups write: {}", e))
+                                })?;
                             }
                             if !uid_maps.is_empty() {
                                 let mut content = String::new();
                                 for map in &uid_maps {
-                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                    content.push_str(&format!(
+                                        "{} {} {}\n",
+                                        map.inside, map.outside, map.count
+                                    ));
                                 }
-                                let mut f = std::fs::OpenOptions::new().write(true)
+                                let mut f = std::fs::OpenOptions::new()
+                                    .write(true)
                                     .open("/proc/self/uid_map")
                                     .map_err(|e| io::Error::other(format!("uid_map: {}", e)))?;
-                                f.write_all(content.as_bytes())
-                                    .map_err(|e| io::Error::other(format!("uid_map write: {}", e)))?;
+                                f.write_all(content.as_bytes()).map_err(|e| {
+                                    io::Error::other(format!("uid_map write: {}", e))
+                                })?;
                             }
                             if !gid_maps.is_empty() {
                                 let mut content = String::new();
                                 for map in &gid_maps {
-                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                    content.push_str(&format!(
+                                        "{} {} {}\n",
+                                        map.inside, map.outside, map.count
+                                    ));
                                 }
-                                let mut f = std::fs::OpenOptions::new().write(true)
+                                let mut f = std::fs::OpenOptions::new()
+                                    .write(true)
                                     .open("/proc/self/gid_map")
                                     .map_err(|e| io::Error::other(format!("gid_map: {}", e)))?;
-                                f.write_all(content.as_bytes())
-                                    .map_err(|e| io::Error::other(format!("gid_map write: {}", e)))?;
+                                f.write_all(content.as_bytes()).map_err(|e| {
+                                    io::Error::other(format!("gid_map write: {}", e))
+                                })?;
                             }
                         }
                         let remaining = namespaces & !Namespace::USER;
@@ -2712,10 +2914,7 @@ impl Command {
 
                     // Set container hostname in the UTS namespace.
                     if let Some(ref name) = hostname {
-                        let r = libc::sethostname(
-                            name.as_ptr() as *const libc::c_char,
-                            name.len(),
-                        );
+                        let r = libc::sethostname(name.as_ptr() as *const libc::c_char, name.len());
                         if r != 0 {
                             return Err(io::Error::last_os_error());
                         }
@@ -2779,32 +2978,41 @@ impl Command {
                             .write(true)
                             .open("/proc/self/setgroups")
                             .map_err(|e| io::Error::other(format!("open setgroups: {}", e)))?;
-                        setgroups.write_all(b"deny\n")
+                        setgroups
+                            .write_all(b"deny\n")
                             .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
                     }
                     // uid_map and gid_map MUST be written in a single write() call.
                     if !uid_maps.is_empty() {
                         let mut content = String::new();
                         for map in &uid_maps {
-                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                            content.push_str(&format!(
+                                "{} {} {}\n",
+                                map.inside, map.outside, map.count
+                            ));
                         }
                         let mut uid_map_file = std::fs::OpenOptions::new()
                             .write(true)
                             .open("/proc/self/uid_map")
                             .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
-                        uid_map_file.write_all(content.as_bytes())
+                        uid_map_file
+                            .write_all(content.as_bytes())
                             .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
                     }
                     if !gid_maps.is_empty() {
                         let mut content = String::new();
                         for map in &gid_maps {
-                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                            content.push_str(&format!(
+                                "{} {} {}\n",
+                                map.inside, map.outside, map.count
+                            ));
                         }
                         let mut gid_map_file = std::fs::OpenOptions::new()
                             .write(true)
                             .open("/proc/self/gid_map")
                             .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
-                        gid_map_file.write_all(content.as_bytes())
+                        gid_map_file
+                            .write_all(content.as_bytes())
                             .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
                     }
                 }
@@ -2812,27 +3020,42 @@ impl Command {
                 // Step 3: Set UID/GID if specified.
                 if let Some(gid_val) = gid {
                     let result = libc::setgid(gid_val);
-                    if result != 0 { return Err(io::Error::last_os_error()); }
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 if let Some(uid_val) = uid {
                     let result = libc::setuid(uid_val);
-                    if result != 0 { return Err(io::Error::last_os_error()); }
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
 
                 // Step 3.5: Mount overlayfs (if configured).
-                let overlay_merged: Option<&std::ffi::CString> = if let Some((lower, upper, work, merged)) = &overlay_cstrings {
-                    let opts = std::ffi::CString::new(format!(
-                        "lowerdir={},upperdir={},workdir={}",
-                        lower.to_string_lossy(), upper.to_string_lossy(), work.to_string_lossy()
-                    )).unwrap();
-                    let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
-                    let ret = libc::mount(ov_type, merged.as_ptr(), ov_type, 0,
-                                         opts.as_ptr() as *const libc::c_void);
-                    if ret != 0 { return Err(io::Error::last_os_error()); }
-                    Some(merged)
-                } else {
-                    None
-                };
+                let overlay_merged: Option<&std::ffi::CString> =
+                    if let Some((lower, upper, work, merged)) = &overlay_cstrings {
+                        let opts = std::ffi::CString::new(format!(
+                            "lowerdir={},upperdir={},workdir={}",
+                            lower.to_string_lossy(),
+                            upper.to_string_lossy(),
+                            work.to_string_lossy()
+                        ))
+                        .unwrap();
+                        let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
+                        let ret = libc::mount(
+                            ov_type,
+                            merged.as_ptr(),
+                            ov_type,
+                            0,
+                            opts.as_ptr() as *const libc::c_void,
+                        );
+                        if ret != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Some(merged)
+                    } else {
+                        None
+                    };
 
                 if let Some((ref new_root, ref put_old)) = pivot_root {
                     use std::os::unix::ffi::OsStrExt;
@@ -2846,13 +3069,15 @@ impl Command {
                     #[cfg(target_arch = "aarch64")]
                     const SYS_PIVOT_ROOT: i64 = 41;
 
-                    let result = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
+                    let result =
+                        libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
                     if result != 0 {
                         return Err(io::Error::last_os_error());
                     }
                     std::env::set_current_dir("/")?;
 
-                    let put_old_rel = put_old.strip_prefix(new_root)
+                    let put_old_rel = put_old
+                        .strip_prefix(new_root)
                         .map_err(|_| io::Error::other("put_old must be inside new_root"))?;
                     let put_old_rel_c = CString::new(put_old_rel.as_os_str().as_bytes()).unwrap();
                     libc::umount2(put_old_rel_c.as_ptr(), libc::MNT_DETACH);
@@ -2860,7 +3085,8 @@ impl Command {
                     use std::os::unix::ffi::OsStrExt;
 
                     // When overlay is active, use the merged dir as the effective root.
-                    let effective_root: &std::path::Path = overlay_merged.as_ref()
+                    let effective_root: &std::path::Path = overlay_merged
+                        .as_ref()
                         .map(|m| std::path::Path::new(m.to_str().unwrap()))
                         .unwrap_or(dir.as_path());
 
@@ -2870,16 +3096,27 @@ impl Command {
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| io::Error::other(format!("dns mkdir /etc: {}", e)))?;
                         let resolv_host = etc_host.join("resolv.conf");
-                        let tgt_c = std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
-                        let fd = libc::open(tgt_c.as_ptr(),
-                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-                                            0o644u32);
-                        if fd >= 0 { libc::close(fd); }
-                        let r = libc::mount(dns_src.as_ptr(), tgt_c.as_ptr(),
-                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        let tgt_c =
+                            std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            dns_src.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
                         if r != 0 {
                             return Err(io::Error::other(format!(
-                                "dns bind mount: {}", io::Error::last_os_error()
+                                "dns bind mount: {}",
+                                io::Error::last_os_error()
                             )));
                         }
                     }
@@ -2890,16 +3127,27 @@ impl Command {
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| io::Error::other(format!("hosts mkdir /etc: {}", e)))?;
                         let hosts_host = etc_host.join("hosts");
-                        let tgt_c = std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
-                        let fd = libc::open(tgt_c.as_ptr(),
-                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-                                            0o644u32);
-                        if fd >= 0 { libc::close(fd); }
-                        let r = libc::mount(hosts_src.as_ptr(), tgt_c.as_ptr(),
-                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        let tgt_c =
+                            std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            hosts_src.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
                         if r != 0 {
                             return Err(io::Error::other(format!(
-                                "hosts bind mount: {}", io::Error::last_os_error()
+                                "hosts bind mount: {}",
+                                io::Error::last_os_error()
                             )));
                         }
                     }
@@ -2939,7 +3187,8 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "bind mount {} -> {}: {}",
-                                bm.source.display(), host_target.display(),
+                                bm.source.display(),
+                                host_target.display(),
                                 io::Error::last_os_error()
                             )));
                         }
@@ -2954,20 +3203,25 @@ impl Command {
                             if r2 != 0 {
                                 return Err(io::Error::other(format!(
                                     "bind mount remount ro {}: {}",
-                                    host_target.display(), io::Error::last_os_error()
+                                    host_target.display(),
+                                    io::Error::last_os_error()
                                 )));
                             }
                         }
                     }
 
-                    chroot(effective_root).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
-                    let cwd = container_cwd.as_deref().unwrap_or(std::path::Path::new("/"));
+                    chroot(effective_root)
+                        .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    let cwd = container_cwd
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("/"));
                     std::env::set_current_dir(cwd)?;
                 }
 
                 if mount_proc {
                     let proc = CString::new("proc").unwrap();
-                    let result = libc::mount(proc.as_ptr(), proc.as_ptr(), proc.as_ptr(), 0, ptr::null());
+                    let result =
+                        libc::mount(proc.as_ptr(), proc.as_ptr(), proc.as_ptr(), 0, ptr::null());
                     // In rootless mode, proc mount fails without an owned PID namespace.
                     // With USER+PID (auto-added by spawn()), proc succeeds. Only skip in rootless.
                     if result != 0 && !is_rootless {
@@ -2978,7 +3232,13 @@ impl Command {
                 if mount_sys {
                     let sys = CString::new("/sys").unwrap();
                     let sysfs = CString::new("sysfs").unwrap();
-                    let result = libc::mount(sys.as_ptr(), sys.as_ptr(), sysfs.as_ptr(), libc::MS_BIND, ptr::null());
+                    let result = libc::mount(
+                        sys.as_ptr(),
+                        sys.as_ptr(),
+                        sysfs.as_ptr(),
+                        libc::MS_BIND,
+                        ptr::null(),
+                    );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
                     if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
@@ -2987,7 +3247,13 @@ impl Command {
 
                 if mount_dev {
                     let dev = CString::new("/dev").unwrap();
-                    let result = libc::mount(dev.as_ptr(), dev.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null());
+                    let result = libc::mount(
+                        dev.as_ptr(),
+                        dev.as_ptr(),
+                        ptr::null(),
+                        libc::MS_BIND | libc::MS_REC,
+                        ptr::null(),
+                    );
                     // Rootless: /dev bind may fail on locked mounts; inherited /dev is still usable.
                     if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
@@ -3001,7 +3267,11 @@ impl Command {
                     let tgt_c = CString::new(tm.target.as_os_str().as_encoded_bytes()).unwrap();
                     let tmpfs_c = CString::new("tmpfs").unwrap();
                     let opts_c = CString::new(tm.options.as_bytes()).unwrap();
-                    let opts_ptr = if tm.options.is_empty() { ptr::null() } else { opts_c.as_ptr() as *const libc::c_void };
+                    let opts_ptr = if tm.options.is_empty() {
+                        ptr::null()
+                    } else {
+                        opts_c.as_ptr() as *const libc::c_void
+                    };
                     let result = libc::mount(
                         tmpfs_c.as_ptr(),
                         tgt_c.as_ptr(),
@@ -3012,7 +3282,8 @@ impl Command {
                     if result != 0 {
                         return Err(io::Error::other(format!(
                             "tmpfs mount {}: {}",
-                            tm.target.display(), io::Error::last_os_error()
+                            tm.target.display(),
+                            io::Error::last_os_error()
                         )));
                     }
                 }
@@ -3033,17 +3304,23 @@ impl Command {
 
                 if !devices.is_empty() {
                     for dev in &devices {
-                        let path_c = match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
+                        let path_c =
+                            match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
                         let type_bits: libc::mode_t = match dev.kind {
                             'b' => libc::S_IFBLK,
                             'p' => libc::S_IFIFO,
                             _ => libc::S_IFCHR,
                         };
-                        let devnum = libc::makedev(dev.major as libc::c_uint, dev.minor as libc::c_uint);
-                        let r = libc::mknod(path_c.as_ptr(), type_bits | (dev.mode as libc::mode_t), devnum);
+                        let devnum =
+                            libc::makedev(dev.major as libc::c_uint, dev.minor as libc::c_uint);
+                        let r = libc::mknod(
+                            path_c.as_ptr(),
+                            type_bits | (dev.mode as libc::mode_t),
+                            devnum,
+                        );
                         if r == 0 && (dev.uid != 0 || dev.gid != 0) {
                             libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
                         }
@@ -3073,7 +3350,13 @@ impl Command {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        libc::mount(dev_null.as_ptr(), path_c.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null());
+                        libc::mount(
+                            dev_null.as_ptr(),
+                            path_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
                     }
                 }
 
@@ -3090,7 +3373,9 @@ impl Command {
                             libc::MS_BIND,
                             ptr::null(),
                         );
-                        if r != 0 { continue; }
+                        if r != 0 {
+                            continue;
+                        }
                         libc::mount(
                             ptr::null(),
                             path_c.as_ptr(),
@@ -3116,7 +3401,10 @@ impl Command {
                 }
 
                 for limit in &rlimits {
-                    let rlimit = libc::rlimit { rlim_cur: limit.soft, rlim_max: limit.hard };
+                    let rlimit = libc::rlimit {
+                        rlim_cur: limit.soft,
+                        rlim_max: limit.hard,
+                    };
                     let result = libc::setrlimit(limit.resource, &rlimit);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
@@ -3192,17 +3480,25 @@ impl Command {
 
         // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
         let pasta: Option<crate::network::PastaSetup> = if is_pasta {
-            Some(crate::network::setup_pasta_network(
-                child_inner.id(),
-                &self.port_forwards,
-            ).map_err(Error::Io)?)
+            Some(
+                crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
+                    .map_err(Error::Io)?,
+            )
         } else {
             None
         };
 
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir, hosts_temp_dir },
+            child: Child {
+                inner: child_inner,
+                cgroup,
+                network,
+                pasta,
+                overlay_merged_dir,
+                dns_temp_dir,
+                hosts_temp_dir,
+            },
         })
     }
 }
@@ -3349,7 +3645,9 @@ impl Child {
             let _ = std::fs::remove_dir_all(dir);
         }
         Ok((
-            ExitStatus { inner: output.status },
+            ExitStatus {
+                inner: output.status,
+            },
             output.stdout,
             output.stderr,
         ))
@@ -3586,7 +3884,7 @@ mod tests {
         let ns1 = Namespace::UTS | Namespace::PID | Namespace::MOUNT;
         let ns2 = Namespace::PID | Namespace::NET;
 
-        let diff = ns1 & !ns2;  // Items in ns1 but not in ns2
+        let diff = ns1 & !ns2; // Items in ns1 but not in ns2
 
         assert!(diff.contains(Namespace::UTS));
         assert!(diff.contains(Namespace::MOUNT));
@@ -3641,7 +3939,7 @@ mod tests {
         let err: Error = io_err.into();
 
         match err {
-            Error::Io(_) => {},
+            Error::Io(_) => {}
             _ => panic!("Expected Error::Io variant"),
         }
     }

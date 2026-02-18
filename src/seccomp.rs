@@ -93,76 +93,61 @@ pub fn docker_default_filter() -> Result<BpfProgram, io::Error> {
     // These are dangerous and commonly used in container escapes.
     let blocked_syscalls = vec![
         // Namespace and isolation manipulation (container escape vectors)
-        "unshare",      // Create new namespaces
-        "setns",        // Join existing namespaces
-        "mount",        // Mount filesystems
-        "umount",       // Unmount filesystems
-        "umount2",      // Unmount with flags
-        "pivot_root",   // Change root mount point
-        "chroot",       // Change root directory
-
+        "unshare",    // Create new namespaces
+        "setns",      // Join existing namespaces
+        "mount",      // Mount filesystems
+        "umount",     // Unmount filesystems
+        "umount2",    // Unmount with flags
+        "pivot_root", // Change root mount point
+        "chroot",     // Change root directory
         // Process tracing and debugging (escape via ptrace injection)
-        "ptrace",       // Trace processes
+        "ptrace",            // Trace processes
         "process_vm_readv",  // Read process memory
         "process_vm_writev", // Write process memory
-
         // Kernel module manipulation (kernel-level access)
-        "init_module",    // Load kernel module
-        "finit_module",   // Load kernel module from fd
-        "delete_module",  // Unload kernel module
-
+        "init_module",   // Load kernel module
+        "finit_module",  // Load kernel module from fd
+        "delete_module", // Unload kernel module
         // System control (DOS or system takeover)
-        "reboot",         // Reboot system
-        "kexec_load",     // Load new kernel
+        "reboot",          // Reboot system
+        "kexec_load",      // Load new kernel
         "kexec_file_load", // Load new kernel from file
-
         // Time manipulation (affects host clock)
-        "clock_settime",  // Set system clock
-        "settimeofday",   // Set time of day
-        "clock_adjtime",  // Adjust system clock
-        "adjtimex",       // Tune kernel clock
-
+        "clock_settime", // Set system clock
+        "settimeofday",  // Set time of day
+        "clock_adjtime", // Adjust system clock
+        "adjtimex",      // Tune kernel clock
         // Swap manipulation
-        "swapon",         // Enable swap
-        "swapoff",        // Disable swap
-
+        "swapon",  // Enable swap
+        "swapoff", // Disable swap
         // Kernel keyring (credential access)
-        "add_key",        // Add key to keyring
-        "request_key",    // Request key from keyring
-        "keyctl",         // Manipulate keyring
-
+        "add_key",     // Add key to keyring
+        "request_key", // Request key from keyring
+        "keyctl",      // Manipulate keyring
         // BPF and performance monitoring (kernel inspection/manipulation)
-        "bpf",            // Extended BPF syscall
+        "bpf",             // Extended BPF syscall
         "perf_event_open", // Performance monitoring
-
         // CPU affinity and NUMA (resource isolation bypass)
-        "mbind",          // Set NUMA memory policy
-        "set_mempolicy",  // Set NUMA memory policy
-        "migrate_pages",  // Move process pages between NUMA nodes
-        "move_pages",     // Move process pages
-
+        "mbind",         // Set NUMA memory policy
+        "set_mempolicy", // Set NUMA memory policy
+        "migrate_pages", // Move process pages between NUMA nodes
+        "move_pages",    // Move process pages
         // Quota manipulation
-        "quotactl",       // Filesystem quotas
-
+        "quotactl", // Filesystem quotas
         // User namespace credential manipulation (when not using user namespaces)
-        "setuid",         // Set user ID (blocked by default, allowed with conditions in real Docker)
-        "setgid",         // Set group ID
-
+        "setuid", // Set user ID (blocked by default, allowed with conditions in real Docker)
+        "setgid", // Set group ID
         // Architecture-specific personality (can bypass security)
-        "personality",    // Set execution domain
-
+        "personality", // Set execution domain
         // ACCT and system accounting
-        "acct",           // Process accounting
-
+        "acct", // Process accounting
         // Lookup dcookie (kernel debugging)
         "lookup_dcookie", // Get file name from dcookie
-
         // Name to handle (expose kernel pointers)
         "name_to_handle_at", // Get handle for pathname
         "open_by_handle_at", // Open file via handle
-
         // User namespace (when not using USER namespace)
-        "userfaultfd",    // User fault handling
+        "userfaultfd", // User fault handling
     ];
 
     // Build map of blocked syscalls with empty rule vectors (match all arguments)
@@ -181,8 +166,8 @@ pub fn docker_default_filter() -> Result<BpfProgram, io::Error> {
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,            // Default: allow everything else
-        SeccompAction::Errno(libc::EPERM as u32),  // Matched syscalls get EPERM
+        SeccompAction::Allow, // Default: allow everything else
+        SeccompAction::Errno(libc::EPERM as u32), // Matched syscalls get EPERM
         target_arch,
     )
     .map_err(|e| io::Error::other(format!("Failed to create seccomp filter: {}", e)))?;
@@ -205,26 +190,59 @@ pub fn minimal_filter() -> Result<BpfProgram, io::Error> {
     // Only allow essential syscalls for basic process execution
     let allowed_syscalls = vec![
         // Process control
-        "exit", "exit_group", "wait4", "waitid",
+        "exit",
+        "exit_group",
+        "wait4",
+        "waitid",
         // Memory
-        "brk", "mmap", "munmap", "mprotect", "mremap",
+        "brk",
+        "mmap",
+        "munmap",
+        "mprotect",
+        "mremap",
         // I/O
-        "read", "write", "readv", "writev", "pread64", "pwrite64",
-        "open", "openat", "close", "lseek",
+        "read",
+        "write",
+        "readv",
+        "writev",
+        "pread64",
+        "pwrite64",
+        "open",
+        "openat",
+        "close",
+        "lseek",
         // File metadata
-        "fstat", "stat", "lstat", "newfstatat", "access", "faccessat",
+        "fstat",
+        "stat",
+        "lstat",
+        "newfstatat",
+        "access",
+        "faccessat",
         // Directories
-        "getcwd", "chdir", "fchdir",
+        "getcwd",
+        "chdir",
+        "fchdir",
         // Signals
-        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
         // Time
-        "clock_gettime", "gettimeofday", "time", "nanosleep",
+        "clock_gettime",
+        "gettimeofday",
+        "time",
+        "nanosleep",
         // Process info
-        "getpid", "getuid", "getgid", "geteuid", "getegid",
+        "getpid",
+        "getuid",
+        "getgid",
+        "geteuid",
+        "getegid",
         // Arch-specific
         "arch_prctl",
         // Futex for threading
-        "futex", "set_robust_list", "get_robust_list",
+        "futex",
+        "set_robust_list",
+        "get_robust_list",
     ];
 
     // Build map of allowed syscalls with empty rule vectors (match all arguments)
@@ -243,8 +261,8 @@ pub fn minimal_filter() -> Result<BpfProgram, io::Error> {
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Errno(libc::EPERM as u32),  // Default: deny everything
-        SeccompAction::Allow,                       // Matched syscalls allowed
+        SeccompAction::Errno(libc::EPERM as u32), // Default: deny everything
+        SeccompAction::Allow,                     // Matched syscalls allowed
         target_arch,
     )
     .map_err(|e| io::Error::other(format!("Failed to create minimal filter: {}", e)))?;
@@ -267,20 +285,22 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
 
     fn oci_action_to_seccomp(action: &str) -> Option<SeccompAction> {
         match action {
-            "SCMP_ACT_ALLOW"                        => Some(SeccompAction::Allow),
-            "SCMP_ACT_ERRNO" | "SCMP_ACT_ENOSYS"   => Some(SeccompAction::Errno(libc::EPERM as u32)),
+            "SCMP_ACT_ALLOW" => Some(SeccompAction::Allow),
+            "SCMP_ACT_ERRNO" | "SCMP_ACT_ENOSYS" => Some(SeccompAction::Errno(libc::EPERM as u32)),
             "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" => Some(SeccompAction::KillThread),
-            "SCMP_ACT_KILL_PROCESS"                 => Some(SeccompAction::KillProcess),
-            "SCMP_ACT_LOG"                          => Some(SeccompAction::Log),
-            "SCMP_ACT_TRAP"                         => Some(SeccompAction::Trap),
-            _                                       => None,
+            "SCMP_ACT_KILL_PROCESS" => Some(SeccompAction::KillProcess),
+            "SCMP_ACT_LOG" => Some(SeccompAction::Log),
+            "SCMP_ACT_TRAP" => Some(SeccompAction::Trap),
+            _ => None,
         }
     }
 
-    let default_action = oci_action_to_seccomp(&config.default_action)
-        .ok_or_else(|| io::Error::other(format!(
-            "unknown seccomp defaultAction: {}", config.default_action
-        )))?;
+    let default_action = oci_action_to_seccomp(&config.default_action).ok_or_else(|| {
+        io::Error::other(format!(
+            "unknown seccomp defaultAction: {}",
+            config.default_action
+        ))
+    })?;
 
     // Build syscall → rules map. For each rule, the action overrides the default.
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -346,13 +366,9 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         .try_into()
         .map_err(|e| io::Error::other(format!("Unsupported architecture: {:?}", e)))?;
 
-    let filter = SeccompFilter::new(
-        filtered_rules,
-        default_action,
-        effective_match,
-        target_arch,
-    )
-    .map_err(|e| io::Error::other(format!("Failed to create OCI seccomp filter: {}", e)))?;
+    let filter =
+        SeccompFilter::new(filtered_rules, default_action, effective_match, target_arch)
+            .map_err(|e| io::Error::other(format!("Failed to create OCI seccomp filter: {}", e)))?;
 
     filter
         .try_into()
@@ -602,7 +618,10 @@ pub fn syscall_number(name: &str) -> Result<i64, io::Error> {
         "set_robust_list" => Ok(99),
         "get_robust_list" => Ok(100),
 
-        _ => Err(io::Error::other(format!("Unknown syscall for aarch64: {}", name))),
+        _ => Err(io::Error::other(format!(
+            "Unknown syscall for aarch64: {}",
+            name
+        ))),
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

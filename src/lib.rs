@@ -5,8 +5,8 @@
 
 pub mod cgroup;
 pub mod container;
-pub mod network;
-pub mod seccomp;
-pub mod pty;
-pub mod oci;
 pub mod image;
+pub mod network;
+pub mod oci;
+pub mod pty;
+pub mod seccomp;

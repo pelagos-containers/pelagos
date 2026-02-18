@@ -4,8 +4,7 @@ use super::read_state;
 use std::io::{self, Write};
 
 pub fn cmd_logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let state = read_state(name)
-        .map_err(|_| format!("no container named '{}'", name))?;
+    let state = read_state(name).map_err(|_| format!("no container named '{}'", name))?;
 
     let stdout_log = state.stdout_log.as_deref().unwrap_or("");
     let stderr_log = state.stderr_log.as_deref().unwrap_or("");
@@ -14,7 +13,8 @@ pub fn cmd_logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Erro
         return Err(format!(
             "container '{}' has no log files (was it started with --detach?)",
             name
-        ).into());
+        )
+        .into());
     }
 
     if follow {
@@ -47,7 +47,9 @@ pub fn cmd_logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Erro
 
 /// Print entire file to stdout, return file size.
 fn print_file(path: &str) -> io::Result<u64> {
-    if path.is_empty() { return Ok(0); }
+    if path.is_empty() {
+        return Ok(0);
+    }
     match std::fs::read(path) {
         Ok(data) => {
             io::stdout().write_all(&data)?;
@@ -60,7 +62,9 @@ fn print_file(path: &str) -> io::Result<u64> {
 
 /// Print new content from `path` since `offset`, return new offset.
 fn tail_file(path: &str, offset: u64) -> io::Result<u64> {
-    if path.is_empty() { return Ok(offset); }
+    if path.is_empty() {
+        return Ok(offset);
+    }
     use std::io::{Read, Seek, SeekFrom};
     match std::fs::File::open(path) {
         Ok(mut f) => {

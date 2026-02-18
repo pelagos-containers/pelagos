@@ -3,11 +3,14 @@
 use super::{check_liveness, read_state, write_state, ContainerStatus};
 
 pub fn cmd_stop(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = read_state(name)
-        .map_err(|_| format!("no container named '{}'", name))?;
+    let mut state = read_state(name).map_err(|_| format!("no container named '{}'", name))?;
 
     if state.status != ContainerStatus::Running {
-        return Err(format!("container '{}' is not running (status: {})", name, state.status).into());
+        return Err(format!(
+            "container '{}' is not running (status: {})",
+            name, state.status
+        )
+        .into());
     }
 
     if !check_liveness(state.pid) {

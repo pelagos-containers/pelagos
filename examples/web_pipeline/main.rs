@@ -177,9 +177,7 @@ fn main() {
         .spawn()
         .expect("Failed to spawn store container");
 
-    let store_ip = store
-        .container_ip()
-        .expect("store should have a bridge IP");
+    let store_ip = store.container_ip().expect("store should have a bridge IP");
     let store_pid = store.pid() as i32;
     println!("[main] store running — PID {} — IP {}", store_pid, store_ip);
 
@@ -300,9 +298,6 @@ fn main() {
     if front_status.success() {
         println!("\nAll containers exited successfully!");
     } else {
-        println!(
-            "\nFrontend exited with code: {:?}",
-            front_status.code()
-        );
+        println!("\nFrontend exited with code: {:?}", front_status.code());
     }
 }

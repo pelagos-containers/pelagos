@@ -1,9 +1,9 @@
 //! `remora run` — create and start a container.
 
 use super::{
-    check_liveness, container_dir, containers_dir, generate_name, parse_capability,
-    parse_cpus, parse_memory, parse_ulimit, parse_user, rootfs_path, write_state,
-    ContainerState, ContainerStatus,
+    check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
+    parse_memory, parse_ulimit, parse_user, rootfs_path, write_state, ContainerState,
+    ContainerStatus,
 };
 use remora::container::{Capability, Command, Namespace, Stdio, Volume};
 use remora::network::NetworkMode;
@@ -175,7 +175,13 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             cmd_args
         };
-        let cmd = build_command(&args, &rootfs_dir, &exe_and_args, &port_forwards, network_mode)?;
+        let cmd = build_command(
+            &args,
+            &rootfs_dir,
+            &exe_and_args,
+            &port_forwards,
+            network_mode,
+        )?;
         (rootfs_name, exe_and_args, cmd)
     };
 
@@ -199,8 +205,12 @@ fn build_image_run(
 
     // Normalise and load the image manifest.
     let full_ref = normalise_image_reference(image_ref);
-    let manifest = image::load_image(&full_ref)
-        .map_err(|e| format!("image '{}' not found locally (run 'remora image pull {}'): {}", image_ref, image_ref, e))?;
+    let manifest = image::load_image(&full_ref).map_err(|e| {
+        format!(
+            "image '{}' not found locally (run 'remora image pull {}'): {}",
+            image_ref, image_ref, e
+        )
+    })?;
 
     // Resolve layer directories (top-first for overlayfs).
     let layers = image::layer_dirs(&manifest);
@@ -224,9 +234,7 @@ fn build_image_run(
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
 
-    let mut cmd = Command::new(exe)
-        .args(rest)
-        .with_image_layers(layers);
+    let mut cmd = Command::new(exe).args(rest).with_image_layers(layers);
 
     // Apply image config defaults: environment.
     for env_str in &manifest.config.env {
@@ -323,7 +331,11 @@ fn apply_cli_options(
                 cmd = cmd.with_volume(&vol, tgt);
             }
         } else {
-            return Err(format!("invalid --volume '{}': expected NAME:/path or /host:/path", v).into());
+            return Err(format!(
+                "invalid --volume '{}': expected NAME:/path or /host:/path",
+                v
+            )
+            .into());
         }
     }
     for b in &args.bind {
@@ -345,7 +357,9 @@ fn apply_cli_options(
             .map_err(|e| format!("--env-file {}: {}", ef.display(), e))?;
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             if let Some((k, v)) = line.split_once('=') {
                 cmd = cmd.env(k, v);
             }
@@ -361,7 +375,10 @@ fn apply_cli_options(
         }
     }
     // Always set a sensible PATH
-    cmd = cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd = cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
 
     // User
     if let Some(ref u) = args.user {
@@ -426,9 +443,15 @@ fn apply_cli_options(
         match key {
             "seccomp" => match val {
                 "default" | "" => cmd = cmd.with_seccomp_default(),
-                "minimal"      => cmd = cmd.with_seccomp_minimal(),
-                "none"         => {}
-                other => return Err(format!("unknown seccomp profile '{}' (use: default, minimal, none)", other).into()),
+                "minimal" => cmd = cmd.with_seccomp_minimal(),
+                "none" => {}
+                other => {
+                    return Err(format!(
+                        "unknown seccomp profile '{}' (use: default, minimal, none)",
+                        other
+                    )
+                    .into())
+                }
             },
             "no-new-privileges" => cmd = cmd.with_no_new_privileges(true),
             other => return Err(format!("unknown --security-opt '{}'", other).into()),
@@ -455,27 +478,43 @@ fn apply_cli_options(
 
 fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>> {
     match s.to_ascii_lowercase().as_str() {
-        "none" | ""  => Ok(NetworkMode::None),
-        "loopback"   => Ok(NetworkMode::Loopback),
-        "bridge"     => Ok(NetworkMode::Bridge),
-        "pasta"      => Ok(NetworkMode::Pasta),
-        other => Err(format!("unknown network mode '{}' (use: none, loopback, bridge, pasta)", other).into()),
+        "none" | "" => Ok(NetworkMode::None),
+        "loopback" => Ok(NetworkMode::Loopback),
+        "bridge" => Ok(NetworkMode::Bridge),
+        "pasta" => Ok(NetworkMode::Pasta),
+        other => Err(format!(
+            "unknown network mode '{}' (use: none, loopback, bridge, pasta)",
+            other
+        )
+        .into()),
     }
 }
 
 fn parse_port_forwards(specs: &[String]) -> Result<Vec<(u16, u16)>, Box<dyn std::error::Error>> {
     let mut out = Vec::new();
     for s in specs {
-        let (h, c) = s.split_once(':').ok_or_else(|| format!("invalid --publish '{}': expected HOST:CONTAINER", s))?;
-        let host = h.trim().parse::<u16>().map_err(|e| format!("invalid host port '{}': {}", h, e))?;
-        let container = c.trim().parse::<u16>().map_err(|e| format!("invalid container port '{}': {}", c, e))?;
+        let (h, c) = s
+            .split_once(':')
+            .ok_or_else(|| format!("invalid --publish '{}': expected HOST:CONTAINER", s))?;
+        let host = h
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| format!("invalid host port '{}': {}", h, e))?;
+        let container = c
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| format!("invalid container port '{}': {}", c, e))?;
         out.push((host, container));
     }
     Ok(out)
 }
 
-fn split_mount_spec<'a>(s: &'a str, flag: &str) -> Result<(&'a str, &'a str), Box<dyn std::error::Error>> {
-    s.split_once(':').ok_or_else(|| format!("invalid {} '{}': expected /host:/container", flag, s).into())
+fn split_mount_spec<'a>(
+    s: &'a str,
+    flag: &str,
+) -> Result<(&'a str, &'a str), Box<dyn std::error::Error>> {
+    s.split_once(':')
+        .ok_or_else(|| format!("invalid {} '{}': expected /host:/container", flag, s).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +574,9 @@ fn run_foreground(
 // ---------------------------------------------------------------------------
 
 fn run_interactive(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
-    let session = cmd.spawn_interactive().map_err(|e| format!("spawn_interactive failed: {}", e))?;
+    let session = cmd
+        .spawn_interactive()
+        .map_err(|e| format!("spawn_interactive failed: {}", e))?;
     match session.run() {
         Ok(status) => {
             let code = status.code().unwrap_or(0);
@@ -627,7 +668,9 @@ fn run_detached(
                         loop {
                             match src.read(&mut buf) {
                                 Ok(0) | Err(_) => break,
-                                Ok(n) => { let _ = f.write_all(&buf[..n]); }
+                                Ok(n) => {
+                                    let _ = f.write_all(&buf[..n]);
+                                }
                             }
                         }
                     }
@@ -640,7 +683,9 @@ fn run_detached(
                         loop {
                             match src.read(&mut buf) {
                                 Ok(0) | Err(_) => break,
-                                Ok(n) => { let _ = f.write_all(&buf[..n]); }
+                                Ok(n) => {
+                                    let _ = f.write_all(&buf[..n]);
+                                }
                             }
                         }
                     }

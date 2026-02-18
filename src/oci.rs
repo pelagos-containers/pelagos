@@ -155,7 +155,9 @@ pub struct OciDevice {
     pub gid: u32,
 }
 
-fn default_file_mode() -> u32 { 0o666 }
+fn default_file_mode() -> u32 {
+    0o666
+}
 
 // ---------------------------------------------------------------------------
 // linux.seccomp
@@ -283,13 +285,12 @@ pub fn exec_sock_path(id: &str) -> PathBuf {
 
 pub fn read_state(id: &str) -> io::Result<OciState> {
     let content = fs::read(state_path(id))?;
-    serde_json::from_slice(&content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub fn write_state(id: &str, state: &OciState) -> io::Result<()> {
-    let content = serde_json::to_vec_pretty(state)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let content =
+        serde_json::to_vec_pretty(state).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     fs::write(state_path(id), content)
 }
 
@@ -300,8 +301,7 @@ pub fn write_state(id: &str, state: &OciState) -> io::Result<()> {
 pub fn config_from_bundle(bundle: &Path) -> io::Result<OciConfig> {
     let config_path = bundle.join("config.json");
     let content = fs::read(&config_path)?;
-    serde_json::from_slice(&content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -315,18 +315,18 @@ fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
     // Strip optional "CAP_" prefix for case-insensitive matching.
     let n = name.strip_prefix("CAP_").unwrap_or(name);
     match n {
-        "CHOWN"           => Some(Capability::CHOWN),
-        "DAC_OVERRIDE"    => Some(Capability::DAC_OVERRIDE),
-        "FOWNER"          => Some(Capability::FOWNER),
-        "FSETID"          => Some(Capability::FSETID),
-        "KILL"            => Some(Capability::KILL),
-        "SETGID"          => Some(Capability::SETGID),
-        "SETUID"          => Some(Capability::SETUID),
+        "CHOWN" => Some(Capability::CHOWN),
+        "DAC_OVERRIDE" => Some(Capability::DAC_OVERRIDE),
+        "FOWNER" => Some(Capability::FOWNER),
+        "FSETID" => Some(Capability::FSETID),
+        "KILL" => Some(Capability::KILL),
+        "SETGID" => Some(Capability::SETGID),
+        "SETUID" => Some(Capability::SETUID),
         "NET_BIND_SERVICE" => Some(Capability::NET_BIND_SERVICE),
-        "NET_RAW"         => Some(Capability::NET_RAW),
-        "SYS_CHROOT"      => Some(Capability::SYS_CHROOT),
-        "SYS_ADMIN"       => Some(Capability::SYS_ADMIN),
-        "SYS_PTRACE"      => Some(Capability::SYS_PTRACE),
+        "NET_RAW" => Some(Capability::NET_RAW),
+        "SYS_CHROOT" => Some(Capability::SYS_CHROOT),
+        "SYS_ADMIN" => Some(Capability::SYS_ADMIN),
+        "SYS_PTRACE" => Some(Capability::SYS_PTRACE),
         _ => None,
     }
 }
@@ -335,10 +335,7 @@ fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
 // Build a container::Command from OCI config
 // ---------------------------------------------------------------------------
 
-pub fn build_command(
-    config: &OciConfig,
-    bundle: &Path,
-) -> io::Result<crate::container::Command> {
+pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::container::Command> {
     use crate::container::{Command, Namespace};
 
     let root_path = bundle.join(&config.root.path);
@@ -357,7 +354,10 @@ pub fn build_command(
 
     // Remaining args (exe is args[0])
     if config.process.args.len() > 1 {
-        let rest: Vec<&str> = config.process.args[1..].iter().map(|s| s.as_str()).collect();
+        let rest: Vec<&str> = config.process.args[1..]
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         cmd = cmd.args(&rest);
     }
 
@@ -411,7 +411,10 @@ pub fn build_command(
         }
 
         // Mount proc automatically when a mount namespace is requested
-        let has_mount_ns = linux.namespaces.iter().any(|n| n.ns_type == "mount" && n.path.is_none());
+        let has_mount_ns = linux
+            .namespaces
+            .iter()
+            .any(|n| n.ns_type == "mount" && n.path.is_none());
         if has_mount_ns {
             cmd = cmd.with_proc_mount();
         }
@@ -538,22 +541,22 @@ pub fn build_command(
     // process.rlimits
     for rl in &config.process.rlimits {
         let resource = match rl.type_.as_str() {
-            "RLIMIT_CORE"    => Some(libc::RLIMIT_CORE),
-            "RLIMIT_CPU"     => Some(libc::RLIMIT_CPU),
-            "RLIMIT_DATA"    => Some(libc::RLIMIT_DATA),
-            "RLIMIT_FSIZE"   => Some(libc::RLIMIT_FSIZE),
-            "RLIMIT_LOCKS"   => Some(libc::RLIMIT_LOCKS),
+            "RLIMIT_CORE" => Some(libc::RLIMIT_CORE),
+            "RLIMIT_CPU" => Some(libc::RLIMIT_CPU),
+            "RLIMIT_DATA" => Some(libc::RLIMIT_DATA),
+            "RLIMIT_FSIZE" => Some(libc::RLIMIT_FSIZE),
+            "RLIMIT_LOCKS" => Some(libc::RLIMIT_LOCKS),
             "RLIMIT_MEMLOCK" => Some(libc::RLIMIT_MEMLOCK),
             "RLIMIT_MSGQUEUE" => Some(libc::RLIMIT_MSGQUEUE),
-            "RLIMIT_NICE"    => Some(libc::RLIMIT_NICE),
-            "RLIMIT_NOFILE"  => Some(libc::RLIMIT_NOFILE),
-            "RLIMIT_NPROC"   => Some(libc::RLIMIT_NPROC),
-            "RLIMIT_RSS"     => Some(libc::RLIMIT_RSS),
-            "RLIMIT_RTPRIO"  => Some(libc::RLIMIT_RTPRIO),
-            "RLIMIT_RTTIME"  => Some(libc::RLIMIT_RTTIME),
+            "RLIMIT_NICE" => Some(libc::RLIMIT_NICE),
+            "RLIMIT_NOFILE" => Some(libc::RLIMIT_NOFILE),
+            "RLIMIT_NPROC" => Some(libc::RLIMIT_NPROC),
+            "RLIMIT_RSS" => Some(libc::RLIMIT_RSS),
+            "RLIMIT_RTPRIO" => Some(libc::RLIMIT_RTPRIO),
+            "RLIMIT_RTTIME" => Some(libc::RLIMIT_RTTIME),
             "RLIMIT_SIGPENDING" => Some(libc::RLIMIT_SIGPENDING),
-            "RLIMIT_STACK"   => Some(libc::RLIMIT_STACK),
-            "RLIMIT_AS"      => Some(libc::RLIMIT_AS),
+            "RLIMIT_STACK" => Some(libc::RLIMIT_STACK),
+            "RLIMIT_AS" => Some(libc::RLIMIT_AS),
             _ => None,
         };
         if let Some(res) = resource {
@@ -597,7 +600,10 @@ fn create_listen_socket(path: &Path) -> io::Result<i32> {
     use std::os::unix::ffi::OsStrExt;
     let path_bytes = path.as_os_str().as_bytes();
     if path_bytes.len() >= 108 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
     }
 
     unsafe {
@@ -680,8 +686,8 @@ fn connect_socket(path: &Path) -> io::Result<i32> {
 fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
     use std::io::Write;
 
-    let state_json = serde_json::to_vec(state)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let state_json =
+        serde_json::to_vec(state).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     for hook in hooks {
         let mut child = std::process::Command::new(&hook.path);
@@ -827,7 +833,10 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
     if dir.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("container '{}' already exists — run 'remora delete {}' first", id, id),
+            format!(
+                "container '{}' already exists — run 'remora delete {}' first",
+                id, id
+            ),
         ));
     }
 
@@ -845,7 +854,10 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
     // Listen socket: grandchild blocks on accept() until "remora start" connects.
     let sock_path = exec_sock_path(id);
     let listen_fd = create_listen_socket(&sock_path).map_err(|e| {
-        unsafe { libc::close(ready_r); libc::close(ready_w); }
+        unsafe {
+            libc::close(ready_r);
+            libc::close(ready_w);
+        }
         e
     })?;
 
@@ -853,7 +865,11 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
     let command = match build_command(&config, &bundle) {
         Ok(c) => c.with_oci_sync(ready_w, listen_fd),
         Err(e) => {
-            unsafe { libc::close(ready_r); libc::close(ready_w); libc::close(listen_fd); }
+            unsafe {
+                libc::close(ready_r);
+                libc::close(ready_w);
+                libc::close(listen_fd);
+            }
             let _ = fs::remove_dir_all(&dir);
             return Err(e);
         }
@@ -864,7 +880,11 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
     // execs; the parent reads the ready pipe and exits without waiting.
     match unsafe { libc::fork() } {
         -1 => {
-            unsafe { libc::close(ready_r); libc::close(ready_w); libc::close(listen_fd); }
+            unsafe {
+                libc::close(ready_r);
+                libc::close(ready_w);
+                libc::close(listen_fd);
+            }
             let _ = fs::remove_dir_all(&dir);
             Err(io::Error::last_os_error())
         }
@@ -912,9 +932,7 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
             // the host.  We only use the read as a "setup complete" gate; the actual
             // host-visible PID comes from the shim's child.pid() below.
             let mut pid_buf = [0u8; 4];
-            let n = unsafe {
-                libc::read(ready_r, pid_buf.as_mut_ptr() as *mut libc::c_void, 4)
-            };
+            let n = unsafe { libc::read(ready_r, pid_buf.as_mut_ptr() as *mut libc::c_void, 4) };
             unsafe { libc::close(ready_r) };
 
             if n != 4 {
@@ -1044,7 +1062,10 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
         s => s.parse::<i32>().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unknown signal '{}' — use a name (SIGTERM) or number (15)", s),
+                format!(
+                    "unknown signal '{}' — use a name (SIGTERM) or number (15)",
+                    s
+                ),
             )
         })?,
     };

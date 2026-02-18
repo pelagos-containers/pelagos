@@ -8,8 +8,8 @@ pub fn cmd_rootfs_import(name: &str, path: &str) -> Result<(), Box<dyn std::erro
     std::fs::create_dir_all(&store)?;
 
     // Resolve path to absolute.
-    let src = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve '{}': {}", path, e))?;
+    let src =
+        std::fs::canonicalize(path).map_err(|e| format!("cannot resolve '{}': {}", path, e))?;
 
     let link = store.join(name);
     if link.exists() || link.is_symlink() {
@@ -62,8 +62,7 @@ pub fn cmd_rootfs_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !link.exists() && !link.is_symlink() {
         return Err(format!("rootfs '{}' not found", name).into());
     }
-    std::fs::remove_file(&link)
-        .map_err(|e| format!("remove '{}': {}", link.display(), e))?;
+    std::fs::remove_file(&link).map_err(|e| format!("remove '{}': {}", link.display(), e))?;
     println!("Removed rootfs '{}'", name);
     Ok(())
 }

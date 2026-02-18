@@ -82,8 +82,8 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         // fchdir(root_fd) + chroot(".") is the correct way to enter the
         // container's root — same technique as nsenter(1).
         let root_path = format!("/proc/{}/root", pid);
-        let root_file = std::fs::File::open(&root_path)
-            .map_err(|e| format!("open {}: {}", root_path, e))?;
+        let root_file =
+            std::fs::File::open(&root_path).map_err(|e| format!("open {}: {}", root_path, e))?;
         let root_fd = root_file.as_raw_fd();
 
         cmd = cmd.with_pre_exec(move || {
@@ -161,8 +161,12 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
             .stdout(Stdio::Inherit)
             .stderr(Stdio::Inherit);
 
-        let mut child = cmd.spawn().map_err(|e| format!("exec spawn failed: {}", e))?;
-        let exit = child.wait().map_err(|e| format!("exec wait failed: {}", e))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("exec spawn failed: {}", e))?;
+        let exit = child
+            .wait()
+            .map_err(|e| format!("exec wait failed: {}", e))?;
         let code = exit.code().unwrap_or(1);
         std::process::exit(code);
     }

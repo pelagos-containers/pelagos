@@ -14,15 +14,11 @@
 //! across concurrent containers.
 
 use cgroups_rs::{
-    fs::{
-        cgroup_builder::CgroupBuilder,
-        cpu::CpuController,
-        hierarchies,
-        memory::MemController,
-        pid::PidController,
-        Cgroup,
-    },
     fs::MaxValue,
+    fs::{
+        cgroup_builder::CgroupBuilder, cpu::CpuController, hierarchies, memory::MemController,
+        pid::PidController, Cgroup,
+    },
     CgroupPid,
 };
 use std::io;
@@ -81,7 +77,12 @@ pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
 
     match (cfg.cpu_shares, cfg.cpu_quota) {
         (Some(shares), Some((quota, period))) => {
-            builder = builder.cpu().shares(shares).quota(quota).period(period).done();
+            builder = builder
+                .cpu()
+                .shares(shares)
+                .quota(quota)
+                .period(period)
+                .done();
         }
         (Some(shares), None) => {
             builder = builder.cpu().shares(shares).done();

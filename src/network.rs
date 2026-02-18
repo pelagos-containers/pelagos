@@ -128,7 +128,11 @@ pub fn bring_up_loopback() -> io::Result<()> {
         _pad: [u8; 22],
     }
 
-    let mut req = Ifreq { ifr_name: [0u8; 16], ifr_flags: 0, _pad: [0u8; 22] };
+    let mut req = Ifreq {
+        ifr_name: [0u8; 16],
+        ifr_flags: 0,
+        _pad: [0u8; 22],
+    };
     req.ifr_name[0] = b'l';
     req.ifr_name[1] = b'o';
 
@@ -257,7 +261,11 @@ fn veth_names_for(ns_name: &str) -> (String, String) {
 ///
 /// Returns a [`NetworkSetup`] that must be passed to [`teardown_network`]
 /// after the container exits.
-pub fn setup_bridge_network(ns_name: &str, nat: bool, port_forwards: Vec<(u16, u16)>) -> io::Result<NetworkSetup> {
+pub fn setup_bridge_network(
+    ns_name: &str,
+    nat: bool,
+    port_forwards: Vec<(u16, u16)>,
+) -> io::Result<NetworkSetup> {
     ensure_bridge()?;
 
     let container_ip = allocate_ip()?;
@@ -270,11 +278,12 @@ pub fn setup_bridge_network(ns_name: &str, nat: bool, port_forwards: Vec<(u16, u
     run("ip", &["-n", ns_name, "link", "set", "lo", "up"])?;
 
     // 3. Create veth pair in the host netns
-    run("ip", &[
-        "link", "add", &veth_host,
-        "type", "veth",
-        "peer", "name", &veth_peer,
-    ])?;
+    run(
+        "ip",
+        &[
+            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
+        ],
+    )?;
 
     // 4. Move the peer into the named netns
     run("ip", &["link", "set", &veth_peer, "netns", ns_name])?;
@@ -282,10 +291,19 @@ pub fn setup_bridge_network(ns_name: &str, nat: bool, port_forwards: Vec<(u16, u
     let ip_cidr = format!("{}/24", container_ip);
 
     // 5. Configure eth0 inside the named netns (rename, assign IP, bring up, add route)
-    run("ip", &["-n", ns_name, "link", "set", &veth_peer, "name", "eth0"])?;
-    run("ip", &["-n", ns_name, "addr", "add", &ip_cidr, "dev", "eth0"])?;
+    run(
+        "ip",
+        &["-n", ns_name, "link", "set", &veth_peer, "name", "eth0"],
+    )?;
+    run(
+        "ip",
+        &["-n", ns_name, "addr", "add", &ip_cidr, "dev", "eth0"],
+    )?;
     run("ip", &["-n", ns_name, "link", "set", "eth0", "up"])?;
-    run("ip", &["-n", ns_name, "route", "add", "default", "via", BRIDGE_GW])?;
+    run(
+        "ip",
+        &["-n", ns_name, "route", "add", "default", "via", BRIDGE_GW],
+    )?;
 
     // 6. Attach host-side veth to bridge and bring it up
     run("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])?;
@@ -405,8 +423,14 @@ fn enable_nat() -> io::Result<()> {
         // the FORWARD chain policy to DROP. Without these, TCP/UDP packets
         // from the remora subnet are silently dropped even though nftables
         // MASQUERADE is in place (ICMP/ping may still work via conntrack).
-        let _ = run("iptables", &["-I", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"]);
-        let _ = run("iptables", &["-I", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"]);
+        let _ = run(
+            "iptables",
+            &["-I", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"],
+        );
+        let _ = run(
+            "iptables",
+            &["-I", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"],
+        );
     }
 
     file.seek(SeekFrom::Start(0))?;
@@ -433,7 +457,10 @@ fn disable_nat() {
 
     let mut file = match file {
         Ok(f) => f,
-        Err(e) => { log::warn!("NAT refcount open (non-fatal): {}", e); return; }
+        Err(e) => {
+            log::warn!("NAT refcount open (non-fatal): {}", e);
+            return;
+        }
     };
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -446,9 +473,13 @@ fn disable_nat() {
     let count: u32 = content.trim().parse().unwrap_or(0);
 
     if count <= 1 {
-        if let Err(e) = file.seek(SeekFrom::Start(0))
+        if let Err(e) = file
+            .seek(SeekFrom::Start(0))
             .and_then(|_| file.set_len(0))
-            .and_then(|_| { write!(file, "0")?; Ok(()) })
+            .and_then(|_| {
+                write!(file, "0")?;
+                Ok(())
+            })
         {
             log::warn!("NAT refcount write (non-fatal): {}", e);
         }
@@ -456,8 +487,14 @@ fn disable_nat() {
         drop(file);
 
         // Remove the iptables FORWARD rules added by enable_nat().
-        let _ = run("iptables", &["-D", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"]);
-        let _ = run("iptables", &["-D", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"]);
+        let _ = run(
+            "iptables",
+            &["-D", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"],
+        );
+        let _ = run(
+            "iptables",
+            &["-D", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"],
+        );
 
         if read_port_forwards_count() == 0 {
             // No active port forwards either — remove the entire table.
@@ -469,9 +506,13 @@ fn disable_nat() {
             let _ = run_nft("flush chain ip remora postrouting\n");
         }
     } else {
-        if let Err(e) = file.seek(SeekFrom::Start(0))
+        if let Err(e) = file
+            .seek(SeekFrom::Start(0))
             .and_then(|_| file.set_len(0))
-            .and_then(|_| { write!(file, "{}", count - 1)?; Ok(()) })
+            .and_then(|_| {
+                write!(file, "{}", count - 1)?;
+                Ok(())
+            })
         {
             log::warn!("NAT refcount write (non-fatal): {}", e);
         }
@@ -595,22 +636,26 @@ fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
 
     let mut file = match file {
         Ok(f) => f,
-        Err(e) => { log::warn!("port forwards file open (non-fatal): {}", e); return; }
+        Err(e) => {
+            log::warn!("port forwards file open (non-fatal): {}", e);
+            return;
+        }
     };
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
     let entries = match read_port_forwards_locked(&mut file) {
         Ok(e) => e,
-        Err(e) => { log::warn!("port forwards read (non-fatal): {}", e); return; }
+        Err(e) => {
+            log::warn!("port forwards read (non-fatal): {}", e);
+            return;
+        }
     };
 
     // Remove all entries belonging to this container.
     let remaining: Vec<(Ipv4Addr, u16, u16)> = entries
         .into_iter()
-        .filter(|(ip, hp, _cp)| {
-            !(*ip == container_ip && forwards.iter().any(|&(h, _)| h == *hp))
-        })
+        .filter(|(ip, hp, _cp)| !(*ip == container_ip && forwards.iter().any(|&(h, _)| h == *hp)))
         .collect();
 
     // Write remaining entries back.
@@ -687,9 +732,9 @@ pub fn setup_pasta_network(child_pid: u32, port_forwards: &[(u16, u16)]) -> io::
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| io::Error::other(format!(
-            "failed to start pasta (is it installed?): {}", e
-        )))?;
+        .map_err(|e| {
+            io::Error::other(format!("failed to start pasta (is it installed?): {}", e))
+        })?;
 
     Ok(PastaSetup { process })
 }
@@ -702,7 +747,8 @@ pub fn teardown_pasta_network(setup: &mut PastaSetup) {
 
 /// Returns true if `pasta` is on PATH and responds to `--version`.
 pub fn is_pasta_available() -> bool {
-    SysCmd::new("pasta").arg("--version")
+    SysCmd::new("pasta")
+        .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

@@ -93,7 +93,11 @@ pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let raw_path = entry.path()?.into_owned();
-        let file_name = raw_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let file_name = raw_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
 
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: mark parent as opaque for overlayfs.
@@ -132,9 +136,7 @@ fn create_whiteout_device(path: &Path) -> io::Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("invalid path for whiteout device"))?;
     let dev = libc::makedev(0, 0);
-    let ret = unsafe {
-        libc::mknod(c_path.as_ptr(), libc::S_IFCHR | 0o666, dev)
-    };
+    let ret = unsafe { libc::mknod(c_path.as_ptr(), libc::S_IFCHR | 0o666, dev) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -169,8 +171,8 @@ fn set_opaque_xattr(dir: &Path) -> io::Result<()> {
 pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
     let dir = image_dir(&manifest.reference);
     std::fs::create_dir_all(&dir)?;
-    let json = serde_json::to_string_pretty(manifest)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(manifest).map_err(|e| io::Error::other(e.to_string()))?;
     std::fs::write(dir.join("manifest.json"), json)
 }
 
@@ -221,8 +223,14 @@ mod tests {
     #[test]
     fn test_reference_to_dirname() {
         assert_eq!(reference_to_dirname("alpine:latest"), "alpine_latest");
-        assert_eq!(reference_to_dirname("docker.io/library/alpine:3.19"), "docker.io_library_alpine_3.19");
-        assert_eq!(reference_to_dirname("registry.example.com/foo/bar:v1"), "registry.example.com_foo_bar_v1");
+        assert_eq!(
+            reference_to_dirname("docker.io/library/alpine:3.19"),
+            "docker.io_library_alpine_3.19"
+        );
+        assert_eq!(
+            reference_to_dirname("registry.example.com/foo/bar:v1"),
+            "registry.example.com_foo_bar_v1"
+        );
     }
 
     #[test]

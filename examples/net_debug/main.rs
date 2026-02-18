@@ -78,7 +78,11 @@ echo "received: '$RESULT'"
         .spawn()
         .expect("Failed to spawn client");
 
-    println!("[main] client: PID={} IP={}\n", client.pid(), client.container_ip().unwrap());
+    println!(
+        "[main] client: PID={} IP={}\n",
+        client.pid(),
+        client.container_ip().unwrap()
+    );
 
     let (_, stdout_b, stderr_b) = client.wait_with_output().expect("wait client");
     println!("--- client stdout ---");
@@ -90,7 +94,9 @@ echo "received: '$RESULT'"
 
     // Kill server (use wait, not wait_with_output — pipes + shell loops hang)
     println!("\n[main] Killing server ...");
-    unsafe { libc::kill(pid_a as i32, libc::SIGTERM); }
+    unsafe {
+        libc::kill(pid_a as i32, libc::SIGTERM);
+    }
     let _ = server.wait();
     println!("[main] Done — networking works!");
 }

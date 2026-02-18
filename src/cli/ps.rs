@@ -25,19 +25,40 @@ pub fn cmd_ps(all: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Column widths
-    let name_w = states.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
-    let rootfs_w = states.iter().map(|s| s.rootfs.len()).max().unwrap_or(6).max(6);
+    let name_w = states
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let rootfs_w = states
+        .iter()
+        .map(|s| s.rootfs.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
     let cmd_w = 12usize;
     let _started_w = 14usize;
 
     println!(
         "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  {}",
-        "NAME", "STATUS", "PID", "ROOTFS", "COMMAND", "STARTED",
-        name_w = name_w, rootfs_w = rootfs_w, cmd_w = cmd_w,
+        "NAME",
+        "STATUS",
+        "PID",
+        "ROOTFS",
+        "COMMAND",
+        "STARTED",
+        name_w = name_w,
+        rootfs_w = rootfs_w,
+        cmd_w = cmd_w,
     );
 
     for s in &states {
-        let pid_str = if s.pid > 0 { s.pid.to_string() } else { "-".to_string() };
+        let pid_str = if s.pid > 0 {
+            s.pid.to_string()
+        } else {
+            "-".to_string()
+        };
         let cmd_str = s.command.join(" ");
         let cmd_display = if cmd_str.len() > cmd_w {
             format!("{}…", &cmd_str[..cmd_w - 1])

@@ -51,7 +51,12 @@ pub fn rootfs_path(name: &str) -> std::io::Result<PathBuf> {
         return Ok(link);
     }
     std::fs::read_link(&link).map_err(|e| {
-        std::io::Error::other(format!("rootfs '{}' not found ({}): {}", name, link.display(), e))
+        std::io::Error::other(format!(
+            "rootfs '{}' not found ({}): {}",
+            name,
+            link.display(),
+            e
+        ))
     })
 }
 
@@ -138,8 +143,8 @@ fn epoch_to_datetime(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
 pub fn write_state(state: &ContainerState) -> std::io::Result<()> {
     let dir = container_dir(&state.name);
     std::fs::create_dir_all(&dir)?;
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(state_path(&state.name), json)
 }
 
@@ -228,35 +233,56 @@ pub fn parse_cpus(s: &str) -> Result<(i64, u64), String> {
 /// Parse --user "1000" or "1000:1000" → (uid, Option<gid>).
 pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
     if let Some((u, g)) = s.split_once(':') {
-        let uid = u.trim().parse::<u32>().map_err(|e| format!("invalid uid '{}': {}", u, e))?;
-        let gid = g.trim().parse::<u32>().map_err(|e| format!("invalid gid '{}': {}", g, e))?;
+        let uid = u
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid uid '{}': {}", u, e))?;
+        let gid = g
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid gid '{}': {}", g, e))?;
         Ok((uid, Some(gid)))
     } else {
-        let uid = s.trim().parse::<u32>().map_err(|e| format!("invalid uid '{}': {}", s, e))?;
+        let uid = s
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid uid '{}': {}", s, e))?;
         Ok((uid, None))
     }
 }
 
 /// Parse --ulimit "nofile=1024:2048" → (resource_int, soft, hard).
 /// Returns the libc resource constant.
-pub fn parse_ulimit(s: &str) -> Result<(libc::__rlimit_resource_t, libc::rlim_t, libc::rlim_t), String> {
-    let (name, limits) = s.split_once('=').ok_or_else(|| format!("invalid --ulimit '{}': expected RESOURCE=SOFT:HARD", s))?;
-    let (soft_s, hard_s) = limits.split_once(':').ok_or_else(|| format!("invalid --ulimit '{}': expected SOFT:HARD", s))?;
-    let soft = soft_s.trim().parse::<libc::rlim_t>().map_err(|e| format!("invalid soft limit '{}': {}", soft_s, e))?;
-    let hard = hard_s.trim().parse::<libc::rlim_t>().map_err(|e| format!("invalid hard limit '{}': {}", hard_s, e))?;
+pub fn parse_ulimit(
+    s: &str,
+) -> Result<(libc::__rlimit_resource_t, libc::rlim_t, libc::rlim_t), String> {
+    let (name, limits) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --ulimit '{}': expected RESOURCE=SOFT:HARD", s))?;
+    let (soft_s, hard_s) = limits
+        .split_once(':')
+        .ok_or_else(|| format!("invalid --ulimit '{}': expected SOFT:HARD", s))?;
+    let soft = soft_s
+        .trim()
+        .parse::<libc::rlim_t>()
+        .map_err(|e| format!("invalid soft limit '{}': {}", soft_s, e))?;
+    let hard = hard_s
+        .trim()
+        .parse::<libc::rlim_t>()
+        .map_err(|e| format!("invalid hard limit '{}': {}", hard_s, e))?;
     let resource = match name.trim().to_ascii_lowercase().as_str() {
         "nofile" | "openfiles" => libc::RLIMIT_NOFILE,
-        "nproc"  | "maxproc"  => libc::RLIMIT_NPROC,
-        "as"     | "vmem"     => libc::RLIMIT_AS,
-        "cpu"                 => libc::RLIMIT_CPU,
-        "fsize"               => libc::RLIMIT_FSIZE,
-        "memlock"             => libc::RLIMIT_MEMLOCK,
-        "stack"               => libc::RLIMIT_STACK,
-        "core"                => libc::RLIMIT_CORE,
-        "rss"                 => libc::RLIMIT_RSS,
-        "msgqueue"            => libc::RLIMIT_MSGQUEUE,
-        "nice"                => libc::RLIMIT_NICE,
-        "rtprio"              => libc::RLIMIT_RTPRIO,
+        "nproc" | "maxproc" => libc::RLIMIT_NPROC,
+        "as" | "vmem" => libc::RLIMIT_AS,
+        "cpu" => libc::RLIMIT_CPU,
+        "fsize" => libc::RLIMIT_FSIZE,
+        "memlock" => libc::RLIMIT_MEMLOCK,
+        "stack" => libc::RLIMIT_STACK,
+        "core" => libc::RLIMIT_CORE,
+        "rss" => libc::RLIMIT_RSS,
+        "msgqueue" => libc::RLIMIT_MSGQUEUE,
+        "nice" => libc::RLIMIT_NICE,
+        "rtprio" => libc::RLIMIT_RTPRIO,
         other => return Err(format!("unknown ulimit resource '{}'", other)),
     };
     Ok((resource, soft, hard))
@@ -308,10 +334,14 @@ fn iso8601_to_epoch(s: &str) -> Option<u64> {
     // Expect: YYYY-MM-DDTHH:MM:SSZ
     let s = s.trim_end_matches('Z');
     let parts: Vec<&str> = s.splitn(2, 'T').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     let date_parts: Vec<u64> = parts[0].split('-').filter_map(|x| x.parse().ok()).collect();
     let time_parts: Vec<u64> = parts[1].split(':').filter_map(|x| x.parse().ok()).collect();
-    if date_parts.len() != 3 || time_parts.len() != 3 { return None; }
+    if date_parts.len() != 3 || time_parts.len() != 3 {
+        return None;
+    }
     let (y, mo, d) = (date_parts[0], date_parts[1], date_parts[2]);
     let (h, mi, s) = (time_parts[0], time_parts[1], time_parts[2]);
     // Days since epoch using the inverse of our epoch_to_datetime algorithm.
@@ -346,6 +376,9 @@ mod tests {
     #[test]
     fn test_rootfs_path_rejects_nonexistent() {
         let result = rootfs_path("nonexistent-rootfs-xyz-12345");
-        assert!(result.is_err(), "rootfs_path should fail for nonexistent name");
+        assert!(
+            result.is_err(),
+            "rootfs_path should fail for nonexistent name"
+        );
     }
 }
