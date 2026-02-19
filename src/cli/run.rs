@@ -125,12 +125,11 @@ pub struct RunArgs {
     #[clap(long = "masked-path")]
     pub masked_path: Vec<String>,
 
-    /// Run from a pulled OCI image instead of a rootfs (e.g. --image alpine)
+    /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
-    pub image: Option<String>,
+    pub rootfs: Option<String>,
 
-    /// Rootfs name followed by optional command: ROOTFS [COMMAND [ARGS...]]
-    /// Not required when --image is given.
+    /// Image reference (or command when using --rootfs): IMAGE [COMMAND [ARGS...]]
     #[clap(multiple_values = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
@@ -160,21 +159,14 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let port_forwards = parse_port_forwards(&args.publish)?;
     let network_mode = parse_network_mode(&args.network)?;
 
-    // Branch: --image (OCI image layers) vs positional args (rootfs).
-    let (rootfs_label, exe_and_args, cmd) = if let Some(ref image_ref) = args.image {
-        build_image_run(&args, image_ref, &port_forwards, network_mode)?
-    } else {
-        if args.args.is_empty() {
-            return Err("either --image or a rootfs name is required".into());
-        }
-        let rootfs_name = args.args[0].clone();
-        let cmd_args: Vec<String> = args.args[1..].to_vec();
-        let rootfs_dir = rootfs_path(&rootfs_name)?;
-        let exe_and_args: Vec<String> = if cmd_args.is_empty() {
+    // Branch: --rootfs (local rootfs) vs positional args (OCI image, default).
+    let (rootfs_label, exe_and_args, cmd) = if let Some(ref rootfs_name) = args.rootfs {
+        let exe_and_args: Vec<String> = if args.args.is_empty() {
             vec!["/bin/sh".to_string()]
         } else {
-            cmd_args
+            args.args.clone()
         };
+        let rootfs_dir = rootfs_path(rootfs_name)?;
         let cmd = build_command(
             &args,
             &rootfs_dir,
@@ -182,7 +174,14 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             &port_forwards,
             network_mode,
         )?;
-        (rootfs_name, exe_and_args, cmd)
+        (rootfs_name.clone(), exe_and_args, cmd)
+    } else {
+        if args.args.is_empty() {
+            return Err("an image name is required".into());
+        }
+        let image_ref = &args.args[0];
+        let cmd_args: Vec<String> = args.args[1..].to_vec();
+        build_image_run(&args, image_ref, &cmd_args, &port_forwards, network_mode)?
     };
 
     if args.detach {
@@ -198,6 +197,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn build_image_run(
     args: &RunArgs,
     image_ref: &str,
+    cmd_args: &[String],
     port_forwards: &[(u16, u16)],
     network_mode: NetworkMode,
 ) -> Result<(String, Vec<String>, Command), Box<dyn std::error::Error>> {
@@ -219,8 +219,8 @@ fn build_image_run(
     }
 
     // Determine the command: CLI args override image Entrypoint+Cmd.
-    let exe_and_args = if !args.args.is_empty() {
-        args.args.clone()
+    let exe_and_args = if !cmd_args.is_empty() {
+        cmd_args.to_vec()
     } else {
         let mut cmd_vec = manifest.config.entrypoint.clone();
         cmd_vec.extend(manifest.config.cmd.clone());

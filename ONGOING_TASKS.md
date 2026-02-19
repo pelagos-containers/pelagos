@@ -1,6 +1,20 @@
 # Ongoing Tasks
 
-## Current: GitHub Actions CI + Release Workflow + Docs — COMPLETE ✅
+## Current: Flip `--image` / rootfs CLI defaults — COMPLETE ✅
+
+Flipped the CLI so OCI images are the default path (positional arg) and local
+rootfs requires `--rootfs` flag. Before: `remora run --image alpine /bin/sh`.
+After: `remora run alpine /bin/sh`. Local rootfs: `remora run --rootfs alpine /bin/sh`.
+
+**Files modified:**
+- `src/cli/run.rs` — replaced `--image` flag with `--rootfs`, flipped branching logic
+- `docs/USER_GUIDE.md` — removed `--image` from all examples, updated reference table
+- `README.md` — removed `--image` from Quick Start examples
+- `CLAUDE.md` — updated image run example
+
+---
+
+## Previous: GitHub Actions CI + Release Workflow + Docs — COMPLETE ✅
 
 Added GitHub Actions CI and release workflows, CHANGELOG, install script,
 and documentation updates. Tagged and released v0.1.0.

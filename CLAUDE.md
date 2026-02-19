@@ -93,7 +93,7 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 
 **OCI Image Layers (COMPLETE ✅):**
 - **Image pull**: `remora image pull alpine` — native OCI registry pulls via `oci-client`; anonymous auth; layers cached content-addressably at `/var/lib/remora/layers/<sha256>/`
-- **Image run**: `remora run --image alpine /bin/sh` — multi-layer overlayfs mount with ephemeral upper/work; image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults
+- **Image run**: `remora run alpine /bin/sh` — multi-layer overlayfs mount with ephemeral upper/work; image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults
 - **Image management**: `remora image ls`, `remora image rm <ref>` — list/remove locally stored images
 - **Multi-layer overlay**: `with_image_layers(layer_dirs)` — API for mounting multiple overlay lower layers; auto-creates ephemeral upper/work dirs
 - **OCI whiteouts**: `.wh.*` files converted to overlayfs char device (0,0) whiteouts; `.wh..wh..opq` sets `trusted.overlay.opaque` xattr

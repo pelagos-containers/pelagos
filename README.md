@@ -95,13 +95,13 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```bash
 # Pull an image and run a command
 sudo remora image pull alpine
-sudo remora run --image alpine /bin/echo hello
+sudo remora run alpine /bin/echo hello
 
 # Interactive shell (Ctrl-D to exit)
-sudo remora run -i --image alpine /bin/sh
+sudo remora run -i alpine /bin/sh
 
 # Detached container with networking
-sudo remora run -d --name mybox --network bridge --nat --image alpine \
+sudo remora run -d --name mybox --network bridge --nat alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
 # Check on it
