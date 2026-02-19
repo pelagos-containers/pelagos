@@ -7,13 +7,30 @@ plus a Rust library API for embedding container isolation into your own programs
 
 ## Installation & Setup
 
-### Build from Source
+### Install
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/skeptomai/remora.git
 cd remora
-cargo build --release
-# Binary: target/release/remora
+
+# Option A: Install to /usr/local/bin (recommended)
+scripts/install.sh
+
+# Option B: Install to ~/.cargo/bin
+cargo install --path .
+
+# Option C: Install to /usr/local/bin via cargo
+sudo cargo install --path . --root /usr/local
+```
+
+You can also download a pre-built binary from the
+[Releases](https://github.com/skeptomai/remora/releases) page and copy it
+to a directory on your PATH.
+
+Verify the installation:
+
+```bash
+remora --help
 ```
 
 ### Prepare a Root Filesystem
