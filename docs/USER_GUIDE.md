@@ -36,13 +36,34 @@ remora --help
 ### Pull an Image
 
 ```bash
+# Rootless (images stored in ~/.local/share/remora/)
+remora image pull alpine
+
+# Or as root (images stored in /var/lib/remora/)
 sudo remora image pull alpine
+
 remora image ls
 ```
 
 ---
 
 ## Quick Start
+
+### Rootless (no sudo)
+
+```bash
+# Pull and run — no root required
+remora image pull alpine
+remora run alpine /bin/echo hello
+
+# Interactive shell with internet (Ctrl-D to exit)
+remora run -i --network pasta alpine /bin/sh
+
+# Check running containers
+remora ps
+```
+
+### Root (full feature set)
 
 ```bash
 # Run a one-shot command
@@ -72,32 +93,39 @@ remora rm mybox
 ## OCI Images
 
 Remora can pull images directly from OCI registries (Docker Hub, etc.) using anonymous
-authentication.
+authentication. Image pull works both as root and rootless.
 
 ```bash
-# Pull an image
-sudo remora image pull alpine
-sudo remora image pull alpine:3.19
-sudo remora image pull library/ubuntu:latest
+# Pull an image (rootless or root)
+remora image pull alpine
+remora image pull alpine:3.19
+remora image pull library/ubuntu:latest
 
 # List local images
 remora image ls
 
 # Run a container from an image
-sudo remora run alpine /bin/sh
-sudo remora run -i alpine /bin/sh
+remora run alpine /bin/sh           # rootless
+sudo remora run -i alpine /bin/sh   # root
 
 # Remove a local image
-sudo remora image rm alpine
+remora image rm alpine
 ```
 
 Remora automatically sets up a multi-layer overlayfs mount with an ephemeral upper/work
 directory (writes are discarded when the container exits). Image config (Env, Cmd,
 Entrypoint, WorkingDir) is applied as defaults that CLI flags override.
 
-**Storage locations:**
+**Storage locations (root):**
 - `/var/lib/remora/images/` -- image manifests and config
 - `/var/lib/remora/layers/<sha256>/` -- content-addressable layer cache
+
+**Storage locations (rootless):**
+- `~/.local/share/remora/images/` -- image manifests and config
+- `~/.local/share/remora/layers/<sha256>/` -- content-addressable layer cache
+
+Root and rootless image stores are separate (matching Podman behavior). An image pulled
+as root is not visible rootless, and vice versa.
 
 ---
 
@@ -212,21 +240,21 @@ Bridge networking requires root and is rejected in rootless mode.
 
 ### Named Volumes
 
-Volumes persist data across container runs. They are stored at
-`/var/lib/remora/volumes/<name>/`.
+Volumes persist data across container runs. They are stored in the data directory
+(root: `/var/lib/remora/volumes/`, rootless: `~/.local/share/remora/volumes/`).
 
 ```bash
-# Create a volume
-sudo remora volume create mydata
+# Create a volume (works rootless)
+remora volume create mydata
 
 # List volumes
 remora volume ls
 
 # Use a volume (auto-created if it doesn't exist)
-sudo remora run -v mydata:/data alpine /bin/sh
+remora run -v mydata:/data alpine /bin/sh
 
 # Remove a volume
-sudo remora volume rm mydata
+remora volume rm mydata
 ```
 
 ### Bind Mounts
@@ -254,6 +282,9 @@ sudo remora run --read-only --tmpfs /tmp --tmpfs /run alpine /bin/sh
 When using OCI images, Remora automatically creates a multi-layer overlayfs mount. The
 base image layers are read-only; writes go to an ephemeral upper directory that is
 discarded when the container exits.
+
+In rootless mode, Remora uses the `userxattr` mount option (kernel 5.11+) or falls back
+to `fuse-overlayfs` automatically. See [Rootless Overlay](#rootless-overlay) for details.
 
 ---
 
@@ -347,22 +378,62 @@ fsize, memlock, stack, core, rss, msgqueue, nice, rtprio.
 ## Rootless Mode
 
 Remora auto-detects rootless mode when run without sudo (`getuid() != 0`). No flag
-needed.
+needed — just omit `sudo`.
 
 ```bash
-# Run rootless (no sudo)
-remora run --network pasta -i alpine /bin/sh
+# Pull and run — fully rootless
+remora image pull alpine
+remora run alpine /bin/echo hello
+
+# Interactive shell with internet
+remora run -i --network pasta alpine /bin/sh
 ```
 
 **What works rootless:**
+- Image pull (`remora image pull`)
+- Image run with overlay filesystem (kernel 5.11+ native, or `fuse-overlayfs` fallback)
+- Named volumes (`-v mydata:/data`)
 - Loopback networking (`--network loopback`)
 - Pasta networking (`--network pasta`) -- full internet access
 - User namespace isolation (auto-configured: container UID 0 maps to your host UID)
 
 **What requires root:**
 - Bridge networking (`--network bridge`)
+- NAT and port mapping (`--nat`, `-p`)
 - Cgroups (skipped gracefully in rootless mode)
-- Named volumes (stored in `/var/lib/remora/`)
+
+### Rootless Overlay
+
+Remora uses overlayfs with the `userxattr` mount option on kernel 5.11+. This stores
+whiteout metadata in `user.*` extended attributes instead of `trusted.*`, which doesn't
+require `CAP_SYS_ADMIN`.
+
+On older kernels, Remora automatically falls back to
+[fuse-overlayfs](https://github.com/containers/fuse-overlayfs). If neither works, you'll
+see a clear error with instructions.
+
+```bash
+# Install fuse-overlayfs (only needed for kernels < 5.11)
+# Arch Linux
+pacman -S fuse-overlayfs
+# Debian/Ubuntu
+apt install fuse-overlayfs
+# Fedora
+dnf install fuse-overlayfs
+```
+
+### Rootless Storage
+
+Rootless mode uses XDG Base Directory paths:
+
+| Purpose | Root path | Rootless path |
+|---------|-----------|---------------|
+| Images & layers | `/var/lib/remora/` | `~/.local/share/remora/` |
+| Volumes | `/var/lib/remora/volumes/` | `~/.local/share/remora/volumes/` |
+| Runtime state | `/run/remora/` | `$XDG_RUNTIME_DIR/remora/` |
+
+Root and rootless stores are completely separate (same as Podman). An image pulled as
+root is not available in rootless mode, and vice versa.
 
 ---
 
@@ -537,6 +608,8 @@ See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
 
 ## Storage Layout
 
+### Root (`sudo remora ...`)
+
 ```
 /var/lib/remora/
   rootfs/<name>              symlink to imported rootfs directory
@@ -558,6 +631,24 @@ See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
   dns-<pid>-<n>/             per-container resolv.conf
 ```
 
+### Rootless (`remora ...`)
+
+```
+~/.local/share/remora/       ($XDG_DATA_HOME/remora/)
+  rootfs/<name>              symlink to imported rootfs directory
+  volumes/<name>/            named volume data
+  images/<ref>/              OCI image manifests and config
+  layers/<sha256>/           content-addressable layer cache
+  container_counter          monotonic counter for auto-naming
+
+$XDG_RUNTIME_DIR/remora/     (fallback: /tmp/remora-$UID/)
+  containers/<name>/
+    state.json               container metadata and status
+    stdout.log               captured stdout (detached mode)
+    stderr.log               captured stderr (detached mode)
+  dns-<pid>-<n>/             per-container resolv.conf
+```
+
 ---
 
 ## Troubleshooting
@@ -567,8 +658,8 @@ See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
 Pull an OCI image first:
 
 ```bash
-sudo remora image pull alpine
-sudo remora run alpine /bin/sh
+remora image pull alpine
+remora run alpine /bin/sh
 ```
 
 Or if using a local rootfs, import it:
@@ -581,8 +672,15 @@ sudo remora run --rootfs alpine /bin/sh
 
 ### Permission denied / EPERM
 
-Most Remora features require root. Run with `sudo` or use rootless mode
-(`--network pasta`) for unprivileged containers.
+Try rootless mode first (no sudo needed for image pull, run, volumes). If a specific
+feature requires root (bridge networking, cgroups), run with `sudo`.
+
+### Rootless overlay fails
+
+If you see an error about overlay mount failing:
+- **Kernel 5.11+:** native overlay with `userxattr` should work automatically
+- **Older kernels:** install `fuse-overlayfs` (see [Rootless Overlay](#rootless-overlay))
+- Check that your filesystem supports user xattrs (`tmpfs`, `ext4`, `btrfs` all do)
 
 ### Integration tests fail
 

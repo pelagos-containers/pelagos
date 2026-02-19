@@ -32,8 +32,8 @@ a daemon, without CNI plugins, and without image management.
 ### Filesystem Flexibility
 - **Bind mounts:** `with_bind_mount()` (RW) and `with_bind_mount_ro()` (RO)
 - **tmpfs:** `with_tmpfs()` — writable scratch space inside a read-only rootfs
-- **Named volumes:** `Volume::create/open/delete`, `with_volume()` — persisted at
-  `/var/lib/remora/volumes/<name>/`
+- **Named volumes:** `Volume::create/open/delete`, `with_volume()` — persisted in
+  the data directory (root: `/var/lib/remora/volumes/`, rootless: `~/.local/share/remora/volumes/`)
 - **Overlay filesystem:** `with_overlay(upper, work)` — copy-on-write view of a
   shared lower rootfs; writes land in `upper_dir`, lower layer is never modified
 
@@ -55,8 +55,10 @@ a daemon, without CNI plugins, and without image management.
 
 ### Rootless Containers
 - **Auto-detection:** `getuid() != 0` triggers rootless mode automatically — no flag needed
+- **Image pull/run:** `remora image pull alpine && remora run alpine /bin/sh` works without root
+- **Rootless overlay:** kernel 5.11+ native overlay with `userxattr`, or automatic `fuse-overlayfs` fallback
+- **Rootless storage:** `~/.local/share/remora/` (images/layers) + `$XDG_RUNTIME_DIR/remora/` (runtime)
 - **User namespace:** auto-adds `Namespace::USER` and a default uid/gid map (`container 0 → host UID`)
-- **Loopback:** `NetworkMode::Loopback` functions in rootless (USER + NET namespace)
 - **Pasta networking:** `NetworkMode::Pasta` — full internet access without root via [pasta](https://passt.top/passt/about/)
 - **Cgroups:** skipped gracefully in rootless (no `CAP_SYS_ADMIN` needed)
 - **Bridge rejected:** clear error if `NetworkMode::Bridge` is attempted without root
@@ -92,6 +94,19 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Quick Start
 
+### Rootless (no sudo)
+
+```bash
+# Pull an image and run a command — no root required
+remora image pull alpine
+remora run alpine /bin/echo hello
+
+# Interactive shell with internet (Ctrl-D to exit)
+remora run -i --network pasta alpine /bin/sh
+```
+
+### Root (full feature set)
+
 ```bash
 # Pull an image and run a command
 sudo remora image pull alpine
@@ -100,7 +115,7 @@ sudo remora run alpine /bin/echo hello
 # Interactive shell (Ctrl-D to exit)
 sudo remora run -i alpine /bin/sh
 
-# Detached container with networking
+# Detached container with bridge networking
 sudo remora run -d --name mybox --network bridge --nat alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
@@ -191,7 +206,7 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Port mapping | ✅ TCP | — | ✅ |
 | DNS | ✅ resolv.conf | ✅ | ✅ |
 | OCI compliant | ✅ Phase 1 | ✅ | ✅ |
-| Rootless | ✅ (loopback + pasta) | ✅ | ✅ |
+| Rootless | ✅ (pull, run, overlay, pasta) | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 
@@ -214,10 +229,11 @@ and `docs/ROADMAP.md` for what's next.
 
 ## Requirements
 
-- Linux kernel 5.0+ (cgroups v2 unified hierarchy)
-- Root / `CAP_SYS_ADMIN` for most features
-- `nft` (nftables) for NAT and port mapping
-- `ip` (iproute2) for bridge networking
+- Linux kernel 5.11+ recommended (rootless overlay with `userxattr`)
+- Kernel 5.0+ works with root, or rootless with `fuse-overlayfs` installed
+- `pasta` ([passt](https://passt.top)) for rootless networking
+- `nft` (nftables) for NAT and port mapping (root only)
+- `ip` (iproute2) for bridge networking (root only)
 
 ## License
 
