@@ -63,9 +63,8 @@ See `docs/BUILD_ROOTFS.md` for detailed instructions.
 After setup, verify:
 
 ```bash
-remora rootfs ls
-# or
-remora image ls
+remora image ls       # if you used Option A
+remora rootfs ls      # if you used Option B
 ```
 
 ---
@@ -73,14 +72,17 @@ remora image ls
 ## Quick Start
 
 ```bash
-# Run a one-shot command
-sudo remora run alpine /bin/echo hello
+# Using an OCI image (from "image pull"):
+sudo remora run --image alpine /bin/echo hello
 
 # Interactive shell (Ctrl-D to exit)
-sudo remora run -i alpine /bin/sh
+sudo remora run -i --image alpine /bin/sh
+
+# Using an imported rootfs (from "rootfs import"):
+sudo remora run alpine /bin/echo hello
 
 # Detached (background) container
-sudo remora run -d --name mybox alpine /bin/sh -c 'while true; do echo tick; sleep 1; done'
+sudo remora run -d --name mybox --image alpine /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
 # Check running containers
 remora ps
