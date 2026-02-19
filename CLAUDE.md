@@ -35,6 +35,16 @@ The entry must include:
 
 This is a hard requirement, not optional cleanup.
 
+### Use `log` Crate for All Diagnostic Output
+**NEVER use `eprintln!` for debugging or diagnostic messages.**
+
+- ✅ `log::debug!("probe result: {}", ok)` — developer diagnostics
+- ✅ `log::info!("using native overlay+userxattr")` — noteworthy runtime events
+- ✅ `log::warn!("fuse unmount failed: {}", e)` — non-fatal problems
+- ❌ `eprintln!("[debug] ...")` — never, even temporarily
+
+`eprintln!` is reserved for **user-facing error messages** in the CLI binary (e.g. `eprintln!("remora: error: {}", e)`). Everything else goes through `log::*` so it respects `RUST_LOG` filtering and doesn't pollute stderr when users don't want it.
+
 ### Ask Before Major Decisions
 - API design choices
 - Adding new features not explicitly requested

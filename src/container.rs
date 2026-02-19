@@ -1729,8 +1729,10 @@ impl Command {
         let use_fuse_overlay: bool;
         if is_rootless && self.overlay.is_some() {
             if native_rootless_overlay_supported() {
+                log::debug!("rootless overlay: using native overlay+userxattr");
                 use_fuse_overlay = false;
             } else if is_fuse_overlayfs_available() {
+                log::info!("rootless overlay: falling back to fuse-overlayfs");
                 // Spawn fuse-overlayfs before fork.
                 if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
                     let lower_str = if !ov.lower_dirs.is_empty() {
@@ -2907,8 +2909,10 @@ impl Command {
                 libc::fcntl(slave_raw_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
             }
             if native_rootless_overlay_supported() {
+                log::debug!("rootless overlay: using native overlay+userxattr");
                 use_fuse_overlay = false;
             } else if is_fuse_overlayfs_available() {
+                log::info!("rootless overlay: falling back to fuse-overlayfs");
                 if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
                     let lower_str = if !ov.lower_dirs.is_empty() {
                         ov.lower_dirs
