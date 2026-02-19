@@ -3809,7 +3809,7 @@ pub struct GidMap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimit {
     /// Resource type (e.g., libc::RLIMIT_NOFILE, libc::RLIMIT_AS)
-    pub resource: libc::__rlimit_resource_t,
+    pub resource: RlimitResource,
     /// Soft limit (can be increased up to hard limit)
     pub soft: libc::rlim_t,
     /// Hard limit (requires privileges to increase)
