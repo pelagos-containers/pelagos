@@ -2815,7 +2815,7 @@ impl Command {
                 }
 
                 // TIOCSCTTY: make the slave the controlling terminal of this session
-                let ioctl_ret = libc::ioctl(slave_raw_fd, libc::TIOCSCTTY, 0 as libc::c_int);
+                let ioctl_ret = libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as _, 0 as libc::c_int);
                 if ioctl_ret < 0 {
                     return Err(io::Error::last_os_error());
                 }

@@ -143,7 +143,7 @@ pub fn bring_up_loopback() -> io::Result<()> {
         }
 
         // Get current flags
-        let ret = libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut req as *mut Ifreq);
+        let ret = libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut req as *mut Ifreq);
         if ret < 0 {
             let e = io::Error::last_os_error();
             libc::close(sock);
@@ -153,7 +153,7 @@ pub fn bring_up_loopback() -> io::Result<()> {
         // Set IFF_UP (bit 0)
         req.ifr_flags |= libc::IFF_UP as libc::c_short;
 
-        let ret = libc::ioctl(sock, libc::SIOCSIFFLAGS, &mut req as *mut Ifreq);
+        let ret = libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &mut req as *mut Ifreq);
         libc::close(sock);
 
         if ret < 0 {

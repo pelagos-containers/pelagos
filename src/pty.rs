@@ -171,7 +171,7 @@ fn get_winsize(fd: RawFd) -> io::Result<libc::winsize> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -180,7 +180,7 @@ fn get_winsize(fd: RawFd) -> io::Result<libc::winsize> {
 
 /// Set the window size on a PTY master fd.
 fn set_winsize(fd: RawFd, ws: &libc::winsize) -> io::Result<()> {
-    let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws) };
+    let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, ws) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
