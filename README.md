@@ -115,6 +115,16 @@ let session = Command::new("/bin/sh")
 session.run()?;  // blocks; relays stdin/stdout, forwards SIGWINCH, restores terminal
 ```
 
+## Installation
+
+```bash
+cargo install --path .
+```
+
+This installs the `remora` binary to `~/.cargo/bin/`, which is on `PATH` for most Rust setups.
+You can also download a pre-built static binary from the
+[Releases](https://github.com/skeptomai/remora/releases) page.
+
 ## Building a Root Filesystem
 
 Remora requires a rootfs directory. The test suite uses Alpine Linux.
