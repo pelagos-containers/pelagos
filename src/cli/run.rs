@@ -204,14 +204,19 @@ fn build_image_run(
 ) -> Result<(String, Vec<String>, Command), Box<dyn std::error::Error>> {
     use remora::image;
 
-    // Normalise and load the image manifest.
-    let full_ref = normalise_image_reference(image_ref);
-    let manifest = image::load_image(&full_ref).map_err(|e| {
-        format!(
-            "image '{}' not found locally (run 'remora image pull {}'): {}",
-            image_ref, image_ref, e
-        )
-    })?;
+    // Try loading the raw reference first (locally-built images), then normalised.
+    let (full_ref, manifest) = if let Ok(m) = image::load_image(image_ref) {
+        (image_ref.to_string(), m)
+    } else {
+        let normalised = normalise_image_reference(image_ref);
+        let m = image::load_image(&normalised).map_err(|e| {
+            format!(
+                "image '{}' not found locally (run 'remora image pull {}'): {}",
+                image_ref, image_ref, e
+            )
+        })?;
+        (normalised, m)
+    };
 
     // Resolve layer directories (top-first for overlayfs).
     let layers = image::layer_dirs(&manifest);

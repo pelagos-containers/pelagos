@@ -61,6 +61,10 @@ enum CliCommand {
         follow: bool,
     },
 
+    // ── Image build ─────────────────────────────────────────────────────
+    /// Build an image from a Remfile
+    Build(cli::build::BuildArgs),
+
     // ── Rootfs management ─────────────────────────────────────────────────
     /// Manage the rootfs image store
     Rootfs {
@@ -163,6 +167,7 @@ fn main() {
 
     let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         // Container lifecycle
+        CliCommand::Build(args) => cli::build::cmd_build(args),
         CliCommand::Run(args) => cli::run::cmd_run(*args),
         CliCommand::Exec(args) => cli::exec::cmd_exec(args),
         CliCommand::Ps { all } => cli::ps::cmd_ps(all),

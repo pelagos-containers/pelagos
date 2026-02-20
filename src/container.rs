@@ -4382,6 +4382,72 @@ impl Child {
         Ok(ExitStatus { inner: status })
     }
 
+    /// Wait for the child process to exit, preserving the overlay base directory.
+    ///
+    /// Performs all normal teardown (cgroup, network, pasta, fuse-overlayfs, dns/hosts)
+    /// but **does not remove** the overlay base directory. Instead, it returns the
+    /// path to the overlay base dir (parent of `merged/`) so the caller can inspect
+    /// the upper layer before cleaning up.
+    ///
+    /// Used by the build engine to extract modified files from each RUN step.
+    pub fn wait_preserve_overlay(&mut self) -> Result<(ExitStatus, Option<PathBuf>), Error> {
+        let status = self.inner.wait().map_err(Error::Wait)?;
+        if let Some(cg) = self.cgroup.take() {
+            match cg {
+                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
+                CgroupHandle::Rootless(ref cg) => {
+                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
+                }
+            }
+        }
+        if let Some(ref net) = self.network {
+            crate::network::teardown_network(net);
+        }
+        if let Some(ref mut p) = self.pasta {
+            crate::network::teardown_pasta_network(p);
+        }
+        // Unmount fuse-overlayfs but keep the base dir intact.
+        if let Some(ref fuse_merged) = self.fuse_overlay_merged {
+            let merged_str = fuse_merged.to_string_lossy();
+            let unmounted = std::process::Command::new("fusermount3")
+                .args(["-u", &merged_str])
+                .status()
+                .is_ok_and(|s| s.success())
+                || std::process::Command::new("fusermount")
+                    .args(["-u", &merged_str])
+                    .status()
+                    .is_ok_and(|s| s.success());
+            if !unmounted {
+                log::warn!(
+                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
+                    merged_str
+                );
+            }
+        }
+        if let Some(ref mut fuse_child) = self.fuse_overlay_child {
+            match fuse_child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
+                    let _ = fuse_child.kill();
+                }
+            }
+            let _ = fuse_child.wait();
+        }
+        // Capture the overlay base dir path but do NOT remove it.
+        let overlay_base = self
+            .overlay_merged_dir
+            .as_ref()
+            .and_then(|merged| merged.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = self.dns_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(ref dir) = self.hosts_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        Ok((ExitStatus { inner: status }, overlay_base))
+    }
+
     /// Wait for the child to exit and collect all output.
     ///
     /// Returns (exit_status, stdout_bytes, stderr_bytes).

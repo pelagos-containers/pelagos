@@ -3,6 +3,7 @@
 //! This library provides tools for creating and managing lightweight containers
 //! using Linux namespaces.
 
+pub mod build;
 pub mod cgroup;
 pub mod cgroup_rootless;
 pub mod container;

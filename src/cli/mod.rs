@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod build;
 pub mod exec;
 pub mod image;
 pub mod logs;

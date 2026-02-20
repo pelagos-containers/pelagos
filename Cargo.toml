@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }  # Async 
 flate2 = "1"  # Gzip decompression for OCI layer tarballs
 tar = "0.4"  # Tar extraction for OCI layers
 tempfile = "3"  # Temp files for layer downloads
+sha2 = "0.10"  # SHA-256 for content-addressable layer digests
 
 [dev-dependencies]
 serial_test = "3"
