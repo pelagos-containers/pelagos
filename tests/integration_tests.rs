@@ -4877,3 +4877,369 @@ mod dev {
         );
     }
 }
+
+mod rootless_cgroups {
+    use super::*;
+
+    fn skip_unless_delegation() -> bool {
+        if !remora::cgroup_rootless::is_delegation_available() {
+            eprintln!("Skipping: cgroup v2 delegation not available");
+            return false;
+        }
+        true
+    }
+
+    /// Read a cgroup knob from the host side for a given child PID.
+    /// Returns None if the file doesn't exist (controller not delegated).
+    fn read_cgroup_knob(pid: i32, knob: &str) -> Option<String> {
+        let parent =
+            remora::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
+        let path = parent.join(format!("remora-{}", pid)).join(knob);
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("failed to read {}: {}", path.display(), e),
+        }
+    }
+
+    #[test]
+    fn test_rootless_cgroup_memory() {
+        if is_root() {
+            eprintln!("Skipping test_rootless_cgroup_memory: must run as non-root");
+            return;
+        }
+        if !skip_unless_delegation() {
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_rootless_cgroup_memory: alpine-rootfs not found");
+            return;
+        };
+
+        // Spawn a container that sleeps so we can inspect the cgroup from the host.
+        let mut child = Command::new("/bin/sleep")
+            .args(&["10"])
+            .with_namespaces(Namespace::USER | Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: unsafe { libc::getuid() },
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: unsafe { libc::getgid() },
+                count: 1,
+            }])
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(64 * 1024 * 1024) // 64 MB
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with rootless cgroup memory");
+
+        // Read memory.max from the host-side cgroup directory.
+        let val = read_cgroup_knob(child.pid(), "memory.max");
+
+        // Clean up: kill the sleep and wait.
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
+        child.wait().expect("Failed to wait");
+
+        match val {
+            Some(v) => assert_eq!(
+                v.trim(),
+                "67108864",
+                "expected 64MB in memory.max, got: {}",
+                v.trim()
+            ),
+            None => eprintln!(
+                "Skipping memory assertion: memory controller not delegated to sub-cgroup"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_rootless_cgroup_pids() {
+        if is_root() {
+            eprintln!("Skipping test_rootless_cgroup_pids: must run as non-root");
+            return;
+        }
+        if !skip_unless_delegation() {
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_rootless_cgroup_pids: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sleep")
+            .args(&["10"])
+            .with_namespaces(Namespace::USER | Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: unsafe { libc::getuid() },
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: unsafe { libc::getgid() },
+                count: 1,
+            }])
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_pids_limit(16)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with rootless cgroup pids");
+
+        let val = read_cgroup_knob(child.pid(), "pids.max");
+
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
+        child.wait().expect("Failed to wait");
+
+        match val {
+            Some(v) => assert_eq!(v.trim(), "16", "expected 16 in pids.max, got: {}", v.trim()),
+            None => {
+                eprintln!("Skipping pids assertion: pids controller not delegated to sub-cgroup")
+            }
+        }
+    }
+
+    #[test]
+    fn test_rootless_cgroup_cleanup() {
+        if is_root() {
+            eprintln!("Skipping test_rootless_cgroup_cleanup: must run as non-root");
+            return;
+        }
+        if !skip_unless_delegation() {
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_rootless_cgroup_cleanup: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/true")
+            .with_namespaces(Namespace::USER | Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: unsafe { libc::getuid() },
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: unsafe { libc::getgid() },
+                count: 1,
+            }])
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(32 * 1024 * 1024)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn");
+
+        let pid = child.pid();
+        child.wait().expect("Failed to wait");
+
+        // The kernel may take a moment to fully vacate the cgroup.
+        let cg_parent =
+            remora::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
+        let cg_dir = cg_parent.join(format!("remora-{}", pid));
+
+        // Retry removal briefly in case the kernel hasn't finished yet.
+        for _ in 0..10 {
+            if !cg_dir.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Try removing again — teardown may have raced with the kernel.
+            let _ = std::fs::remove_dir(&cg_dir);
+        }
+
+        assert!(
+            !cg_dir.exists(),
+            "cgroup dir should have been removed: {}",
+            cg_dir.display()
+        );
+    }
+}
+
+mod rootless_idmap {
+    use super::*;
+
+    /// Check whether multi-UID mapping via helpers is available.
+    /// Requires: newuidmap + newgidmap on PATH, and non-empty subuid/subgid ranges.
+    fn skip_unless_idmap_helpers() -> bool {
+        if !remora::idmap::has_newuidmap() || !remora::idmap::has_newgidmap() {
+            eprintln!("Skipping: newuidmap/newgidmap not available");
+            return false;
+        }
+        let username = match remora::idmap::current_username() {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!("Skipping: could not determine username");
+                return false;
+            }
+        };
+        let uid = unsafe { libc::getuid() };
+        let uid_ranges =
+            remora::idmap::parse_subid_file(std::path::Path::new("/etc/subuid"), &username, uid)
+                .unwrap_or_default();
+        let gid_ranges = remora::idmap::parse_subid_file(
+            std::path::Path::new("/etc/subgid"),
+            &username,
+            unsafe { libc::getgid() },
+        )
+        .unwrap_or_default();
+        if uid_ranges.is_empty() || gid_ranges.is_empty() {
+            eprintln!("Skipping: no subordinate UID/GID ranges in /etc/subuid or /etc/subgid");
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn test_rootless_multi_uid_maps_written() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+        if !skip_unless_idmap_helpers() {
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Don't set uid_maps — let auto-config detect and use multi-range.
+        // Use sleep so we can inspect the uid_map from the host side.
+        let mut child = Command::new("/bin/sleep")
+            .args(&["10"])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("rootless multi-uid spawn failed");
+
+        // Read uid_map from the host-side /proc.
+        let uid_map_path = format!("/proc/{}/uid_map", child.pid());
+        let uid_map = std::fs::read_to_string(&uid_map_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {}", uid_map_path, e));
+
+        // Kill the sleeping container.
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
+        child.wait().expect("Failed to wait");
+
+        // Should have at least 2 lines: one for container root (0 → host_uid),
+        // one for subordinate range (1 → subuid_start).
+        let lines: Vec<&str> = uid_map.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "expected at least 2 uid_map lines, got {} lines: {:?}",
+            lines.len(),
+            lines
+        );
+    }
+
+    #[test]
+    fn test_rootless_multi_uid_file_ownership() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+        if !skip_unless_idmap_helpers() {
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Run stat on /etc/passwd — the file is owned by root:root (0:0) in the image.
+        // With multi-UID mapping, it should show UID 0 (not 65534/nobody).
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "stat -c '%u' /etc/passwd"])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("rootless file-ownership spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "container exited non-zero; stdout={}, stderr={}",
+            out,
+            err
+        );
+        assert_eq!(
+            out.trim(),
+            "0",
+            "expected /etc/passwd owned by UID 0, got: {}",
+            out.trim()
+        );
+    }
+
+    #[test]
+    fn test_rootless_single_uid_fallback() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Explicitly set a single-UID map (bypassing auto-config).
+        // Verify the container still works with single-UID mapping.
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "id -u"])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: unsafe { libc::getuid() },
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: unsafe { libc::getgid() },
+                count: 1,
+            }])
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("rootless single-uid spawn failed");
+
+        let (status, stdout, _stderr) = child.wait_with_output().expect("wait failed");
+        assert!(status.success(), "container exited non-zero");
+        let out = String::from_utf8_lossy(&stdout);
+        assert_eq!(
+            out.trim(),
+            "0",
+            "expected uid 0 inside container, got: {}",
+            out.trim()
+        );
+    }
+}

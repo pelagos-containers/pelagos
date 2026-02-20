@@ -4,7 +4,9 @@
 //! using Linux namespaces.
 
 pub mod cgroup;
+pub mod cgroup_rootless;
 pub mod container;
+pub mod idmap;
 pub mod image;
 pub mod network;
 pub mod oci;

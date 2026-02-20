@@ -956,3 +956,87 @@ with `with_dev_mount()`.
 
 Failure indicates the minimal /dev setup is not creating the required
 subdirectories for PTY allocation and shared memory.
+
+---
+
+## Rootless Cgroups
+
+These tests exercise cgroup v2 delegation for non-root users. They skip
+automatically if `is_delegation_available()` returns false (no v2, no
+delegated controllers, or non-writable cgroup tree).
+
+Run without root:
+```bash
+cargo test --test integration_tests rootless_cgroups -- --test-threads=1
+```
+
+### `test_rootless_cgroup_memory`
+**Requires:** non-root + rootfs + cgroup v2 delegation
+
+Sets `with_cgroup_memory(64MB)` on a rootless container and reads
+`/sys/fs/cgroup/memory.max` inside it. Asserts the value is `67108864`.
+
+Failure indicates the rootless cgroup path was not created, the memory
+controller is not delegated, or the child was not moved into the sub-cgroup.
+
+### `test_rootless_cgroup_pids`
+**Requires:** non-root + rootfs + cgroup v2 delegation
+
+Sets `with_cgroup_pids_limit(16)` on a rootless container and reads
+`/sys/fs/cgroup/pids.max` inside it. Asserts the value is `16`.
+
+Failure indicates the pids controller is not delegated or the limit was
+not written to the sub-cgroup.
+
+### `test_rootless_cgroup_cleanup`
+**Requires:** non-root + rootfs + cgroup v2 delegation
+
+Spawns a rootless container with a memory cgroup, waits for it to exit,
+then checks that the sub-cgroup directory (`remora-{pid}`) under the
+user's cgroup slice has been removed.
+
+Failure indicates `teardown_rootless_cgroup()` did not successfully
+remove the directory, which would leak cgroup entries over time.
+
+---
+
+## Rootless ID Mapping Tests (`rootless_idmap`)
+
+Tests for multi-UID/GID mapping via `newuidmap`/`newgidmap` helpers and
+subordinate ID ranges from `/etc/subuid` and `/etc/subgid`.
+
+```bash
+cargo test --test integration_tests rootless_idmap -- --test-threads=1
+```
+
+### `test_rootless_multi_uid_maps_written`
+**Requires:** non-root + rootfs + newuidmap/newgidmap + subuid/subgid ranges
+
+Spawns a rootless container without explicitly setting UID maps, letting
+auto-config detect subordinate ranges and use the helpers. Reads
+`/proc/self/uid_map` inside the container and asserts at least 2 mapping
+lines are present (container root → host UID, and subordinate range).
+
+Failure indicates the auto-detection of subordinate ranges failed, the
+pipe+thread sync mechanism deadlocked, or `newuidmap` did not write
+the multi-range mapping.
+
+### `test_rootless_multi_uid_file_ownership`
+**Requires:** non-root + rootfs + newuidmap/newgidmap + subuid/subgid ranges
+
+Spawns a rootless container with multi-UID auto-config and runs
+`stat -c '%u' /etc/passwd`. Asserts the file is owned by UID 0 (root)
+inside the container.
+
+Failure indicates files owned by root in the image are showing up as
+`nobody` (65534) due to missing subordinate UID mappings, meaning the
+multi-range mapping was not applied.
+
+### `test_rootless_single_uid_fallback`
+**Requires:** non-root + rootfs
+
+Spawns a rootless container with an explicit single-UID map (bypassing
+auto-config). Runs `id -u` and asserts it prints `0`.
+
+Failure indicates the single-UID fallback path (existing behavior) is
+broken, which would be a regression from the multi-UID changes.

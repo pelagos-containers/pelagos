@@ -624,6 +624,8 @@ pub struct Command {
     seccomp_program: Option<seccompiler::BpfProgram>,
     // Hostname to set inside the container's UTS namespace.
     hostname: Option<String>,
+    // Whether to use newuidmap/newgidmap helpers for multi-range UID/GID mapping.
+    use_id_helpers: bool,
     // Container links: (container_name, alias) → resolved to /etc/hosts entries at spawn time.
     links: Vec<(String, String)>,
 }
@@ -667,6 +669,7 @@ impl Command {
             seccomp_program: None,
             hostname: None,
             links: Vec::new(),
+            use_id_helpers: false,
         }
     }
 
@@ -1560,20 +1563,71 @@ impl Command {
         if is_rootless {
             // Unprivileged containers require a user namespace.
             self.namespaces |= Namespace::USER;
-            // Map the calling user to UID 0 inside the container by default.
+            let host_uid = unsafe { libc::getuid() };
+            let host_gid = unsafe { libc::getgid() };
+
+            // Try multi-range subordinate UID/GID mapping via newuidmap/newgidmap.
             if self.uid_maps.is_empty() {
-                self.uid_maps.push(UidMap {
-                    inside: 0,
-                    outside: unsafe { libc::getuid() },
-                    count: 1,
-                });
-            }
-            if self.gid_maps.is_empty() {
-                self.gid_maps.push(GidMap {
-                    inside: 0,
-                    outside: unsafe { libc::getgid() },
-                    count: 1,
-                });
+                if crate::idmap::has_newuidmap() && crate::idmap::has_newgidmap() {
+                    if let Ok(username) = crate::idmap::current_username() {
+                        let uid_ranges = crate::idmap::parse_subid_file(
+                            std::path::Path::new("/etc/subuid"),
+                            &username,
+                            host_uid,
+                        )
+                        .unwrap_or_default();
+                        let gid_ranges = crate::idmap::parse_subid_file(
+                            std::path::Path::new("/etc/subgid"),
+                            &username,
+                            host_gid,
+                        )
+                        .unwrap_or_default();
+
+                        if !uid_ranges.is_empty() && !gid_ranges.is_empty() {
+                            self.uid_maps.push(UidMap {
+                                inside: 0,
+                                outside: host_uid,
+                                count: 1,
+                            });
+                            self.uid_maps.push(UidMap {
+                                inside: 1,
+                                outside: uid_ranges[0].start,
+                                count: uid_ranges[0].count,
+                            });
+                            self.gid_maps.push(GidMap {
+                                inside: 0,
+                                outside: host_gid,
+                                count: 1,
+                            });
+                            self.gid_maps.push(GidMap {
+                                inside: 1,
+                                outside: gid_ranges[0].start,
+                                count: gid_ranges[0].count,
+                            });
+                            self.use_id_helpers = true;
+                            log::info!(
+                                "rootless multi-UID: {} subordinate UIDs, {} subordinate GIDs",
+                                uid_ranges[0].count,
+                                gid_ranges[0].count
+                            );
+                        }
+                    }
+                }
+                // Fallback: single-UID map (current behavior).
+                if self.uid_maps.is_empty() {
+                    self.uid_maps.push(UidMap {
+                        inside: 0,
+                        outside: host_uid,
+                        count: 1,
+                    });
+                }
+                if self.gid_maps.is_empty() {
+                    self.gid_maps.push(GidMap {
+                        inside: 0,
+                        outside: host_gid,
+                        count: 1,
+                    });
+                }
             }
             // Bridge networking requires root-level capabilities on the host network.
             if self
@@ -1624,6 +1678,7 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let hostname = self.hostname.clone();
+        let use_id_helpers = self.use_id_helpers;
         // Loopback/Pasta mode: bring up lo inside pre_exec (after unshare(NEWNET)).
         // Bridge mode uses setns instead — lo is configured by setup_bridge_network.
         let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
@@ -1844,6 +1899,21 @@ impl Command {
                 std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
             });
 
+        // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
+        // (ready_w, done_r) go into the child closure; (ready_r, done_w) stay for the parent thread.
+        let (idmap_ready_w, idmap_done_r, idmap_ready_r, idmap_done_w) = if use_id_helpers {
+            let mut ready_fds = [0i32; 2];
+            let mut done_fds = [0i32; 2];
+            if unsafe { libc::pipe(ready_fds.as_mut_ptr()) } != 0
+                || unsafe { libc::pipe(done_fds.as_mut_ptr()) } != 0
+            {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            (ready_fds[1], done_fds[0], ready_fds[0], done_fds[1])
+        } else {
+            (-1, -1, -1, -1)
+        };
+
         // Install our combined pre_exec hook
         unsafe {
             self.inner.pre_exec(move || {
@@ -1857,15 +1927,24 @@ impl Command {
                         // 1a. Unshare user namespace alone first.
                         unshare(CloneFlags::CLONE_NEWUSER)
                             .map_err(|e| io::Error::other(format!("unshare USER: {}", e)))?;
-                        // 1b. Write uid/gid maps while only in the user namespace.
-                        //     Must happen before unsharing other namespaces that
-                        //     require capabilities granted by the uid/gid mapping.
-                        {
+                        // 1b. Write uid/gid maps.
+                        if use_id_helpers {
+                            // Multi-range maps: signal parent thread to run newuidmap/newgidmap.
+                            let pid: u32 = libc::getpid() as u32;
+                            let pid_bytes = pid.to_ne_bytes();
+                            libc::write(
+                                idmap_ready_w,
+                                pid_bytes.as_ptr() as *const libc::c_void,
+                                4,
+                            );
+                            libc::close(idmap_ready_w);
+                            // Block until parent has written the maps.
+                            let mut buf = [0u8; 1];
+                            libc::read(idmap_done_r, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                            libc::close(idmap_done_r);
+                        } else {
+                            // Single-UID map: write directly to /proc/self/{uid,gid}_map.
                             use std::io::Write;
-                            // uid_map and gid_map MUST be written in a single write() syscall.
-                            // The kernel processes each write() call atomically; multiple writes
-                            // fail with EINVAL because the map is committed on the first write.
-                            // Pre-format the entire content as a single String, then write_all().
                             if !gid_maps.is_empty() {
                                 let mut sg = std::fs::OpenOptions::new()
                                     .write(true)
@@ -2723,22 +2802,74 @@ impl Command {
             });
         }
 
+        // If using ID helpers, spawn the helper thread now (before fork).
+        // It reads the child PID from the pipe, runs newuidmap/newgidmap, signals done.
+        if use_id_helpers {
+            let uid_maps_h = self.uid_maps.clone();
+            let gid_maps_h = self.gid_maps.clone();
+            let ready_r = idmap_ready_r;
+            let done_w = idmap_done_w;
+
+            std::thread::spawn(move || {
+                let mut pid_bytes = [0u8; 4];
+                let n =
+                    unsafe { libc::read(ready_r, pid_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
+                unsafe { libc::close(ready_r) };
+                if n != 4 {
+                    unsafe { libc::close(done_w) };
+                    return;
+                }
+                let child_pid = u32::from_ne_bytes(pid_bytes);
+
+                if let Err(e) = crate::idmap::apply_uid_map(child_pid, &uid_maps_h) {
+                    log::warn!("newuidmap failed: {}", e);
+                }
+                if let Err(e) = crate::idmap::apply_gid_map(child_pid, &gid_maps_h) {
+                    log::warn!("newgidmap failed: {}", e);
+                }
+
+                unsafe { libc::write(done_w, [0u8].as_ptr() as *const libc::c_void, 1) };
+                unsafe { libc::close(done_w) };
+            });
+        }
+
         // Spawn the process
-        let child_inner = self.inner.spawn().map_err(Error::Spawn)?;
+        let child_inner = match self.inner.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if use_id_helpers {
+                    // Close child-side pipe ends to unblock the helper thread.
+                    unsafe { libc::close(idmap_ready_w) };
+                    unsafe { libc::close(idmap_done_r) };
+                }
+                return Err(Error::Spawn(e));
+            }
+        };
+
+        // Close child-side pipe ends in the parent (child inherited them via fork).
+        if use_id_helpers {
+            unsafe { libc::close(idmap_ready_w) };
+            unsafe { libc::close(idmap_done_r) };
+        }
 
         // Keep join_ns_files alive until here so file descriptors remain valid
         drop(join_ns_files);
 
         // Create cgroup and add child PID (parent-side, after fork)
         let cgroup = if let Some(ref cfg) = self.cgroup_config {
-            match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
-                Ok(cg) => Some(cg),
-                Err(e) if is_rootless => {
-                    // Cgroups require root or cgroup delegation; skip gracefully in rootless mode.
-                    let _ = e;
-                    None
+            if is_rootless {
+                match crate::cgroup_rootless::setup_rootless_cgroup(cfg, child_inner.id()) {
+                    Ok(cg) => Some(CgroupHandle::Rootless(cg)),
+                    Err(e) => {
+                        log::warn!("rootless cgroup setup failed, skipping: {}", e);
+                        None
+                    }
                 }
-                Err(e) => return Err(Error::Io(e)),
+            } else {
+                match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
+                    Ok(cg) => Some(CgroupHandle::Root(cg)),
+                    Err(e) => return Err(Error::Io(e)),
+                }
             }
         } else {
             None
@@ -2843,20 +2974,73 @@ impl Command {
         let is_rootless = unsafe { libc::getuid() } != 0;
         if is_rootless {
             self.namespaces |= Namespace::USER;
+            let host_uid = unsafe { libc::getuid() };
+            let host_gid = unsafe { libc::getgid() };
+
+            // Try multi-range subordinate UID/GID mapping via newuidmap/newgidmap.
             if self.uid_maps.is_empty() {
-                self.uid_maps.push(UidMap {
-                    inside: 0,
-                    outside: unsafe { libc::getuid() },
-                    count: 1,
-                });
+                if crate::idmap::has_newuidmap() && crate::idmap::has_newgidmap() {
+                    if let Ok(username) = crate::idmap::current_username() {
+                        let uid_ranges = crate::idmap::parse_subid_file(
+                            std::path::Path::new("/etc/subuid"),
+                            &username,
+                            host_uid,
+                        )
+                        .unwrap_or_default();
+                        let gid_ranges = crate::idmap::parse_subid_file(
+                            std::path::Path::new("/etc/subgid"),
+                            &username,
+                            host_gid,
+                        )
+                        .unwrap_or_default();
+
+                        if !uid_ranges.is_empty() && !gid_ranges.is_empty() {
+                            self.uid_maps.push(UidMap {
+                                inside: 0,
+                                outside: host_uid,
+                                count: 1,
+                            });
+                            self.uid_maps.push(UidMap {
+                                inside: 1,
+                                outside: uid_ranges[0].start,
+                                count: uid_ranges[0].count,
+                            });
+                            self.gid_maps.push(GidMap {
+                                inside: 0,
+                                outside: host_gid,
+                                count: 1,
+                            });
+                            self.gid_maps.push(GidMap {
+                                inside: 1,
+                                outside: gid_ranges[0].start,
+                                count: gid_ranges[0].count,
+                            });
+                            self.use_id_helpers = true;
+                            log::info!(
+                                "rootless multi-UID: {} subordinate UIDs, {} subordinate GIDs",
+                                uid_ranges[0].count,
+                                gid_ranges[0].count
+                            );
+                        }
+                    }
+                }
+                // Fallback: single-UID map (current behavior).
+                if self.uid_maps.is_empty() {
+                    self.uid_maps.push(UidMap {
+                        inside: 0,
+                        outside: host_uid,
+                        count: 1,
+                    });
+                }
+                if self.gid_maps.is_empty() {
+                    self.gid_maps.push(GidMap {
+                        inside: 0,
+                        outside: host_gid,
+                        count: 1,
+                    });
+                }
             }
-            if self.gid_maps.is_empty() {
-                self.gid_maps.push(GidMap {
-                    inside: 0,
-                    outside: unsafe { libc::getgid() },
-                    count: 1,
-                });
-            }
+            // Bridge networking requires root-level capabilities on the host network.
             if self
                 .network_config
                 .as_ref()
@@ -2904,6 +3088,7 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let hostname = self.hostname.clone();
+        let use_id_helpers = self.use_id_helpers;
         let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
@@ -3124,26 +3309,36 @@ impl Command {
                 std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
             });
 
+        // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
+        let (idmap_ready_w_i, idmap_done_r_i, idmap_ready_r_i, idmap_done_w_i) = if use_id_helpers {
+            let mut ready_fds = [0i32; 2];
+            let mut done_fds = [0i32; 2];
+            if unsafe { libc::pipe(ready_fds.as_mut_ptr()) } != 0
+                || unsafe { libc::pipe(done_fds.as_mut_ptr()) } != 0
+            {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            (ready_fds[1], done_fds[0], ready_fds[0], done_fds[1])
+        } else {
+            (-1, -1, -1, -1)
+        };
+
         unsafe {
             self.inner.pre_exec(move || {
                 use std::ffi::CString;
                 use std::ptr;
 
                 // Step 0: PTY slave setup — runs before everything else.
-                // Create a new session so the container is isolated from the
-                // parent's session, then make the slave our controlling terminal.
                 let setsid_ret = libc::setsid();
                 if setsid_ret < 0 {
                     return Err(io::Error::last_os_error());
                 }
 
-                // TIOCSCTTY: make the slave the controlling terminal of this session
                 let ioctl_ret = libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as _, 0 as libc::c_int);
                 if ioctl_ret < 0 {
                     return Err(io::Error::last_os_error());
                 }
 
-                // Wire stdin/stdout/stderr to the slave
                 for dest_fd in [0i32, 1, 2] {
                     if slave_raw_fd != dest_fd {
                         let dup_ret = libc::dup2(slave_raw_fd, dest_fd);
@@ -3152,18 +3347,28 @@ impl Command {
                         }
                     }
                 }
-                // Close the original slave fd — 0/1/2 are now the duplicates
                 libc::close(slave_raw_fd);
 
                 // Steps 1–7: identical to spawn() from here
                 if !namespaces.is_empty() {
                     if is_rootless && namespaces.contains(Namespace::USER) {
-                        // Rootless two-phase unshare (same logic as spawn()).
                         unshare(CloneFlags::CLONE_NEWUSER)
                             .map_err(|e| io::Error::other(format!("unshare USER: {}", e)))?;
-                        {
+                        // 1b. Write uid/gid maps.
+                        if use_id_helpers {
+                            let pid: u32 = libc::getpid() as u32;
+                            let pid_bytes = pid.to_ne_bytes();
+                            libc::write(
+                                idmap_ready_w_i,
+                                pid_bytes.as_ptr() as *const libc::c_void,
+                                4,
+                            );
+                            libc::close(idmap_ready_w_i);
+                            let mut buf = [0u8; 1];
+                            libc::read(idmap_done_r_i, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                            libc::close(idmap_done_r_i);
+                        } else {
                             use std::io::Write;
-                            // uid_map and gid_map MUST be written in a single write() syscall.
                             if !gid_maps.is_empty() {
                                 let mut sg = std::fs::OpenOptions::new()
                                     .write(true)
@@ -3882,7 +4087,55 @@ impl Command {
             });
         }
 
-        let child_inner = self.inner.spawn().map_err(Error::Spawn)?;
+        // If using ID helpers, spawn the helper thread now (before fork).
+        // It reads the child PID from the pipe, runs newuidmap/newgidmap, signals done.
+        if use_id_helpers {
+            let uid_maps_h = self.uid_maps.clone();
+            let gid_maps_h = self.gid_maps.clone();
+            let ready_r = idmap_ready_r_i;
+            let done_w = idmap_done_w_i;
+
+            std::thread::spawn(move || {
+                let mut pid_bytes = [0u8; 4];
+                let n =
+                    unsafe { libc::read(ready_r, pid_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
+                unsafe { libc::close(ready_r) };
+                if n != 4 {
+                    unsafe { libc::close(done_w) };
+                    return;
+                }
+                let child_pid = u32::from_ne_bytes(pid_bytes);
+
+                if let Err(e) = crate::idmap::apply_uid_map(child_pid, &uid_maps_h) {
+                    log::warn!("newuidmap failed: {}", e);
+                }
+                if let Err(e) = crate::idmap::apply_gid_map(child_pid, &gid_maps_h) {
+                    log::warn!("newgidmap failed: {}", e);
+                }
+
+                unsafe { libc::write(done_w, [0u8].as_ptr() as *const libc::c_void, 1) };
+                unsafe { libc::close(done_w) };
+            });
+        }
+
+        // Spawn the process
+        let child_inner = match self.inner.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if use_id_helpers {
+                    // Close child-side pipe ends to unblock the helper thread.
+                    unsafe { libc::close(idmap_ready_w_i) };
+                    unsafe { libc::close(idmap_done_r_i) };
+                }
+                return Err(Error::Spawn(e));
+            }
+        };
+
+        // Close child-side pipe ends in the parent (child inherited them via fork).
+        if use_id_helpers {
+            unsafe { libc::close(idmap_ready_w_i) };
+            unsafe { libc::close(idmap_done_r_i) };
+        }
 
         // Close the slave in the parent — only the child should have it.
         // If we keep it open, POLLHUP on the master will never fire when
@@ -3892,13 +4145,19 @@ impl Command {
 
         // Create cgroup and add child PID (parent-side, after fork)
         let cgroup = if let Some(ref cfg) = self.cgroup_config {
-            match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
-                Ok(cg) => Some(cg),
-                Err(e) if is_rootless => {
-                    let _ = e;
-                    None
+            if is_rootless {
+                match crate::cgroup_rootless::setup_rootless_cgroup(cfg, child_inner.id()) {
+                    Ok(cg) => Some(CgroupHandle::Rootless(cg)),
+                    Err(e) => {
+                        log::warn!("rootless cgroup setup failed, skipping: {}", e);
+                        None
+                    }
                 }
-                Err(e) => return Err(Error::Io(e)),
+            } else {
+                match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
+                    Ok(cg) => Some(CgroupHandle::Root(cg)),
+                    Err(e) => return Err(Error::Io(e)),
+                }
             }
         } else {
             None
@@ -3955,10 +4214,16 @@ impl Command {
 /// println!("Process exited with: {:?}", status);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+/// Handle for either a root (cgroups-rs) or rootless (direct fs) cgroup.
+pub(crate) enum CgroupHandle {
+    Root(cgroups_rs::fs::Cgroup),
+    Rootless(crate::cgroup_rootless::RootlessCgroup),
+}
+
 pub struct Child {
     inner: process::Child,
     /// Optional cgroup for this container. Deleted after the child exits.
-    pub(crate) cgroup: Option<cgroups_rs::fs::Cgroup>,
+    pub(crate) cgroup: Option<CgroupHandle>,
     /// Optional network state (veth pair). Torn down after the child exits.
     network: Option<crate::network::NetworkSetup>,
     /// Optional pasta relay process. Killed after the child exits.
@@ -4029,7 +4294,12 @@ impl Child {
     pub fn wait(&mut self) -> Result<ExitStatus, Error> {
         let status = self.inner.wait().map_err(Error::Wait)?;
         if let Some(cg) = self.cgroup.take() {
-            crate::cgroup::teardown_cgroup(cg);
+            match cg {
+                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
+                CgroupHandle::Rootless(ref cg) => {
+                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
+                }
+            }
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
@@ -4091,7 +4361,12 @@ impl Child {
     pub fn wait_with_output(mut self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
         let output = self.inner.wait_with_output().map_err(Error::Wait)?;
         if let Some(cg) = self.cgroup {
-            crate::cgroup::teardown_cgroup(cg);
+            match cg {
+                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
+                CgroupHandle::Rootless(ref cg) => {
+                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
+                }
+            }
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
@@ -4167,7 +4442,12 @@ impl Child {
     /// ```
     pub fn resource_stats(&self) -> Result<crate::cgroup::ResourceStats, Error> {
         if let Some(ref cg) = self.cgroup {
-            crate::cgroup::read_stats(cg).map_err(Error::Io)
+            match cg {
+                CgroupHandle::Root(cg) => crate::cgroup::read_stats(cg).map_err(Error::Io),
+                CgroupHandle::Rootless(cg) => {
+                    crate::cgroup_rootless::read_rootless_stats(cg).map_err(Error::Io)
+                }
+            }
         } else {
             Ok(crate::cgroup::ResourceStats::default())
         }
