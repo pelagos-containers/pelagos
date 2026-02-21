@@ -282,8 +282,15 @@ pub fn execute_build(
     // Compute a digest for the final manifest.
     let digest = compute_manifest_digest(&layers);
 
+    // Append :latest if the tag has no version/digest, matching OCI convention.
+    let reference = if !tag.contains(':') && !tag.contains('@') {
+        format!("{}:latest", tag)
+    } else {
+        tag.to_string()
+    };
+
     let manifest = ImageManifest {
-        reference: tag.to_string(),
+        reference,
         digest,
         layers,
         config,
@@ -330,7 +337,12 @@ fn execute_run(
     }
 
     // Apply network mode for package installs etc.
-    cmd = cmd.with_network(network_mode);
+    // Bridge mode needs NAT (MASQUERADE) for outbound internet and DNS for
+    // hostname resolution.  Pasta provides both natively.
+    cmd = cmd.with_network(network_mode.clone());
+    if matches!(network_mode, NetworkMode::Bridge) {
+        cmd = cmd.with_nat().with_dns(&["8.8.8.8", "1.1.1.1"]);
+    }
 
     let mut child = cmd.spawn()?;
     let (status, overlay_base) = child.wait_preserve_overlay()?;
@@ -422,12 +434,16 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     use sha2::{Digest, Sha256};
 
     // Create a tar.gz in memory to compute the digest.
+    // We walk the tree manually instead of using `append_dir_all` because the
+    // overlay upper dir may contain absolute symlinks that only resolve inside
+    // the container rootfs — following them on the host would fail with ENOENT.
     let mut tar_gz_bytes = Vec::new();
     {
         let gz_encoder =
             flate2::write::GzEncoder::new(&mut tar_gz_bytes, flate2::Compression::fast());
         let mut tar_builder = tar::Builder::new(gz_encoder);
-        tar_builder.append_dir_all(".", source_dir)?;
+        tar_builder.follow_symlinks(false);
+        append_dir_all_no_follow(&mut tar_builder, Path::new("."), source_dir)?;
         let gz_encoder = tar_builder.into_inner()?;
         gz_encoder.finish()?;
     }
@@ -456,6 +472,52 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Walk a directory tree and append entries to a tar builder without following
+/// symlinks.  Symlinks are stored as symlinks in the archive (preserving their
+/// target path), which is critical for overlay upper dirs that contain absolute
+/// symlinks into the container rootfs.
+fn append_dir_all_no_follow<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    prefix: &Path,
+    src: &Path,
+) -> Result<(), io::Error> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?; // does NOT follow symlinks
+        let name = prefix.join(entry.file_name());
+        let path = entry.path();
+
+        if ft.is_dir() {
+            builder.append_dir(&name, &path)?;
+            append_dir_all_no_follow(builder, &name, &path)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            // Read symlink metadata for permissions/ownership.
+            let meta = path.symlink_metadata()?;
+            header.set_mode(std::os::unix::fs::MetadataExt::mode(&meta));
+            header.set_uid(std::os::unix::fs::MetadataExt::uid(&meta) as u64);
+            header.set_gid(std::os::unix::fs::MetadataExt::gid(&meta) as u64);
+            header.set_mtime(std::os::unix::fs::MetadataExt::mtime(&meta) as u64);
+            header.set_cksum();
+            builder.append_link(&mut header, &name, &target)?;
+        } else {
+            // Regular file (or special file — best-effort).
+            match builder.append_path_with_name(&path, &name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Race condition or stale overlay entry — skip silently.
+                    log::debug!("skipping vanished file: {}", path.display());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Check if a directory contains any entries.
 fn dir_has_content(dir: &Path) -> Result<bool, io::Error> {

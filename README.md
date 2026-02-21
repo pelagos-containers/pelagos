@@ -6,7 +6,7 @@ A modern, lightweight Linux container runtime library written in Rust.
 
 Remora provides a safe, ergonomic API for creating containerized processes using
 Linux namespaces, seccomp filtering, cgroups v2, and native networking — without
-a daemon, without CNI plugins, and without image management.
+a daemon and without CNI plugins.
 
 **[User Guide](docs/USER_GUIDE.md)** — full CLI reference, networking, storage, security, and more.
 
@@ -52,6 +52,12 @@ a daemon, without CNI plugins, and without image management.
 - **Sync:** Unix socket at `/run/remora/<id>/exec.sock` suspends exec until `start`
 - **Phase 2 (complete):** `process.capabilities`, `linux.maskedPaths`, `linux.readonlyPaths`,
   `linux.resources`, `process.rlimits`, `linux.sysctl`, `linux.devices`, hooks, `linux.seccomp`
+
+### Image Build
+- **`remora build`:** build custom images from Remfiles (simplified Dockerfiles)
+- **Instructions:** FROM, RUN, COPY, CMD, ENV, WORKDIR, EXPOSE
+- **Daemonless:** Buildah-style — each RUN step snapshots the overlay upper dir as a layer
+- **Path safety:** COPY rejects sources outside the build context
 
 ### Rootless Containers
 - **Auto-detection:** `getuid() != 0` triggers rootless mode automatically — no flag needed
@@ -205,12 +211,13 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | NAT (MASQUERADE) | ✅ | ✅ | ✅ |
 | Port mapping | ✅ TCP | — | ✅ |
 | DNS | ✅ resolv.conf | ✅ | ✅ |
+| Image build | ✅ Remfile | — | ✅ Dockerfile |
 | OCI compliant | ✅ Phase 1 | ✅ | ✅ |
-| Rootless | ✅ (pull, run, overlay, pasta) | ✅ | ✅ |
+| Rootless | ✅ (pull, build, run, overlay, pasta) | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 
-**Estimated runc parity: ~85%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
+**Estimated runc parity: ~80%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
 and `docs/ROADMAP.md` for what's next.
 
 ## Documentation

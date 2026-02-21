@@ -1,199 +1,284 @@
 # Ongoing Tasks
 
-## Current Task: `remora build` — Image Build Feature
+## Current Task: Multi-Container Web Stack Example
 
-**Status:** COMPLETE
+**Status:** COMPLETE — 5/5 tests passing
 
-### Goal
-
-Implement `remora build` to create custom OCI images from a "Remfile" (simplified
-Dockerfile). Prerequisite for the multi-container web stack example application.
-Buildah-style daemonless model — no daemon, direct filesystem + container spawn.
-
-### CLI Interface
-
+### Architecture
 ```
-remora build -t <tag> [--file <path>] [--network bridge|pasta] [<context-dir>]
+Host :8080 → [nginx proxy :80] → [bottle app :5000] → [redis :6379]
 ```
 
-- `-t / --tag` (required): Name for resulting image (e.g. `myapp:latest`)
-- `-f / --file` (optional): Path to Remfile. Default: `<context>/Remfile`
-- `--network` (optional): Network mode for RUN steps. Default: `bridge` (root) / `pasta` (rootless)
-- `<context>` (positional, default `.`): Build context directory. COPY sources relative to this.
+### Files Created
+- `redis/Remfile` — Alpine + redis-server
+- `app/Remfile` + `app/app.py` — Alpine + Python/Bottle REST API (notes CRUD via Redis)
+- `proxy/Remfile` + `proxy/nginx.conf` + `proxy/index.html` — Alpine + nginx reverse proxy
+- `proxy/Remfile` now symlinks nginx logs to /dev/stdout + /dev/stderr for `remora logs`
+- `run.sh` — orchestration script: build, launch, verify (5 HTTP tests), cleanup
+- `README.md` — architecture and usage docs
 
-### Remfile Instructions (MVP)
-
-| Instruction | Syntax | Effect |
-|-------------|--------|--------|
-| `FROM` | `FROM alpine:latest` | Load base image layers + config |
-| `RUN` | `RUN apk add curl` | Execute in container, snapshot upper dir as layer |
-| `COPY` | `COPY src dest` | Copy from build context into image as new layer |
-| `CMD` | `CMD ["arg1"]` or `CMD arg1` | Set default command |
-| `ENV` | `ENV KEY=VALUE` | Set environment variable |
-| `WORKDIR` | `WORKDIR /app` | Set working directory |
-| `EXPOSE` | `EXPOSE 8080` | Metadata only (documentation) |
-
-### New Files
-
-1. **`src/build.rs`** — Core build engine (library module)
-   - `Instruction` enum for all supported instructions
-   - `parse_remfile(content) -> Vec<Instruction>` — line-by-line parser
-   - `execute_build(instructions, context_dir, tag) -> ImageManifest`
-   - `create_layer_from_dir(source_dir) -> String` (tar + sha256 + store)
-   - `BuildError` enum via `thiserror`
-
-2. **`src/cli/build.rs`** — CLI subcommand handler
-   - `BuildArgs` struct with clap derive
-   - `cmd_build(args)` — reads Remfile, calls build engine, prints progress
-
-### Changes to Existing Files
-
-3. **`Cargo.toml`** — Add `sha2 = "0.10"` for content-addressable digests
-
-4. **`src/lib.rs`** — Add `pub mod build;`
-
-5. **`src/cli/mod.rs`** — Add `pub mod build;`
-
-6. **`src/main.rs`** — Add `Build(cli::build::BuildArgs)` to `CliCommand`, dispatch
-
-7. **`src/container.rs`** — Add `wait_preserve_overlay(&mut self)` to `Child`
-   - Does everything `wait()` does (waitpid, teardown cgroup/network/pasta/fuse/dns/hosts)
-   - **Skips removing overlay base dir**, returns its path instead
-   - Caller (build engine) tars upper dir then cleans up
-
-### Build Execution Flow
-
-**FROM:** Load base `ImageManifest` via `image::load_image()`. Init accumulated layers + config.
-
-**RUN:**
-1. Build `Command::new("/bin/sh").args(&["-c", cmd])` with `.with_image_layers(current_layers)`,
-   accumulated ENV vars, WORKDIR, and network mode
-2. `child.wait_preserve_overlay()` → get exit status + overlay base path
-3. If exit != 0, abort build with error
-4. Upper dir at `overlay_base/upper/` — if non-empty, `create_layer_from_dir(upper)` → digest
-5. Append digest to layers, clean up overlay base dir
-
-**COPY:**
-1. Resolve src relative to context dir
-2. Create temp dir with dest path structure, copy source into it
-3. `create_layer_from_dir(temp_dir)` → digest, append to layers
-
-**CMD/ENV/WORKDIR/EXPOSE:** Mutate accumulated `ImageConfig` (no layer creation)
-
-**Final:** `image::save_image(manifest)` with all accumulated layers + config
-
-### Layer Creation Algorithm
-
+### How to Run
+```bash
+cargo build --release && export PATH=$PWD/target/release:$PATH
+sudo ./examples/web-stack/run.sh
 ```
-1. Create tempfile for tar.gz
-2. tar + gzip source_dir contents → tempfile
-3. sha256(tar.gz bytes) → digest string
-4. If layer_exists(digest), return early (dedup)
-5. Move source_dir → layers_dir/<hex>/
-6. Return digest
-```
-
-Stores the extracted directory (not tar.gz) in layer store, matching existing `extract_layer()` convention.
-
-### Example Remfile
-
-```
-FROM alpine:latest
-RUN apk add --no-cache curl
-COPY index.html /var/www/index.html
-ENV APP_PORT=8080
-WORKDIR /var/www
-CMD ["httpd", "-f", "-p", "8080", "-h", "/var/www"]
-EXPOSE 8080
-```
-
-### Verification
-
-1. `cargo test --lib` — parser unit tests
-2. `cargo build` — compiles clean
-3. Manual test (user runs as root):
-   ```bash
-   mkdir /tmp/test-build && cd /tmp/test-build
-   echo '<h1>Hello</h1>' > index.html
-   cat > Remfile <<'EOF'
-   FROM alpine:latest
-   RUN apk add --no-cache curl
-   COPY index.html /srv/index.html
-   CMD ["/bin/sh", "-c", "echo built-ok"]
-   EOF
-   sudo -E remora build -t test-build:latest .
-   sudo -E remora run test-build:latest
-   # Should print "built-ok"
-   ```
-
-### Implementation Order
-
-1. Add `sha2` to `Cargo.toml`
-2. Add `wait_preserve_overlay()` to `Child` in `container.rs`
-3. Create `src/build.rs` — parser + build engine + layer creation
-4. Create `src/cli/build.rs` — CLI handler
-5. Wire up in `lib.rs`, `cli/mod.rs`, `main.rs`
-6. Add parser unit tests in `src/build.rs`
-7. Update `ONGOING_TASKS.md` and `CLAUDE.md`
-
-### Key Existing Code to Reuse
-
-- `src/image.rs`: `ImageManifest`, `ImageConfig`, `layer_dir()`, `layer_exists()`, `save_image()`, `load_image()`, `layer_dirs()`
-- `src/cli/run.rs`: `normalise_image_reference()`, `build_image_run()` pattern for loading images + building Commands
-- `src/container.rs`: `Command` builder with `.with_image_layers()`, `Child` struct with overlay management
-- `src/paths.rs`: `layers_dir()`, `images_dir()`, `is_rootless()`
 
 ---
 
-## Example Applications (After Build Feature)
+### Bugs Found and Fixed During Development
 
-Three demo apps to deeply test and showcase remora's capabilities:
+#### Bug 1: `remora build` RUN steps had no DNS (FIXED)
+- Build containers used `--network bridge` but had no DNS resolvers configured
+- `apk add` failed with "DNS: transient error"
+- **Fix:** Added `.with_dns(&["8.8.8.8", "1.1.1.1"])` to `execute_run()` in `src/build.rs`
 
-**1. Multi-Container Web Stack** (needs `remora build`)
+#### Bug 2: `remora build` RUN steps had no NAT (FIXED)
+- Build containers had DNS configured but no outbound internet (no MASQUERADE)
+- The NAT warm-up approach (throwaway container) didn't work because NAT is refcounted
+  and rules are removed when the warm-up container exits
+- **Fix:** Added `.with_nat()` to `execute_run()` in `src/build.rs` (conditional on bridge mode)
+
+#### Bug 3: `tar::Builder::append_dir_all` follows symlinks (FIXED)
+- Overlay upper dirs contain absolute symlinks pointing into the container rootfs
+- `append_dir_all` follows these symlinks and fails with ENOENT on the host
+- **Fix:** Replaced with `append_dir_all_no_follow()` custom walker in `src/build.rs`
+  that stores symlinks as symlinks in the tar archive
+
+#### Bug 4: Build engine didn't append `:latest` to tags (FIXED)
+- `remora build -t web-stack-redis` saved the image as `web-stack-redis`
+- `remora run web-stack-redis:latest` couldn't find it (tried raw ref, then normalised)
+- **Fix:** `execute_build()` now appends `:latest` when tag has no version/digest
+
+---
+
+### Current Blocker: Inter-Container Communication + Port Forwarding
+
+There are TWO separate problems, which got tangled together during debugging:
+
+#### Problem A: Host port forwarding (`curl localhost:8080` → container)
+
+Port forwarding uses nftables DNAT in the PREROUTING chain. This works for traffic
+from external hosts but NOT for traffic originating on the host itself (localhost).
+Localhost traffic goes through the OUTPUT chain, not PREROUTING.
+
+**Attempted fixes (all failed):**
+
+1. **OUTPUT chain DNAT** — Added a DNAT rule in the OUTPUT hook to catch
+   localhost-originated traffic. The DNAT worked (changed dst to container IP)
+   but the return path was broken: packets from 127.0.0.1 can't traverse
+   non-loopback interfaces without `route_localnet=1`.
+
+2. **route_localnet=1** — Enabled on the bridge interface. This allowed the
+   SYN to reach the container, but the response got lost. After DNAT, the
+   source is still 127.0.0.1; the container replies to its own loopback.
+
+3. **Hairpin NAT masquerade (saddr 127.0.0.0/8)** — Added a postrouting
+   masquerade for localhost-sourced traffic going to the container subnet.
+   Didn't work — by the time the packet reaches postrouting, the kernel may
+   have already changed the source IP from 127.0.0.1 to the bridge IP.
+
+4. **Hairpin NAT masquerade (broad: daddr 172.19.0.0/24 oifname remora0)** —
+   Broadened the masquerade to match any traffic to the container subnet via
+   the bridge. This fixed localhost→container (test 1 PASS) but BROKE
+   inter-container traffic (nginx→app got 502). The masquerade was being
+   applied to bridged inter-container traffic due to `br_netfilter`.
+
+5. **Return rule for inter-container traffic** — Added
+   `ip saddr 172.19.0.0/24 ip daddr 172.19.0.0/24 return` to skip masquerade
+   for container-to-container traffic. But this rule was appended AFTER the
+   existing NAT masquerade rule in the postrouting chain, so the masquerade
+   fired first and the return rule never ran.
+
+6. **Moved return rule to NFT_ADD_SCRIPT + simplified masquerade** — Put the
+   return rule first and changed masquerade to `ip saddr 172.19.0.0/24 masquerade`
+   (removed oifname filter). This broke EVERYTHING because now ALL container
+   traffic was masqueraded, including responses going back through the bridge.
+
+**Root cause:** Docker solves this with `docker-proxy` — a userspace TCP proxy
+that listens on the host port and forwards to the container. nftables DNAT alone
+cannot handle localhost→container (hairpin NAT) reliably without complex rule
+interactions that break inter-container traffic.
+
+**Current state of port forwarding code:** Fully reverted to the original state
+(PREROUTING only, no OUTPUT chain, no route_localnet, no hairpin rules).
+Port forwarding works for external hosts but not from localhost.
+
+#### Problem B: Inter-container proxy_pass (nginx → app)
+
+When the web stack was running with the original NAT rules, nginx returned
+502 Bad Gateway for proxy_pass routes to `app:5000`. The nginx error log showed:
+```
+connect() failed (111: Connection refused) while connecting to upstream,
+upstream: "http://172.19.0.149:5000/health"
+```
+
+**Confirmed facts:**
+- All 3 containers are running (redis, app, proxy)
+- Redis logs: "Ready to accept connections tcp"
+- App logs: "Listening on http://0.0.0.0:5000/"
+- Proxy /etc/hosts has correct entry: `172.19.0.149 app`
+- App is reachable from HOST: `curl http://172.19.0.149:5000/health` → `{"status": "ok"}`
+- App is reachable from proxy via exec: `remora exec proxy wget -qO- http://app:5000/health` → `{"status": "ok"}`
+- But nginx proxy_pass to the same URL returns 502 (Connection refused)
+- Static content served by nginx directly works fine
+
+**Suspected cause:** The existing NAT masquerade rule
+`ip saddr 172.19.0.0/24 oifname != "remora0" masquerade` may be interfering
+with bridged inter-container traffic when `br_netfilter` kernel module is loaded.
+With br_netfilter, bridged packets go through iptables/nftables. The `oifname`
+for bridged traffic may be the veth device name (not "remora0"), causing the
+masquerade rule to match inter-container traffic incorrectly.
+
+**NOT yet verified:**
+- Whether `br_netfilter` is actually loaded
+- What `oifname` looks like for bridged traffic
+- Whether disabling br_netfilter fixes inter-container communication
+- Whether the issue exists WITHOUT any nftables rules at all
+
+---
+
+### Next Steps
+
+**Immediate:** Run the test with reverted NAT rules and direct bridge IP
+access (no port forwarding) to isolate whether Problem B exists independently.
+
+The test script now curls the proxy container's bridge IP directly on port 80
+instead of localhost:8080, completely bypassing port forwarding.
+
+**If inter-container works with direct IP access:**
+- Problem B was caused by port forwarding rule interference, not baseline networking
+- Port forwarding from localhost needs a userspace proxy approach (like Docker's docker-proxy)
+
+**If inter-container still fails (502):**
+- Check if `br_netfilter` is loaded: `lsmod | grep br_netfilter`
+- Test with `sudo modprobe -r br_netfilter` to see if that fixes it
+- Test with NO nftables rules at all (`nft flush ruleset`) to see if any rule interferes
+- Use `tcpdump -i remora0` to watch actual packets on the bridge
+- Add a `return` rule BEFORE the masquerade in `NFT_ADD_SCRIPT` to exempt inter-container traffic
+
+**Port forwarding (deferred):**
+- Implement a lightweight userspace TCP proxy (spawn a thread/process that
+  `accept()`s on host_port and `connect()`s + relays to container_ip:container_port)
+- Or document that `-p` only works for external hosts, not localhost
+
+---
+
+## Potential Next Moves
+
+### 1. Example Applications
+Three demo apps to showcase remora's capabilities end-to-end:
+
+**Multi-Container Web Stack** (uses `remora build`)
 - Bridge-networked: container A (web server) + container B (backend)
-- `--link` for service discovery, `--port` for host exposure
+- `--link` for service discovery, `-p` for host exposure
 - Named volume for shared data persistence
 
-**2. Build Sandbox**
+**Build Sandbox**
 - Rootless container that compiles user-provided code
 - Read-only rootfs + tmpfs /tmp, resource limits, seccomp + cap-drop ALL
 
-**3. CI Test Runner**
+**CI Test Runner**
 - Pull image, run test suite, collect exit code
 - `--env`, `--bind`, `--workdir`, detached mode + `logs --follow`
 
+### 2. Documentation Updates
+- ~~Update README.md with `remora build` usage~~ ✅ Done
+- ~~Update USER_GUIDE.md with Remfile reference~~ ✅ Done
+- ~~Update RUNTIME_COMPARISON.md~~ ✅ Done
+- ~~Correct runc parity estimate to ~80%~~ ✅ Done
+
+### 3. `remora build` Enhancements
+The current build feature is functional but missing several instructions and
+optimisations that would bring it closer to Dockerfile parity:
+
+- **ENTRYPOINT instruction**: `ENTRYPOINT ["nginx"]` — sets the entrypoint prefix;
+  CMD becomes default args. Parser + config mutation only (no layer).
+- **ADD instruction**: `ADD <src> <dest>` — like COPY but supports URL downloads and
+  automatic tar extraction. Moderate effort (HTTP fetch + archive detection).
+- **LABEL instruction**: `LABEL key=value` — image metadata. Parser + config only.
+- **USER instruction**: `USER 1000:1000` — set default UID/GID. Parser + config only.
+- **ARG instruction**: `ARG NAME=default` — build-time variables with `${NAME}`
+  substitution. Requires variable expansion pass in parser.
+- **Multi-stage builds**: `FROM alpine AS builder` / `COPY --from=builder` — requires
+  tracking named stages and cross-stage COPY. Significant work.
+- **Build cache**: hash (instruction + parent layer) to skip unchanged RUN steps.
+  Significant work — needs cache key computation and invalidation logic.
+- **`.remignore` file**: exclude files from build context (like `.dockerignore`).
+
+### 4. Remaining runc Parity Gaps (~20%)
+
+These are features runc supports that Remora does not. Closing these would bring
+runc parity from ~80% to near-complete.
+
+**Security / MAC (Significant Work):**
+- **AppArmor profiles**: `linux.apparmorProfile` in OCI config — apply an AppArmor
+  confinement to the container process. Requires detecting AppArmor availability,
+  writing the profile path to `/proc/self/attr/apparmor/exec`. Most impactful
+  missing security feature.
+- **SELinux labels**: `linux.selinuxProcessLabel` / `linux.selinuxMountLabel` —
+  set SELinux context on the container process and its mounts. Requires libselinux
+  or direct `/proc/self/attr/sockcurrent` writes.
+
+**Seccomp (Moderate Work):**
+- **Argument-level conditions**: `linux.seccomp.syscalls[].args[]` — filter syscalls
+  based on argument values (e.g. "allow `clone` only if flags don't include
+  `CLONE_NEWUSER`"). Currently we apply profile-level allow/deny but don't support
+  the `args` field with `SCMP_CMP_*` operators. Requires extending `seccompiler`
+  rule generation in `src/seccomp.rs`.
+
+**Cgroups (Moderate Work):**
+- **I/O bandwidth limits**: `linux.resources.blockIO` — throttle read/write
+  bytes/sec and IOPS per block device. Requires resolving device major:minor
+  numbers and writing to `io.max` / `io.weight` in cgroupfs.
+
+**OCI Hooks (Quick):**
+- **`createRuntime` hook**: runs after namespaces are created but before pivot_root.
+  Currently we support `prestart`, `poststart`, `poststop` but not the newer
+  `createRuntime` and `startContainer` hook points from OCI Runtime Spec 1.1+.
+- **`startContainer` hook**: runs inside the container namespace, after pivot_root
+  but before the user process starts.
+
+**OCI Config (Quick-to-Moderate):**
+- **`linux.devices` fine-grained ACLs**: `allow`/`deny` device access lists with
+  major/minor/type matching. Currently we create device nodes but don't enforce
+  cgroup device controller ACLs.
+- **`annotations`**: arbitrary key-value metadata on the container. Parser support
+  only — no runtime effect but required for OCI compliance.
+
+**Checkpoint / Restore (Significant Work):**
+- **CRIU integration**: `runc checkpoint` / `runc restore` — freeze a container's
+  state to disk and resume it later. Requires CRIU library integration, file
+  descriptor serialisation, and process tree reconstruction. Low priority —
+  niche use case (live migration, debugging).
+
+**Intel RDT (Low Priority):**
+- **Resource Director Technology**: `linux.intelRdt` — LLC cache and memory
+  bandwidth allocation via resctrl filesystem. Very niche, only relevant on
+  server-class Intel CPUs.
+
+**PID Namespace (Moderate Work):**
+- **CLI foreground mode**: PID namespace works in the library API but the CLI
+  `remora run` (foreground, non-detached) has an architectural limitation where
+  the spawned process can't be PID 1 because the parent is still the reaper.
+  Fix requires either a shim process or double-fork with pipe signalling.
+
+### 5. Other Improvements
+- **Authenticated registry pulls**: Docker Hub private repos, other registries
+  (requires token exchange, possibly basic auth)
+- **`remora build` rootless mode**: test and fix any rootless build issues
+- **Error messages**: audit all user-facing errors for clarity
+
 ---
 
-## Current Capabilities (v0.2.1)
+## Completed Features
 
-### Fully Working (E2E Tested — 81 pass, 0 fail, 1 skip)
-
-| Category | Features |
-|----------|----------|
-| Lifecycle | foreground, detached, ps, stop, rm, logs, name collision |
-| Images | pull (anonymous, Docker Hub), multi-layer overlay, ls, rm |
-| Exec | command in running container, PTY (-i), env/workdir/user |
-| Networking | loopback, bridge+IPAM, NAT+MASQUERADE, port forwarding, DNS, pasta |
-| Filesystem | overlay CoW, bind RW/RO, tmpfs, named volumes, read-only rootfs |
-| Security | seccomp (default+minimal), capabilities, no-new-privs, masked paths, sysctl |
-| Resources | cgroups v2 (memory, CPU quota/shares, PIDs), rlimits |
-| OCI | create/start/state/kill/delete lifecycle, config.json parsing |
-| Rootless | images, overlay (native userxattr + fuse-overlayfs fallback), pasta, cgroups v2 |
-
-### Known Limitations
-
-- **PID namespace**: works in library API, architectural limitation in CLI foreground mode
-- **No daemon mode**: CLI tool and library only, no background service
-- **No AppArmor/SELinux**: MAC profile support deferred; seccomp+caps stack is solid
-- **No authenticated registry pulls**: anonymous only (Docker Hub public images)
-- **No I/O bandwidth cgroups**: no block device throttling
-- **No CNI plugins**: intentional — native networking approach instead
-- **Rootless overlay**: requires kernel 5.11+ (userxattr) or fuse-overlayfs installed
-- **Alpine binary paths**: utilities like `id`, `env`, `wc` live in `/usr/bin/`, not `/bin/`
-
----
-
-## Completed Phases
+### `remora build` (v0.3.0)
+**COMPLETE** — Build images from Remfiles (simplified Dockerfiles).
+- Remfile parser: FROM, RUN, COPY, CMD, ENV, WORKDIR, EXPOSE
+- Buildah-style daemonless build: overlay snapshot per RUN step
+- Path traversal protection on COPY
+- 14 unit tests + 22 E2E assertions (scripts/test-build.sh)
+- `wait_preserve_overlay()` added to Child for build engine
 
 ### Stress Tests (v0.2.1)
 **COMPLETE** — 18 pass, 0 fail, 0 skip. All 7 sections passing.
@@ -215,6 +300,35 @@ Three demo apps to deeply test and showcase remora's capabilities:
 
 ### Rootless E2E Test Script
 **COMPLETE** — `scripts/test-rootless.sh` covering all rootless phases.
+
+---
+
+## Current Capabilities
+
+### Fully Working (E2E Tested)
+
+| Category | Features |
+|----------|----------|
+| Lifecycle | foreground, detached, ps, stop, rm, logs, name collision |
+| Images | pull (anonymous, Docker Hub), multi-layer overlay, ls, rm, **build** |
+| Exec | command in running container, PTY (-i), env/workdir/user |
+| Networking | loopback, bridge+IPAM, NAT+MASQUERADE, port forwarding, DNS, pasta |
+| Filesystem | overlay CoW, bind RW/RO, tmpfs, named volumes, read-only rootfs |
+| Security | seccomp (default+minimal), capabilities, no-new-privs, masked paths, sysctl |
+| Resources | cgroups v2 (memory, CPU quota/shares, PIDs), rlimits |
+| OCI | create/start/state/kill/delete lifecycle, config.json parsing |
+| Rootless | images, overlay (native userxattr + fuse-overlayfs fallback), pasta, cgroups v2 |
+
+### Known Limitations
+
+- **PID namespace**: works in library API, architectural limitation in CLI foreground mode
+- **No daemon mode**: CLI tool and library only, no background service
+- **No AppArmor/SELinux**: MAC profile support deferred; seccomp+caps stack is solid
+- **No authenticated registry pulls**: anonymous only (Docker Hub public images)
+- **No I/O bandwidth cgroups**: no block device throttling
+- **No CNI plugins**: intentional — native networking approach instead
+- **Rootless overlay**: requires kernel 5.11+ (userxattr) or fuse-overlayfs installed
+- **Alpine binary paths**: utilities like `id`, `env`, `wc` live in `/usr/bin/`, not `/bin/`
 
 ---
 

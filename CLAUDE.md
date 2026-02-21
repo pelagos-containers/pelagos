@@ -133,6 +133,16 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay cleaned up in `wait()` / `wait_with_output()`
 - **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
 
+**Image Build (COMPLETE ✅):**
+- **`remora build -t <tag> [--file <path>] [--network bridge|pasta] [context]`**: build images from Remfiles
+- **Remfile parser**: FROM, RUN, COPY, CMD (JSON + shell form), ENV, WORKDIR, EXPOSE
+- **Build engine**: overlay snapshot per RUN step, context COPY as layers, config-only instructions
+- **Layer creation**: tar+gzip for sha256 digest, extracted dir stored in layer store (dedup)
+- **Path traversal protection**: COPY rejects sources outside the build context
+- **`wait_preserve_overlay()`**: Child method that skips overlay cleanup for build engine
+- **`src/build.rs`**: `Instruction`, `parse_remfile()`, `execute_build()`, `create_layer_from_dir()`, `BuildError`
+- **`src/cli/build.rs`**: `BuildArgs`, `cmd_build()`
+
 **Container Exec (COMPLETE ✅):**
 - **`remora exec <name> <command>`**: run a command inside a running container
 - **Namespace discovery**: compares `/proc/{pid}/ns/*` inodes against `/proc/1/ns/*` to find container namespaces
@@ -162,6 +172,7 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 src/
   lib.rs                  # Library entry point
   main.rs                 # CLI binary (run/exec/ps/stop/rm/logs + OCI lifecycle)
+  build.rs                # Image build engine: Remfile parser + executor
   container.rs            # Main API (~2270 lines)
   oci.rs                  # OCI Runtime Spec implementation
   cgroup.rs               # Cgroups v2 resource management
@@ -171,6 +182,7 @@ src/
   image.rs                # OCI image store: layer extraction, manifest persistence
   cli/
     mod.rs                # Shared types: ContainerState, helpers, parsers
+    build.rs              # remora build — build images from Remfiles
     exec.rs               # remora exec — run command in running container
     run.rs                # remora run — build + launch containers
     ps.rs                 # remora ps — list containers
@@ -423,7 +435,8 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 | Networking | ✅ N1–N5 + pasta (Loopback/Bridge/NAT/Ports/DNS/Pasta) | ✅ Native libnetwork |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
 | OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
+| Image build | ✅ `remora build` (Remfile) | ✅ Dockerfile |
 | Container exec | ✅ `remora exec` (ns join + PTY) | ✅ |
 | OCI Compatible | 🔄 Partial | ✅ |
 
-**Current parity: ~90% of runc features**
+**Current parity: ~80% of runc features**

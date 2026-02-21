@@ -1,6 +1,6 @@
 # Remora vs Established Container Runtimes
 
-**Last Updated:** 2026-02-17
+**Last Updated:** 2026-02-20
 **Compared Against:** runc (OCI reference), Docker Engine, Podman
 
 ---
@@ -10,7 +10,7 @@
 - ✅ Low-level container runtime **library** (like liblxc, not like Docker)
 - ✅ Focused on Linux namespaces, seccomp, cgroups, and native networking
 - ✅ Ergonomic Rust API for embedding containers in applications
-- ❌ Not a full container platform (no image management, no registry, no daemon)
+- ✅ OCI image pull + daemonless image build (`remora build`)
 - ✅ OCI Runtime Spec v1.0.2 Phase 1 (create/start/state/kill/delete + config.json parsing)
 
 ---
@@ -30,7 +30,7 @@
 | Mount | ✅ | ✅ | ✅ | |
 | IPC | ✅ | ✅ | ✅ | |
 | Network | ✅ | ✅ | ✅ | Loopback + bridge; see Networking |
-| User | ⚠️ | ✅ | ✅ | API exists; rootless not implemented |
+| User | ✅ | ✅ | ✅ | Rootless auto-detection + multi-UID mapping |
 | Cgroup | ✅ | ✅ | ✅ | |
 | PID | ⚠️ | ✅ | ✅ | Works in library; CLI limitation |
 | **Filesystem** |
@@ -67,26 +67,28 @@
 | Interactive PTY | ✅ | ✅ | ✅ | `spawn_interactive()` |
 | SIGWINCH forwarding | ✅ | ✅ | ✅ | |
 | Signal sending | ⚠️ | ✅ | ✅ | Via `std::process::Child::kill()` |
-| Exec into container | ❌ | ✅ | ✅ | Not planned near-term |
+| Exec into container | ✅ | ✅ | ✅ | `remora exec` (ns join + PTY) |
 | **OCI** |
 | OCI config.json | ✅ | ✅ | ✅ | Phase 1 fields (see ROADMAP) |
 | OCI bundle format | ✅ | ✅ | ✅ | create/start/state/kill/delete |
-| OCI lifecycle hooks | ❌ | ✅ | ✅ | Phase 2 |
+| OCI lifecycle hooks | ✅ | ✅ | ✅ | prestart/poststart/poststop |
+| **Image Build** |
+| Image build | ✅ | 🚫 | ✅ | `remora build` (Remfile), daemonless |
 | **Rootless** |
-| Unprivileged mode | ⚠️ | ✅ | ✅ | Phase 1: USER ns + loopback; Phase 2: pasta |
-| Subuid/subgid | ❌ | ✅ | ✅ | Planned (Phase 2) |
+| Unprivileged mode | ✅ | ✅ | ✅ | Auto-detection, USER ns, pasta, overlay |
+| Subuid/subgid | ✅ | ✅ | ✅ | newuidmap/newgidmap helpers |
 | **Testing** |
-| Integration tests | ✅ | ✅ | ✅ | 65 tests, all passing |
+| Integration tests | ✅ | ✅ | ✅ | 72+ tests, all passing |
 | Unit tests | ✅ | ✅ | ✅ | |
 
 ---
 
 ## Parity Estimate
 
-| vs | Estimate |
-|----|----------|
-| runc | ~85% |
-| Docker Engine | ~35% (Docker is a full platform, not a fair comparison) |
+| vs | Estimate | Notes |
+|----|----------|-------|
+| runc | ~80% | Missing: AppArmor/SELinux, CRIU, Intel RDT, seccomp arg conditions, I/O cgroups, some OCI hooks |
+| Docker Engine | ~50% | Docker is a full platform (daemon, swarm, compose) — not a fair comparison |
 
 ---
 

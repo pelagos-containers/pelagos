@@ -1,7 +1,7 @@
 # Remora Development Roadmap
 
-**Last Updated:** 2026-02-18
-**Current Status:** Container exec complete — `remora exec <name> <command>`
+**Last Updated:** 2026-02-20
+**Current Status:** Image build complete — `remora build -t <tag> .`
 
 ---
 
@@ -188,13 +188,29 @@ Run commands inside running containers — analogous to `docker exec`.
 
 ---
 
-## In Progress
+### Image Build ✅
 
-(nothing currently in progress)
+Build custom OCI images from Remfiles (simplified Dockerfiles).
+
+- `remora build -t <tag> [--file <path>] [--network bridge|pasta] [context]`
+- Remfile instructions: FROM, RUN, COPY, CMD (JSON + shell), ENV, WORKDIR, EXPOSE
+- Daemonless build: overlay snapshot per RUN step, COPY as layer, config-only mutations
+- Content-addressable layer store with SHA-256 dedup
+- Path traversal protection on COPY
+- `wait_preserve_overlay()` on Child for build engine integration
+- `src/build.rs` (parser + engine), `src/cli/build.rs` (CLI handler)
 
 ---
 
 ## Planned
+
+### Image Build Enhancements
+
+Additional Remfile instructions and build optimisations:
+- ENTRYPOINT, ADD, LABEL, USER, ARG instructions
+- Multi-stage builds (`FROM ... AS builder` / `COPY --from=builder`)
+- Build cache (skip unchanged RUN steps)
+- `.remignore` file (exclude from build context)
 
 ### AppArmor / SELinux (Moderate Effort)
 
@@ -204,10 +220,15 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 
 ## Feature Parity Estimate
 
-| Milestone | Estimated runc parity |
-|-----------|----------------------|
-| N1–N5 + overlay complete | ~73% |
-| OCI compliance (Phase 1) ✅ | ~85% |
-| Rootless Phase 1 + Phase 2 (pasta) ✅ | ~90% |
-| OCI image layers ✅ | ~93% |
-| Container exec ✅ | ~95% |
+| Milestone | Estimated runc parity | Notes |
+|-----------|----------------------|-------|
+| N1–N5 + overlay complete | ~55% | Core isolation working |
+| OCI compliance (Phase 1) ✅ | ~65% | Lifecycle + config.json |
+| Rootless + pasta ✅ | ~70% | User ns, multi-UID, overlay |
+| OCI image layers ✅ | ~75% | Pull, run, layer cache (not runc's job, but closes UX gap) |
+| Container exec ✅ | ~78% | ns join + PTY |
+| Image build ✅ | ~80% | Remfile-based build (also not runc's job) |
+
+**Remaining runc gaps (~20%):** AppArmor/SELinux, CRIU checkpoint/restore,
+Intel RDT, seccomp arg-level conditions, I/O bandwidth cgroups, PID namespace
+in CLI foreground, createRuntime/startContainer hooks, some OCI config.json fields.

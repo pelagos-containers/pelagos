@@ -1,0 +1,7 @@
+FROM alpine:latest
+RUN apk add --no-cache python3 py3-bottle py3-redis
+COPY app.py /app/app.py
+WORKDIR /app
+CMD ["python3", "app.py"]
+ENV REDIS_HOST=redis
+EXPOSE 5000

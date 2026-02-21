@@ -129,6 +129,109 @@ as root is not visible rootless, and vice versa.
 
 ---
 
+## Building Images
+
+Remora can build custom images from a **Remfile** (simplified Dockerfile). The build
+process is daemonless (Buildah-style) — each `RUN` instruction spawns a container,
+snapshots the overlay upper directory as a new layer, and stores it in the layer cache.
+
+### Remfile Reference
+
+```
+FROM alpine:latest
+RUN apk add --no-cache curl nginx
+COPY index.html /var/www/index.html
+ENV APP_PORT=8080
+WORKDIR /var/www
+CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 8080
+```
+
+| Instruction | Syntax | Effect |
+|-------------|--------|--------|
+| `FROM` | `FROM <image>[:<tag>]` | Load base image (must be pulled locally first) |
+| `RUN` | `RUN <command>` | Execute in a container; filesystem changes become a new layer |
+| `COPY` | `COPY <src> <dest>` | Copy file/directory from build context into image as a new layer |
+| `CMD` | `CMD ["arg1", "arg2"]` or `CMD command args` | Set default command (JSON array or shell form) |
+| `ENV` | `ENV KEY=VALUE` or `ENV KEY VALUE` | Set an environment variable |
+| `WORKDIR` | `WORKDIR /path` | Set working directory for subsequent RUN and the final image |
+| `EXPOSE` | `EXPOSE <port>[/protocol]` | Documentation only (no runtime effect) |
+
+Comments (`#`) and blank lines are ignored. Continuation lines (trailing `\`) are supported.
+
+### Building
+
+```bash
+# Build from Remfile in current directory
+sudo remora build -t myapp:latest .
+
+# Build from a specific Remfile
+sudo remora build -t myapp:latest -f path/to/Remfile .
+
+# Specify network mode for RUN steps (default: bridge for root, pasta for rootless)
+sudo remora build -t myapp:latest --network bridge .
+
+# Rootless build (uses pasta networking for RUN steps)
+remora build -t myapp:latest .
+```
+
+The base image must be pulled locally first:
+
+```bash
+remora image pull alpine
+remora build -t myapp:latest .
+```
+
+### Running Built Images
+
+Built images are stored in the same image store as pulled images and can be run
+with `remora run`:
+
+```bash
+sudo remora build -t myapp:latest .
+sudo remora run myapp:latest
+sudo remora run -i myapp:latest /bin/sh   # override CMD with interactive shell
+```
+
+### Build Example
+
+```bash
+# Create a build context
+mkdir myapp && cd myapp
+echo '<h1>Hello from Remora</h1>' > index.html
+
+cat > Remfile <<'EOF'
+FROM alpine:latest
+RUN apk add --no-cache curl
+COPY index.html /srv/index.html
+ENV GREETING=hello
+WORKDIR /srv
+CMD ["/bin/sh", "-c", "cat index.html && echo $GREETING"]
+EOF
+
+# Pull base image, build, and run
+sudo remora image pull alpine
+sudo remora build -t myapp:latest .
+sudo remora run myapp:latest
+```
+
+### `build` Reference
+
+```
+remora build [OPTIONS] [CONTEXT]
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--tag <TAG>` | `-t` | Image tag (required), e.g. `myapp:latest` |
+| `--file <PATH>` | `-f` | Path to Remfile (default: `<context>/Remfile`) |
+| `--network <MODE>` | | Network for RUN steps: `bridge`, `pasta`, `none`, `auto` (default) |
+| `CONTEXT` | | Build context directory (default: `.`) |
+
+`--network auto` selects `bridge` when running as root, `pasta` when rootless.
+
+---
+
 ## Container Lifecycle
 
 ```bash
