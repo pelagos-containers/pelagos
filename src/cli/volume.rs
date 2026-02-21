@@ -8,12 +8,16 @@ pub fn cmd_volume_create(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn cmd_volume_ls() -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_volume_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let volumes_dir = remora::paths::volumes_dir();
     let entries = match std::fs::read_dir(&volumes_dir) {
         Ok(e) => e,
         Err(_) => {
-            println!("No volumes found.");
+            if json {
+                println!("[]");
+            } else {
+                println!("No volumes found.");
+            }
             return Ok(());
         }
     };
@@ -23,6 +27,23 @@ pub fn cmd_volume_ls() -> Result<(), Box<dyn std::error::Error>> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct VolumeInfo {
+            name: String,
+            path: String,
+        }
+        let infos: Vec<VolumeInfo> = names
+            .iter()
+            .map(|n| VolumeInfo {
+                name: n.clone(),
+                path: volumes_dir.join(n).to_string_lossy().into_owned(),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&infos)?);
+        return Ok(());
+    }
 
     if names.is_empty() {
         println!("No volumes. Use: remora volume create <name>");

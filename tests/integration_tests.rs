@@ -1034,6 +1034,87 @@ mod filesystem {
         );
     }
 
+    /// A named volume mounted into an overlay container is visible in the merged
+    /// view, persists data to the host, and does not write to the overlay upper
+    /// layer.
+    #[test]
+    fn test_overlay_with_volume() {
+        if !is_root() {
+            eprintln!("Skipping test_overlay_with_volume: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_overlay_with_volume: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        // Set up overlay scratch dirs.
+        let scratch = tempfile::tempdir().expect("failed to create tempdir");
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Set up a named volume.
+        let _ = Volume::delete("test_ov_vol");
+        let vol = Volume::create("test_ov_vol").expect("failed to create volume");
+
+        // Run a container that writes to the volume AND to a regular path.
+        let mut child = Command::new("/bin/ash")
+            .args(&[
+                "-c",
+                "echo vol_data > /data/vol_file.txt && echo overlay_data > /overlay_file.txt",
+            ])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_overlay(&upper, &work)
+            .with_volume(&vol, "/data")
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("failed to spawn overlay+volume container");
+
+        let status = child.wait().expect("failed to wait");
+        assert!(status.success(), "container should exit successfully");
+
+        // Volume write should persist on the host.
+        let vol_file = vol.path().join("vol_file.txt");
+        assert!(
+            vol_file.exists(),
+            "volume file should exist on host after container exits"
+        );
+        let vol_contents = std::fs::read_to_string(&vol_file).expect("failed to read volume file");
+        assert_eq!(
+            vol_contents, "vol_data\n",
+            "volume file has expected content"
+        );
+
+        // The regular write should be in the overlay upper dir, not in the rootfs.
+        assert!(
+            !rootfs.join("overlay_file.txt").exists(),
+            "rootfs (lower layer) should not contain overlay_file.txt"
+        );
+        assert!(
+            upper.join("overlay_file.txt").exists(),
+            "overlay upper dir should contain overlay_file.txt"
+        );
+
+        // The volume write should NOT appear in the overlay upper dir — it goes
+        // directly to the host volume, bypassing the overlay entirely.
+        assert!(
+            !upper.join("data/vol_file.txt").exists(),
+            "volume writes should not appear in overlay upper dir"
+        );
+
+        // Clean up.
+        Volume::delete("test_ov_vol").expect("failed to delete volume");
+    }
+
     /// Modifying an existing lower-layer file writes a copy to upper_dir;
     /// the original file in lower_dir is untouched.
     #[test]
@@ -5070,6 +5151,313 @@ mod rootless_cgroups {
             "cgroup dir should have been removed: {}",
             cg_dir.display()
         );
+    }
+}
+
+mod json_output {
+    use super::*;
+
+    /// Helper: run the remora binary, return (stdout, stderr, success).
+    fn remora(args: &[&str]) -> (String, String, bool) {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            .args(args)
+            .output()
+            .expect("failed to run remora binary");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    /// test_volume_ls_json
+    ///
+    /// Requires: root (volumes are stored under /var/lib/remora/volumes/).
+    ///
+    /// Creates a volume, verifies `volume ls --format json` contains an entry
+    /// with the volume's name and path. Removes the volume and verifies the
+    /// entry is gone from the JSON output.
+    ///
+    /// Failure indicates JSON serialization of volumes is broken or the
+    /// --format flag is not wired correctly.
+    #[test]
+    #[serial]
+    fn test_volume_ls_json() {
+        if !is_root() {
+            eprintln!("Skipping test_volume_ls_json: requires root");
+            return;
+        }
+
+        let vol_name = "test-json-vol";
+
+        // Clean up any leftover from a previous run.
+        let _ = remora(&["volume", "rm", vol_name]);
+
+        // Create a volume.
+        let (_, stderr, ok) = remora(&["volume", "create", vol_name]);
+        assert!(ok, "volume create failed: {}", stderr);
+
+        // List with --format json.
+        let (stdout, stderr, ok) = remora(&["volume", "ls", "--format", "json"]);
+        assert!(ok, "volume ls --format json failed: {}", stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("volume ls JSON should parse");
+        let arr = parsed.as_array().expect("expected JSON array");
+        let found = arr
+            .iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(vol_name));
+        assert!(
+            found,
+            "volume '{}' not in JSON output: {}",
+            vol_name, stdout
+        );
+
+        // Each entry should have a "path" field.
+        let entry = arr
+            .iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some(vol_name))
+            .unwrap();
+        assert!(
+            entry.get("path").and_then(|p| p.as_str()).is_some(),
+            "volume JSON entry should have a 'path' field"
+        );
+
+        // Remove the volume.
+        let (_, stderr, ok) = remora(&["volume", "rm", vol_name]);
+        assert!(ok, "volume rm failed: {}", stderr);
+
+        // List again — volume should be gone.
+        let (stdout, _, ok) = remora(&["volume", "ls", "--format", "json"]);
+        assert!(ok, "volume ls --format json failed after rm");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("volume ls JSON should parse after rm");
+        let arr = parsed.as_array().expect("expected JSON array");
+        let found = arr
+            .iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(vol_name));
+        assert!(
+            !found,
+            "volume '{}' should not appear after rm: {}",
+            vol_name, stdout
+        );
+    }
+
+    /// test_rootfs_ls_json
+    ///
+    /// Requires: root (rootfs store is under /var/lib/remora/rootfs/).
+    ///
+    /// Imports a rootfs entry (symlink to /tmp), verifies `rootfs ls --format json`
+    /// contains an entry with the correct name and path. Removes the entry and
+    /// verifies it is gone from the JSON output.
+    ///
+    /// Failure indicates JSON serialization of rootfs entries is broken or the
+    /// --format flag is not wired correctly.
+    #[test]
+    #[serial]
+    fn test_rootfs_ls_json() {
+        if !is_root() {
+            eprintln!("Skipping test_rootfs_ls_json: requires root");
+            return;
+        }
+
+        let name = "test-json-rootfs";
+
+        // Clean up leftover.
+        let _ = remora(&["rootfs", "rm", name]);
+
+        // Import /tmp as a dummy rootfs.
+        let (_, stderr, ok) = remora(&["rootfs", "import", name, "/tmp"]);
+        assert!(ok, "rootfs import failed: {}", stderr);
+
+        // List with --format json.
+        let (stdout, stderr, ok) = remora(&["rootfs", "ls", "--format", "json"]);
+        assert!(ok, "rootfs ls --format json failed: {}", stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("rootfs ls JSON should parse");
+        let arr = parsed.as_array().expect("expected JSON array");
+        let entry = arr
+            .iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some(name));
+        assert!(
+            entry.is_some(),
+            "rootfs '{}' not in JSON output: {}",
+            name,
+            stdout
+        );
+        assert!(
+            entry
+                .unwrap()
+                .get("path")
+                .and_then(|p| p.as_str())
+                .is_some(),
+            "rootfs JSON entry should have a 'path' field"
+        );
+
+        // Remove.
+        let (_, stderr, ok) = remora(&["rootfs", "rm", name]);
+        assert!(ok, "rootfs rm failed: {}", stderr);
+
+        // Verify gone.
+        let (stdout, _, ok) = remora(&["rootfs", "ls", "--format", "json"]);
+        assert!(ok, "rootfs ls --format json failed after rm");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("rootfs ls JSON should parse after rm");
+        let arr = parsed.as_array().expect("expected JSON array");
+        let found = arr
+            .iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(name));
+        assert!(
+            !found,
+            "rootfs '{}' should not appear after rm: {}",
+            name, stdout
+        );
+    }
+
+    /// test_ps_json_and_inspect
+    ///
+    /// Requires: root (container state is stored under /run/remora/containers/).
+    ///
+    /// Writes a synthetic container state.json, verifies `ps -a --format json`
+    /// includes the container with the correct name. Then runs
+    /// `container inspect <name>` and verifies the JSON object has the expected
+    /// fields. Removes the container via `rm` and verifies it is gone from the
+    /// JSON listing.
+    ///
+    /// Failure indicates JSON serialization of container state or the inspect
+    /// command is broken.
+    #[test]
+    #[serial]
+    fn test_ps_json_and_inspect() {
+        if !is_root() {
+            eprintln!("Skipping test_ps_json_and_inspect: requires root");
+            return;
+        }
+
+        let name = "test-json-ctr";
+
+        // Clean up leftover.
+        let _ = remora(&["rm", name]);
+
+        // Write a synthetic container state directly (avoids spawning a real
+        // container and the associated process lifecycle / cleanup overhead).
+        let ctr_dir = remora::paths::containers_dir().join(name);
+        std::fs::create_dir_all(&ctr_dir).expect("create container dir");
+        let state = serde_json::json!({
+            "name": name,
+            "rootfs": "alpine",
+            "status": "exited",
+            "pid": 0,
+            "watcher_pid": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+            "exit_code": 0,
+            "command": ["/bin/sh"],
+            "stdout_log": null,
+            "stderr_log": null
+        });
+        std::fs::write(
+            ctr_dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .expect("write state.json");
+
+        // ps -a --format json should include the container.
+        let (stdout, stderr, ok) = remora(&["ps", "-a", "--format", "json"]);
+        assert!(ok, "ps --format json failed: {}", stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("ps JSON should parse");
+        let arr = parsed.as_array().expect("expected JSON array");
+        let found = arr
+            .iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(name));
+        assert!(
+            found,
+            "container '{}' not in ps JSON output: {}",
+            name, stdout
+        );
+
+        // container inspect should return a JSON object.
+        let (stdout, stderr, ok) = remora(&["container", "inspect", name]);
+        assert!(ok, "container inspect failed: {}", stderr);
+        let obj: serde_json::Value =
+            serde_json::from_str(&stdout).expect("inspect JSON should parse");
+        assert!(obj.is_object(), "inspect should return a JSON object");
+        assert_eq!(
+            obj.get("name").and_then(|n| n.as_str()),
+            Some(name),
+            "inspect name mismatch"
+        );
+        assert!(
+            obj.get("pid").is_some(),
+            "inspect should include 'pid' field"
+        );
+        assert!(
+            obj.get("status").is_some(),
+            "inspect should include 'status' field"
+        );
+
+        // Remove the container.
+        let (_, stderr, ok) = remora(&["rm", name]);
+        assert!(ok, "rm failed: {}", stderr);
+
+        // ps -a --format json should no longer include the container.
+        let (stdout, _, ok) = remora(&["ps", "-a", "--format", "json"]);
+        assert!(ok, "ps --format json failed after rm");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("ps JSON should parse after rm");
+        let arr = parsed.as_array().expect("expected JSON array");
+        let found = arr
+            .iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(name));
+        assert!(
+            !found,
+            "container '{}' should not appear after rm: {}",
+            name, stdout
+        );
+    }
+
+    /// test_image_ls_json
+    ///
+    /// Requires: root (images are stored under /var/lib/remora/images/).
+    ///
+    /// Verifies `image ls --format json` returns a valid JSON array. Does NOT
+    /// pull an image (to keep the test fast and offline). If images already
+    /// exist, validates that each entry has the expected fields (reference,
+    /// digest, layers). If no images exist, verifies the output is `[]`.
+    ///
+    /// Failure indicates JSON serialization of image manifests is broken or
+    /// the --format flag is not wired correctly.
+    #[test]
+    #[serial]
+    fn test_image_ls_json() {
+        if !is_root() {
+            eprintln!("Skipping test_image_ls_json: requires root");
+            return;
+        }
+
+        let (stdout, stderr, ok) = remora(&["image", "ls", "--format", "json"]);
+        assert!(ok, "image ls --format json failed: {}", stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("image ls JSON should parse");
+        let arr = parsed.as_array().expect("expected JSON array");
+
+        // Validate structure of any entries that exist.
+        for entry in arr {
+            assert!(
+                entry.get("reference").and_then(|v| v.as_str()).is_some(),
+                "image entry should have 'reference': {:?}",
+                entry
+            );
+            assert!(
+                entry.get("digest").and_then(|v| v.as_str()).is_some(),
+                "image entry should have 'digest': {:?}",
+                entry
+            );
+            assert!(
+                entry.get("layers").and_then(|v| v.as_array()).is_some(),
+                "image entry should have 'layers' array: {:?}",
+                entry
+            );
+        }
     }
 }
 

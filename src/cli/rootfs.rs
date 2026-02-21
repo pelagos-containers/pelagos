@@ -24,12 +24,16 @@ pub fn cmd_rootfs_import(name: &str, path: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-pub fn cmd_rootfs_ls() -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_rootfs_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let store = rootfs_store();
     let entries = match std::fs::read_dir(&store) {
         Ok(e) => e,
         Err(_) => {
-            println!("No rootfs store found at {}", store.display());
+            if json {
+                println!("[]");
+            } else {
+                println!("No rootfs store found at {}", store.display());
+            }
             return Ok(());
         }
     };
@@ -43,6 +47,23 @@ pub fn cmd_rootfs_ls() -> Result<(), Box<dyn std::error::Error>> {
         items.push((name, target));
     }
     items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct RootfsInfo {
+            name: String,
+            path: String,
+        }
+        let infos: Vec<RootfsInfo> = items
+            .iter()
+            .map(|(n, p)| RootfsInfo {
+                name: n.clone(),
+                path: p.clone(),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&infos)?);
+        return Ok(());
+    }
 
     if items.is_empty() {
         println!("No rootfs images. Use: remora rootfs import <name> <path>");

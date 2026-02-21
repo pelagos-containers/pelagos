@@ -514,6 +514,17 @@ and that `upper_dir/newfile` contains `"hello\n"`. Failure would indicate that
 writes inside an overlay container are reaching the lower layer instead of the
 upper layer — overlayfs copy-on-write is broken or the overlay was not mounted.
 
+### `test_overlay_with_volume`
+**Requires:** root, rootfs
+
+Spawns a container with both `with_overlay(upper, work)` and
+`with_volume(&vol, "/data")`. The container writes to the volume (`/data/vol_file.txt`)
+and to a regular path (`/overlay_file.txt`). After `wait()`: asserts that the volume
+file persists on the host, the regular write lands in the overlay upper dir (not the
+rootfs), and the volume write does **not** appear in the overlay upper dir. Failure
+would indicate that volume bind mounts are not correctly layered on top of the overlay
+merged view, or that volume writes are leaking into the overlay upper directory.
+
 ### `test_overlay_lower_unchanged`
 **Requires:** root, rootfs
 
@@ -1040,3 +1051,53 @@ auto-config). Runs `id -u` and asserts it prints `0`.
 
 Failure indicates the single-UID fallback path (existing behavior) is
 broken, which would be a regression from the multi-UID changes.
+
+---
+
+## JSON Output Tests
+
+These tests verify the `--format json` flag on all list commands and the
+`container inspect` command. They exercise create→list→remove→list cycles
+to ensure JSON output is correct and consistent.
+
+### `test_volume_ls_json`
+**Requires:** root
+
+Creates a volume, runs `volume ls --format json`, and verifies the JSON array
+contains an entry with the correct `name` and `path` fields. Removes the volume
+and verifies the entry is gone from the JSON output.
+
+Failure indicates JSON serialization of volumes is broken or the `--format`
+flag is not wired correctly to `cmd_volume_ls`.
+
+### `test_rootfs_ls_json`
+**Requires:** root
+
+Imports a rootfs entry (symlink to `/tmp`), runs `rootfs ls --format json`,
+and verifies the JSON array contains an entry with the correct `name` and
+`path` fields. Removes the entry and verifies it is gone from the JSON output.
+
+Failure indicates JSON serialization of rootfs entries is broken or the
+`--format` flag is not wired correctly to `cmd_rootfs_ls`.
+
+### `test_ps_json_and_inspect`
+**Requires:** root
+
+Writes a synthetic container `state.json` to the containers directory, verifies
+`ps -a --format json` includes the container with the correct name. Runs
+`container inspect <name>` and verifies the returned JSON object has `name`,
+`pid`, and `status` fields. Removes the container via `rm` and verifies it is
+gone from the JSON listing.
+
+Failure indicates JSON serialization of container state is broken, the
+`--format` flag is not wired correctly, or `container inspect` does not work.
+
+### `test_image_ls_json`
+**Requires:** root
+
+Runs `image ls --format json` and verifies the output is a valid JSON array.
+If images are present, validates each entry has `reference`, `digest`, and
+`layers` fields. If no images exist, verifies the output is `[]`.
+
+Failure indicates JSON serialization of image manifests is broken or the
+`--format` flag is not wired correctly to `cmd_image_ls`.

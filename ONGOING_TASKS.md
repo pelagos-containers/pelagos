@@ -1,6 +1,31 @@
 # Ongoing Tasks
 
-## Current Task: Multi-Container Web Stack Example
+## Current Task: `--format json` on All List Commands + `container inspect`
+
+**Status:** COMPLETE
+
+### What Was Done
+- Added `OutputFormat` enum (table/json) to `src/main.rs` with `FromStr` for clap parsing
+- Added `--format` flag to: `remora ps`, `container ls`, `volume ls`, `image ls`, `rootfs ls`
+- Added `container inspect <name>` subcommand (always JSON output)
+- Updated `cmd_ps()`, `cmd_volume_ls()`, `cmd_image_ls()`, `cmd_rootfs_ls()` to accept `json: bool`
+- JSON mode: prints `serde_json::to_string_pretty` of the data; empty results print `[]`
+- Table mode: unchanged from before
+- `VolumeInfo` and `RootfsInfo` structs added inline for JSON serialization
+- `ContainerState` and `ImageManifest` already derived `Serialize`
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/main.rs` | `OutputFormat` enum; `--format` on all `Ls` variants; `Inspect` in `ContainerCmd` |
+| `src/cli/ps.rs` | `cmd_ps(all, json)` JSON branch; new `cmd_inspect(name)` |
+| `src/cli/volume.rs` | `VolumeInfo` struct; `cmd_volume_ls(json)` JSON branch |
+| `src/cli/image.rs` | `cmd_image_ls(json)` JSON branch |
+| `src/cli/rootfs.rs` | `RootfsInfo` struct; `cmd_rootfs_ls(json)` JSON branch |
+
+---
+
+## Previous Task: Multi-Container Web Stack Example
 
 **Status:** COMPLETE — 5/5 tests passing
 

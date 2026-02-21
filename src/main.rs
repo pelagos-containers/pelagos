@@ -4,6 +4,40 @@ mod cli;
 
 use clap::{Parser, Subcommand};
 use log::{error, info};
+use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Output format enum (shared by all list commands)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Table,
+    Json,
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "table" => Ok(OutputFormat::Table),
+            "json" => Ok(OutputFormat::Json),
+            other => Err(format!(
+                "unknown format '{}': expected 'table' or 'json'",
+                other
+            )),
+        }
+    }
+}
+
+impl fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutputFormat::Table => write!(f, "table"),
+            OutputFormat::Json => write!(f, "json"),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI structure
@@ -35,6 +69,9 @@ enum CliCommand {
         /// Show all containers (default: only running)
         #[clap(long, short = 'a')]
         all: bool,
+        /// Output format: table or json
+        #[clap(long, default_value = "table")]
+        format: OutputFormat,
     },
 
     /// Send SIGTERM to a running container
@@ -86,6 +123,13 @@ enum CliCommand {
         cmd: ImageCmd,
     },
 
+    // ── Container management ─────────────────────────────────────────────
+    /// Manage containers
+    Container {
+        #[clap(subcommand)]
+        cmd: ContainerCmd,
+    },
+
     // ── OCI lifecycle (unchanged) ─────────────────────────────────────────
     /// OCI lifecycle: create a container (machine interface)
     Create {
@@ -107,6 +151,45 @@ enum CliCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum ContainerCmd {
+    /// List containers
+    Ls {
+        /// Show all containers (default: only running)
+        #[clap(long, short = 'a')]
+        all: bool,
+        /// Output format: table or json
+        #[clap(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Show detailed information about a container (JSON)
+    Inspect {
+        /// Container name
+        name: String,
+    },
+    /// Send SIGTERM to a running container
+    Stop {
+        /// Container name
+        name: String,
+    },
+    /// Remove a container
+    Rm {
+        /// Container name
+        name: String,
+        /// Kill and remove even if running
+        #[clap(long, short = 'f')]
+        force: bool,
+    },
+    /// Print container logs
+    Logs {
+        /// Container name
+        name: String,
+        /// Follow log output
+        #[clap(long, short = 'f')]
+        follow: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum RootfsCmd {
     /// Import a local directory as a named rootfs image
     Import {
@@ -116,7 +199,11 @@ enum RootfsCmd {
         path: String,
     },
     /// List available rootfs images
-    Ls,
+    Ls {
+        /// Output format: table or json
+        #[clap(long, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Remove a rootfs image (removes the symlink, not the directory)
     Rm {
         /// Name of the rootfs image
@@ -132,7 +219,11 @@ enum VolumeCmd {
         name: String,
     },
     /// List named volumes
-    Ls,
+    Ls {
+        /// Output format: table or json
+        #[clap(long, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Remove a named volume and its contents
     Rm {
         /// Volume name
@@ -148,7 +239,11 @@ enum ImageCmd {
         reference: String,
     },
     /// List locally stored images
-    Ls,
+    Ls {
+        /// Output format: table or json
+        #[clap(long, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Remove a locally stored image
     Rm {
         /// Image reference
@@ -170,29 +265,38 @@ fn main() {
         CliCommand::Build(args) => cli::build::cmd_build(args),
         CliCommand::Run(args) => cli::run::cmd_run(*args),
         CliCommand::Exec(args) => cli::exec::cmd_exec(args),
-        CliCommand::Ps { all } => cli::ps::cmd_ps(all),
+        CliCommand::Ps { all, format } => cli::ps::cmd_ps(all, format == OutputFormat::Json),
         CliCommand::Stop { name } => cli::stop::cmd_stop(&name),
         CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),
         CliCommand::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
 
+        // Container (noun subcommand)
+        CliCommand::Container { cmd } => match cmd {
+            ContainerCmd::Ls { all, format } => cli::ps::cmd_ps(all, format == OutputFormat::Json),
+            ContainerCmd::Inspect { name } => cli::ps::cmd_inspect(&name),
+            ContainerCmd::Stop { name } => cli::stop::cmd_stop(&name),
+            ContainerCmd::Rm { name, force } => cli::rm::cmd_rm(&name, force),
+            ContainerCmd::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
+        },
+
         // Rootfs
         CliCommand::Rootfs { cmd } => match cmd {
             RootfsCmd::Import { name, path } => cli::rootfs::cmd_rootfs_import(&name, &path),
-            RootfsCmd::Ls => cli::rootfs::cmd_rootfs_ls(),
+            RootfsCmd::Ls { format } => cli::rootfs::cmd_rootfs_ls(format == OutputFormat::Json),
             RootfsCmd::Rm { name } => cli::rootfs::cmd_rootfs_rm(&name),
         },
 
         // Volume
         CliCommand::Volume { cmd } => match cmd {
             VolumeCmd::Create { name } => cli::volume::cmd_volume_create(&name),
-            VolumeCmd::Ls => cli::volume::cmd_volume_ls(),
+            VolumeCmd::Ls { format } => cli::volume::cmd_volume_ls(format == OutputFormat::Json),
             VolumeCmd::Rm { name } => cli::volume::cmd_volume_rm(&name),
         },
 
         // Image
         CliCommand::Image { cmd } => match cmd {
             ImageCmd::Pull { reference } => cli::image::cmd_image_pull(&reference),
-            ImageCmd::Ls => cli::image::cmd_image_ls(),
+            ImageCmd::Ls { format } => cli::image::cmd_image_ls(format == OutputFormat::Json),
             ImageCmd::Rm { reference } => cli::image::cmd_image_rm(&reference),
         },
 

@@ -19,8 +19,14 @@ pub fn cmd_image_pull(reference: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// List all locally stored images.
-pub fn cmd_image_ls() -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_image_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let images = list_images();
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&images)?);
+        return Ok(());
+    }
+
     if images.is_empty() {
         println!("No images found. Use 'remora image pull <name>' to pull one.");
         return Ok(());

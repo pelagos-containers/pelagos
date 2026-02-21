@@ -1,8 +1,11 @@
 //! `remora ps` — list containers.
+//! `remora container inspect` — show detailed container state as JSON.
 
-use super::{check_liveness, format_age, list_containers, write_state, ContainerStatus};
+use super::{
+    check_liveness, format_age, list_containers, read_state, write_state, ContainerStatus,
+};
 
-pub fn cmd_ps(all: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut states = list_containers();
 
     // Sort by started_at (lexicographic on ISO 8601 string = chronological).
@@ -20,7 +23,17 @@ pub fn cmd_ps(all: bool) -> Result<(), Box<dyn std::error::Error>> {
         states.retain(|s| s.status == ContainerStatus::Running);
     }
 
+    if json {
+        println!("{}", serde_json::to_string_pretty(&states)?);
+        return Ok(());
+    }
+
     if states.is_empty() {
+        if all {
+            println!("No containers found. Use 'remora run' to start one.");
+        } else {
+            println!("No containers running. Use 'remora run' to start one.");
+        }
         return Ok(());
     }
 
@@ -80,5 +93,18 @@ pub fn cmd_ps(all: bool) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    Ok(())
+}
+
+pub fn cmd_inspect(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = read_state(name).map_err(|e| format!("container '{}': {}", name, e))?;
+
+    // Refresh liveness.
+    if state.status == ContainerStatus::Running && !check_liveness(state.pid) {
+        state.status = ContainerStatus::Exited;
+        let _ = write_state(&state);
+    }
+
+    println!("{}", serde_json::to_string_pretty(&state)?);
     Ok(())
 }
