@@ -139,8 +139,9 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **N5 DNS**: `with_dns(&[...])` — writes to `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
 - **N6 Pasta**: `with_network(NetworkMode::Pasta)` — user-mode networking via `pasta`; rootless-compatible full internet access; attaches to container netns via `/proc/{pid}/ns/net` after exec
 - **Multi-network**: `remora network create/ls/rm/inspect` — per-network `Ipv4Net` subnets, `NetworkDef` config, IPAM, NAT, nftables tables (`remora-<name>`); `--network <name>` on run/build
-- **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay cleaned up in `wait()` / `wait_with_output()`
-- **`src/network.rs`**: `NetworkMode`, `Ipv4Net`, `NetworkDef`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `bootstrap_default_network()`, `load_network_def()`
+- **Multi-network containers**: `with_additional_network("backend")` — attach secondary bridge interfaces (eth1, eth2, ...) with subnet routes; `attach_network_to_netns()` / `teardown_secondary_network()` in network.rs; `--network frontend --network backend` CLI; smart link resolution via `network_ips` in state.json
+- **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay, secondary networks cleaned up in `wait()` / `wait_with_output()`
+- **`src/network.rs`**: `NetworkMode`, `Ipv4Net`, `NetworkDef`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `attach_network_to_netns()`, `teardown_secondary_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `bootstrap_default_network()`, `load_network_def()`
 - **`src/cli/network.rs`**: `cmd_network_create()`, `cmd_network_ls()`, `cmd_network_rm()`, `cmd_network_inspect()`
 
 **Image Build (COMPLETE ✅):**
@@ -444,7 +445,7 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 | tmpfs mounts | ✅ | ✅ |
 | Named volumes | ✅ | ✅ |
 | Overlay filesystem | ✅ CoW layered rootfs | ✅ |
-| Networking | ✅ N1–N6 + multi-network (Loopback/Bridge/NAT/Ports/DNS/Pasta/Named) | ✅ Native libnetwork |
+| Networking | ✅ N1–N6 + multi-network containers (Loopback/Bridge/NAT/Ports/DNS/Pasta/Named/Multi-attach) | ✅ Native libnetwork |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
 | OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
 | Image build | ✅ `remora build` (Remfile) | ✅ Dockerfile |

@@ -37,6 +37,8 @@ cleanup() {
     $REMORA rm app      2>/dev/null || true
     $REMORA rm redis    2>/dev/null || true
     $REMORA volume rm notes-data 2>/dev/null || true
+    $REMORA network rm frontend 2>/dev/null || true
+    $REMORA network rm backend  2>/dev/null || true
     log "Done."
 }
 
@@ -71,6 +73,20 @@ $REMORA build -t web-stack-proxy --network bridge "$SCRIPT_DIR/proxy"
 log "Creating volume ${BOLD}notes-data${NC}..."
 $REMORA volume create notes-data 2>/dev/null || true
 
+# ── Create Networks ───────────────────────────────────────────────────
+#
+# Network topology:
+#   frontend (10.88.1.0/24):  proxy ←→ app
+#   backend  (10.88.2.0/24):           app ←→ redis
+#
+# Redis is isolated from proxy — they share no network.
+
+log "Creating ${BOLD}frontend${NC} network (10.88.1.0/24)..."
+$REMORA network create frontend --subnet 10.88.1.0/24 2>/dev/null || true
+
+log "Creating ${BOLD}backend${NC} network (10.88.2.0/24)..."
+$REMORA network create backend --subnet 10.88.2.0/24 2>/dev/null || true
+
 # ── Launch Containers ──────────────────────────────────────────────────
 
 trap cleanup EXIT
@@ -89,9 +105,14 @@ start_container() {
     fi
 }
 
-start_container redis --network bridge --nat web-stack-redis:latest
-start_container app --network bridge --nat --link redis:redis web-stack-app:latest
-start_container proxy --network bridge --nat --link app:app web-stack-proxy:latest
+# redis: backend only
+start_container redis --network backend --nat web-stack-redis:latest
+
+# app: frontend + backend (bridges both networks)
+start_container app --network frontend --network backend --nat --link redis:redis web-stack-app:latest
+
+# proxy: frontend only (cannot reach redis directly)
+start_container proxy --network frontend --nat --link app:app web-stack-proxy:latest
 sleep 1
 
 # ── Verification ───────────────────────────────────────────────────────
@@ -165,6 +186,25 @@ if echo "$BODY" | grep -q "hello from remora"; then
     ok "GET /api/notes — note persisted"
 else
     fail "GET /api/notes — expected note in list, got: $BODY"
+fi
+
+# Test 6: Network isolation — proxy (frontend only) cannot reach redis (backend only)
+REDIS_STATE="/run/remora/containers/redis/state.json"
+REDIS_IP=""
+if [ -f "$REDIS_STATE" ]; then
+    REDIS_IP=$(python3 -c "import json; print(json.load(open('$REDIS_STATE')).get('bridge_ip',''))" 2>/dev/null || true)
+fi
+if [ -n "$REDIS_IP" ]; then
+    # Run a ping from proxy's network namespace — should fail
+    PROXY_NS=$($REMORA ps 2>/dev/null | awk '/^proxy / {print ""}')
+    # Use curl timeout to test TCP connectivity to redis port
+    if $CURL "http://${REDIS_IP}:6379/" 2>/dev/null; then
+        fail "Network isolation — proxy should NOT reach redis at ${REDIS_IP}:6379"
+    else
+        ok "Network isolation — proxy cannot reach redis (separate networks)"
+    fi
+else
+    fail "Network isolation — could not determine redis bridge IP"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────

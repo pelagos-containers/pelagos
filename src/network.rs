@@ -489,16 +489,32 @@ fn allocate_ip(net: &NetworkDef) -> io::Result<Ipv4Addr> {
     Ok(ip)
 }
 
+/// FNV-1a hash of a byte string, returning a u32.
+fn fnv1a(input: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for &b in input {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
 /// Derive unique veth interface names from a namespace name via FNV-1a hash.
 ///
 /// Interface names are limited to 15 bytes (IFNAMSIZ − 1).
 /// `"vh-" + 8 hex digits` = 11 chars — safely within limit.
 fn veth_names_for(ns_name: &str) -> (String, String) {
-    let mut hash: u32 = 0x811c9dc5;
-    for b in ns_name.bytes() {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
+    let hash = fnv1a(ns_name.as_bytes());
+    (format!("vh-{:08x}", hash), format!("vp-{:08x}", hash))
+}
+
+/// Derive unique veth interface names for a secondary network attachment.
+///
+/// Hashes `"ns_name:network_name"` to avoid collisions with the primary veth
+/// pair (which hashes just `ns_name`).
+fn veth_names_for_network(ns_name: &str, network_name: &str) -> (String, String) {
+    let input = format!("{}:{}", ns_name, network_name);
+    let hash = fnv1a(input.as_bytes());
     (format!("vh-{:08x}", hash), format!("vp-{:08x}", hash))
 }
 
@@ -646,6 +662,89 @@ pub fn teardown_network(setup: &NetworkSetup) {
     }
     if setup.nat_enabled {
         disable_nat(&net_def);
+    }
+}
+
+// ── Secondary network attachment ──────────────────────────────────────────────
+
+/// Attach an additional bridge network to an existing named netns.
+///
+/// Unlike [`setup_bridge_network`] which creates the netns and assigns `eth0`
+/// with a default route, this adds a secondary interface (e.g. `eth1`, `eth2`)
+/// with only a subnet route — no default route.
+///
+/// Called **from the parent process** after the primary network is set up.
+/// The child joins the netns via the primary network's `setns()`.
+///
+/// Returns a [`NetworkSetup`] for teardown. The `ns_name` field is set to the
+/// same namespace as the primary — [`teardown_secondary_network`] will NOT
+/// delete the netns (the primary owns it).
+pub fn attach_network_to_netns(
+    ns_name: &str,
+    network_name: &str,
+    iface_name: &str,
+) -> io::Result<NetworkSetup> {
+    let net_def = load_network_def(network_name)?;
+    ensure_bridge(&net_def)?;
+
+    let container_ip = allocate_ip(&net_def)?;
+    let (veth_host, veth_peer) = veth_names_for_network(ns_name, network_name);
+
+    // 1. Create veth pair in host netns
+    run(
+        "ip",
+        &[
+            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
+        ],
+    )?;
+
+    // 2. Move the peer into the existing named netns
+    run("ip", &["link", "set", &veth_peer, "netns", ns_name])?;
+
+    let ip_cidr = format!("{}/{}", container_ip, net_def.subnet.prefix_len);
+
+    // 3. Configure the interface inside the netns (rename, assign IP, bring up)
+    run(
+        "ip",
+        &["-n", ns_name, "link", "set", &veth_peer, "name", iface_name],
+    )?;
+    run(
+        "ip",
+        &["-n", ns_name, "addr", "add", &ip_cidr, "dev", iface_name],
+    )?;
+    run("ip", &["-n", ns_name, "link", "set", iface_name, "up"])?;
+
+    // The kernel automatically creates the subnet route when the interface
+    // comes up with an IP in CIDR notation (e.g. 10.99.2.2/24 → route for
+    // 10.99.2.0/24 dev eth1). No explicit `route add` needed — and attempting
+    // one would fail with EEXIST.
+
+    // 4. Attach host-side veth to bridge and bring it up
+    run(
+        "ip",
+        &["link", "set", &veth_host, "master", &net_def.bridge_name],
+    )?;
+    run("ip", &["link", "set", &veth_host, "up"])?;
+
+    Ok(NetworkSetup {
+        veth_host,
+        ns_name: ns_name.to_string(),
+        container_ip,
+        nat_enabled: false,
+        port_forwards: Vec::new(),
+        proxy_stop: None,
+        network_name: network_name.to_string(),
+    })
+}
+
+/// Remove a secondary network's veth pair.
+///
+/// Unlike [`teardown_network`], this does NOT delete the named netns (the
+/// primary network owns it). Only the host-side veth is deleted — the kernel
+/// cascades removal of the container-side peer.
+pub fn teardown_secondary_network(setup: &NetworkSetup) {
+    if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
+        log::warn!("secondary network teardown veth (non-fatal): {}", e);
     }
 }
 
@@ -1383,6 +1482,23 @@ mod tests {
         assert!(NetworkMode::Bridge.is_bridge());
         assert!(NetworkMode::BridgeNamed("frontend".into()).is_bridge());
         assert!(!NetworkMode::Pasta.is_bridge());
+    }
+
+    #[test]
+    fn test_veth_names_for_network_unique() {
+        let (h1, p1) = super::veth_names_for("rem-123-0");
+        let (h2, p2) = super::veth_names_for_network("rem-123-0", "frontend");
+        let (h3, p3) = super::veth_names_for_network("rem-123-0", "backend");
+        // Primary and secondary must differ
+        assert_ne!(h1, h2);
+        assert_ne!(p1, p2);
+        // Different networks must differ
+        assert_ne!(h2, h3);
+        assert_ne!(p2, p3);
+        // Names must be within IFNAMSIZ (15 chars)
+        assert!(h1.len() <= 15);
+        assert!(h2.len() <= 15);
+        assert!(h3.len() <= 15);
     }
 
     #[test]

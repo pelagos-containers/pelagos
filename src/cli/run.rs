@@ -25,9 +25,10 @@ pub struct RunArgs {
     #[clap(long, short = 'i')]
     pub interactive: bool,
 
-    /// Network mode: none, loopback, bridge, pasta
-    #[clap(long, default_value = "none")]
-    pub network: String,
+    /// Network mode (repeatable for multi-network): none, loopback, bridge, pasta, or named
+    /// First value is primary; additional values attach secondary bridge interfaces.
+    #[clap(long)]
+    pub network: Vec<String>,
 
     /// TCP port forward HOST:CONTAINER (repeatable; requires bridge/pasta)
     #[clap(long = "publish", short = 'p')]
@@ -158,7 +159,19 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse port forwards and network mode (shared by both paths).
     let port_forwards = parse_port_forwards(&args.publish)?;
-    let network_mode = parse_network_mode(&args.network)?;
+    let primary_network_str = args.network.first().map(|s| s.as_str()).unwrap_or("none");
+    let network_mode = parse_network_mode(primary_network_str)?;
+    let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
+    // Validate additional networks exist.
+    for net_name in &additional_networks {
+        let config = remora::paths::network_config_dir(net_name).join("config.json");
+        if !config.exists() {
+            return Err(format!(
+                "additional network '{}' not found — create it first: remora network create {} --subnet CIDR",
+                net_name, net_name
+            ).into());
+        }
+    }
 
     // Branch: --rootfs (local rootfs) vs positional args (OCI image, default).
     let (rootfs_label, exe_and_args, cmd) = if let Some(ref rootfs_name) = args.rootfs {
@@ -174,6 +187,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             &exe_and_args,
             &port_forwards,
             network_mode,
+            &additional_networks,
         )?;
         (rootfs_name.clone(), exe_and_args, cmd)
     } else {
@@ -182,7 +196,14 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         let image_ref = &args.args[0];
         let cmd_args: Vec<String> = args.args[1..].to_vec();
-        build_image_run(&args, image_ref, &cmd_args, &port_forwards, network_mode)?
+        build_image_run(
+            &args,
+            image_ref,
+            &cmd_args,
+            &port_forwards,
+            network_mode,
+            &additional_networks,
+        )?
     };
 
     if args.detach {
@@ -201,6 +222,7 @@ fn build_image_run(
     cmd_args: &[String],
     port_forwards: &[(u16, u16)],
     network_mode: NetworkMode,
+    additional_networks: &[String],
 ) -> Result<(String, Vec<String>, Command), Box<dyn std::error::Error>> {
     use remora::image;
 
@@ -264,7 +286,7 @@ fn build_image_run(
     }
 
     // Apply shared CLI options (network, volumes, security, etc.)
-    cmd = apply_cli_options(cmd, args, port_forwards, network_mode)?;
+    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks)?;
 
     Ok((full_ref, exe_and_args, cmd))
 }
@@ -290,6 +312,7 @@ fn build_command(
     exe_and_args: &[String],
     port_forwards: &[(u16, u16)],
     network_mode: NetworkMode,
+    additional_networks: &[String],
 ) -> Result<Command, Box<dyn std::error::Error>> {
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
@@ -301,7 +324,7 @@ fn build_command(
         .with_proc_mount()
         .with_dev_mount();
 
-    cmd = apply_cli_options(cmd, args, port_forwards, network_mode)?;
+    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks)?;
     Ok(cmd)
 }
 
@@ -312,10 +335,14 @@ fn apply_cli_options(
     args: &RunArgs,
     port_forwards: &[(u16, u16)],
     network_mode: NetworkMode,
+    additional_networks: &[String],
 ) -> Result<Command, Box<dyn std::error::Error>> {
     // Network
     if network_mode != NetworkMode::None {
         cmd = cmd.with_network(network_mode);
+    }
+    for net_name in additional_networks {
+        cmd = cmd.with_additional_network(net_name);
     }
     for &(host, container) in port_forwards {
         cmd = cmd.with_port_forward(host, container);
@@ -569,16 +596,22 @@ fn run_foreground(
         stdout_log: None,
         stderr_log: None,
         bridge_ip: None,
+        network_ips: std::collections::HashMap::new(),
     };
     write_state(&state)?;
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
     let pid = child.pid();
 
-    // Update state with real PID and bridge IP (if bridge networking).
+    // Update state with real PID and network IPs (if bridge networking).
     let mut state2 = state;
     state2.pid = pid;
     state2.bridge_ip = child.container_ip();
+    state2.network_ips = child
+        .container_ips()
+        .into_iter()
+        .map(|(name, ip)| (name.to_string(), ip))
+        .collect();
     write_state(&state2)?;
 
     let exit = child.wait().map_err(|e| format!("wait failed: {}", e))?;
@@ -639,6 +672,7 @@ fn run_detached(
         stdout_log: Some(stdout_log.to_string_lossy().into_owned()),
         stderr_log: Some(stderr_log.to_string_lossy().into_owned()),
         bridge_ip: None,
+        network_ips: std::collections::HashMap::new(),
     };
     write_state(&state)?;
 
@@ -669,11 +703,16 @@ fn run_detached(
             let pid = child.pid();
             let watcher_pid = unsafe { libc::getpid() };
 
-            // Update state with real PIDs and bridge IP.
+            // Update state with real PIDs and network IPs.
             let mut updated = state;
             updated.pid = pid;
             updated.watcher_pid = watcher_pid;
             updated.bridge_ip = child.container_ip();
+            updated.network_ips = child
+                .container_ips()
+                .into_iter()
+                .map(|(name, ip)| (name.to_string(), ip))
+                .collect();
             let _ = write_state(&updated);
 
             // Relay stdout and stderr to log files concurrently.

@@ -1249,3 +1249,45 @@ Bootstraps the default network and verifies the config file exists. This tests
 that the default `remora0` network is always available and cannot be removed.
 
 Failure indicates `bootstrap_default_network()` is not persisting the config.
+
+### `test_multi_network_dual_interface`
+**Requires:** root, alpine-rootfs
+
+Creates two test networks (`mntest1` at `10.99.1.0/24`, `mntest2` at `10.99.2.0/24`),
+spawns a container on both using `with_network()` + `with_additional_network()`, and
+verifies that eth0 has a `10.99.1.x` IP and eth1 has a `10.99.2.x` IP. Also checks
+the `container_ip()` and `container_ip_on()` accessors return the correct IPs.
+
+Failure indicates `attach_network_to_netns()` is not correctly configuring the secondary
+interface, or the IPAM allocation is assigning IPs from the wrong subnet.
+
+### `test_multi_network_isolation`
+**Requires:** root, alpine-rootfs
+
+Creates two isolated networks (`mniso1`, `mniso2`). Spawns container A on net1 only,
+container B on net2 only, and container C on both. Verifies C can ping both A and B,
+but a container on net1 alone cannot ping B (on net2).
+
+Failure indicates network isolation is broken — traffic is leaking between bridges
+that should be completely separate.
+
+### `test_multi_network_teardown`
+**Requires:** root, alpine-rootfs
+
+Spawns a container on two networks, records the netns name and both veth interface
+names, then waits for exit. Verifies that the named netns no longer exists at
+`/run/netns/` and both veth pairs (primary and secondary) are removed.
+
+Failure indicates `teardown_secondary_network()` or `teardown_network()` is not
+cleaning up properly, which would leak network namespaces or veth interfaces.
+
+### `test_multi_network_link_resolution`
+**Requires:** root, alpine-rootfs
+
+Creates two networks, starts a "server" container on both, writes its state.json
+with `network_ips` map, then starts a "client" on net2 only with `--link server`.
+Verifies that `/etc/hosts` contains the server's net2 IP (the shared network),
+not its net1 IP.
+
+Failure indicates `resolve_container_ip_on_shared_network()` is not correctly
+matching networks, causing links to resolve to IPs on unreachable networks.

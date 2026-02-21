@@ -104,6 +104,9 @@ pub struct ContainerState {
     /// Bridge IP address (e.g. "172.19.0.5"), populated when using bridge networking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_ip: Option<String>,
+    /// Per-network IP addresses: network_name → IP string.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub network_ips: std::collections::HashMap<String, String>,
 }
 
 pub fn now_iso8601() -> String {

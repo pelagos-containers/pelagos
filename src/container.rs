@@ -300,6 +300,42 @@ pub fn resolve_container_ip(name: &str) -> io::Result<String> {
     )))
 }
 
+/// Resolve a container's IP on a network shared with this container.
+///
+/// Reads the target container's `state.json`, checks the `network_ips` map
+/// for any network in `my_networks`. Returns the first match.
+pub fn resolve_container_ip_on_shared_network(
+    name: &str,
+    my_networks: &[String],
+) -> io::Result<String> {
+    let cli_path = crate::paths::containers_dir().join(name).join("state.json");
+    if let Ok(data) = std::fs::read_to_string(&cli_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+            // Check liveness first.
+            if let Some(pid) = v.get("pid").and_then(|v| v.as_i64()) {
+                if pid <= 0 || unsafe { libc::kill(pid as i32, 0) } != 0 {
+                    return Err(io::Error::other(format!(
+                        "linked container '{}' is not running",
+                        name
+                    )));
+                }
+            }
+            // Check network_ips map for a shared network.
+            if let Some(ips) = v.get("network_ips").and_then(|v| v.as_object()) {
+                for net_name in my_networks {
+                    if let Some(ip) = ips.get(net_name).and_then(|v| v.as_str()) {
+                        return Ok(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Err(io::Error::other(format!(
+        "container '{}' has no IP on a shared network",
+        name
+    )))
+}
+
 bitflags! {
     /// Linux namespace types that can be unshared.
     ///
@@ -628,6 +664,8 @@ pub struct Command {
     use_id_helpers: bool,
     // Container links: (container_name, alias) → resolved to /etc/hosts entries at spawn time.
     links: Vec<(String, String)>,
+    // Additional bridge networks to attach (secondary interfaces: eth1, eth2, ...).
+    additional_networks: Vec<String>,
 }
 
 impl Command {
@@ -670,6 +708,7 @@ impl Command {
             hostname: None,
             links: Vec::new(),
             use_id_helpers: false,
+            additional_networks: Vec::new(),
         }
     }
 
@@ -1088,6 +1127,26 @@ impl Command {
             self.namespaces |= Namespace::NET;
         }
         self.network_config = Some(crate::network::NetworkConfig { mode });
+        self
+    }
+
+    /// Attach an additional bridge network to this container.
+    ///
+    /// The container must already have a primary bridge network set via
+    /// [`with_network`]. Each additional network gets a secondary interface
+    /// (`eth1`, `eth2`, ...) with a subnet route only (no default route).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use remora::container::Command;
+    /// # use remora::network::NetworkMode;
+    /// let cmd = Command::new("/bin/sh")
+    ///     .with_network(NetworkMode::BridgeNamed("frontend".into()))
+    ///     .with_additional_network("backend");
+    /// ```
+    pub fn with_additional_network(mut self, network_name: &str) -> Self {
+        self.additional_networks.push(network_name.to_string());
         self
     }
 
@@ -1719,6 +1778,18 @@ impl Command {
             .as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
+        // Attach additional bridge networks to the same netns (secondary interfaces).
+        let mut secondary_networks: Vec<crate::network::NetworkSetup> = Vec::new();
+        if let Some(ref primary) = bridge_network {
+            for (i, net_name) in self.additional_networks.iter().enumerate() {
+                let iface = format!("eth{}", i + 1);
+                secondary_networks.push(
+                    crate::network::attach_network_to_netns(&primary.ns_name, net_name, &iface)
+                        .map_err(Error::Io)?,
+                );
+            }
+        }
+
         // Validate overlay prerequisites before fork.
         if self.overlay.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
             return Err(Error::Io(io::Error::other(
@@ -1891,6 +1962,17 @@ impl Command {
                 )));
             }
         }
+        // Collect this container's network names for smart link resolution.
+        let my_networks: Vec<String> = {
+            let mut nets = Vec::new();
+            if let Some(ref name) = bridge_network_name {
+                nets.push(name.clone());
+            }
+            for name in &self.additional_networks {
+                nets.push(name.clone());
+            }
+            nets
+        };
         let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1898,7 +1980,10 @@ impl Command {
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::from("127.0.0.1\tlocalhost\n");
             for (container_name, alias) in &self.links {
-                let ip = resolve_container_ip(container_name).map_err(Error::Io)?;
+                // Try to resolve on a shared network first, fall back to any IP.
+                let ip = resolve_container_ip_on_shared_network(container_name, &my_networks)
+                    .or_else(|_| resolve_container_ip(container_name))
+                    .map_err(Error::Io)?;
                 if alias == container_name {
                     content.push_str(&format!("{}\t{}\n", ip, alias));
                 } else {
@@ -2916,6 +3001,7 @@ impl Command {
             inner: child_inner,
             cgroup,
             network,
+            secondary_networks,
             pasta,
             overlay_merged_dir,
             dns_temp_dir,
@@ -3143,6 +3229,18 @@ impl Command {
             .as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
+        // Attach additional bridge networks to the same netns (secondary interfaces).
+        let mut secondary_networks: Vec<crate::network::NetworkSetup> = Vec::new();
+        if let Some(ref primary) = bridge_network {
+            for (i, net_name) in self.additional_networks.iter().enumerate() {
+                let iface = format!("eth{}", i + 1);
+                secondary_networks.push(
+                    crate::network::attach_network_to_netns(&primary.ns_name, net_name, &iface)
+                        .map_err(Error::Io)?,
+                );
+            }
+        }
+
         // Validate overlay prerequisites before fork.
         if self.overlay.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
             return Err(Error::Io(io::Error::other(
@@ -3311,6 +3409,17 @@ impl Command {
                 )));
             }
         }
+        // Collect this container's network names for smart link resolution.
+        let my_networks: Vec<String> = {
+            let mut nets = Vec::new();
+            if let Some(ref name) = bridge_network_name {
+                nets.push(name.clone());
+            }
+            for name in &self.additional_networks {
+                nets.push(name.clone());
+            }
+            nets
+        };
         let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3318,7 +3427,10 @@ impl Command {
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::from("127.0.0.1\tlocalhost\n");
             for (container_name, alias) in &self.links {
-                let ip = resolve_container_ip(container_name).map_err(Error::Io)?;
+                // Try to resolve on a shared network first, fall back to any IP.
+                let ip = resolve_container_ip_on_shared_network(container_name, &my_networks)
+                    .or_else(|_| resolve_container_ip(container_name))
+                    .map_err(Error::Io)?;
                 if alias == container_name {
                     content.push_str(&format!("{}\t{}\n", ip, alias));
                 } else {
@@ -4223,6 +4335,7 @@ impl Command {
                 inner: child_inner,
                 cgroup,
                 network,
+                secondary_networks,
                 pasta,
                 overlay_merged_dir,
                 dns_temp_dir,
@@ -4267,6 +4380,8 @@ pub struct Child {
     pub(crate) cgroup: Option<CgroupHandle>,
     /// Optional network state (veth pair). Torn down after the child exits.
     network: Option<crate::network::NetworkSetup>,
+    /// Secondary network attachments (eth1, eth2, ...). Torn down before primary.
+    secondary_networks: Vec<crate::network::NetworkSetup>,
     /// Optional pasta relay process. Killed after the child exits.
     pasta: Option<crate::network::PastaSetup>,
     /// Overlay merged-dir created before fork; removed after the child exits.
@@ -4302,6 +4417,40 @@ impl Child {
     /// Returns the container's bridge IP (e.g. `172.19.0.5`) if bridge networking is active.
     pub fn container_ip(&self) -> Option<String> {
         self.network.as_ref().map(|n| n.container_ip.to_string())
+    }
+
+    /// Returns all network IPs as `(network_name, ip_string)` pairs.
+    ///
+    /// Includes the primary network (if any) and all secondary networks.
+    pub fn container_ips(&self) -> Vec<(&str, String)> {
+        let mut ips = Vec::new();
+        if let Some(ref net) = self.network {
+            ips.push((net.network_name.as_str(), net.container_ip.to_string()));
+        }
+        for net in &self.secondary_networks {
+            ips.push((net.network_name.as_str(), net.container_ip.to_string()));
+        }
+        ips
+    }
+
+    /// Returns the container's IP on a specific network, or `None` if not attached.
+    pub fn container_ip_on(&self, network_name: &str) -> Option<String> {
+        if let Some(ref net) = self.network {
+            if net.network_name == network_name {
+                return Some(net.container_ip.to_string());
+            }
+        }
+        for net in &self.secondary_networks {
+            if net.network_name == network_name {
+                return Some(net.container_ip.to_string());
+            }
+        }
+        None
+    }
+
+    /// Returns the secondary network setups (for test assertions).
+    pub fn secondary_networks(&self) -> &[crate::network::NetworkSetup] {
+        &self.secondary_networks
     }
 
     /// Returns the overlay merged-dir path if an overlay filesystem was configured.
@@ -4341,6 +4490,10 @@ impl Child {
                     crate::cgroup_rootless::teardown_rootless_cgroup(cg)
                 }
             }
+        }
+        // Tear down secondary networks before primary (veths before netns).
+        for net in &self.secondary_networks {
+            crate::network::teardown_secondary_network(net);
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
@@ -4474,6 +4627,10 @@ impl Child {
                     crate::cgroup_rootless::teardown_rootless_cgroup(cg)
                 }
             }
+        }
+        // Tear down secondary networks before primary (veths before netns).
+        for net in &self.secondary_networks {
+            crate::network::teardown_secondary_network(net);
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);

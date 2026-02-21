@@ -6229,4 +6229,427 @@ mod multi_network {
         let config = remora::paths::network_config_dir("remora0").join("config.json");
         assert!(config.exists(), "default network config should exist");
     }
+
+    // ── Multi-network container tests ─────────────────────────────────────
+
+    /// Helper: create a test network.
+    fn create_test_network(name: &str, cidr: &str) {
+        cleanup_test_network(name);
+        let subnet = Ipv4Net::from_cidr(cidr).unwrap();
+        let net = NetworkDef {
+            name: name.to_string(),
+            subnet: subnet.clone(),
+            gateway: subnet.gateway(),
+            bridge_name: format!("rm-{}", name),
+        };
+        net.save().expect("save network");
+    }
+
+    /// Container on two networks should have both eth0 and eth1 with IPs in
+    /// the correct subnets.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_multi_network_dual_interface() {
+        if !is_root() {
+            eprintln!("Skipping test_multi_network_dual_interface (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_multi_network_dual_interface (no rootfs)");
+                return;
+            }
+        };
+
+        let net1 = "mntest1";
+        let net2 = "mntest2";
+        create_test_network(net1, "10.99.1.0/24");
+        create_test_network(net2, "10.99.2.0/24");
+
+        let child = Command::new("/bin/sh")
+            .args(&[
+                "-c",
+                "ip addr show eth0 | grep 'inet '; ip addr show eth1 | grep 'inet '",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_additional_network(net2)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn multi-network");
+
+        let ip1 = child.container_ip().expect("primary IP");
+        assert!(
+            ip1.starts_with("10.99.1."),
+            "primary IP should be in 10.99.1.0/24, got: {}",
+            ip1
+        );
+
+        let ip2 = child
+            .container_ip_on(net2)
+            .expect("secondary IP on mntest2");
+        assert!(
+            ip2.starts_with("10.99.2."),
+            "secondary IP should be in 10.99.2.0/24, got: {}",
+            ip2
+        );
+
+        let (_status, stdout_raw, _stderr) = child.wait_with_output().expect("wait_with_output");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+
+        assert!(
+            stdout.contains("10.99.1."),
+            "eth0 should have 10.99.1.x IP in output: {}",
+            stdout.trim()
+        );
+        assert!(
+            stdout.contains("10.99.2."),
+            "eth1 should have 10.99.2.x IP in output: {}",
+            stdout.trim()
+        );
+
+        cleanup_test_network(net1);
+        cleanup_test_network(net2);
+    }
+
+    /// Network isolation: container A (net1 only) cannot reach container B
+    /// (net2 only), but container C (both) can reach both.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_multi_network_isolation() {
+        if !is_root() {
+            eprintln!("Skipping test_multi_network_isolation (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_multi_network_isolation (no rootfs)");
+                return;
+            }
+        };
+
+        let net1 = "mniso1";
+        let net2 = "mniso2";
+        let bridge1 = "rm-mniso1";
+        let bridge2 = "rm-mniso2";
+        create_test_network(net1, "10.98.1.0/24");
+        create_test_network(net2, "10.98.2.0/24");
+
+        // Insert iptables DROP rules between the two bridges to enforce
+        // isolation. Without these, a host with ip_forward=1 and a permissive
+        // FORWARD policy will happily route between bridges. This mirrors
+        // Docker's ICC=false behaviour.
+        let _ = std::process::Command::new("iptables")
+            .args(["-I", "FORWARD", "-i", bridge1, "-o", bridge2, "-j", "DROP"])
+            .status();
+        let _ = std::process::Command::new("iptables")
+            .args(["-I", "FORWARD", "-i", bridge2, "-o", bridge1, "-j", "DROP"])
+            .status();
+
+        // Container A: only on net1
+        let mut child_a = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container A");
+
+        let ip_a = child_a.container_ip().expect("A's IP");
+
+        // Container B: only on net2
+        let mut child_b = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net2.to_string()))
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container B");
+
+        let ip_b = child_b.container_ip().expect("B's IP");
+
+        // Container C: on both net1 and net2 — can it ping both A and B?
+        // C has interfaces on BOTH bridges, so the DROP rules don't block its
+        // traffic (it talks to each peer via the local bridge, not cross-bridge).
+        let test_cmd = format!("ping -c1 -W1 {} && ping -c1 -W1 {}", ip_a, ip_b);
+        let child_c = Command::new("/bin/sh")
+            .args(&["-c", &test_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_additional_network(net2)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn container C");
+
+        let (status_c, _stdout, _stderr) = child_c.wait_with_output().expect("wait C");
+        assert!(
+            status_c.success(),
+            "container C (both networks) should reach both A and B"
+        );
+
+        // Container D on net1 only — should NOT be able to reach container B on net2.
+        // The iptables DROP rules block cross-bridge forwarding.
+        let test_cmd_fail = format!("ping -c1 -W1 {}", ip_b);
+        let child_d = Command::new("/bin/sh")
+            .args(&["-c", &test_cmd_fail])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn isolation test");
+
+        let (status_d, _stdout, _stderr) = child_d.wait_with_output().expect("wait D");
+        assert!(
+            !status_d.success(),
+            "container on net1 should NOT reach container on net2"
+        );
+
+        // Clean up sleeping containers
+        unsafe {
+            libc::kill(child_a.pid(), libc::SIGTERM);
+            libc::kill(child_b.pid(), libc::SIGTERM);
+        }
+        let _ = child_a.wait();
+        let _ = child_b.wait();
+
+        // Remove the iptables DROP rules.
+        let _ = std::process::Command::new("iptables")
+            .args(["-D", "FORWARD", "-i", bridge1, "-o", bridge2, "-j", "DROP"])
+            .status();
+        let _ = std::process::Command::new("iptables")
+            .args(["-D", "FORWARD", "-i", bridge2, "-o", bridge1, "-j", "DROP"])
+            .status();
+
+        cleanup_test_network(net1);
+        cleanup_test_network(net2);
+    }
+
+    /// After a multi-network container exits, both veth pairs and the netns
+    /// should be cleaned up.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_multi_network_teardown() {
+        if !is_root() {
+            eprintln!("Skipping test_multi_network_teardown (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_multi_network_teardown (no rootfs)");
+                return;
+            }
+        };
+
+        let net1 = "mntd1";
+        let net2 = "mntd2";
+        create_test_network(net1, "10.97.1.0/24");
+        create_test_network(net2, "10.97.2.0/24");
+
+        let mut child = Command::new("/bin/true")
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_additional_network(net2)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn teardown test");
+
+        // Record names before wait() cleans them up.
+        let ns_name = child.netns_name().unwrap().to_string();
+        let primary_veth = child.veth_name().unwrap().to_string();
+        let secondary_veths: Vec<String> = child
+            .secondary_networks()
+            .iter()
+            .map(|n| n.veth_host.clone())
+            .collect();
+        assert_eq!(
+            secondary_veths.len(),
+            1,
+            "should have one secondary network"
+        );
+
+        child.wait().expect("wait for container");
+
+        // Verify netns is gone.
+        let ns_path = format!("/run/netns/{}", ns_name);
+        assert!(
+            !std::path::Path::new(&ns_path).exists(),
+            "netns {} should be removed after wait()",
+            ns_name
+        );
+
+        // Verify primary veth is gone.
+        let veth_check = std::process::Command::new("ip")
+            .args(["link", "show", &primary_veth])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("ip link show");
+        assert!(
+            !veth_check.success(),
+            "primary veth {} should be removed",
+            primary_veth
+        );
+
+        // Verify secondary veth is gone.
+        for veth in &secondary_veths {
+            let check = std::process::Command::new("ip")
+                .args(["link", "show", veth])
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("ip link show");
+            assert!(
+                !check.success(),
+                "secondary veth {} should be removed",
+                veth
+            );
+        }
+
+        cleanup_test_network(net1);
+        cleanup_test_network(net2);
+    }
+
+    /// `--link` resolves to the IP on a shared network when the target container
+    /// is on multiple networks.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_multi_network_link_resolution() {
+        if !is_root() {
+            eprintln!("Skipping test_multi_network_link_resolution (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_multi_network_link_resolution (no rootfs)");
+                return;
+            }
+        };
+
+        let net1 = "mnlink1";
+        let net2 = "mnlink2";
+        create_test_network(net1, "10.96.1.0/24");
+        create_test_network(net2, "10.96.2.0/24");
+
+        // Start a "server" container on both networks.
+        let mut server = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_additional_network(net2)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn server");
+
+        let server_ip_net1 = server.container_ip_on(net1).expect("server IP on net1");
+        let server_ip_net2 = server.container_ip_on(net2).expect("server IP on net2");
+
+        // Save server state so link resolution can find it.
+        let server_name = "mnlink-server";
+        let server_dir = remora::paths::containers_dir().join(server_name);
+        std::fs::create_dir_all(&server_dir).expect("create server dir");
+        let mut network_ips = std::collections::HashMap::new();
+        network_ips.insert(net1.to_string(), server_ip_net1.clone());
+        network_ips.insert(net2.to_string(), server_ip_net2.clone());
+        let state_json = serde_json::json!({
+            "name": server_name,
+            "rootfs": rootfs.to_string_lossy(),
+            "status": "running",
+            "pid": server.pid(),
+            "watcher_pid": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+            "command": ["/bin/sleep", "30"],
+            "bridge_ip": server_ip_net1,
+            "network_ips": network_ips,
+        });
+        std::fs::write(
+            server_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .expect("write server state");
+
+        // Client on net2 only — link should resolve to server's net2 IP.
+        let client = Command::new("/bin/sh")
+            .args(&["-c", "cat /etc/hosts"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net2.to_string()))
+            .with_nat()
+            .with_link(server_name)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, _stderr) = client.wait_with_output().expect("wait client");
+        let hosts = String::from_utf8_lossy(&stdout_raw);
+
+        // The link should resolve to the net2 IP (shared network), not net1.
+        assert!(
+            hosts.contains(&server_ip_net2),
+            "/etc/hosts should contain server's net2 IP {}, got: {}",
+            server_ip_net2,
+            hosts.trim()
+        );
+
+        // Clean up
+        unsafe { libc::kill(server.pid(), libc::SIGTERM) };
+        let _ = server.wait();
+        let _ = std::fs::remove_dir_all(&server_dir);
+
+        cleanup_test_network(net1);
+        cleanup_test_network(net2);
+    }
 }
