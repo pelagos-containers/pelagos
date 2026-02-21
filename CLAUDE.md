@@ -25,6 +25,13 @@
 - ✅ Explain what the command will do
 - ✅ Wait for user to run it and report results
 
+### Integration Tests Are Part of the Feature
+**Every feature MUST include integration tests in the same commit. A feature is not done until it is tested.**
+
+- Parser/serialization features: add tests in `tests/integration_tests.rs` that exercise the public API
+- Runtime features (networking, containers, cgroups): add root-requiring tests that spawn real containers
+- Do NOT defer test writing to a follow-up — tests ship with the code
+
 ### Document Every Integration Test
 **When writing a new integration test, you MUST also add its entry to `docs/INTEGRATION_TESTS.md` in the same change.**
 

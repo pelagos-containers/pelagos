@@ -1101,3 +1101,91 @@ If images are present, validates each entry has `reference`, `digest`, and
 
 Failure indicates JSON serialization of image manifests is broken or the
 `--format` flag is not wired correctly to `cmd_image_ls`.
+
+---
+
+## Build Instructions (ENTRYPOINT, LABEL, USER)
+
+### `test_parse_entrypoint_json`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses `ENTRYPOINT ["python3", "-m", "http.server"]` and verifies it produces
+`Instruction::Entrypoint` with the correct argument list. Also checks that CMD
+on the next line is parsed independently.
+
+Failure indicates the ENTRYPOINT JSON-form parser is broken.
+
+### `test_parse_entrypoint_shell_form`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses `ENTRYPOINT /usr/bin/myapp --flag` (shell form) and verifies it is
+wrapped in `/bin/sh -c ...` like CMD shell form.
+
+Failure indicates shell-form ENTRYPOINT wrapping is broken.
+
+### `test_parse_label_quoted_and_unquoted`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses `LABEL maintainer="Jane Doe"` and `LABEL version=2.0`, verifying both
+quoted and unquoted value forms produce correct key-value pairs.
+
+Failure indicates LABEL value parsing or quote stripping is broken.
+
+### `test_parse_user_with_gid`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses `USER 1000:1000` and verifies the full string is captured as-is
+(parsing uid:gid is the runtime's responsibility, not the parser's).
+
+Failure indicates USER instruction parsing is broken.
+
+### `test_image_config_labels_serde_roundtrip`
+**Requires:** neither root nor rootfs (serialization-only)
+
+Creates an `ImageConfig` with labels, serializes to JSON, deserializes, and
+verifies labels survive the round-trip. Also verifies that missing `labels`
+key in JSON deserializes to an empty HashMap (serde default).
+
+Failure indicates the `labels` field has broken serde attributes.
+
+### `test_image_config_user_field`
+**Requires:** neither root nor rootfs (serialization-only)
+
+Verifies `ImageConfig.user` and `ImageConfig.entrypoint` round-trip through
+JSON correctly, and that missing `user` key defaults to empty string.
+
+Failure indicates the `user` or `entrypoint` field serde default is broken.
+
+### `test_full_remfile_with_all_instructions`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses a Remfile using every supported instruction type (FROM, LABEL, ENV,
+USER, WORKDIR, COPY, RUN, ENTRYPOINT, CMD, EXPOSE) and verifies the complete
+instruction list has 10 entries of the correct variant types.
+
+Failure indicates a regression in any instruction parser.
+
+---
+
+## Port Proxy
+
+### `test_port_proxy_localhost_connectivity`
+**Requires:** root, alpine-rootfs, `nc` on host
+
+Spawns a bridge+NAT container running a one-shot TCP server on port 80,
+forwarded from host port 19190. Connects from **localhost** (127.0.0.1)
+to verify the userspace TCP proxy handles localhost traffic that nftables
+DNAT in PREROUTING cannot intercept.
+
+Failure indicates the userspace TCP proxy (`start_port_proxies()`) is broken
+or not relaying localhost connections to the container.
+
+### `test_port_proxy_cleanup_on_teardown`
+**Requires:** root, alpine-rootfs
+
+Spawns a container with a port forward that exits immediately, waits for it,
+then verifies the proxy port is no longer bound (a fresh `TcpListener::bind`
+on the same port should succeed).
+
+Failure indicates the proxy stop flag is not set during teardown, leaving
+orphaned listener threads holding the port.

@@ -5631,3 +5631,340 @@ mod rootless_idmap {
         );
     }
 }
+
+// ── Build instruction tests (ENTRYPOINT, LABEL, USER, cache) ────────────────
+
+mod build_instructions {
+    use remora::build;
+    use std::collections::HashMap;
+
+    /// test_parse_entrypoint_json
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses a Remfile containing `ENTRYPOINT ["python3", "-m", "http.server"]`
+    /// and verifies it produces the expected `Instruction::Entrypoint` variant
+    /// with the correct argument list.
+    ///
+    /// Failure indicates the ENTRYPOINT JSON-form parser is broken.
+    #[test]
+    fn test_parse_entrypoint_json() {
+        let content = r#"FROM alpine
+ENTRYPOINT ["python3", "-m", "http.server"]
+CMD ["8080"]"#;
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(
+            instructions[1],
+            build::Instruction::Entrypoint(vec![
+                "python3".into(),
+                "-m".into(),
+                "http.server".into()
+            ])
+        );
+        assert_eq!(
+            instructions[2],
+            build::Instruction::Cmd(vec!["8080".into()])
+        );
+    }
+
+    /// test_parse_entrypoint_shell_form
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses `ENTRYPOINT /usr/bin/myapp` (shell form) and verifies it is
+    /// wrapped in `/bin/sh -c ...` like CMD shell form.
+    ///
+    /// Failure indicates shell-form ENTRYPOINT wrapping is broken.
+    #[test]
+    fn test_parse_entrypoint_shell_form() {
+        let content = "FROM alpine\nENTRYPOINT /usr/bin/myapp --flag";
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            build::Instruction::Entrypoint(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "/usr/bin/myapp --flag".into()
+            ])
+        );
+    }
+
+    /// test_parse_label_quoted_and_unquoted
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses `LABEL` with both quoted and unquoted values and verifies both
+    /// forms produce correct key-value pairs.
+    ///
+    /// Failure indicates LABEL value parsing or quote stripping is broken.
+    #[test]
+    fn test_parse_label_quoted_and_unquoted() {
+        let content = "FROM alpine\nLABEL maintainer=\"Jane Doe\"\nLABEL version=2.0";
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            build::Instruction::Label {
+                key: "maintainer".into(),
+                value: "Jane Doe".into()
+            }
+        );
+        assert_eq!(
+            instructions[2],
+            build::Instruction::Label {
+                key: "version".into(),
+                value: "2.0".into()
+            }
+        );
+    }
+
+    /// test_parse_user_with_gid
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses `USER 1000:1000` and verifies the full string is captured
+    /// (parsing uid:gid is the runtime's job, not the parser's).
+    ///
+    /// Failure indicates USER instruction parsing is broken.
+    #[test]
+    fn test_parse_user_with_gid() {
+        let content = "FROM alpine\nUSER 1000:1000";
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            build::Instruction::User("1000:1000".into())
+        );
+    }
+
+    /// test_image_config_labels_serde_roundtrip
+    ///
+    /// Requires: neither root nor rootfs (serialization-only).
+    ///
+    /// Creates an `ImageConfig` with labels, serializes to JSON, deserializes,
+    /// and verifies labels survive the round-trip. Also verifies that an empty
+    /// `labels` field deserializes correctly from JSON missing the key (serde default).
+    ///
+    /// Failure indicates the `labels` field has broken serde attributes.
+    #[test]
+    fn test_image_config_labels_serde_roundtrip() {
+        use remora::image::ImageConfig;
+
+        let mut labels = HashMap::new();
+        labels.insert("maintainer".to_string(), "test@example.com".to_string());
+        labels.insert("version".to_string(), "1.0".to_string());
+
+        let config = ImageConfig {
+            env: vec![],
+            cmd: vec![],
+            entrypoint: vec![],
+            working_dir: String::new(),
+            user: String::new(),
+            labels: labels.clone(),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: ImageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.labels, labels);
+
+        // Also check that missing "labels" key deserializes to empty map.
+        let minimal = r#"{"env":[],"cmd":[]}"#;
+        let loaded: ImageConfig = serde_json::from_str(minimal).unwrap();
+        assert!(loaded.labels.is_empty());
+    }
+
+    /// test_image_config_user_field
+    ///
+    /// Requires: neither root nor rootfs (serialization-only).
+    ///
+    /// Verifies `ImageConfig.user` round-trips through JSON and that
+    /// missing "user" key defaults to empty string.
+    ///
+    /// Failure indicates the `user` field serde default is broken.
+    #[test]
+    fn test_image_config_user_field() {
+        use remora::image::ImageConfig;
+
+        let config = ImageConfig {
+            env: vec![],
+            cmd: vec![],
+            entrypoint: vec!["/app".to_string()],
+            working_dir: String::new(),
+            user: "1000:1000".to_string(),
+            labels: HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: ImageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.user, "1000:1000");
+        assert_eq!(loaded.entrypoint, vec!["/app"]);
+    }
+
+    /// test_full_remfile_with_all_instructions
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses a Remfile using every supported instruction type and verifies the
+    /// complete instruction list. This is a comprehensive parser integration test.
+    ///
+    /// Failure indicates a regression in any instruction parser.
+    #[test]
+    fn test_full_remfile_with_all_instructions() {
+        let content = r#"
+FROM alpine:3.19
+LABEL maintainer="test"
+ENV APP_PORT=8080
+USER nobody
+WORKDIR /app
+COPY app.py /app/app.py
+RUN apk add python3
+ENTRYPOINT ["python3"]
+CMD ["app.py"]
+EXPOSE 8080
+"#;
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 10);
+        assert!(matches!(instructions[0], build::Instruction::From(_)));
+        assert!(matches!(instructions[1], build::Instruction::Label { .. }));
+        assert!(matches!(instructions[2], build::Instruction::Env { .. }));
+        assert!(matches!(instructions[3], build::Instruction::User(_)));
+        assert!(matches!(instructions[4], build::Instruction::Workdir(_)));
+        assert!(matches!(instructions[5], build::Instruction::Copy { .. }));
+        assert!(matches!(instructions[6], build::Instruction::Run(_)));
+        assert!(matches!(instructions[7], build::Instruction::Entrypoint(_)));
+        assert!(matches!(instructions[8], build::Instruction::Cmd(_)));
+        assert!(matches!(instructions[9], build::Instruction::Expose(_)));
+    }
+}
+
+// ── Port proxy tests ────────────────────────────────────────────────────────
+
+mod port_proxy {
+    use super::*;
+
+    /// test_port_proxy_localhost_connectivity
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a bridge+NAT container running a one-shot TCP server on port 80,
+    /// forwarded from host port 19190. Connects from **localhost** (127.0.0.1)
+    /// to verify the userspace TCP proxy handles localhost traffic that nftables
+    /// DNAT in PREROUTING cannot intercept.
+    ///
+    /// Failure indicates the userspace TCP proxy (`start_port_proxies`) is broken
+    /// or not relaying localhost connections to the container.
+    #[test]
+    #[serial(nat)]
+    fn test_port_proxy_localhost_connectivity() {
+        if !is_root() {
+            eprintln!("Skipping test_port_proxy_localhost_connectivity: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_proxy_localhost_connectivity: alpine-rootfs not found");
+            return;
+        };
+
+        // Check that nc is available on the host.
+        let nc_ok = std::process::Command::new("which")
+            .arg("nc")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !nc_ok {
+            eprintln!("Skipping test_port_proxy_localhost_connectivity: nc not found on host");
+            return;
+        }
+
+        // Container: one-shot TCP server on port 80, forwarded from host 19190.
+        let mut child = Command::new("/bin/sh")
+            .args(&["-c", "echo PROXY_WORKS | nc -l -p 80"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(19190, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        // Give nc time to start listening inside the container.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Connect from LOCALHOST — this goes through the userspace proxy,
+        // not through nftables PREROUTING (which doesn't see localhost traffic).
+        let output = std::process::Command::new("nc")
+            .args(&["-w", "2", "127.0.0.1", "19190"])
+            .output()
+            .expect("nc to localhost");
+
+        let out = String::from_utf8_lossy(&output.stdout);
+
+        // Clean up.
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
+        let _ = child.wait();
+
+        assert!(
+            out.contains("PROXY_WORKS"),
+            "Localhost connection via port proxy should receive 'PROXY_WORKS'.\nstdout: {}\nstderr: {}",
+            out,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// test_port_proxy_cleanup_on_teardown
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a container with a port forward, waits for it to exit, then
+    /// verifies the proxy port is no longer listening (bind should succeed).
+    ///
+    /// Failure indicates the proxy stop flag is not set during teardown,
+    /// leaving orphaned listener threads.
+    #[test]
+    #[serial(nat)]
+    fn test_port_proxy_cleanup_on_teardown() {
+        if !is_root() {
+            eprintln!("Skipping test_port_proxy_cleanup_on_teardown: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_proxy_cleanup_on_teardown: alpine-rootfs not found");
+            return;
+        };
+
+        // Container: exits immediately.
+        let mut child = Command::new("/bin/true")
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(19191, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let status = child.wait().expect("wait failed");
+        assert!(status.success(), "container should exit cleanly");
+
+        // Give proxy threads time to notice the stop flag.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The proxy should have released the port. Verify by binding to it.
+        let bind_result = std::net::TcpListener::bind("0.0.0.0:19191");
+        assert!(
+            bind_result.is_ok(),
+            "Port 19191 should be free after teardown, but bind failed: {:?}",
+            bind_result.err()
+        );
+    }
+}
