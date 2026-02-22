@@ -1201,6 +1201,18 @@ are present with correct contents.
 
 Failure indicates the ADD archive extraction logic is broken.
 
+### `test_parse_multi_stage_remfile`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses a two-stage Remfile (`FROM alpine:3.19 AS builder` + `FROM alpine:3.19` +
+`COPY --from=builder`). Verifies:
+- First `FROM` has alias `"builder"`
+- Second `FROM` has no alias
+- `COPY --from=builder` has correct `from_stage` field
+- Regular `COPY` has `from_stage: None`
+
+Failure indicates multi-stage `FROM ... AS` or `COPY --from=` parsing is broken.
+
 ---
 
 ## Port Proxy

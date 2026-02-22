@@ -5819,7 +5819,7 @@ EXPOSE 8080
 "#;
         let instructions = build::parse_remfile(content).unwrap();
         assert_eq!(instructions.len(), 10);
-        assert!(matches!(instructions[0], build::Instruction::From(_)));
+        assert!(matches!(instructions[0], build::Instruction::From { .. }));
         assert!(matches!(instructions[1], build::Instruction::Label { .. }));
         assert!(matches!(instructions[2], build::Instruction::Env { .. }));
         assert!(matches!(instructions[3], build::Instruction::User(_)));
@@ -6032,6 +6032,68 @@ EXPOSE 8080
         assert_eq!(
             std::fs::read_to_string(extract_dir.join("subdir/file.txt")).unwrap(),
             "sub content"
+        );
+    }
+
+    /// test_parse_multi_stage_remfile
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses a two-stage Remfile (FROM ... AS builder + FROM ... + COPY --from=builder)
+    /// and verifies:
+    /// - First FROM has alias "builder"
+    /// - Second FROM has no alias
+    /// - COPY --from=builder has the correct from_stage field
+    ///
+    /// Failure indicates multi-stage FROM/COPY --from parsing is broken.
+    #[test]
+    fn test_parse_multi_stage_remfile() {
+        let content = r#"
+FROM alpine:3.19 AS builder
+RUN echo "building..."
+COPY src/ /build/src/
+
+FROM alpine:3.19
+COPY --from=builder /build/output /app/bin
+CMD ["/app/bin"]
+"#;
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 6);
+
+        // Stage 1: FROM with alias
+        assert_eq!(
+            instructions[0],
+            build::Instruction::From {
+                image: "alpine:3.19".into(),
+                alias: Some("builder".into()),
+            }
+        );
+
+        // Stage 1: COPY without --from
+        assert!(matches!(
+            instructions[2],
+            build::Instruction::Copy {
+                ref from_stage, ..
+            } if from_stage.is_none()
+        ));
+
+        // Stage 2: FROM without alias
+        assert_eq!(
+            instructions[3],
+            build::Instruction::From {
+                image: "alpine:3.19".into(),
+                alias: None,
+            }
+        );
+
+        // Stage 2: COPY --from=builder
+        assert_eq!(
+            instructions[4],
+            build::Instruction::Copy {
+                src: "/build/output".into(),
+                dest: "/app/bin".into(),
+                from_stage: Some("builder".into()),
+            }
         );
     }
 }

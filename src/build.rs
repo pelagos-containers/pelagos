@@ -44,11 +44,15 @@ pub enum BuildError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
-    From(String),
+    From {
+        image: String,
+        alias: Option<String>,
+    },
     Run(String),
     Copy {
         src: String,
         dest: String,
+        from_stage: Option<String>,
     },
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
@@ -111,7 +115,15 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                         message: "FROM requires an image reference".to_string(),
                     });
                 }
-                instructions.push(Instruction::From(rest.to_string()));
+                // Detect "FROM image AS alias" (case-insensitive AS).
+                let (image, alias) = if let Some(pos) = rest.to_ascii_lowercase().find(" as ") {
+                    let img = rest[..pos].trim().to_string();
+                    let al = rest[pos + 4..].trim().to_string();
+                    (img, Some(al))
+                } else {
+                    (rest.to_string(), None)
+                };
+                instructions.push(Instruction::From { image, alias });
             }
             "RUN" => {
                 if rest.is_empty() {
@@ -123,7 +135,21 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 instructions.push(Instruction::Run(rest.to_string()));
             }
             "COPY" => {
-                let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+                // Detect optional --from=<stage> prefix.
+                let (from_stage, remaining) = if let Some(after_flag) = rest.strip_prefix("--from=")
+                {
+                    if let Some((stage, r)) = after_flag.split_once(char::is_whitespace) {
+                        (Some(stage.to_string()), r.trim())
+                    } else {
+                        return Err(BuildError::Parse {
+                            line: line_num,
+                            message: "COPY --from=<stage> requires <src> <dest>".to_string(),
+                        });
+                    }
+                } else {
+                    (None, rest)
+                };
+                let parts: Vec<&str> = remaining.splitn(2, char::is_whitespace).collect();
                 if parts.len() < 2 {
                     return Err(BuildError::Parse {
                         line: line_num,
@@ -133,6 +159,7 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 instructions.push(Instruction::Copy {
                     src: parts[0].to_string(),
                     dest: parts[1].trim().to_string(),
+                    from_stage,
                 });
             }
             "CMD" => {
@@ -356,11 +383,19 @@ pub fn substitute_vars(text: &str, vars: &HashMap<String, String>) -> String {
 /// Clone an instruction with all string fields substituted.
 fn substitute_instruction(instr: &Instruction, vars: &HashMap<String, String>) -> Instruction {
     match instr {
-        Instruction::From(r) => Instruction::From(substitute_vars(r, vars)),
+        Instruction::From { image, alias } => Instruction::From {
+            image: substitute_vars(image, vars),
+            alias: alias.clone(),
+        },
         Instruction::Run(cmd) => Instruction::Run(substitute_vars(cmd, vars)),
-        Instruction::Copy { src, dest } => Instruction::Copy {
+        Instruction::Copy {
+            src,
+            dest,
+            from_stage,
+        } => Instruction::Copy {
             src: substitute_vars(src, vars),
             dest: substitute_vars(dest, vars),
+            from_stage: from_stage.clone(),
         },
         Instruction::Cmd(args) => {
             Instruction::Cmd(args.iter().map(|a| substitute_vars(a, vars)).collect())
@@ -393,6 +428,238 @@ fn substitute_instruction(instr: &Instruction, vars: &HashMap<String, String>) -
 // ---------------------------------------------------------------------------
 // Build execution
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Multi-stage build support
+// ---------------------------------------------------------------------------
+
+/// A single stage in a multi-stage build.
+struct BuildStage {
+    alias: Option<String>,
+    instructions: Vec<Instruction>,
+}
+
+/// Split a flat instruction list into stages at FROM boundaries.
+/// Each stage starts with a FROM instruction. Pre-FROM ARG instructions
+/// are placed into the first stage.
+fn split_into_stages(instructions: &[Instruction]) -> Vec<BuildStage> {
+    let mut stages: Vec<BuildStage> = Vec::new();
+
+    for instr in instructions {
+        match instr {
+            Instruction::From {
+                image: _,
+                ref alias,
+            } => {
+                stages.push(BuildStage {
+                    alias: alias.clone(),
+                    instructions: vec![instr.clone()],
+                });
+            }
+            _ => {
+                if stages.is_empty() {
+                    // Pre-FROM instructions (ARGs) — create a virtual first stage.
+                    stages.push(BuildStage {
+                        alias: None,
+                        instructions: vec![instr.clone()],
+                    });
+                } else {
+                    stages.last_mut().unwrap().instructions.push(instr.clone());
+                }
+            }
+        }
+    }
+
+    stages
+}
+
+/// Execute a single build stage, returning (layers, config).
+#[allow(clippy::too_many_arguments)]
+fn execute_stage(
+    instructions: &[Instruction],
+    context_dir: &Path,
+    network_mode: NetworkMode,
+    use_cache: bool,
+    args_map: &mut HashMap<String, String>,
+    sub_vars: &mut HashMap<String, String>,
+    remignore: Option<&ignore::gitignore::Gitignore>,
+    completed_stages: &HashMap<String, Vec<String>>,
+) -> Result<(Vec<String>, ImageConfig), BuildError> {
+    // Find the FROM instruction to load the base image.
+    let from_idx = instructions
+        .iter()
+        .position(|i| matches!(i, Instruction::From { .. }));
+
+    let (mut layers, mut config) = if let Some(idx) = from_idx {
+        let from_instr = substitute_instruction(&instructions[idx], sub_vars);
+        let base_ref = match &from_instr {
+            Instruction::From { ref image, .. } => image.clone(),
+            _ => unreachable!(),
+        };
+
+        let normalised = normalise_image_reference(&base_ref);
+        let base_manifest = image::load_image(&normalised)
+            .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
+
+        (base_manifest.layers.clone(), base_manifest.config.clone())
+    } else {
+        // Stage without FROM (pre-FROM ARGs only).
+        (Vec::new(), ImageConfig::default())
+    };
+
+    let total = instructions.len();
+    let mut cache_active = use_cache;
+
+    for (idx, raw_instr) in instructions.iter().enumerate() {
+        let instr = substitute_instruction(raw_instr, sub_vars);
+        let step = idx + 1;
+        match &instr {
+            Instruction::From { ref image, .. } => {
+                eprintln!("Step {}/{}: FROM {}", step, total, image);
+            }
+            Instruction::Arg {
+                ref name,
+                ref default,
+            } => {
+                let value = args_map
+                    .entry(name.clone())
+                    .or_insert_with(|| default.clone().unwrap_or_default())
+                    .clone();
+                sub_vars.insert(name.clone(), value.clone());
+                eprintln!("Step {}/{}: ARG {}={}", step, total, name, value);
+            }
+            Instruction::Run(ref cmd_text) => {
+                let cache_key = if cache_active {
+                    Some(compute_cache_key(&layers, &format!("RUN {}", cmd_text)))
+                } else {
+                    None
+                };
+                if let Some(ref key) = cache_key {
+                    if let Some(cached_digest) = cache_lookup(key) {
+                        eprintln!("Step {}/{}: RUN {} (cached)", step, total, cmd_text);
+                        layers.push(cached_digest);
+                        continue;
+                    }
+                }
+                cache_active = false;
+                eprintln!("Step {}/{}: RUN {}", step, total, cmd_text);
+                let new_digest = execute_run(cmd_text, &layers, &config, network_mode.clone())?;
+                if let Some(ref digest) = new_digest {
+                    if let Some(ref key) = cache_key {
+                        cache_store(key, digest);
+                    }
+                    layers.push(digest.clone());
+                }
+            }
+            Instruction::Copy {
+                ref src,
+                ref dest,
+                ref from_stage,
+            } => {
+                cache_active = false;
+                if let Some(ref stage_name) = from_stage {
+                    eprintln!(
+                        "Step {}/{}: COPY --from={} {} {}",
+                        step, total, stage_name, src, dest
+                    );
+                    let stage_layers =
+                        completed_stages
+                            .get(stage_name)
+                            .ok_or_else(|| BuildError::Parse {
+                                line: 0,
+                                message: format!("COPY --from={}: unknown stage", stage_name),
+                            })?;
+                    let digest = execute_copy_from_stage(src, dest, stage_layers)?;
+                    layers.push(digest);
+                } else {
+                    eprintln!("Step {}/{}: COPY {} {}", step, total, src, dest);
+                    let digest = execute_copy(src, dest, context_dir, remignore)?;
+                    layers.push(digest);
+                }
+            }
+            Instruction::Cmd(ref args) => {
+                eprintln!("Step {}/{}: CMD {:?}", step, total, args);
+                config.cmd = args.clone();
+            }
+            Instruction::Env { ref key, ref value } => {
+                eprintln!("Step {}/{}: ENV {}={}", step, total, key, value);
+                config.env.retain(|e| !e.starts_with(&format!("{}=", key)));
+                config.env.push(format!("{}={}", key, value));
+                sub_vars.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            Instruction::Workdir(ref path) => {
+                eprintln!("Step {}/{}: WORKDIR {}", step, total, path);
+                config.working_dir = path.clone();
+            }
+            Instruction::Entrypoint(ref args) => {
+                eprintln!("Step {}/{}: ENTRYPOINT {:?}", step, total, args);
+                config.entrypoint = args.clone();
+            }
+            Instruction::Expose(port) => {
+                eprintln!("Step {}/{}: EXPOSE {}", step, total, port);
+            }
+            Instruction::Label { ref key, ref value } => {
+                eprintln!("Step {}/{}: LABEL {}={}", step, total, key, value);
+                config.labels.insert(key.clone(), value.clone());
+            }
+            Instruction::User(ref user) => {
+                eprintln!("Step {}/{}: USER {}", step, total, user);
+                config.user = user.clone();
+            }
+            Instruction::Add { ref src, ref dest } => {
+                cache_active = false;
+                eprintln!("Step {}/{}: ADD {} {}", step, total, src, dest);
+                let digest = execute_add(src, dest, context_dir, remignore)?;
+                layers.push(digest);
+            }
+        }
+    }
+
+    Ok((layers, config))
+}
+
+/// Copy a file from a previous stage's layers into a new layer.
+///
+/// Walks the stage's layer directories top-to-bottom (last layer = highest
+/// priority) looking for the source path. This is a simplified approach that
+/// does not handle overlayfs whiteouts — deleted files in upper layers may
+/// still be visible from lower layers. Acceptable for typical COPY --from
+/// use cases (copying build artifacts).
+fn execute_copy_from_stage(
+    src: &str,
+    dest: &str,
+    stage_layers: &[String],
+) -> Result<String, BuildError> {
+    let relative_src = src.strip_prefix('/').unwrap_or(src);
+
+    // Walk layers top-to-bottom (last added = highest priority).
+    for layer_digest in stage_layers.iter().rev() {
+        let layer_dir = image::layer_dir(layer_digest);
+        let candidate = layer_dir.join(relative_src);
+        if candidate.exists() {
+            let tmp = tempfile::tempdir()?;
+            let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+            let dest_in_tmp = tmp.path().join(relative_dest);
+
+            if let Some(parent) = dest_in_tmp.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            if candidate.is_dir() {
+                copy_dir_recursive(&candidate, &dest_in_tmp)?;
+            } else {
+                std::fs::copy(&candidate, &dest_in_tmp)?;
+            }
+
+            return Ok(create_layer_from_dir(tmp.path())?);
+        }
+    }
+
+    Err(BuildError::Io(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("COPY --from: source '{}' not found in stage layers", src),
+    )))
+}
 
 /// Execute a parsed Remfile and produce a tagged image.
 ///
@@ -440,119 +707,58 @@ pub fn execute_build(
     sub_vars.extend(args_map.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     let from_instr = substitute_instruction(&instructions[first_non_arg], &sub_vars);
-    let base_ref = match &from_instr {
-        Instruction::From(r) => r.clone(),
+    let _base_ref = match &from_instr {
+        Instruction::From { ref image, .. } => image.clone(),
         _ => return Err(BuildError::MissingFrom),
     };
 
     // Load .remignore patterns (if present) for COPY filtering.
     let remignore = load_remignore(context_dir);
 
-    // Load base image.
-    let normalised = normalise_image_reference(&base_ref);
-    let base_manifest =
-        image::load_image(&normalised).map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
+    // Split into stages (multi-stage builds).
+    let stages = split_into_stages(instructions);
 
-    // Accumulated state.
-    let mut layers: Vec<String> = base_manifest.layers.clone();
-    let mut config = base_manifest.config.clone();
-    let total = instructions.len();
-    // Once a cache miss occurs, all subsequent steps run uncached.
-    let mut cache_active = use_cache;
+    // Track completed stages for COPY --from resolution.
+    let mut completed_stages: HashMap<String, Vec<String>> = HashMap::new();
+    let mut final_layers = Vec::new();
+    let mut final_config = ImageConfig::default();
+    let num_stages = stages.len();
 
-    for (idx, raw_instr) in instructions.iter().enumerate() {
-        // Apply variable substitution (ARG + ENV values) to every instruction.
-        let instr = substitute_instruction(raw_instr, &sub_vars);
-        let step = idx + 1;
-        match &instr {
-            Instruction::From(ref r) => {
-                eprintln!("Step {}/{}: FROM {}", step, total, r);
-            }
-            Instruction::Arg {
-                ref name,
-                ref default,
-            } => {
-                // Set ARG value: CLI override > default > empty.
-                let value = args_map
-                    .entry(name.clone())
-                    .or_insert_with(|| default.clone().unwrap_or_default())
-                    .clone();
-                sub_vars.insert(name.clone(), value.clone());
-                eprintln!("Step {}/{}: ARG {}={}", step, total, name, value);
-            }
-            Instruction::Run(ref cmd_text) => {
-                // Build cache: hash(parent_layer_digest + instruction) → cached layer.
-                let cache_key = if cache_active {
-                    Some(compute_cache_key(&layers, &format!("RUN {}", cmd_text)))
-                } else {
-                    None
-                };
-                if let Some(ref key) = cache_key {
-                    if let Some(cached_digest) = cache_lookup(key) {
-                        eprintln!("Step {}/{}: RUN {} (cached)", step, total, cmd_text);
-                        layers.push(cached_digest);
-                        continue;
-                    }
-                }
-                // Cache miss — invalidate for all subsequent steps.
-                cache_active = false;
-                eprintln!("Step {}/{}: RUN {}", step, total, cmd_text);
-                let new_digest = execute_run(cmd_text, &layers, &config, network_mode.clone())?;
-                if let Some(ref digest) = new_digest {
-                    if let Some(ref key) = cache_key {
-                        cache_store(key, digest);
-                    }
-                    layers.push(digest.clone());
-                }
-            }
-            Instruction::Copy { ref src, ref dest } => {
-                // COPY always invalidates cache (context content may have changed).
-                cache_active = false;
-                eprintln!("Step {}/{}: COPY {} {}", step, total, src, dest);
-                let digest = execute_copy(src, dest, context_dir, remignore.as_ref())?;
-                layers.push(digest);
-            }
-            Instruction::Cmd(ref args) => {
-                eprintln!("Step {}/{}: CMD {:?}", step, total, args);
-                config.cmd = args.clone();
-            }
-            Instruction::Env { ref key, ref value } => {
-                eprintln!("Step {}/{}: ENV {}={}", step, total, key, value);
-                // Remove any existing entry for this key, then add.
-                config.env.retain(|e| !e.starts_with(&format!("{}=", key)));
-                config.env.push(format!("{}={}", key, value));
-                // Add ENV to substitution context (ARG overrides on conflict).
-                sub_vars.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-            Instruction::Workdir(ref path) => {
-                eprintln!("Step {}/{}: WORKDIR {}", step, total, path);
-                config.working_dir = path.clone();
-            }
-            Instruction::Entrypoint(ref args) => {
-                eprintln!("Step {}/{}: ENTRYPOINT {:?}", step, total, args);
-                config.entrypoint = args.clone();
-            }
-            Instruction::Expose(port) => {
-                eprintln!("Step {}/{}: EXPOSE {}", step, total, port);
-                // Metadata only — no layer created.
-            }
-            Instruction::Label { ref key, ref value } => {
-                eprintln!("Step {}/{}: LABEL {}={}", step, total, key, value);
-                config.labels.insert(key.clone(), value.clone());
-            }
-            Instruction::User(ref user) => {
-                eprintln!("Step {}/{}: USER {}", step, total, user);
-                config.user = user.clone();
-            }
-            Instruction::Add { ref src, ref dest } => {
-                // ADD always invalidates cache.
-                cache_active = false;
-                eprintln!("Step {}/{}: ADD {} {}", step, total, src, dest);
-                let digest = execute_add(src, dest, context_dir, remignore.as_ref())?;
-                layers.push(digest);
-            }
+    for (stage_idx, stage) in stages.iter().enumerate() {
+        let is_final = stage_idx == num_stages - 1;
+        eprintln!(
+            "==> Stage {} ({}){}",
+            stage_idx,
+            stage.alias.as_deref().unwrap_or("unnamed"),
+            if is_final { " [final]" } else { "" }
+        );
+
+        let (layers, config) = execute_stage(
+            &stage.instructions,
+            context_dir,
+            network_mode.clone(),
+            use_cache,
+            &mut args_map,
+            &mut sub_vars,
+            remignore.as_ref(),
+            &completed_stages,
+        )?;
+
+        // Record this stage's layers for COPY --from.
+        if let Some(ref alias) = stage.alias {
+            completed_stages.insert(alias.clone(), layers.clone());
+        }
+        // Also track by stage index.
+        completed_stages.insert(stage_idx.to_string(), layers.clone());
+
+        if is_final {
+            final_layers = layers;
+            final_config = config;
         }
     }
+
+    let layers = final_layers;
+    let config = final_config;
 
     // Compute a digest for the final manifest.
     let digest = compute_manifest_digest(&layers);
@@ -1118,7 +1324,13 @@ EXPOSE 8080
 "#;
         let instructions = parse_remfile(content).unwrap();
         assert_eq!(instructions.len(), 7);
-        assert_eq!(instructions[0], Instruction::From("alpine:latest".into()));
+        assert_eq!(
+            instructions[0],
+            Instruction::From {
+                image: "alpine:latest".into(),
+                alias: None
+            }
+        );
         assert_eq!(
             instructions[1],
             Instruction::Run("apk add --no-cache curl".into())
@@ -1127,7 +1339,8 @@ EXPOSE 8080
             instructions[2],
             Instruction::Copy {
                 src: "index.html".into(),
-                dest: "/var/www/index.html".into()
+                dest: "/var/www/index.html".into(),
+                from_stage: None,
             }
         );
         assert_eq!(
@@ -1259,7 +1472,13 @@ CMD ["/bin/sh", "-c", "echo hello"]"#;
         let content = "from alpine\nrun echo hi\ncmd echo hello";
         let instructions = parse_remfile(content).unwrap();
         assert_eq!(instructions.len(), 3);
-        assert_eq!(instructions[0], Instruction::From("alpine".into()));
+        assert_eq!(
+            instructions[0],
+            Instruction::From {
+                image: "alpine".into(),
+                alias: None
+            }
+        );
     }
 
     #[test]
@@ -1432,7 +1651,7 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         let instructions = parse_remfile(content).unwrap();
         assert_eq!(instructions.len(), 3);
         assert!(matches!(instructions[0], Instruction::Arg { .. }));
-        assert!(matches!(instructions[1], Instruction::From(_)));
+        assert!(matches!(instructions[1], Instruction::From { .. }));
     }
 
     #[test]
@@ -1568,5 +1787,96 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         assert!(!tmp_dst.path().join("a.log").exists());
         assert!(tmp_dst.path().join("important.log").exists());
         assert!(tmp_dst.path().join("b.txt").exists());
+    }
+
+    // -- Multi-stage build tests --
+
+    #[test]
+    fn test_parse_from_with_alias() {
+        let content = "FROM alpine:3.19 AS builder\nRUN echo hi";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[0],
+            Instruction::From {
+                image: "alpine:3.19".into(),
+                alias: Some("builder".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_from_without_alias() {
+        let content = "FROM alpine\nRUN echo hi";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[0],
+            Instruction::From {
+                image: "alpine".into(),
+                alias: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_from_as_case_insensitive() {
+        let content = "FROM alpine as builder\nRUN echo hi";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[0],
+            Instruction::From {
+                image: "alpine".into(),
+                alias: Some("builder".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_from_stage() {
+        let content = "FROM alpine\nCOPY --from=builder /app/bin /usr/bin/app";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "/app/bin".into(),
+                dest: "/usr/bin/app".into(),
+                from_stage: Some("builder".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_without_from() {
+        let content = "FROM alpine\nCOPY src.txt /dest.txt";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "src.txt".into(),
+                dest: "/dest.txt".into(),
+                from_stage: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_split_into_stages() {
+        let content =
+            "FROM alpine AS builder\nRUN echo build\nFROM alpine\nCOPY --from=builder /app /app";
+        let instructions = parse_remfile(content).unwrap();
+        let stages = split_into_stages(&instructions);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].alias, Some("builder".into()));
+        assert_eq!(stages[0].instructions.len(), 2);
+        assert_eq!(stages[1].alias, None);
+        assert_eq!(stages[1].instructions.len(), 2);
+    }
+
+    #[test]
+    fn test_split_single_stage() {
+        let content = "FROM alpine\nRUN echo hi\nCOPY a b";
+        let instructions = parse_remfile(content).unwrap();
+        let stages = split_into_stages(&instructions);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].instructions.len(), 3);
     }
 }

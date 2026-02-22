@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 // pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
 
 /// Image configuration extracted from the OCI config JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageConfig {
     /// Environment variables, e.g. `["PATH=/usr/bin", "HOME=/root"]`.
     #[serde(default)]
