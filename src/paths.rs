@@ -151,6 +151,21 @@ pub fn dns_network_file(name: &str) -> PathBuf {
     dns_config_dir().join(name)
 }
 
+/// DNS backend marker file: `<runtime>/dns/backend`.
+pub fn dns_backend_file() -> PathBuf {
+    dns_config_dir().join("backend")
+}
+
+/// dnsmasq generated config: `<runtime>/dns/dnsmasq.conf`.
+pub fn dns_dnsmasq_conf() -> PathBuf {
+    dns_config_dir().join("dnsmasq.conf")
+}
+
+/// Per-network hosts file for dnsmasq: `<runtime>/dns/hosts.<network>`.
+pub fn dns_hosts_file(network_name: &str) -> PathBuf {
+    dns_config_dir().join(format!("hosts.{}", network_name))
+}
+
 // ── Per-network directories ─────────────────────────────────────────────────
 
 /// Persistent config directory for all named networks: `<data>/networks/`.
@@ -255,6 +270,18 @@ mod tests {
         assert_eq!(
             dns_network_file("frontend"),
             dns_config_dir().join("frontend")
+        );
+    }
+
+    #[test]
+    fn test_dns_dnsmasq_paths_under_runtime_dir() {
+        let rt = runtime_dir();
+        assert!(dns_backend_file().starts_with(&rt));
+        assert!(dns_dnsmasq_conf().starts_with(&rt));
+        assert!(dns_hosts_file("remora0").starts_with(&rt));
+        assert_eq!(
+            dns_hosts_file("frontend"),
+            dns_config_dir().join("hosts.frontend")
         );
     }
 }

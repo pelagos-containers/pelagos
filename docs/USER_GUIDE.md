@@ -317,6 +317,25 @@ sudo remora run --network bridge --nat -p 8080:80 alpine /bin/sh
 sudo remora run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
 ```
 
+### DNS Backend
+
+Remora supports two DNS backends for container name resolution on bridge networks:
+
+- **builtin** (default): the embedded `remora-dns` daemon — minimal, zero-dependency A-record server with upstream forwarding
+- **dnsmasq**: production-grade DNS with caching, AAAA support, EDNS, and DNSSEC
+
+Select the backend via the `--dns-backend` flag or the `REMORA_DNS_BACKEND` environment variable:
+
+```bash
+# Use dnsmasq for DNS (requires dnsmasq installed)
+sudo remora run --network bridge --nat --dns-backend dnsmasq alpine /bin/sh
+
+# Or via environment variable
+sudo REMORA_DNS_BACKEND=dnsmasq remora run --network bridge --nat alpine /bin/sh
+```
+
+If dnsmasq is requested but not found on PATH, Remora logs a warning and falls back to the builtin backend.
+
 ### Container Linking
 
 ```bash
@@ -557,6 +576,7 @@ remora run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 | `--publish <H:C>` | `-p` | TCP port forward host:container (repeatable) |
 | `--nat` | | Enable MASQUERADE NAT (requires bridge) |
 | `--dns <IP>` | | DNS server (repeatable) |
+| `--dns-backend <BE>` | | DNS backend: `builtin` (default) or `dnsmasq` |
 | `--link <NAME[:ALIAS]>` | | Link to another container |
 | `--volume <V:/PATH>` | `-v` | Named volume (auto-created) |
 | `--bind <H:C>` | | RW bind mount host:container (repeatable) |

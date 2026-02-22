@@ -1,101 +1,64 @@
 # Ongoing Tasks
 
-## Current Task: Embedded DNS Server for Container Name Resolution
+## Current Task: Dual DNS Backend — builtin + dnsmasq
 
 ### Context
 
-Remora containers currently use `--link name:alias` to resolve other containers
-by name. The goal is automatic DNS-based service discovery: any container on a
-bridge network can resolve other containers on the same network by name, with no
-`--link` needed.
+The embedded DNS server (`remora-dns`) works but is minimal — A-records only, no caching, no AAAA, blocking upstream forwarding, no EDNS/DNSSEC. Rather than building a full DNS server, support dnsmasq as an alternative backend. Keep the builtin for zero-dependency deployments.
 
-**Architecture model: Podman's aardvark-dns.** A custom Rust micro-daemon binary
-(`remora-dns`) that:
-- Is forked by the first `remora run` on a network
-- Listens on each bridge gateway IP (e.g., `172.19.0.1:53`)
-- Reads per-network config files for container name → IP mappings
-- Reloads on SIGHUP when containers start/stop
-- Auto-exits when all config files are empty (last container left)
+**Default: builtin.** Users opt into dnsmasq via `--dns-backend dnsmasq` CLI flag or `REMORA_DNS_BACKEND=dnsmasq` env var.
 
 ### Implementation Steps
 
-#### Step 1: `src/bin/remora-dns.rs` — DNS daemon binary (~400 lines)
+#### Step 1: `src/paths.rs` — New path helpers
 
-New binary. Minimal DNS server compiled as a separate binary in the same crate.
+- `dns_backend_file()` → `<runtime>/dns/backend`
+- `dns_dnsmasq_conf()` → `<runtime>/dns/dnsmasq.conf`
+- `dns_hosts_file(network)` → `<runtime>/dns/hosts.<network>`
 
-- DNS packet parsing: only A-record queries
-- Config file format: one file per network in `/run/remora/dns/`
-  ```
-  172.19.0.1 8.8.8.8,1.1.1.1
-  redis 172.19.0.2
-  app 172.19.0.3
-  ```
-- Server loop: bind UDP sockets to gateway IPs, poll with 100ms timeout
-- SIGHUP handler: reload config files, rebind/unbind sockets
-- Auto-exit: when all config files are empty/gone
-- Upstream forwarding: relay unknown queries to upstream DNS servers
-- PID file: `<config-dir>/pid`
-- Unit tests: parse/build DNS packets, config parsing
+#### Step 2: `src/dns.rs` — Backend abstraction + dnsmasq support
 
-#### Step 2: `src/dns.rs` — DNS daemon management library
+- Add `DnsBackend` enum (`Builtin`, `Dnsmasq`)
+- `active_backend()` reads `REMORA_DNS_BACKEND` env var (cached in OnceLock)
+- Extract existing `ensure_dns_daemon()` body → `ensure_builtin_daemon()`
+- Add: `generate_dnsmasq_conf()`, `regenerate_dnsmasq_hosts()`, `ensure_dnsmasq_daemon()`, `stop_daemon()`
+- Dispatch in `ensure_dns_daemon()`, `dns_add_entry()`, `dns_remove_entry()`
+- Backend consistency: write/check `<runtime>/dns/backend` file
+- Fallback: if dnsmasq not found, warn and use builtin
 
-- `ensure_dns_daemon()` — start daemon if not running (double-fork + exec)
-- `dns_add_entry()` — add container to network config file, SIGHUP daemon
-- `dns_remove_entry()` — remove container, SIGHUP daemon
-- `daemon_pid()` / `signal_reload()` — PID file management
-- Config file locking with flock
+#### Step 3: `src/cli/run.rs` + `src/cli/build.rs` — CLI flag
 
-#### Step 3: `src/paths.rs` — DNS paths
+- `--dns-backend <builtin|dnsmasq>` on RunArgs and BuildArgs
+- Set `REMORA_DNS_BACKEND` env var before DNS calls
 
-- `dns_config_dir()` → `<runtime>/dns/`
-- `dns_pid_file()` → `<runtime>/dns/pid`
-- `dns_network_file(name)` → `<runtime>/dns/<network_name>`
-
-#### Step 4: `src/container.rs` — Auto-inject gateway as nameserver
-
-In `spawn()` and `spawn_interactive()`, auto-inject bridge gateway IP(s) as
-primary nameservers in resolv.conf when bridge networking is active. User
-`--dns` servers appended as fallback.
-
-#### Step 5: `src/cli/run.rs` — Register/deregister containers with DNS
-
-After spawn: call `dns_add_entry()` for primary + secondary networks.
-On container exit: call `dns_remove_entry()` for all networks.
-
-#### Step 6: Module registration + Cargo.toml
-
-- `src/lib.rs`: add `pub mod dns;`
-- `Cargo.toml`: add `[[bin]]` for `remora-dns`
-
-#### Step 7: Integration tests (5 new tests)
+#### Step 4: Integration tests (3 new dnsmasq tests)
 
 | Test | Asserts |
 |------|---------|
-| `test_dns_resolves_container_name` | Container B resolves A by name |
-| `test_dns_upstream_forward` | Container resolves `example.com` |
-| `test_dns_network_isolation` | A on net1, B on net2 → NXDOMAIN |
-| `test_dns_multi_network` | A on net1+net2, B on net2 → resolves A's net2 IP |
-| `test_dns_daemon_lifecycle` | Daemon starts/stops with containers |
+| `test_dns_dnsmasq_resolves_container_name` | Same as builtin but with dnsmasq backend |
+| `test_dns_dnsmasq_upstream_forward` | Upstream forwarding via dnsmasq |
+| `test_dns_dnsmasq_lifecycle` | Daemon starts/stops with dnsmasq backend |
 
-#### Step 8: Documentation
+Skip if dnsmasq not on PATH.
 
-- `docs/INTEGRATION_TESTS.md` — document 5 new tests
-- `CLAUDE.md` — update networking section
+#### Step 5: Documentation
+
+- `docs/USER_GUIDE.md` — DNS Backend section
+- `docs/INTEGRATION_TESTS.md` — Document 3 new tests
+- `CLAUDE.md` — Update DNS section
 
 ### Files Changed
 
 | File | Change |
 |------|--------|
-| `src/bin/remora-dns.rs` | **NEW** — DNS daemon binary |
-| `src/dns.rs` | **NEW** — daemon management library |
-| `src/lib.rs` | Add `pub mod dns;` |
-| `src/paths.rs` | Add DNS path functions |
-| `src/container.rs` | Auto-inject gateway nameserver |
-| `src/cli/run.rs` | Register/deregister DNS entries |
-| `Cargo.toml` | Add `[[bin]]` |
-| `tests/integration_tests.rs` | 5 new tests |
+| `src/paths.rs` | Add `dns_backend_file()`, `dns_dnsmasq_conf()`, `dns_hosts_file()` |
+| `src/dns.rs` | DnsBackend enum, active_backend(), dnsmasq helpers, dispatch |
+| `src/cli/run.rs` | Add `--dns-backend` flag |
+| `src/cli/build.rs` | Add `--dns-backend` flag |
+| `tests/integration_tests.rs` | 3 new dnsmasq tests |
+| `docs/USER_GUIDE.md` | DNS backend section |
 | `docs/INTEGRATION_TESTS.md` | Document new tests |
-| `CLAUDE.md` | Update networking docs |
+| `CLAUDE.md` | Update DNS docs |
 
 ---
 
@@ -107,6 +70,11 @@ scripts like `examples/web-stack/run.sh`.
 ---
 
 ## Previously Completed
+
+### Embedded DNS Server (v0.4.x)
+- `remora-dns` daemon with A-record resolution, upstream forwarding, SIGHUP reload
+- Per-network config files, automatic lifecycle management
+- 5 integration tests
 
 ### Multi-Network Containers (v0.4.0)
 - Containers join multiple bridge networks simultaneously

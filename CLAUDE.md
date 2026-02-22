@@ -140,10 +140,10 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **N6 Pasta**: `with_network(NetworkMode::Pasta)` — user-mode networking via `pasta`; rootless-compatible full internet access; attaches to container netns via `/proc/{pid}/ns/net` after exec
 - **Multi-network**: `remora network create/ls/rm/inspect` — per-network `Ipv4Net` subnets, `NetworkDef` config, IPAM, NAT, nftables tables (`remora-<name>`); `--network <name>` on run/build
 - **Multi-network containers**: `with_additional_network("backend")` — attach secondary bridge interfaces (eth1, eth2, ...) with subnet routes; `attach_network_to_netns()` / `teardown_secondary_network()` in network.rs; `--network frontend --network backend` CLI; smart link resolution via `network_ips` in state.json
-- **N7 DNS service discovery**: `remora-dns` daemon — automatic container name resolution on bridge networks; per-network config files at `/run/remora/dns/<network>.conf`; SIGHUP reload; upstream forwarding; auto-start/stop lifecycle managed by `ensure_dns_daemon()` / container teardown
+- **N7 DNS service discovery**: dual-backend DNS — `builtin` (`remora-dns` daemon, default) or `dnsmasq` (production-grade); automatic container name resolution on bridge networks; per-network config files at `/run/remora/dns/<network>.conf`; SIGHUP reload; upstream forwarding; `--dns-backend` CLI flag or `REMORA_DNS_BACKEND` env var; auto-start/stop lifecycle managed by `ensure_dns_daemon()` / container teardown
 - **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay, secondary networks, DNS entries cleaned up in `wait()` / `wait_with_output()`
 - **`src/network.rs`**: `NetworkMode`, `Ipv4Net`, `NetworkDef`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `attach_network_to_netns()`, `teardown_secondary_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `bootstrap_default_network()`, `load_network_def()`
-- **`src/dns.rs`**: DNS daemon management: `ensure_dns_daemon()`, `dns_add_entry()`, `dns_remove_entry()`
+- **`src/dns.rs`**: DNS daemon management: `DnsBackend` enum, `active_backend()`, `ensure_dns_daemon()`, `dns_add_entry()`, `dns_remove_entry()`; dual-backend dispatch (builtin/dnsmasq)
 - **`src/bin/remora-dns.rs`**: DNS daemon binary: UDP server, A-record resolution, upstream forwarding, SIGHUP reload
 - **`src/cli/network.rs`**: `cmd_network_create()`, `cmd_network_ls()`, `cmd_network_rm()`, `cmd_network_inspect()`
 
@@ -415,7 +415,7 @@ The spawn process has a carefully orchestrated setup:
 - ✅ N3 NAT — `with_nat()`
 - ✅ N4 Port mapping — `with_port_forward(host_port, container_port)`
 - ✅ N5 DNS — `with_dns(&[...])`
-- ✅ N7 DNS service discovery — `remora-dns` daemon with automatic container name resolution
+- ✅ N7 DNS service discovery — dual-backend (builtin `remora-dns` + dnsmasq), `--dns-backend` flag
 
 **Rootless Mode - Phase 2 (Pasta): COMPLETE ✅**
 - ✅ N6 Pasta — `with_network(NetworkMode::Pasta)` — rootless-compatible full internet via `pasta`
@@ -455,7 +455,7 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 | Named volumes | ✅ | ✅ |
 | Overlay filesystem | ✅ CoW layered rootfs | ✅ |
 | Networking | ✅ N1–N7 + multi-network containers (Loopback/Bridge/NAT/Ports/DNS/Pasta/Named/Multi-attach/DNS-SD) | ✅ Native libnetwork |
-| DNS service discovery | ✅ Automatic container name resolution on bridge networks | ✅ Embedded DNS server |
+| DNS service discovery | ✅ Dual-backend (builtin + dnsmasq) container name resolution | ✅ Embedded DNS server |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
 | OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
 | Image build | ✅ `remora build` (Remfile) | ✅ Dockerfile |

@@ -127,6 +127,10 @@ pub struct RunArgs {
     #[clap(long = "masked-path")]
     pub masked_path: Vec<String>,
 
+    /// DNS backend: builtin (default) or dnsmasq
+    #[clap(long = "dns-backend", value_name = "BACKEND")]
+    pub dns_backend: Option<String>,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -139,6 +143,12 @@ pub struct RunArgs {
 pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.detach && args.interactive {
         return Err("--detach and --interactive are mutually exclusive".into());
+    }
+
+    // Set DNS backend env var before any DNS calls so active_backend() picks it up.
+    if let Some(ref backend) = args.dns_backend {
+        // SAFETY: called early in single-threaded CLI startup, before spawning threads.
+        unsafe { std::env::set_var("REMORA_DNS_BACKEND", backend) };
     }
 
     // Generate container name

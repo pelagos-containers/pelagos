@@ -20,6 +20,10 @@ pub struct BuildArgs {
     #[clap(long)]
     pub no_cache: bool,
 
+    /// DNS backend: builtin (default) or dnsmasq
+    #[clap(long = "dns-backend", value_name = "BACKEND")]
+    pub dns_backend: Option<String>,
+
     /// Build context directory (default: current directory)
     #[clap(default_value = ".")]
     pub context: String,
@@ -28,6 +32,12 @@ pub struct BuildArgs {
 pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
     use remora::build;
     use remora::network::NetworkMode;
+
+    // Set DNS backend env var before any DNS calls so active_backend() picks it up.
+    if let Some(ref backend) = args.dns_backend {
+        // SAFETY: called early in single-threaded CLI startup, before spawning threads.
+        unsafe { std::env::set_var("REMORA_DNS_BACKEND", backend) };
+    }
 
     let context_dir = PathBuf::from(&args.context)
         .canonicalize()

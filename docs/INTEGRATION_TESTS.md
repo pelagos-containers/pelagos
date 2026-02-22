@@ -1338,3 +1338,31 @@ should start (PID file appears, process alive). Removes the entry — daemon
 should auto-exit.
 
 Failure means the daemon lifecycle management is broken.
+
+### `test_dns_dnsmasq_resolves_container_name`
+**Requires:** root, rootfs, dnsmasq installed
+
+Same as `test_dns_resolves_container_name` but with `REMORA_DNS_BACKEND=dnsmasq`.
+Container B resolves container A by name via dnsmasq. Verifies the backend marker
+file says "dnsmasq" and the resolved IP matches A's bridge IP.
+
+Failure means dnsmasq backend isn't resolving container names correctly or the
+hosts file generation is broken.
+
+### `test_dns_dnsmasq_upstream_forward`
+**Requires:** root, rootfs, dnsmasq installed
+
+Registers a dummy DNS entry to start dnsmasq, then resolves `example.com` via
+the gateway. Verifies upstream forwarding works through dnsmasq's `server=`
+directives.
+
+Failure means dnsmasq can't forward queries to upstream DNS servers, likely a
+config generation issue.
+
+### `test_dns_dnsmasq_lifecycle`
+**Requires:** root, rootfs, dnsmasq installed
+
+Adds a DNS entry with dnsmasq backend — daemon should start (PID file appears,
+process alive, backend marker says "dnsmasq"). Removes entry and sends SIGTERM.
+
+Failure means dnsmasq lifecycle management (start/stop/PID tracking) is broken.

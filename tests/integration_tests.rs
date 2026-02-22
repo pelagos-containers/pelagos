@@ -7230,4 +7230,336 @@ mod dns {
         cleanup_dns();
         cleanup_test_network(net_name);
     }
+
+    /// Check if dnsmasq is available on PATH.
+    fn has_dnsmasq() -> bool {
+        std::process::Command::new("which")
+            .arg("dnsmasq")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Container B resolves container A by name via dnsmasq backend.
+    ///
+    /// Requires root + rootfs + dnsmasq installed.
+    ///
+    /// Same as test_dns_resolves_container_name but with REMORA_DNS_BACKEND=dnsmasq.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_dnsmasq_resolves_container_name() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_dnsmasq_resolves_container_name (requires root)");
+            return;
+        }
+        if !has_dnsmasq() {
+            eprintln!("Skipping test_dns_dnsmasq_resolves_container_name (dnsmasq not found)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_dnsmasq_resolves_container_name (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnsmq1";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.11.0/24");
+
+        // Set dnsmasq backend.
+        unsafe { std::env::set_var("REMORA_DNS_BACKEND", "dnsmasq") };
+
+        // Spawn container A (long-running sleep).
+        let mut server = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn server");
+
+        let server_ip = server.container_ip().expect("server should have IP");
+
+        // Register server with DNS daemon.
+        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+        remora::dns::dns_add_entry(
+            net_name,
+            "dnsmasq-server",
+            server_ip.parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("dns_add_entry");
+
+        // Give dnsmasq time to start.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Verify dnsmasq backend was used.
+        let backend_file = remora::paths::dns_backend_file();
+        if backend_file.exists() {
+            let backend = std::fs::read_to_string(&backend_file).unwrap_or_default();
+            assert_eq!(
+                backend.trim(),
+                "dnsmasq",
+                "backend marker should say dnsmasq"
+            );
+        }
+
+        // Spawn container B to resolve dnsmasq-server.
+        let resolve_cmd = format!(
+            "nslookup dnsmasq-server {} 2>&1 || echo 'NSLOOKUP_FAILED'",
+            net_def.gateway
+        );
+        let client = Command::new("/bin/sh")
+            .args(&["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, stderr_raw) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+        let stderr = String::from_utf8_lossy(&stderr_raw);
+
+        assert!(
+            stdout.contains(&server_ip),
+            "nslookup should resolve dnsmasq-server to {}, stdout: {}, stderr: {}",
+            server_ip,
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        // Cleanup.
+        remora::dns::dns_remove_entry(net_name, "dnsmasq-server").ok();
+        unsafe { libc::kill(server.pid(), libc::SIGTERM) };
+        let _ = server.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+        unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
+    }
+
+    /// Upstream forwarding works via dnsmasq backend.
+    ///
+    /// Requires root + rootfs + dnsmasq installed.
+    ///
+    /// Registers a dummy DNS entry to start dnsmasq, then resolves example.com
+    /// via the gateway.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_dnsmasq_upstream_forward() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_dnsmasq_upstream_forward (requires root)");
+            return;
+        }
+        if !has_dnsmasq() {
+            eprintln!("Skipping test_dns_dnsmasq_upstream_forward (dnsmasq not found)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_dnsmasq_upstream_forward (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnsmq2";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.12.0/24");
+
+        unsafe { std::env::set_var("REMORA_DNS_BACKEND", "dnsmasq") };
+
+        // Spawn a holder container to create the bridge.
+        let mut holder = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder");
+
+        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+
+        // Register a dummy entry to start the daemon.
+        remora::dns::dns_add_entry(
+            net_name,
+            "dummy-fwd",
+            "10.90.12.5".parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        )
+        .expect("dns_add_entry");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Resolve example.com via gateway.
+        let resolve_cmd = format!(
+            "nslookup example.com {} 2>&1 || echo 'NSLOOKUP_FAILED'",
+            net_def.gateway
+        );
+        let client = Command::new("/bin/sh")
+            .args(&["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, stderr_raw) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+        let stderr = String::from_utf8_lossy(&stderr_raw);
+
+        // example.com should resolve to some IP (93.184.x.x or similar).
+        assert!(
+            !stdout.contains("NSLOOKUP_FAILED")
+                && (stdout.contains("Address") || stdout.contains("Name")),
+            "dnsmasq should forward upstream queries, stdout: {}, stderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        // Cleanup.
+        remora::dns::dns_remove_entry(net_name, "dummy-fwd").ok();
+        unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+        let _ = holder.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+        unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
+    }
+
+    /// dnsmasq daemon starts and stops correctly with the dnsmasq backend.
+    ///
+    /// Requires root + rootfs + dnsmasq installed.
+    ///
+    /// Adds a DNS entry (daemon starts), removes it (daemon is stopped).
+    /// Checks PID file and process liveness.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_dnsmasq_lifecycle() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_dnsmasq_lifecycle (requires root)");
+            return;
+        }
+        if !has_dnsmasq() {
+            eprintln!("Skipping test_dns_dnsmasq_lifecycle (dnsmasq not found)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_dnsmasq_lifecycle (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnsmqlc";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.13.0/24");
+
+        unsafe { std::env::set_var("REMORA_DNS_BACKEND", "dnsmasq") };
+
+        // Spawn a holder container to create the bridge.
+        let mut holder = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder");
+
+        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+        let pid_file = remora::paths::dns_pid_file();
+
+        // No daemon initially.
+        assert!(
+            !pid_file.exists(),
+            "PID file should not exist before DNS entries"
+        );
+
+        // Add entry — daemon should start.
+        remora::dns::dns_add_entry(
+            net_name,
+            "lifecycle-dnsmasq",
+            "10.90.13.5".parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("dns_add_entry");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(
+            pid_file.exists(),
+            "PID file should exist after DNS entry added"
+        );
+
+        let pid_str = std::fs::read_to_string(&pid_file).expect("read PID file");
+        let pid: i32 = pid_str.trim().parse().expect("parse PID");
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "dnsmasq daemon (PID {}) should be alive",
+            pid
+        );
+
+        // Verify backend marker.
+        let backend_file = remora::paths::dns_backend_file();
+        assert!(backend_file.exists(), "backend marker should exist");
+        let marker = std::fs::read_to_string(&backend_file).unwrap();
+        assert_eq!(marker.trim(), "dnsmasq", "backend should be dnsmasq");
+
+        // Remove entry — we need to stop the daemon manually since dnsmasq
+        // doesn't auto-exit like the builtin daemon.
+        remora::dns::dns_remove_entry(net_name, "lifecycle-dnsmasq").expect("dns_remove_entry");
+
+        // Cleanup: kill the daemon.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "dnsmasq daemon (PID {}) should have exited after SIGTERM",
+            pid
+        );
+
+        // Cleanup.
+        unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+        let _ = holder.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+        unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
+    }
 }
