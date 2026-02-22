@@ -127,6 +127,30 @@ fn build_a_response(query: &DnsQuery, ip: Ipv4Addr) -> Vec<u8> {
     resp
 }
 
+/// Build a NODATA response (NOERROR, zero answers).
+///
+/// Used when the name exists but has no records of the requested type.
+/// This is distinct from NXDOMAIN which asserts the name itself doesn't exist.
+fn build_nodata(query: &DnsQuery) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(32);
+
+    // Header — rcode=0 (NOERROR), AA=1, zero answers
+    resp.extend_from_slice(&query.id.to_be_bytes());
+    let flags: u16 = DNS_FLAG_QR | DNS_FLAG_AA | DNS_FLAG_RD | DNS_FLAG_RA;
+    resp.extend_from_slice(&flags.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+    // Question section (echo back)
+    encode_qname(&mut resp, &query.qname);
+    resp.extend_from_slice(&query.qtype.to_be_bytes());
+    resp.extend_from_slice(&query.qclass.to_be_bytes());
+
+    resp
+}
+
 /// Build an NXDOMAIN response.
 fn build_nxdomain(query: &DnsQuery) -> Vec<u8> {
     let mut resp = Vec::with_capacity(32);
@@ -493,7 +517,15 @@ fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Optio
                 return Some(build_a_response(&query, ip));
             }
         }
-        // Container name not found, or non-A query (e.g. AAAA) for a bare name.
+        // Name exists but has no record of the requested type (e.g. AAAA)?
+        // Return NODATA (NOERROR + zero answers) — NOT NXDOMAIN.
+        // NXDOMAIN means "name does not exist" which is a domain-level assertion.
+        // If we return NXDOMAIN for the AAAA query while the A query succeeds,
+        // parallel resolvers (like musl libc) may treat the NXDOMAIN as
+        // authoritative proof that the name doesn't exist, discarding the A result.
+        if state.lookup(network_name, name).is_some() {
+            return Some(build_nodata(&query));
+        }
         return Some(build_nxdomain(&query));
     }
 
@@ -582,6 +614,20 @@ mod tests {
         // Verify the IP is in the response (last 4 bytes of answer)
         let len = response.len();
         assert_eq!(&response[len - 4..], &[172, 19, 0, 5]);
+    }
+
+    #[test]
+    fn test_build_nodata() {
+        let packet = make_a_query("app");
+        let query = parse_dns_query(&packet).unwrap();
+        let response = build_nodata(&query);
+
+        // Verify RCODE = 0 (NOERROR) — name exists but no records of this type
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        assert_eq!(flags & 0x000F, 0); // NOERROR
+        assert!(flags & DNS_FLAG_AA != 0); // Authoritative
+                                           // ANCOUNT should be 0
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
     }
 
     #[test]

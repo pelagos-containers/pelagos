@@ -1,0 +1,1033 @@
+//! `remora compose` — multi-service orchestration with S-expression compose files.
+
+use super::{
+    check_liveness, container_dir, containers_dir, now_iso8601, write_state, ContainerState,
+    ContainerStatus,
+};
+use remora::compose::{parse_compose, topo_sort, ComposeFile, Dependency, ServiceSpec};
+use remora::container::{Command, Stdio, Volume};
+use remora::network::NetworkMode;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// CLI args (clap)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ComposeCmd {
+    /// Start all services defined in the compose file
+    Up {
+        /// Path to compose file (default: compose.rem)
+        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        file: PathBuf,
+        /// Project name (default: parent directory name)
+        #[clap(long = "project", short = 'p')]
+        project: Option<String>,
+        /// Run in foreground (don't daemonise)
+        #[clap(long)]
+        foreground: bool,
+    },
+    /// Stop and remove all services
+    Down {
+        /// Path to compose file (default: compose.rem)
+        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        file: PathBuf,
+        /// Project name
+        #[clap(long = "project", short = 'p')]
+        project: Option<String>,
+        /// Also remove volumes
+        #[clap(long = "volumes", short = 'v')]
+        volumes: bool,
+    },
+    /// List services in the compose project
+    Ps {
+        /// Path to compose file (default: compose.rem)
+        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        file: PathBuf,
+        /// Project name
+        #[clap(long = "project", short = 'p')]
+        project: Option<String>,
+    },
+    /// View logs for compose services
+    Logs {
+        /// Path to compose file (default: compose.rem)
+        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        file: PathBuf,
+        /// Project name
+        #[clap(long = "project", short = 'p')]
+        project: Option<String>,
+        /// Follow log output
+        #[clap(long)]
+        follow: bool,
+        /// Service name (show all if omitted)
+        service: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Project state (persisted as JSON)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeProject {
+    pub name: String,
+    pub file_path: String,
+    pub services: HashMap<String, ComposeServiceState>,
+    pub networks: Vec<String>,
+    pub volumes: Vec<String>,
+    pub supervisor_pid: i32,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeServiceState {
+    pub container_name: String,
+    pub status: String,
+    pub pid: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+pub fn cmd_compose(cmd: ComposeCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        ComposeCmd::Up {
+            file,
+            project,
+            foreground,
+        } => cmd_compose_up(&file, project.as_deref(), foreground),
+        ComposeCmd::Down {
+            file,
+            project,
+            volumes,
+        } => cmd_compose_down(&file, project.as_deref(), volumes),
+        ComposeCmd::Ps { file, project } => cmd_compose_ps(&file, project.as_deref()),
+        ComposeCmd::Logs {
+            file,
+            project,
+            follow,
+            service,
+        } => cmd_compose_logs(&file, project.as_deref(), follow, service.as_deref()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compose up
+// ---------------------------------------------------------------------------
+
+fn cmd_compose_up(
+    file: &std::path::Path,
+    project_name: Option<&str>,
+    foreground: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(file)
+        .map_err(|e| format!("cannot read '{}': {}", file.display(), e))?;
+    let compose = parse_compose(&content)?;
+    let project = derive_project_name(file, project_name)?;
+    let order = topo_sort(&compose.services)?;
+
+    // Check for existing project.
+    let state_file = remora::paths::compose_state_file(&project);
+    if state_file.exists() {
+        if let Ok(existing) = load_project_state(&project) {
+            if existing.supervisor_pid > 0 && check_liveness(existing.supervisor_pid) {
+                return Err(format!(
+                    "project '{}' is already running (supervisor PID {})",
+                    project, existing.supervisor_pid
+                )
+                .into());
+            }
+        }
+    }
+
+    // Create scoped networks.
+    let mut created_networks = Vec::new();
+    for net in &compose.networks {
+        let scoped = scoped_network_name(&project, &net.name);
+        let config = remora::paths::network_config_dir(&scoped).join("config.json");
+        if !config.exists() {
+            let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
+            if let Err(e) = super::network::cmd_network_create(&scoped, subnet) {
+                log::warn!("compose: failed to create network '{}': {}", scoped, e);
+            }
+        }
+        created_networks.push(scoped);
+    }
+
+    // Create scoped volumes.
+    let mut created_volumes = Vec::new();
+    for vol in &compose.volumes {
+        let scoped = scoped_volume_name(&project, vol);
+        let _ = Volume::open(&scoped).or_else(|_| Volume::create(&scoped));
+        created_volumes.push(scoped);
+    }
+
+    // Clean any stale DNS config files for this project's networks
+    // (leftover from a previous run whose compose down didn't clean up properly).
+    for net in &created_networks {
+        let dns_file = remora::paths::dns_network_file(net);
+        if dns_file.exists() {
+            log::info!("compose: removing stale DNS config for network '{}'", net);
+            let _ = std::fs::remove_file(&dns_file);
+        }
+    }
+
+    if foreground {
+        run_supervisor(
+            &project,
+            file,
+            &compose,
+            &order,
+            &created_networks,
+            &created_volumes,
+        )
+    } else {
+        // Double-fork to daemonise.
+        let fork_result = unsafe { libc::fork() };
+        match fork_result {
+            -1 => Err(std::io::Error::last_os_error().into()),
+            0 => {
+                // Child: detach from parent's session.
+                unsafe { libc::setsid() };
+                if let Err(e) = run_supervisor(
+                    &project,
+                    file,
+                    &compose,
+                    &order,
+                    &created_networks,
+                    &created_volumes,
+                ) {
+                    log::error!("compose supervisor: {}", e);
+                    unsafe { libc::_exit(1) };
+                }
+                unsafe { libc::_exit(0) };
+            }
+            _child_pid => {
+                // Parent: brief sleep to let supervisor write state, then print status.
+                std::thread::sleep(Duration::from_millis(200));
+                println!("Project '{}' started", project);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn run_supervisor(
+    project: &str,
+    file: &std::path::Path,
+    compose: &ComposeFile,
+    order: &[String],
+    created_networks: &[String],
+    created_volumes: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor_pid = unsafe { libc::getpid() };
+
+    // Write initial project state.
+    let mut project_state = ComposeProject {
+        name: project.to_string(),
+        file_path: file.to_string_lossy().into_owned(),
+        services: HashMap::new(),
+        networks: created_networks.to_vec(),
+        volumes: created_volumes.to_vec(),
+        supervisor_pid,
+        started_at: now_iso8601(),
+    };
+    save_project_state(&project_state)?;
+
+    // Build service lookup.
+    let svc_map: HashMap<&str, &ServiceSpec> = compose
+        .services
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+
+    // Track container PIDs for monitoring and IPs for readiness.
+    let mut container_pids: HashMap<String, i32> = HashMap::new();
+    let mut container_ips: HashMap<String, String> = HashMap::new();
+
+    // Start services in topo order.
+    for svc_name in order {
+        let svc = svc_map[svc_name.as_str()];
+        let container_name = scoped_container_name(project, svc_name);
+
+        // Wait for dependencies.
+        for dep in &svc.depends_on {
+            wait_for_dependency(project, dep, &container_pids, &container_ips)?;
+        }
+
+        // Spawn the service container.
+        log::info!(
+            "compose: starting service '{}' as '{}'",
+            svc_name,
+            container_name
+        );
+        let pid = spawn_service(project, svc, &container_name, compose)?;
+
+        // Read back container state to get IP.
+        if let Ok(cstate) = super::read_state(&container_name) {
+            if let Some(ip) = cstate.bridge_ip.as_ref() {
+                container_ips.insert(svc_name.clone(), ip.clone());
+            }
+            for (net, ip) in &cstate.network_ips {
+                container_ips.insert(svc_name.clone(), ip.clone());
+                let _ = net; // We store the latest IP per service for readiness.
+            }
+        }
+
+        container_pids.insert(svc_name.clone(), pid);
+
+        project_state.services.insert(
+            svc_name.clone(),
+            ComposeServiceState {
+                container_name: container_name.clone(),
+                status: "running".into(),
+                pid,
+            },
+        );
+        save_project_state(&project_state)?;
+    }
+
+    println!("All services started for project '{}'", project);
+
+    // Monitor loop: check liveness every 2s.
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let mut all_exited = true;
+        for (svc_name, svc_state) in &mut project_state.services {
+            if svc_state.status == "exited" {
+                continue;
+            }
+            if check_liveness(svc_state.pid) {
+                all_exited = false;
+            } else {
+                log::info!("compose: service '{}' exited", svc_name);
+                svc_state.status = "exited".into();
+            }
+        }
+        save_project_state(&project_state)?;
+        if all_exited {
+            log::info!("compose: all services exited for project '{}'", project);
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_service(
+    project: &str,
+    svc: &ServiceSpec,
+    container_name: &str,
+    compose: &ComposeFile,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    // Resolve image layers.
+    let image_ref = &svc.image;
+    let (full_ref, manifest) = resolve_image(image_ref)?;
+
+    let layers = remora::image::layer_dirs(&manifest);
+    if layers.is_empty() {
+        return Err(format!("service '{}': image has no layers", svc.name).into());
+    }
+
+    // Determine command.
+    let exe_and_args = if let Some(ref cmd) = svc.command {
+        cmd.clone()
+    } else {
+        let mut cmd_vec = manifest.config.entrypoint.clone();
+        cmd_vec.extend(manifest.config.cmd.clone());
+        if cmd_vec.is_empty() {
+            vec!["/bin/sh".to_string()]
+        } else {
+            cmd_vec
+        }
+    };
+
+    let exe = &exe_and_args[0];
+    let rest = &exe_and_args[1..];
+
+    let mut cmd = Command::new(exe).args(rest).with_image_layers(layers);
+
+    // Apply image config env.
+    for env_str in &manifest.config.env {
+        if let Some((k, v)) = env_str.split_once('=') {
+            cmd = cmd.env(k, v);
+        }
+    }
+
+    // Apply image config workdir.
+    if !manifest.config.working_dir.is_empty() && svc.workdir.is_none() {
+        cmd = cmd.with_cwd(&manifest.config.working_dir);
+    }
+
+    // Apply image config user as default.
+    if svc.user.is_none() && !manifest.config.user.is_empty() {
+        let (uid, gid) = super::parse_user(&manifest.config.user)?;
+        cmd = cmd.with_uid(uid);
+        if let Some(g) = gid {
+            cmd = cmd.with_gid(g);
+        }
+    }
+
+    // Apply service-specific settings.
+
+    // Networks: first is primary, rest are additional.
+    let mut svc_network_names: Vec<String> = svc
+        .networks
+        .iter()
+        .map(|n| scoped_network_name(project, n))
+        .collect();
+    if svc_network_names.is_empty() {
+        // If no networks specified but compose has networks, use the first one.
+        if let Some(first_net) = compose.networks.first() {
+            svc_network_names.push(scoped_network_name(project, &first_net.name));
+        }
+    }
+    if let Some(primary) = svc_network_names.first() {
+        cmd = cmd.with_network(NetworkMode::BridgeNamed(primary.clone()));
+    }
+    for additional in svc_network_names.iter().skip(1) {
+        cmd = cmd.with_additional_network(additional);
+    }
+
+    // NAT for internet access.
+    if !svc_network_names.is_empty() {
+        cmd = cmd.with_nat();
+    }
+
+    // Note: DNS nameservers (gateway IPs) are auto-injected by the container
+    // runtime's spawn() — no explicit with_dns() needed here.
+
+    // Volumes.
+    for vol in &svc.volumes {
+        let scoped = scoped_volume_name(project, &vol.name);
+        let v = Volume::open(&scoped)?;
+        cmd = cmd.with_volume(&v, &vol.mount_path);
+    }
+
+    // Environment.
+    for (k, v) in &svc.env {
+        cmd = cmd.env(k, v);
+    }
+    cmd = cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
+
+    // Port forwards.
+    for port in &svc.ports {
+        cmd = cmd.with_port_forward(port.host, port.container);
+    }
+
+    // Resource limits.
+    if let Some(ref mem) = svc.memory {
+        let bytes = super::parse_memory(mem)?;
+        cmd = cmd.with_cgroup_memory(bytes);
+    }
+    if let Some(ref cpus) = svc.cpus {
+        let (quota, period) = super::parse_cpus(cpus)?;
+        cmd = cmd.with_cgroup_cpu_quota(quota, period);
+    }
+
+    // User.
+    if let Some(ref u) = svc.user {
+        let (uid, gid) = super::parse_user(u)?;
+        cmd = cmd.with_uid(uid);
+        if let Some(g) = gid {
+            cmd = cmd.with_gid(g);
+        }
+    }
+
+    // Workdir.
+    if let Some(ref w) = svc.workdir {
+        cmd = cmd.with_cwd(w);
+    }
+
+    // Spawn detached with log capture.
+    std::fs::create_dir_all(containers_dir())?;
+    let dir = container_dir(container_name);
+    std::fs::create_dir_all(&dir)?;
+
+    let stdout_log = dir.join("stdout.log");
+    let stderr_log = dir.join("stderr.log");
+
+    cmd = cmd
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn '{}' failed: {}", svc.name, e))?;
+    let pid = child.pid();
+
+    // Write container state.
+    let cstate = ContainerState {
+        name: container_name.to_string(),
+        rootfs: full_ref,
+        status: ContainerStatus::Running,
+        pid,
+        watcher_pid: unsafe { libc::getpid() },
+        started_at: now_iso8601(),
+        exit_code: None,
+        command: exe_and_args.clone(),
+        stdout_log: Some(stdout_log.to_string_lossy().into_owned()),
+        stderr_log: Some(stderr_log.to_string_lossy().into_owned()),
+        bridge_ip: child.container_ip(),
+        network_ips: child
+            .container_ips()
+            .into_iter()
+            .map(|(name, ip)| (name.to_string(), ip))
+            .collect(),
+    };
+    write_state(&cstate)?;
+
+    // Register DNS with bare service name.
+    let all_ips: Vec<(String, String)> = cstate
+        .network_ips
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (net_name, ip_str) in &all_ips {
+        let ip: Ipv4Addr = match ip_str.parse() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        let net_def = match remora::network::load_network_def(net_name) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // Register with the bare service name (not project-prefixed).
+        if let Err(e) = remora::dns::dns_add_entry(
+            net_name,
+            &svc.name,
+            ip,
+            net_def.gateway,
+            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        ) {
+            log::warn!(
+                "dns: failed to register '{}' on {}: {}",
+                svc.name,
+                net_name,
+                e
+            );
+        }
+    }
+
+    // Wait for DNS daemon to be reachable on each network's gateway.
+    // After dns_add_entry sends SIGHUP, the daemon needs time to reload
+    // and bind new sockets. Without this, dependent services may start
+    // before DNS is ready.
+    for (net_name, _) in &all_ips {
+        if let Ok(net_def) = remora::network::load_network_def(net_name) {
+            let gw = net_def.gateway;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if probe_dns(gw, &svc.name) {
+                    log::debug!("dns: '{}' resolves on {} via {}", svc.name, net_name, gw);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    // Spawn log relay threads.
+    let mut stdout_handle = child.take_stdout();
+    let mut stderr_handle = child.take_stderr();
+    let stdout_path = stdout_log.clone();
+    let stderr_path = stderr_log.clone();
+    let svc_name = svc.name.clone();
+    let cn = container_name.to_string();
+
+    std::thread::spawn(move || {
+        if let Some(mut src) = stdout_handle.take() {
+            if let Ok(mut f) = std::fs::File::create(&stdout_path) {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match src.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = f.write_all(&buf[..n]);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        if let Some(mut src) = stderr_handle.take() {
+            if let Ok(mut f) = std::fs::File::create(&stderr_path) {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match src.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = f.write_all(&buf[..n]);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Spawn a waiter thread that updates state when the container exits.
+    let cn_wait = cn.clone();
+    let all_ips_wait = all_ips.clone();
+    let svc_name_wait = svc_name.clone();
+    std::thread::spawn(move || {
+        let exit = child.wait();
+        // Deregister DNS.
+        for (net_name, _) in &all_ips_wait {
+            let _ = remora::dns::dns_remove_entry(net_name, &svc_name_wait);
+        }
+        // Update container state.
+        if let Ok(mut st) = super::read_state(&cn_wait) {
+            st.status = ContainerStatus::Exited;
+            st.exit_code = exit.ok().and_then(|e| e.code());
+            let _ = write_state(&st);
+        }
+    });
+
+    Ok(pid)
+}
+
+fn resolve_image(
+    image_ref: &str,
+) -> Result<(String, remora::image::ImageManifest), Box<dyn std::error::Error>> {
+    use remora::image;
+
+    if let Ok(m) = image::load_image(image_ref) {
+        return Ok((image_ref.to_string(), m));
+    }
+    let normalised = normalise_image_reference(image_ref);
+    let m = image::load_image(&normalised).map_err(|e| {
+        format!(
+            "image '{}' not found locally (run 'remora image pull {}'): {}",
+            image_ref, image_ref, e
+        )
+    })?;
+    Ok((normalised, m))
+}
+
+fn normalise_image_reference(reference: &str) -> String {
+    let r = reference.to_string();
+    let r = if !r.contains(':') && !r.contains('@') {
+        format!("{}:latest", r)
+    } else {
+        r
+    };
+    if !r.contains('/') {
+        format!("docker.io/library/{}", r)
+    } else {
+        r
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compose down
+// ---------------------------------------------------------------------------
+
+fn cmd_compose_down(
+    file: &std::path::Path,
+    project_name: Option<&str>,
+    remove_volumes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = derive_project_name(file, project_name)?;
+    let project_state = load_project_state(&project)
+        .map_err(|_| format!("no running project '{}' found", project))?;
+
+    // Kill supervisor if alive.
+    if project_state.supervisor_pid > 0 && check_liveness(project_state.supervisor_pid) {
+        unsafe { libc::kill(project_state.supervisor_pid, libc::SIGTERM) };
+        std::thread::sleep(Duration::from_millis(500));
+        if check_liveness(project_state.supervisor_pid) {
+            unsafe { libc::kill(project_state.supervisor_pid, libc::SIGKILL) };
+        }
+    }
+
+    // Stop services in reverse order.
+    // Re-read the compose file to get topo order for reverse teardown.
+    let order: Vec<String> = if let Ok(content) = std::fs::read_to_string(file) {
+        if let Ok(compose) = parse_compose(&content) {
+            topo_sort(&compose.services).unwrap_or_default()
+        } else {
+            project_state.services.keys().cloned().collect()
+        }
+    } else {
+        project_state.services.keys().cloned().collect()
+    };
+
+    let reverse_order: Vec<String> = order.into_iter().rev().collect();
+
+    for svc_name in &reverse_order {
+        if let Some(svc_state) = project_state.services.get(svc_name) {
+            let cn = &svc_state.container_name;
+            // SIGTERM
+            if svc_state.pid > 0 && check_liveness(svc_state.pid) {
+                log::info!("compose: stopping service '{}'", svc_name);
+                unsafe { libc::kill(svc_state.pid, libc::SIGTERM) };
+                // Wait up to 10s.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline && check_liveness(svc_state.pid) {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                // SIGKILL if still alive.
+                if check_liveness(svc_state.pid) {
+                    log::warn!("compose: SIGKILL service '{}'", svc_name);
+                    unsafe { libc::kill(svc_state.pid, libc::SIGKILL) };
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            // Remove container state.
+            let dir = container_dir(cn);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Also stop any services not in the current compose file order.
+    for (svc_name, svc_state) in &project_state.services {
+        if !reverse_order.contains(svc_name) {
+            if svc_state.pid > 0 && check_liveness(svc_state.pid) {
+                unsafe { libc::kill(svc_state.pid, libc::SIGKILL) };
+            }
+            let dir = container_dir(&svc_state.container_name);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Clean up DNS entries for all services on all networks.
+    for svc_name in project_state.services.keys() {
+        for net in &project_state.networks {
+            let _ = remora::dns::dns_remove_entry(net, svc_name);
+        }
+    }
+
+    // Remove networks.
+    for net in &project_state.networks {
+        if let Err(e) = super::network::cmd_network_rm(net) {
+            log::warn!("compose: failed to remove network '{}': {}", net, e);
+        }
+    }
+
+    // Remove volumes if requested.
+    if remove_volumes {
+        for vol in &project_state.volumes {
+            if let Err(e) = Volume::delete(vol) {
+                log::warn!("compose: failed to remove volume '{}': {}", vol, e);
+            }
+        }
+    }
+
+    // Remove project state.
+    let project_dir = remora::paths::compose_project_dir(&project);
+    let _ = std::fs::remove_dir_all(&project_dir);
+
+    println!("Project '{}' stopped and removed", project);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// compose ps
+// ---------------------------------------------------------------------------
+
+fn cmd_compose_ps(
+    file: &std::path::Path,
+    project_name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = derive_project_name(file, project_name)?;
+    let project_state =
+        load_project_state(&project).map_err(|_| format!("no project '{}' found", project))?;
+
+    println!(
+        "{:<15} {:<25} {:<10} {:<8}",
+        "SERVICE", "CONTAINER", "STATUS", "PID"
+    );
+    for (svc_name, svc_state) in &project_state.services {
+        let status = if check_liveness(svc_state.pid) {
+            "running"
+        } else {
+            "exited"
+        };
+        println!(
+            "{:<15} {:<25} {:<10} {:<8}",
+            svc_name, svc_state.container_name, status, svc_state.pid
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// compose logs
+// ---------------------------------------------------------------------------
+
+fn cmd_compose_logs(
+    file: &std::path::Path,
+    project_name: Option<&str>,
+    follow: bool,
+    service: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = derive_project_name(file, project_name)?;
+    let project_state =
+        load_project_state(&project).map_err(|_| format!("no project '{}' found", project))?;
+
+    let services_to_show: Vec<(&str, &ComposeServiceState)> = if let Some(svc_name) = service {
+        let svc_state = project_state
+            .services
+            .get(svc_name)
+            .ok_or_else(|| format!("service '{}' not found in project '{}'", svc_name, project))?;
+        vec![(svc_name, svc_state)]
+    } else {
+        project_state
+            .services
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect()
+    };
+
+    for (svc_name, svc_state) in &services_to_show {
+        // Delegate to the existing logs infrastructure.
+        let cn = &svc_state.container_name;
+        if let Ok(cstate) = super::read_state(cn) {
+            if let Some(ref log_path) = cstate.stdout_log {
+                if let Ok(data) = std::fs::read(log_path) {
+                    if !data.is_empty() {
+                        // Prefix each line with service name.
+                        let text = String::from_utf8_lossy(&data);
+                        for line in text.lines() {
+                            println!("{} | {}", svc_name, line);
+                        }
+                    }
+                }
+            }
+            if let Some(ref log_path) = cstate.stderr_log {
+                if let Ok(data) = std::fs::read(log_path) {
+                    if !data.is_empty() {
+                        let text = String::from_utf8_lossy(&data);
+                        for line in text.lines() {
+                            eprintln!("{} | {}", svc_name, line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if follow {
+        // Poll for new content.
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            // Simple approach: re-check if any services are still running.
+            let mut any_running = false;
+            for (_, svc_state) in &services_to_show {
+                if check_liveness(svc_state.pid) {
+                    any_running = true;
+                    break;
+                }
+            }
+            if !any_running {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dependency readiness
+// ---------------------------------------------------------------------------
+
+fn wait_for_dependency(
+    _project: &str,
+    dep: &Dependency,
+    container_pids: &HashMap<String, i32>,
+    container_ips: &HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dep_name = &dep.service;
+
+    // Make sure the dependency is running.
+    if let Some(&pid) = container_pids.get(dep_name.as_str()) {
+        if !check_liveness(pid) {
+            return Err(format!("dependency '{}' exited before becoming ready", dep_name).into());
+        }
+    }
+
+    // If no ready_port, just check the process is alive.
+    let port = match dep.ready_port {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    // Get the container IP.
+    let ip_str = container_ips.get(dep_name.as_str()).ok_or_else(|| {
+        format!(
+            "dependency '{}' has no IP address for readiness check",
+            dep_name
+        )
+    })?;
+    let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
+        format!(
+            "dependency '{}' has invalid IP '{}': {}",
+            dep_name, ip_str, e
+        )
+    })?;
+
+    let addr = SocketAddr::new(ip.into(), port);
+    let timeout = Duration::from_secs(60);
+    let interval = Duration::from_millis(250);
+    let deadline = Instant::now() + timeout;
+
+    log::info!(
+        "compose: waiting for {}:{} (service '{}')",
+        ip,
+        port,
+        dep_name
+    );
+
+    while Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+            Ok(_) => {
+                log::info!("compose: {}:{} ready", ip, port);
+                return Ok(());
+            }
+            Err(_) => {
+                // Check dependency is still alive.
+                if let Some(&pid) = container_pids.get(dep_name.as_str()) {
+                    if !check_liveness(pid) {
+                        return Err(format!(
+                            "dependency '{}' exited while waiting for port {}",
+                            dep_name, port
+                        )
+                        .into());
+                    }
+                }
+                std::thread::sleep(interval);
+            }
+        }
+    }
+
+    Err(format!(
+        "dependency '{}' did not become ready on port {} within {}s",
+        dep_name,
+        port,
+        timeout.as_secs()
+    )
+    .into())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn derive_project_name(
+    file: &std::path::Path,
+    explicit: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(name) = explicit {
+        return Ok(name.to_string());
+    }
+    // Use the parent directory name.
+    let abs = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let parent = abs
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    // Sanitise: only alphanumeric + hyphen.
+    let sanitised: String = parent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    Ok(sanitised)
+}
+
+fn scoped_network_name(project: &str, net: &str) -> String {
+    let name = format!("{}-{}", project, net);
+    // Kernel IFNAMSIZ limit is 15; bridge name is "rm-{name}".
+    // Network name itself is max 12 chars.
+    if name.len() > 12 {
+        // Truncate and append short hash.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        let h = hasher.finish();
+        format!("{}{:04x}", &name[..8], h as u16)
+    } else {
+        name
+    }
+}
+
+fn scoped_volume_name(project: &str, vol: &str) -> String {
+    format!("{}-{}", project, vol)
+}
+
+fn scoped_container_name(project: &str, service: &str) -> String {
+    format!("{}-{}", project, service)
+}
+
+/// Send a DNS A-record query for `name` to the given gateway IP on port 53.
+/// Returns true if we get any response (even NXDOMAIN means the daemon is alive).
+fn probe_dns(gateway: Ipv4Addr, name: &str) -> bool {
+    use std::net::UdpSocket;
+
+    let addr = SocketAddr::new(gateway.into(), 53);
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+
+    // Build a minimal DNS A query.
+    let mut pkt = Vec::with_capacity(64);
+    pkt.extend_from_slice(&[0xAB, 0xCD]); // ID
+    pkt.extend_from_slice(&[0x01, 0x00]); // Flags: RD=1
+    pkt.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    pkt.extend_from_slice(&[0x00, 0x00]); // ANCOUNT
+    pkt.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+    pkt.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+                                          // QNAME
+    for label in name.split('.') {
+        if !label.is_empty() {
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+    }
+    pkt.push(0); // Root label
+    pkt.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    pkt.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+    if sock.send_to(&pkt, addr).is_err() {
+        return false;
+    }
+
+    let mut buf = [0u8; 512];
+    matches!(sock.recv_from(&mut buf), Ok((n, _)) if n >= 12)
+}
+
+fn save_project_state(state: &ComposeProject) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = remora::paths::compose_project_dir(&state.name);
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(state)?;
+    std::fs::write(remora::paths::compose_state_file(&state.name), json)?;
+    Ok(())
+}
+
+fn load_project_state(project: &str) -> Result<ComposeProject, Box<dyn std::error::Error>> {
+    let data = std::fs::read_to_string(remora::paths::compose_state_file(project))?;
+    let state: ComposeProject = serde_json::from_str(&data)?;
+    Ok(state)
+}

@@ -1381,3 +1381,60 @@ without calling `wait()`. Asserts that the netns mount is removed after drop.
 Failure means the `Drop` implementation for `Child` is not properly tearing down
 network namespaces, which would cause stale `/run/netns/rem-*` mounts to
 accumulate over time (especially from test panics or early returns).
+
+---
+
+## Compose Tests
+
+### `test_sexpr_parse_compose_file`
+**Type:** No-root
+
+Parses a full compose file example through the S-expression parser (`remora::sexpr::parse`).
+Verifies the top-level structure: the root is a list starting with `compose`, containing
+the expected number of declarations (networks, volumes, services).
+
+Failure means the S-expression parser cannot handle the compose file syntax (comments,
+nested lists, quoted strings, keyword arguments).
+
+### `test_compose_parse_and_validate`
+**Type:** No-root
+
+Parses a compose file through the full pipeline (`remora::compose::parse_compose`) which
+includes S-expression parsing, AST-to-struct transformation, and cross-reference validation.
+Checks that all fields are correctly populated: networks with subnets, volumes, service
+names/images/networks/volumes/env/ports/memory, and dependency with `:ready-port`.
+
+Failure means the compose model parser is dropping or misinterpreting fields from the AST.
+
+### `test_compose_topo_sort`
+**Type:** No-root
+
+Verifies topological sort of service dependencies: given web -> api -> db, the sort must
+produce db before api before web. Uses `remora::compose::topo_sort`.
+
+Failure means services would be started in wrong order, causing dependency failures.
+
+### `test_compose_cycle_detection`
+**Type:** No-root
+
+Verifies that a circular dependency (a -> b -> a) is detected and reported as a
+`DependencyCycle` error by the compose parser/validator.
+
+Failure means `compose up` would hang or stack overflow on circular dependencies.
+
+### `test_compose_unknown_dependency`
+**Type:** No-root
+
+Verifies that a `depends-on` referencing a nonexistent service produces an
+`UnknownDependency` error.
+
+Failure means typos in service names would be silently ignored, causing runtime failures.
+
+### `test_compose_up_down_single_service`
+**Requires:** root, rootfs
+
+Verifies compose project state directory creation and cleanup. Creates a compose project
+directory, asserts it exists, then cleans it up. This exercises the compose path helpers
+(`compose_project_dir`, `compose_state_file`).
+
+Failure means the compose state filesystem layout is broken.

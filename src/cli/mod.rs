@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod build;
 pub mod cleanup;
+pub mod compose;
 pub mod exec;
 pub mod image;
 pub mod logs;

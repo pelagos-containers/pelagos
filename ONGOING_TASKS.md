@@ -1,33 +1,25 @@
 # Ongoing Tasks
 
-## Completed: Fix stale netns mounts — Add Drop impl for Child
+## Completed: `remora compose` — S-Expression Multi-Service Orchestration
 
 ### Summary
 
-Added `impl Drop for Child` in `src/container.rs` so that dropping a `Child`
-without calling `wait()` still cleans up network namespaces, cgroups, overlay
-dirs, DNS temp dirs, pasta relays, and fuse-overlayfs mounts.
+Added `remora compose up/down/ps/logs` with S-expression compose files. Includes
+a zero-dependency recursive descent parser, typed compose model with validation
+and topological sort, and a full CLI orchestrator with supervisor process,
+TCP readiness polling, scoped naming, DNS registration, and log relay.
 
 ### Changes Made
 
-1. **`src/container.rs`**: Extracted shared teardown logic into `teardown_resources(&mut self, preserve_overlay: bool)` method. Refactored `wait()`, `wait_with_output()`, and `wait_preserve_overlay()` to use it. All fields use `take()`/`drain()` for idempotency. Added `impl Drop for Child` that kills+reaps the child process then calls `teardown_resources()`. Changed `wait_with_output` from `(mut self)` to `(&mut self)` since you can't move fields out of a type implementing Drop.
-
-2. **`src/cli/cleanup.rs`**: New `remora cleanup` subcommand that scans `/run/netns/rem-*`, `/run/remora/overlay-*`, `/run/remora/dns-*`, and `/run/remora/hosts-*` for orphaned entries whose owning PID is dead, and removes them.
-
-3. **`src/cli/mod.rs`**: Added `cleanup` module.
-
-4. **`src/main.rs`**: Added `Cleanup` subcommand variant and wired to `cli::cleanup::cmd_cleanup()`.
-
-5. **`tests/integration_tests.rs`**: Added `test_child_drop_cleans_up_netns` test. Updated all `wait_with_output()` callers from `let child` to `let mut child` (signature changed to `&mut self`).
-
-6. **`docs/INTEGRATION_TESTS.md`**: Documented the new test.
-
-7. **Examples**: Updated `mut` bindings in `web_pipeline`, `full_stack_smoke`, `net_debug`.
-
-### Bug Fix: wait_preserve_overlay missing secondary network teardown
-
-`wait_preserve_overlay()` was missing teardown of secondary networks — now
-handled by the shared `teardown_resources()` method.
+1. **`src/sexpr.rs`** (NEW): Zero-dependency S-expression parser — `SExpr::Atom`/`List`, `parse()`, full test suite (atoms, quoted strings, nested lists, comments, errors)
+2. **`src/compose.rs`** (NEW): Compose model — `ComposeFile`, `ServiceSpec`, `NetworkSpec`, `Dependency`, `VolumeMount`, `PortMapping`; `parse_compose()` AST-to-struct; `validate()` cross-references; `topo_sort()` Kahn's algorithm with cycle detection
+3. **`src/cli/compose.rs`** (NEW): CLI orchestrator — `compose up` (parse, create scoped networks/volumes, supervisor, topo-order start, TCP readiness, DNS, log relay, monitor); `compose down` (reverse-order SIGTERM/SIGKILL, network/volume/state cleanup); `compose ps` (status table); `compose logs` (prefixed output)
+4. **`src/paths.rs`**: Added `compose_dir()`, `compose_project_dir()`, `compose_state_file()` + tests
+5. **`src/lib.rs`**: Added `pub mod sexpr` and `pub mod compose`
+6. **`src/cli/mod.rs`**: Added `pub mod compose`
+7. **`src/main.rs`**: Added `Compose` subcommand variant + dispatch
+8. **`tests/integration_tests.rs`**: 5 no-root parser/model tests + 1 root test
+9. **`docs/INTEGRATION_TESTS.md`**: Documented all 6 new tests
 
 ## Next Task
 

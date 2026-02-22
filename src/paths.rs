@@ -166,6 +166,23 @@ pub fn dns_hosts_file(network_name: &str) -> PathBuf {
     dns_config_dir().join(format!("hosts.{}", network_name))
 }
 
+// ── Compose directories ─────────────────────────────────────────────────────
+
+/// Compose project root: `<runtime>/compose/`.
+pub fn compose_dir() -> PathBuf {
+    runtime_dir().join("compose")
+}
+
+/// Compose project directory: `<runtime>/compose/<project>/`.
+pub fn compose_project_dir(project: &str) -> PathBuf {
+    compose_dir().join(project)
+}
+
+/// Compose project state file: `<runtime>/compose/<project>/state.json`.
+pub fn compose_state_file(project: &str) -> PathBuf {
+    compose_project_dir(project).join("state.json")
+}
+
 // ── Per-network directories ─────────────────────────────────────────────────
 
 /// Persistent config directory for all named networks: `<data>/networks/`.
@@ -259,6 +276,19 @@ mod tests {
         assert!(network_ipam_file("frontend").starts_with(&rt));
         assert!(network_nat_refcount_file("frontend").starts_with(&rt));
         assert!(network_port_forwards_file("frontend").starts_with(&rt));
+    }
+
+    #[test]
+    fn test_compose_paths_under_runtime_dir() {
+        let rt = runtime_dir();
+        assert!(compose_dir().starts_with(&rt));
+        assert!(compose_project_dir("myapp").starts_with(&rt));
+        assert!(compose_state_file("myapp").starts_with(&rt));
+        assert_eq!(compose_project_dir("myapp"), compose_dir().join("myapp"));
+        assert_eq!(
+            compose_state_file("myapp"),
+            compose_project_dir("myapp").join("state.json")
+        );
     }
 
     #[test]

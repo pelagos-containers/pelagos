@@ -166,6 +166,18 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **User/workdir**: `--user UID[:GID]`, `--workdir /path` options
 - **`src/cli/exec.rs`**: `ExecArgs`, `cmd_exec()`, `discover_namespaces()`, `read_proc_environ()`
 
+**Compose (COMPLETE ✅):**
+- **`remora compose up [-f compose.rem] [-p project] [--foreground]`**: parse S-expression compose file, create scoped networks/volumes, start services in dependency order with TCP readiness polling, supervisor process with log relay
+- **`remora compose down [-f compose.rem] [-p project] [-v]`**: stop services in reverse topo order (SIGTERM → SIGKILL), remove networks/volumes/state
+- **`remora compose ps [-f compose.rem] [-p project]`**: list services with status
+- **`remora compose logs [-f compose.rem] [-p project] [--follow] [service]`**: view prefixed service logs
+- **S-expression format**: `(compose (network ...) (volume ...) (service ...))` — `;` comments, bare words, quoted strings, keyword args (`:ready-port`), nested lists
+- **Dependency management**: `(depends-on (db :ready-port 5432))` — topological sort (Kahn's), cycle detection, TCP readiness polling (250ms interval, 60s timeout)
+- **Scoped naming**: containers `{project}-{service}`, networks `{project}-{net}`, volumes `{project}-{vol}`; DNS uses bare service names for intra-project discovery
+- **`src/sexpr.rs`**: `SExpr`, `parse()`, `ParseError` — zero-dependency recursive descent parser
+- **`src/compose.rs`**: `ComposeFile`, `ServiceSpec`, `parse_compose()`, `validate()`, `topo_sort()`
+- **`src/cli/compose.rs`**: `ComposeCmd`, `cmd_compose()`, supervisor, TCP readiness, scoped naming
+
 **OCI Compliance (Phase 1 COMPLETE ✅):**
 - **`remora create <id> <bundle>`**: parse `config.json`, fork shim, block on `exec.sock` until `start`
 - **`remora start <id>`**: connect to `exec.sock`, send byte → container execs
@@ -188,12 +200,14 @@ src/
   lib.rs                  # Library entry point
   main.rs                 # CLI binary (run/exec/ps/stop/rm/logs + OCI lifecycle)
   build.rs                # Image build engine: Remfile parser + executor
+  compose.rs              # Compose model: ComposeFile, ServiceSpec, parse, validate, topo-sort
   container.rs            # Main API (~2270 lines)
   oci.rs                  # OCI Runtime Spec implementation
   cgroup.rs               # Cgroups v2 resource management
   network.rs              # Native networking (N1-N7 + multi-network)
   dns.rs                  # DNS daemon management: ensure_dns_daemon, dns_add/remove_entry
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
+  sexpr.rs                # S-expression parser: SExpr, parse(), zero-dependency recursive descent
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
   image.rs                # OCI image store: layer extraction, manifest persistence
   bin/
@@ -201,6 +215,7 @@ src/
   cli/
     mod.rs                # Shared types: ContainerState, helpers, parsers
     build.rs              # remora build — build images from Remfiles
+    compose.rs            # remora compose up/down/ps/logs — multi-service orchestration
     exec.rs               # remora exec — run command in running container
     run.rs                # remora run — build + launch containers
     ps.rs                 # remora ps — list containers
@@ -213,7 +228,7 @@ src/
     image.rs              # remora image pull/ls/rm — OCI registry pulls
 
 tests/
-  integration_tests.rs    # 78 integration tests (require root)
+  integration_tests.rs    # 84 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -223,6 +238,7 @@ Documentation:
   CLAUDE.md                             # This file
   docs/ROADMAP.md                       # Development plan (NO time estimates!)
   docs/INTEGRATION_TESTS.md            # Every integration test documented
+  docs/DESIGN_PRINCIPLES.md             # Non-negotiable design principles
   docs/USER_GUIDE.md                    # Full CLI and API user guide
   docs/RUNTIME_COMPARISON.md            # vs Docker/runc/Podman
   docs/SECCOMP_DEEP_DIVE.md            # Seccomp implementation details
@@ -460,6 +476,7 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 | OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
 | Image build | ✅ `remora build` (Remfile) | ✅ Dockerfile |
 | Container exec | ✅ `remora exec` (ns join + PTY) | ✅ |
+| Compose | ✅ `remora compose` (S-expression) | ✅ docker compose (YAML) |
 | OCI Compatible | 🔄 Partial | ✅ |
 
 **Current parity: ~80% of runc features**

@@ -6,6 +6,7 @@
 pub mod build;
 pub mod cgroup;
 pub mod cgroup_rootless;
+pub mod compose;
 pub mod container;
 pub mod dns;
 pub mod idmap;
@@ -15,3 +16,4 @@ pub mod oci;
 pub mod paths;
 pub mod pty;
 pub mod seccomp;
+pub mod sexpr;

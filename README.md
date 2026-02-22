@@ -237,6 +237,7 @@ and `docs/ROADMAP.md` for what's next.
 
 | File | Contents |
 |------|----------|
+| `docs/DESIGN_PRINCIPLES.md` | Non-negotiable design principles |
 | `docs/USER_GUIDE.md` | CLI and API user guide |
 | `docs/ROADMAP.md` | What's done and what's next |
 | `docs/RUNTIME_COMPARISON.md` | Full feature matrix vs runc/Docker |

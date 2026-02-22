@@ -588,7 +588,7 @@ impl Volume {
 ///
 /// // Create and configure a containerized process
 /// let child = Command::new("/bin/sh")
-///     .args(&["-c", "echo hello"])
+///     .args(["-c", "echo hello"])
 ///     .with_namespaces(Namespace::UTS | Namespace::PID)
 ///     .with_chroot("/path/to/rootfs")
 ///     .stdin(Stdio::Inherit)
@@ -603,7 +603,7 @@ impl Volume {
 /// ```no_run
 /// # use remora::container::{Command, Namespace};
 /// Command::new("/bin/ls")
-///     .args(&["-la"])
+///     .args(["-la"])
 ///     .with_namespaces(Namespace::MOUNT)
 ///     .spawn()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -4395,7 +4395,7 @@ impl Command {
 /// use remora::container::{Command, Namespace};
 ///
 /// let mut child = Command::new("/bin/sleep")
-///     .args(&["5"])
+///     .args(["5"])
 ///     .with_namespaces(Namespace::PID)
 ///     .spawn()?;
 ///
@@ -4891,7 +4891,7 @@ mod tests {
     #[test]
     fn test_command_builder_pattern() {
         let cmd = Command::new("/bin/echo")
-            .args(&["hello", "world"])
+            .args(["hello", "world"])
             .with_namespaces(Namespace::UTS)
             .stdin(Stdio::Null)
             .stdout(Stdio::Null)
@@ -4905,7 +4905,7 @@ mod tests {
     fn test_command_chaining() {
         // Test that methods can be chained fluently
         let _cmd = Command::new("/bin/true")
-            .args(&["arg1"])
+            .args(["arg1"])
             .with_chroot("/tmp")
             .with_namespaces(Namespace::PID | Namespace::MOUNT);
 

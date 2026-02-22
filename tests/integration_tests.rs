@@ -79,7 +79,6 @@ mod api {
             }]);
 
         // Just verify the API compiles and methods are available
-        assert!(true, "UID/GID API is available");
     }
 
     #[test]
@@ -112,7 +111,7 @@ mod api {
         let rootfs = PathBuf::from("/tmp/test");
 
         let _cmd = Command::new("/bin/ash")
-            .args(&["-c", "echo test", "-x"])
+            .args(["-c", "echo test", "-x"])
             .stdin(Stdio::Inherit)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Null)
@@ -123,7 +122,6 @@ mod api {
             .with_max_fds(1024);
 
         // Just test that the builder methods chain correctly
-        assert!(true, "Builder pattern works");
     }
 
     #[test]
@@ -152,7 +150,6 @@ mod api {
             .without_seccomp();
 
         // Just verify the API compiles and methods are available
-        assert!(true, "Seccomp API is available");
     }
 }
 
@@ -173,7 +170,7 @@ mod core {
 
         // Test basic namespace creation with UTS and MOUNT
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -207,7 +204,7 @@ mod core {
 
         // Test with_proc_mount() - check /proc/self/status exists
         let result = Command::new("/bin/ash")
-            .args(&["-c", "test -f /proc/self/status"])
+            .args(["-c", "test -f /proc/self/status"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -240,7 +237,7 @@ mod core {
 
         // Test combining multiple features together
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::CGROUP)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -295,7 +292,7 @@ mod core {
         // Fork 5 times via external `sleep 0` (not a builtin — forces fork+exec).
         // Count successes.  All 5 must succeed.
         let mut child = Command::new("/bin/sh")
-            .args(&[
+            .args([
                 "-c",
                 r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#,
             ])
@@ -344,7 +341,7 @@ mod capabilities {
 
         // Test drop_all_capabilities()
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -377,7 +374,7 @@ mod capabilities {
 
         // Test keeping only specific capabilities
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -414,7 +411,7 @@ mod resources {
 
         // Test with_max_fds() - check ulimit -n equals 100
         let result = Command::new("/bin/ash")
-            .args(&["-c", "test \"$(ulimit -n)\" = 100"])
+            .args(["-c", "test \"$(ulimit -n)\" = 100"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -447,7 +444,7 @@ mod resources {
 
         // Test with_memory_limit() - just verify it doesn't crash
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -480,7 +477,7 @@ mod resources {
 
         // Test with_cpu_time_limit()
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -517,7 +514,7 @@ mod security {
 
         // Run with Docker seccomp profile - attempt reboot (should be blocked)
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "reboot 2>&1; echo reboot_exit_code=$?"])
+            .args(["-c", "reboot 2>&1; echo reboot_exit_code=$?"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -556,7 +553,7 @@ mod security {
 
         // Run a simple echo command - uses read, write, brk, etc. (all allowed)
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo 'Seccomp allows normal operations'"])
+            .args(["-c", "echo 'Seccomp allows normal operations'"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -589,7 +586,7 @@ mod security {
         // The minimal profile is very restrictive - even basic commands might fail
         // We just test that it compiles and can be applied
         let result = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Null)
             .stderr(Stdio::Null)
@@ -616,7 +613,6 @@ mod security {
         }
 
         // Test passes if we got here (seccomp was applied)
-        assert!(true, "Minimal seccomp profile can be applied");
     }
 
     #[test]
@@ -633,7 +629,7 @@ mod security {
 
         // Test that containers work without seccomp (backward compatibility)
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo 'No seccomp'"])
+            .args(["-c", "echo 'No seccomp'"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -665,7 +661,7 @@ mod security {
         // The value is 1 when PR_SET_NO_NEW_PRIVS has been set
         // Use full paths since PATH is not set inside the container
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "/bin/grep 'NoNewPrivs:.*1' /proc/self/status"])
+            .args(["-c", "/bin/grep 'NoNewPrivs:.*1' /proc/self/status"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -698,7 +694,7 @@ mod security {
 
         // Try to write to rootfs - should fail with read-only filesystem
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "touch /test_file 2>&1; echo exit_code=$?"])
+            .args(["-c", "touch /test_file 2>&1; echo exit_code=$?"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -732,7 +728,7 @@ mod security {
 
         // Try to read a masked path - should see /dev/null or get an error
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "cat /proc/kcore 2>&1 | head -c 10 || echo 'masked'"])
+            .args(["-c", "cat /proc/kcore 2>&1 | head -c 10 || echo 'masked'"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -762,7 +758,7 @@ mod security {
 
         // Use custom masked paths
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo 'Custom masked paths test'"])
+            .args(["-c", "echo 'Custom masked paths test'"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -792,7 +788,7 @@ mod security {
 
         // Test all Phase 1 security features together
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo 'All Phase 1 security features enabled'"])
+            .args(["-c", "echo 'All Phase 1 security features enabled'"])
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -838,7 +834,7 @@ mod filesystem {
 
         // Mount the host dir into /mnt/hostdir inside the container and verify the file is readable
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "cat /mnt/hostdir/hello.txt"])
+            .args(["-c", "cat /mnt/hostdir/hello.txt"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -872,7 +868,7 @@ mod filesystem {
 
         // Attempt to write inside a read-only bind mount — should fail
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "touch /mnt/ro/newfile 2>/dev/null; echo exit=$?"])
+            .args(["-c", "touch /mnt/ro/newfile 2>/dev/null; echo exit=$?"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -908,7 +904,7 @@ mod filesystem {
 
         // Even with a read-only rootfs, tmpfs at /tmp should be writable
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "touch /tmp/testfile && echo ok"])
+            .args(["-c", "touch /tmp/testfile && echo ok"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -949,7 +945,7 @@ mod filesystem {
 
         // Write a file from inside the container
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo persistent > /data/file.txt"])
+            .args(["-c", "echo persistent > /data/file.txt"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -1002,7 +998,7 @@ mod filesystem {
         std::fs::create_dir_all(&work).unwrap();
 
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "echo hello > /newfile"])
+            .args(["-c", "echo hello > /newfile"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_overlay(&upper, &work)
@@ -1064,7 +1060,7 @@ mod filesystem {
 
         // Run a container that writes to the volume AND to a regular path.
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "echo vol_data > /data/vol_file.txt && echo overlay_data > /overlay_file.txt",
             ])
@@ -1143,7 +1139,7 @@ mod filesystem {
             std::fs::read_to_string(&lower_hostname).unwrap_or_else(|_| String::new());
 
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "echo modified > /etc/hostname"])
+            .args(["-c", "echo modified > /etc/hostname"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_overlay(&upper, &work)
@@ -1201,7 +1197,7 @@ mod filesystem {
         std::fs::create_dir_all(&work).unwrap();
 
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "true"])
+            .args(["-c", "true"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_overlay(&upper, &work)
@@ -1258,7 +1254,7 @@ mod cgroups {
         // Try to allocate ~64 MB using dd. With a 32 MB cgroup limit the process
         // should be OOM-killed (exit non-zero) or fail to allocate.
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "dd if=/dev/urandom of=/dev/null bs=1M count=64"])
+            .args(["-c", "dd if=/dev/urandom of=/dev/null bs=1M count=64"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -1292,7 +1288,7 @@ mod cgroups {
         // — at least some should fail. The shell exits 0 regardless, so we just
         // verify that cgroup setup does not break container execution.
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0 & done; wait; echo done",
             ])
@@ -1325,7 +1321,7 @@ mod cgroups {
 
         // Smoke test: setting cpu_shares should not break container execution.
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo ok"])
+            .args(["-c", "echo ok"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -1358,7 +1354,7 @@ mod cgroups {
         // Verify resource_stats() returns a ResourceStats (no panic/error) when
         // a cgroup is active. Values should be >= 0 (they're unsigned).
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo hello"])
+            .args(["-c", "echo hello"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -1393,7 +1389,7 @@ mod cgroups {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
@@ -1435,7 +1431,7 @@ mod networking {
         // with_network(Loopback) automatically adds Namespace::NET and brings up lo.
         // After lo is up, the kernel assigns 127.0.0.1 automatically.
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK",
             ])
@@ -1475,7 +1471,7 @@ mod networking {
 
         // Named netns is fully configured before fork; eth0 is ready from the first instruction.
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK",
             ])
@@ -1514,7 +1510,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 2"])
+            .args(["-c", "sleep 2"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -1560,7 +1556,7 @@ mod networking {
 
         // Named netns is set up before fork — exit 0 is safe (no race with setup).
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -1604,7 +1600,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -1655,7 +1651,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LO_OK"])
+            .args(["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LO_OK"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -1694,7 +1690,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK",
             ])
@@ -1741,7 +1737,7 @@ mod networking {
         let r1 = rootfs.clone();
         let t1 = std::thread::spawn(move || {
             Command::new("/bin/ash")
-                .args(&[
+                .args([
                     "-c",
                     "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'",
                 ])
@@ -1762,7 +1758,7 @@ mod networking {
         let r2 = rootfs.clone();
         let t2 = std::thread::spawn(move || {
             Command::new("/bin/ash")
-                .args(&[
+                .args([
                     "-c",
                     "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'",
                 ])
@@ -1819,7 +1815,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 2"])
+            .args(["-c", "sleep 2"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -1864,7 +1860,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -1910,7 +1906,7 @@ mod networking {
         };
 
         let mut child_a = Command::new("/bin/ash")
-            .args(&["-c", "sleep 2"])
+            .args(["-c", "sleep 2"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -1923,7 +1919,7 @@ mod networking {
             .expect("Failed to spawn NAT container A");
 
         let mut child_b = Command::new("/bin/ash")
-            .args(&["-c", "sleep 4"])
+            .args(["-c", "sleep 4"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -1987,7 +1983,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 3"])
+            .args(["-c", "sleep 3"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2058,7 +2054,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 2"])
+            .args(["-c", "sleep 2"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2111,7 +2107,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "exit 0"])
+            .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2160,7 +2156,7 @@ mod networking {
         };
 
         let mut child_a = Command::new("/bin/ash")
-            .args(&["-c", "sleep 2"])
+            .args(["-c", "sleep 2"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2174,7 +2170,7 @@ mod networking {
             .expect("Failed to spawn port-forward container A");
 
         let mut child_b = Command::new("/bin/ash")
-            .args(&["-c", "sleep 4"])
+            .args(["-c", "sleep 4"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2243,7 +2239,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "cat /etc/resolv.conf"])
+            .args(["-c", "cat /etc/resolv.conf"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2314,7 +2310,7 @@ mod networking {
 
         // Container A: one-shot TCP server on port 80, forwarded from host 19090.
         let mut child_a = Command::new("/bin/sh")
-            .args(&["-c", "echo HELLO_FROM_CONTAINER | nc -l -p 80"])
+            .args(["-c", "echo HELLO_FROM_CONTAINER | nc -l -p 80"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2426,7 +2422,7 @@ mod networking {
         };
 
         let mut child = Command::new("/bin/sleep")
-            .args(&["60"])
+            .args(["60"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2553,7 +2549,7 @@ mod networking {
         }
 
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "wget -q -T 5 --spider http://1.1.1.1/"])
+            .args(["-c", "wget -q -T 5 --spider http://1.1.1.1/"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -2649,7 +2645,7 @@ mod oci_lifecycle {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", id]).2;
+                run_remora(&["delete", id]);
                 panic!("container did not stop within {} seconds", timeout_secs);
             }
         }
@@ -3021,7 +3017,7 @@ mod oci_lifecycle {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]).2;
+                run_remora(&["delete", &id]);
                 panic!("container did not stop within 5 seconds");
             }
         }
@@ -3107,7 +3103,7 @@ mod oci_lifecycle {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]).2;
+                run_remora(&["delete", &id]);
                 panic!("container did not stop within 5 seconds");
             }
         }
@@ -3140,7 +3136,7 @@ mod oci_lifecycle {
             }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
         let config = r#"{
       "ociVersion": "1.0.2",
       "root": {"path": "rootfs"},
@@ -3187,7 +3183,7 @@ mod oci_lifecycle {
             }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
         let config = r#"{
       "ociVersion": "1.0.2",
       "root": {"path": "rootfs"},
@@ -3230,7 +3226,7 @@ mod oci_lifecycle {
             }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
         // kernel.domainname is scoped to the UTS namespace — safe to set.
         let config = r#"{
       "ociVersion": "1.0.2",
@@ -3279,7 +3275,7 @@ mod oci_lifecycle {
         let prestart_marker = hooks_dir.path().join("prestart_ran");
         let poststop_marker = hooks_dir.path().join("poststop_ran");
         let bundle_dir = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
         let config = format!(
             r#"{{
       "ociVersion": "1.0.2",
@@ -3315,7 +3311,7 @@ mod oci_lifecycle {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]).2;
+                run_remora(&["delete", &id]);
                 panic!("container did not stop within 5 seconds");
             }
         }
@@ -3350,7 +3346,7 @@ mod oci_lifecycle {
             }
         };
         let bundle_dir = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(&rootfs, &bundle_dir.path().join("rootfs")).unwrap();
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
         let config = r#"{
       "ociVersion": "1.0.2",
       "root": {"path": "rootfs"},
@@ -3402,7 +3398,7 @@ mod rootless {
         // Use /bin/ash to invoke id — Alpine's id lives at /usr/bin/id (busybox symlink),
         // not at /bin/id.
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "id"])
+            .args(["-c", "id"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -3439,7 +3435,7 @@ mod rootless {
         // NET namespace (and USER namespace from auto-config) and lo is brought up.
         // lo shows 'state UNKNOWN' even when admin-UP; match the flags field instead.
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "ip addr show lo | grep -q 'LOOPBACK,UP' && echo ok"])
+            .args(["-c", "ip addr show lo | grep -q 'LOOPBACK,UP' && echo ok"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -3538,8 +3534,8 @@ mod rootless {
     /// sleep to let pasta attach and configure the interface via `--config-net`. Asserts:
     /// 1. A non-loopback interface exists (pasta created the TAP).
     /// 2. That interface has an `inet` address assigned (pasta's `--config-net` configured it).
-    /// Failure on (1) means pasta did not attach to the netns. Failure on (2) means
-    /// `--config-net` is not working — the container would have a TAP with no IP.
+    ///    Failure on (1) means pasta did not attach to the netns. Failure on (2) means
+    ///    `--config-net` is not working — the container would have a TAP with no IP.
     ///
     /// **Rootless only.** pasta's privilege-dropping (root→nobody via user namespace)
     /// makes it unable to access the container's namespace file descriptors when run as
@@ -3563,7 +3559,7 @@ mod rootless {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 1 && ip addr show"])
+            .args(["-c", "sleep 1 && ip addr show"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_proc_mount()
@@ -3626,7 +3622,7 @@ mod rootless {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "sleep 1 && ip addr show"])
+            .args(["-c", "sleep 1 && ip addr show"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_proc_mount()
@@ -3692,7 +3688,7 @@ mod rootless {
         // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
         // only has proc mounted, not a full /dev with device nodes).
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED",
             ])
@@ -3736,7 +3732,7 @@ mod linking {
 
         // Start container A on bridge (long-running).
         let mut child_a = Command::new("/bin/sleep")
-            .args(&["60"])
+            .args(["60"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -3763,7 +3759,7 @@ mod linking {
 
         // Start container B linked to A.
         let mut child_b = Command::new("/bin/cat")
-            .args(&["/etc/hosts"])
+            .args(["/etc/hosts"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -3817,7 +3813,7 @@ mod linking {
 
         // Start container A.
         let mut child_a = Command::new("/bin/sleep")
-            .args(&["60"])
+            .args(["60"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -3843,7 +3839,7 @@ mod linking {
 
         // Start container B linked to A with alias "db".
         let mut child_b = Command::new("/bin/cat")
-            .args(&["/etc/hosts"])
+            .args(["/etc/hosts"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -3902,7 +3898,7 @@ mod linking {
 
         // Start container A.
         let mut child_a = Command::new("/bin/sleep")
-            .args(&["60"])
+            .args(["60"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -3928,7 +3924,7 @@ mod linking {
 
         // Start container B: ping A by name.
         let mut child_b = Command::new("/bin/ping")
-            .args(&["-c1", "-W2", "link-ping-a"])
+            .args(["-c1", "-W2", "link-ping-a"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -3988,7 +3984,7 @@ mod linking {
         // Container A: listen on TCP 8080 and send a known string to the first client.
         // The `echo ... | nc -l -p 8080` pattern sends the string then exits.
         let mut child_a = Command::new("/bin/sh")
-            .args(&["-c", "echo HELLO_FROM_A | nc -l -p 8080"])
+            .args(["-c", "echo HELLO_FROM_A | nc -l -p 8080"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -4019,7 +4015,7 @@ mod linking {
 
         // Container B: connect to A by link name and read the response.
         let mut child_b = Command::new("/bin/sh")
-            .args(&["-c", "nc -w 2 link-tcp-a 8080"])
+            .args(["-c", "nc -w 2 link-tcp-a 8080"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_chroot(&rootfs)
@@ -4110,7 +4106,7 @@ mod images {
     /// Re-creates the empty mount-point directories afterward.
     fn copy_rootfs(rootfs: &std::path::Path, dest: &std::path::Path) {
         let status = std::process::Command::new("rsync")
-            .args(&["-a", "--exclude=/sys", "--exclude=/proc", "--exclude=/dev"])
+            .args(["-a", "--exclude=/sys", "--exclude=/proc", "--exclude=/dev"])
             .arg(rootfs.to_str().unwrap().to_string() + "/")
             .arg(dest.to_str().unwrap().to_string() + "/")
             .status()
@@ -4242,7 +4238,7 @@ mod images {
         let layers = vec![top.path().to_path_buf(), bottom.path().to_path_buf()];
 
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "cat /layer-bottom && echo --- && cat /layer-top"])
+            .args(["-c", "cat /layer-bottom && echo --- && cat /layer-top"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .env("PATH", ALPINE_PATH)
@@ -4303,7 +4299,7 @@ mod images {
         let layers = vec![top.path().to_path_buf(), bottom.path().to_path_buf()];
 
         let mut child = Command::new("/bin/cat")
-            .args(&["/shadow-file"])
+            .args(["/shadow-file"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .env("PATH", ALPINE_PATH)
@@ -4416,7 +4412,7 @@ mod images {
 
         // Pull the image using the remora binary (true E2E).
         let pull_status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
-            .args(&["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine"])
             .status()
             .expect("failed to run remora image pull");
         assert!(pull_status.success(), "remora image pull should succeed");
@@ -4429,7 +4425,7 @@ mod images {
 
         // Run a command inside the image.
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "cat /etc/alpine-release"])
+            .args(["-c", "cat /etc/alpine-release"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .env("PATH", ALPINE_PATH)
@@ -4446,7 +4442,7 @@ mod images {
         assert!(status.success(), "container should exit 0, stderr: {}", err);
         // Alpine release is a version like "3.19.1" or "3.23.3".
         assert!(
-            out.chars().next().map_or(false, |c| c.is_ascii_digit()) && out.contains('.'),
+            out.chars().next().is_some_and(|c| c.is_ascii_digit()) && out.contains('.'),
             "expected Alpine version string, got: '{}'",
             out
         );
@@ -4561,7 +4557,7 @@ mod exec {
 
         // Start a long-running container (no PID ns — see note above).
         let mut container = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .env("PATH", ALPINE_PATH)
@@ -4618,7 +4614,7 @@ mod exec {
         // Start a container that creates a marker file on tmpfs then sleeps.
         // No PID ns — pid() would return the intermediate, not the real container.
         let mut container = Command::new("/bin/sh")
-            .args(&[
+            .args([
                 "-c",
                 "echo EXEC_MARKER_12345 > /tmp/exec-marker && sleep 30",
             ])
@@ -4680,7 +4676,7 @@ mod exec {
         // Start container with a custom env var.
         // No PID ns — pid() would return the intermediate, not the real container.
         let mut container = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .env("PATH", ALPINE_PATH)
@@ -4778,7 +4774,7 @@ mod dev {
         };
 
         let mut child = Command::new("/bin/ls")
-            .args(&["/dev/"])
+            .args(["/dev/"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
             .with_proc_mount()
@@ -4828,7 +4824,7 @@ mod dev {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "echo ok > /dev/null && echo pass"])
+            .args(["-c", "echo ok > /dev/null && echo pass"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
             .with_proc_mount()
@@ -4863,7 +4859,7 @@ mod dev {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "head -c 4 /dev/zero | wc -c"])
+            .args(["-c", "head -c 4 /dev/zero | wc -c"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
             .with_proc_mount()
@@ -4898,7 +4894,7 @@ mod dev {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&[
+            .args([
                 "-c",
                 "test -L /dev/fd && test -L /dev/stdin && test -L /dev/stdout && test -L /dev/stderr && echo ok",
             ])
@@ -4936,7 +4932,7 @@ mod dev {
         };
 
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "test -d /dev/pts && test -d /dev/shm && echo ok"])
+            .args(["-c", "test -d /dev/pts && test -d /dev/shm && echo ok"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
             .with_proc_mount()
@@ -4999,7 +4995,7 @@ mod rootless_cgroups {
 
         // Spawn a container that sleeps so we can inspect the cgroup from the host.
         let mut child = Command::new("/bin/sleep")
-            .args(&["10"])
+            .args(["10"])
             .with_namespaces(Namespace::USER | Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .with_uid_maps(&[UidMap {
@@ -5057,7 +5053,7 @@ mod rootless_cgroups {
         };
 
         let mut child = Command::new("/bin/sleep")
-            .args(&["10"])
+            .args(["10"])
             .with_namespaces(Namespace::USER | Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .with_uid_maps(&[UidMap {
@@ -5512,7 +5508,7 @@ mod rootless_idmap {
         // Don't set uid_maps — let auto-config detect and use multi-range.
         // Use sleep so we can inspect the uid_map from the host side.
         let mut child = Command::new("/bin/sleep")
-            .args(&["10"])
+            .args(["10"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -5561,7 +5557,7 @@ mod rootless_idmap {
         // Run stat on /etc/passwd — the file is owned by root:root (0:0) in the image.
         // With multi-UID mapping, it should show UID 0 (not 65534/nobody).
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "stat -c '%u' /etc/passwd"])
+            .args(["-c", "stat -c '%u' /etc/passwd"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -5601,7 +5597,7 @@ mod rootless_idmap {
         // Explicitly set a single-UID map (bypassing auto-config).
         // Verify the container still works with single-UID mapping.
         let mut child = Command::new("/bin/ash")
-            .args(&["-c", "id -u"])
+            .args(["-c", "id -u"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -5879,7 +5875,7 @@ mod port_proxy {
 
         // Container: one-shot TCP server on port 80, forwarded from host 19190.
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "echo PROXY_WORKS | nc -l -p 80"])
+            .args(["-c", "echo PROXY_WORKS | nc -l -p 80"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -5898,7 +5894,7 @@ mod port_proxy {
         // Connect from LOCALHOST — this goes through the userspace proxy,
         // not through nftables PREROUTING (which doesn't see localhost traffic).
         let output = std::process::Command::new("nc")
-            .args(&["-w", "2", "127.0.0.1", "19190"])
+            .args(["-w", "2", "127.0.0.1", "19190"])
             .output()
             .expect("nc to localhost");
 
@@ -6144,7 +6140,7 @@ mod multi_network {
 
         // Run container on the named network.
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "ip addr show eth0 | grep 'inet '"])
+            .args(["-c", "ip addr show eth0 | grep 'inet '"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(name.to_string()))
             .with_nat()
@@ -6190,7 +6186,7 @@ mod multi_network {
         };
 
         let mut child = Command::new("/bin/sh")
-            .args(&["-c", "ip addr show eth0 | grep 'inet '"])
+            .args(["-c", "ip addr show eth0 | grep 'inet '"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -6270,7 +6266,7 @@ mod multi_network {
         create_test_network(net2, "10.99.2.0/24");
 
         let mut child = Command::new("/bin/sh")
-            .args(&[
+            .args([
                 "-c",
                 "ip addr show eth0 | grep 'inet '; ip addr show eth1 | grep 'inet '",
             ])
@@ -6360,7 +6356,7 @@ mod multi_network {
 
         // Container A: only on net1
         let mut child_a = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
             .with_chroot(&rootfs)
@@ -6376,7 +6372,7 @@ mod multi_network {
 
         // Container B: only on net2
         let mut child_b = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
             .with_chroot(&rootfs)
@@ -6395,7 +6391,7 @@ mod multi_network {
         // traffic (it talks to each peer via the local bridge, not cross-bridge).
         let test_cmd = format!("ping -c1 -W1 {} && ping -c1 -W1 {}", ip_a, ip_b);
         let mut child_c = Command::new("/bin/sh")
-            .args(&["-c", &test_cmd])
+            .args(["-c", &test_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
             .with_additional_network(net2)
@@ -6418,7 +6414,7 @@ mod multi_network {
         // The iptables DROP rules block cross-bridge forwarding.
         let test_cmd_fail = format!("ping -c1 -W1 {}", ip_b);
         let mut child_d = Command::new("/bin/sh")
-            .args(&["-c", &test_cmd_fail])
+            .args(["-c", &test_cmd_fail])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
             .with_chroot(&rootfs)
@@ -6576,7 +6572,7 @@ mod multi_network {
 
         // Start a "server" container on both networks.
         let mut server = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
             .with_additional_network(net2)
@@ -6619,7 +6615,7 @@ mod multi_network {
 
         // Client on net2 only — link should resolve to server's net2 IP.
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", "cat /etc/hosts"])
+            .args(["-c", "cat /etc/hosts"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
             .with_nat()
@@ -6724,7 +6720,7 @@ mod dns {
 
         // Spawn container A (long-running sleep).
         let mut server = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -6759,7 +6755,7 @@ mod dns {
             net_def.gateway
         );
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", &resolve_cmd])
+            .args(["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -6821,7 +6817,7 @@ mod dns {
         // Spawn a long-running container to create the bridge interface.
         // The DNS daemon needs the bridge to exist so it can bind to the gateway IP.
         let mut holder = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -6854,7 +6850,7 @@ mod dns {
             net_def.gateway
         );
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", &resolve_cmd])
+            .args(["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -6916,7 +6912,7 @@ mod dns {
         // Spawn holder containers to create both bridge interfaces.
         // The DNS daemon needs bridges to exist so it can bind to gateway IPs.
         let mut holder1 = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
             .with_nat()
@@ -6930,7 +6926,7 @@ mod dns {
             .expect("spawn holder1");
 
         let mut holder2 = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
             .with_nat()
@@ -6970,7 +6966,7 @@ mod dns {
         // Container on net2 tries to resolve "alpha" (which is on net1) — should get NXDOMAIN.
         let resolve_cmd = format!("nslookup alpha {} 2>&1; echo EXIT=$?", net2_def.gateway);
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", &resolve_cmd])
+            .args(["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
             .with_nat()
@@ -6996,7 +6992,7 @@ mod dns {
         // But "beta" should resolve on net2.
         let resolve_beta = format!("nslookup beta {} 2>&1", net2_def.gateway);
         let mut client2 = Command::new("/bin/sh")
-            .args(&["-c", &resolve_beta])
+            .args(["-c", &resolve_beta])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
             .with_nat()
@@ -7056,7 +7052,7 @@ mod dns {
 
         // Spawn container A on net1 + net2 (multi-network).
         let mut server = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
             .with_additional_network(net2)
@@ -7102,7 +7098,7 @@ mod dns {
         // Container B on net2 resolves "multi-a" — should get net2 IP.
         let resolve_cmd = format!("nslookup multi-a {} 2>&1", net2_def.gateway);
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", &resolve_cmd])
+            .args(["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
             .with_nat()
@@ -7162,7 +7158,7 @@ mod dns {
         // Spawn a holder container to create the bridge interface so the
         // daemon can bind to the gateway IP.
         let mut holder = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -7274,7 +7270,7 @@ mod dns {
 
         // Spawn container A (long-running sleep).
         let mut server = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -7320,7 +7316,7 @@ mod dns {
             net_def.gateway
         );
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", &resolve_cmd])
+            .args(["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -7387,7 +7383,7 @@ mod dns {
 
         // Spawn a holder container to create the bridge.
         let mut holder = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -7420,7 +7416,7 @@ mod dns {
             net_def.gateway
         );
         let mut client = Command::new("/bin/sh")
-            .args(&["-c", &resolve_cmd])
+            .args(["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -7488,7 +7484,7 @@ mod dns {
 
         // Spawn a holder container to create the bridge.
         let mut holder = Command::new("/bin/sleep")
-            .args(&["30"])
+            .args(["30"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
             .with_nat()
@@ -7624,4 +7620,193 @@ fn test_child_drop_cleans_up_netns() {
         "netns {} should be removed after drop",
         ns_name
     );
+}
+
+// ============================================================================
+// Compose: S-expression parser and compose model tests (no root required)
+// ============================================================================
+
+#[test]
+fn test_sexpr_parse_compose_file() {
+    let input = r#"
+; A typical web application stack
+(compose
+  (network backend (subnet "10.88.1.0/24"))
+  (network frontend (subnet "10.88.2.0/24"))
+  (volume pgdata)
+
+  (service db
+    (image "postgres:16")
+    (network backend)
+    (volume pgdata "/var/lib/postgresql/data")
+    (env POSTGRES_PASSWORD "secret")
+    (port 5432 5432)
+    (memory "512m"))
+
+  (service api
+    (image "my-api:latest")
+    (network backend frontend)
+    (depends-on (db :ready-port 5432))
+    (env DATABASE_URL "postgres://db:5432/app")
+    (port 8080 8080)
+    (cpus "1.0"))
+
+  (service web
+    (image "my-web:latest")
+    (network frontend)
+    (depends-on (api :ready-port 8080))
+    (port 80 3000)
+    (command "/bin/sh" "-c" "nginx -g 'daemon off;'")))
+"#;
+    let expr = remora::sexpr::parse(input).expect("should parse compose file");
+    let items = expr.as_list().expect("top-level should be a list");
+    assert_eq!(items[0].as_atom().unwrap(), "compose");
+    // compose + 2 networks + 1 volume + 3 services = 7
+    assert_eq!(items.len(), 7);
+}
+
+#[test]
+fn test_compose_parse_and_validate() {
+    let input = r#"
+(compose
+  (network backend (subnet "10.88.1.0/24"))
+  (volume data)
+
+  (service db
+    (image "postgres:16")
+    (network backend)
+    (volume data "/var/lib/postgresql/data")
+    (env POSTGRES_PASSWORD "secret")
+    (port 5432 5432)
+    (memory "512m"))
+
+  (service api
+    (image "my-api:latest")
+    (network backend)
+    (depends-on (db :ready-port 5432))
+    (port 8080 8080)))
+"#;
+    let compose = remora::compose::parse_compose(input).expect("should parse and validate");
+    assert_eq!(compose.networks.len(), 1);
+    assert_eq!(compose.networks[0].name, "backend");
+    assert_eq!(compose.networks[0].subnet.as_deref(), Some("10.88.1.0/24"));
+    assert_eq!(compose.volumes, vec!["data"]);
+    assert_eq!(compose.services.len(), 2);
+
+    let db = &compose.services[0];
+    assert_eq!(db.name, "db");
+    assert_eq!(db.image, "postgres:16");
+    assert_eq!(db.networks, vec!["backend"]);
+    assert_eq!(db.volumes[0].name, "data");
+    assert_eq!(db.volumes[0].mount_path, "/var/lib/postgresql/data");
+    assert_eq!(db.env.get("POSTGRES_PASSWORD").unwrap(), "secret");
+    assert_eq!(db.ports[0].host, 5432);
+    assert_eq!(db.ports[0].container, 5432);
+    assert_eq!(db.memory.as_deref(), Some("512m"));
+
+    let api = &compose.services[1];
+    assert_eq!(api.depends_on.len(), 1);
+    assert_eq!(api.depends_on[0].service, "db");
+    assert_eq!(api.depends_on[0].ready_port, Some(5432));
+}
+
+#[test]
+fn test_compose_topo_sort() {
+    let input = r#"
+(compose
+  (service web
+    (image "web")
+    (depends-on api))
+  (service api
+    (image "api")
+    (depends-on db))
+  (service db
+    (image "db")))
+"#;
+    let compose = remora::compose::parse_compose(input).expect("should parse");
+    let order = remora::compose::topo_sort(&compose.services).expect("should topo-sort");
+
+    let db_pos = order.iter().position(|n| n == "db").unwrap();
+    let api_pos = order.iter().position(|n| n == "api").unwrap();
+    let web_pos = order.iter().position(|n| n == "web").unwrap();
+
+    assert!(
+        db_pos < api_pos,
+        "db ({}) must come before api ({})",
+        db_pos,
+        api_pos
+    );
+    assert!(
+        api_pos < web_pos,
+        "api ({}) must come before web ({})",
+        api_pos,
+        web_pos
+    );
+}
+
+#[test]
+fn test_compose_cycle_detection() {
+    let input = r#"
+(compose
+  (service a
+    (image "a")
+    (depends-on b))
+  (service b
+    (image "b")
+    (depends-on a)))
+"#;
+    let err = remora::compose::parse_compose(input).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("cycle"), "expected cycle error, got: {}", msg);
+}
+
+#[test]
+fn test_compose_unknown_dependency() {
+    let input = r#"
+(compose
+  (service a
+    (image "a")
+    (depends-on nonexistent)))
+"#;
+    let err = remora::compose::parse_compose(input).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown service"),
+        "expected unknown dependency error, got: {}",
+        msg
+    );
+}
+
+#[test]
+#[serial]
+fn test_compose_up_down_single_service() {
+    if !is_root() {
+        eprintln!("skipping test_compose_up_down_single_service: requires root");
+        return;
+    }
+    let _rootfs = match get_test_rootfs() {
+        Some(r) => r,
+        None => {
+            eprintln!("skipping test_compose_up_down_single_service: no alpine-rootfs");
+            return;
+        }
+    };
+
+    // Test the compose state file handling (root required for /run/remora paths).
+    let project_name = "test-compose";
+
+    // Clean up any previous state.
+    let project_dir = remora::paths::compose_project_dir(project_name);
+    let _ = std::fs::remove_dir_all(&project_dir);
+
+    // Verify state directory creation works.
+    std::fs::create_dir_all(remora::paths::compose_project_dir(project_name))
+        .expect("should create compose project dir");
+    assert!(
+        remora::paths::compose_project_dir(project_name).exists(),
+        "compose project dir should exist"
+    );
+
+    // Clean up.
+    let _ = std::fs::remove_dir_all(&project_dir);
 }

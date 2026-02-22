@@ -134,6 +134,13 @@ pub(crate) enum CliCommand {
         cmd: NetworkCmd,
     },
 
+    // ── Compose ──────────────────────────────────────────────────────────
+    /// Multi-service orchestration
+    Compose {
+        #[clap(subcommand)]
+        cmd: cli::compose::ComposeCmd,
+    },
+
     // ── Container management ─────────────────────────────────────────────
     /// Manage containers
     Container {
@@ -350,6 +357,9 @@ fn main() {
             NetworkCmd::Rm { name } => cli::network::cmd_network_rm(&name),
             NetworkCmd::Inspect { name } => cli::network::cmd_network_inspect(&name),
         },
+
+        // Compose
+        CliCommand::Compose { cmd } => cli::compose::cmd_compose(cmd),
 
         // Cleanup
         CliCommand::Cleanup => cli::cleanup::cmd_cleanup(),
