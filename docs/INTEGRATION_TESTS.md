@@ -1366,3 +1366,18 @@ Adds a DNS entry with dnsmasq backend — daemon should start (PID file appears,
 process alive, backend marker says "dnsmasq"). Removes entry and sends SIGTERM.
 
 Failure means dnsmasq lifecycle management (start/stop/PID tracking) is broken.
+
+---
+
+## Drop Cleanup Tests
+
+### `test_child_drop_cleans_up_netns`
+**Requires:** root, rootfs
+
+Spawns a container with bridge networking (which creates a named network namespace
+under `/run/netns/rem-{pid}-{n}`), records the netns name, then drops the `Child`
+without calling `wait()`. Asserts that the netns mount is removed after drop.
+
+Failure means the `Drop` implementation for `Child` is not properly tearing down
+network namespaces, which would cause stale `/run/netns/rem-*` mounts to
+accumulate over time (especially from test panics or early returns).

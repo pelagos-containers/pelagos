@@ -65,7 +65,7 @@ echo "received: '$RESULT'"
     );
 
     println!("[main] Spawning client ...\n");
-    let client = Command::new("/bin/sh")
+    let mut client = Command::new("/bin/sh")
         .args(&["-c", &client_script])
         .stdin(Stdio::Null)
         .stdout(Stdio::Piped)

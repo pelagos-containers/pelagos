@@ -141,6 +141,10 @@ pub(crate) enum CliCommand {
         cmd: ContainerCmd,
     },
 
+    // ── Cleanup ────────────────────────────────────────────────────────────
+    /// Remove stale network namespaces, overlay dirs, and temp dirs from dead containers
+    Cleanup,
+
     // ── OCI lifecycle (unchanged) ─────────────────────────────────────────
     /// OCI lifecycle: create a container (machine interface)
     Create {
@@ -346,6 +350,9 @@ fn main() {
             NetworkCmd::Rm { name } => cli::network::cmd_network_rm(&name),
             NetworkCmd::Inspect { name } => cli::network::cmd_network_inspect(&name),
         },
+
+        // Cleanup
+        CliCommand::Cleanup => cli::cleanup::cmd_cleanup(),
 
         // OCI lifecycle
         CliCommand::Create { id, bundle } => {

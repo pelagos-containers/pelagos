@@ -4520,67 +4520,7 @@ impl Child {
     /// If a cgroup was configured, it is deleted after the child exits.
     pub fn wait(&mut self) -> Result<ExitStatus, Error> {
         let status = self.inner.wait().map_err(Error::Wait)?;
-        if let Some(cg) = self.cgroup.take() {
-            match cg {
-                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
-                CgroupHandle::Rootless(ref cg) => {
-                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
-                }
-            }
-        }
-        // Tear down secondary networks before primary (veths before netns).
-        for net in &self.secondary_networks {
-            crate::network::teardown_secondary_network(net);
-        }
-        if let Some(ref net) = self.network {
-            crate::network::teardown_network(net);
-        }
-        if let Some(ref mut p) = self.pasta {
-            crate::network::teardown_pasta_network(p);
-        }
-        // Unmount fuse-overlayfs before removing the overlay base dir.
-        if let Some(ref fuse_merged) = self.fuse_overlay_merged {
-            let merged_str = fuse_merged.to_string_lossy();
-            let unmounted = std::process::Command::new("fusermount3")
-                .args(["-u", &merged_str])
-                .status()
-                .is_ok_and(|s| s.success())
-                || std::process::Command::new("fusermount")
-                    .args(["-u", &merged_str])
-                    .status()
-                    .is_ok_and(|s| s.success());
-            if !unmounted {
-                log::warn!(
-                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
-                    merged_str
-                );
-            }
-        }
-        if let Some(ref mut fuse_child) = self.fuse_overlay_child {
-            // A successful fusermount causes the daemon to exit on its own.
-            // If unmount failed, the daemon is still alive — kill it so we
-            // don't block forever, but log so the user knows something is wrong.
-            match fuse_child.try_wait() {
-                Ok(Some(_)) => {} // already exited
-                _ => {
-                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
-                    let _ = fuse_child.kill();
-                }
-            }
-            let _ = fuse_child.wait();
-        }
-        if let Some(ref merged) = self.overlay_merged_dir {
-            // Remove the entire overlay base dir (merged + ephemeral upper/work).
-            if let Some(parent) = merged.parent() {
-                let _ = std::fs::remove_dir_all(parent);
-            }
-        }
-        if let Some(ref dir) = self.dns_temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        if let Some(ref dir) = self.hosts_temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        self.teardown_resources(false);
         Ok(ExitStatus { inner: status })
     }
 
@@ -4594,59 +4534,12 @@ impl Child {
     /// Used by the build engine to extract modified files from each RUN step.
     pub fn wait_preserve_overlay(&mut self) -> Result<(ExitStatus, Option<PathBuf>), Error> {
         let status = self.inner.wait().map_err(Error::Wait)?;
-        if let Some(cg) = self.cgroup.take() {
-            match cg {
-                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
-                CgroupHandle::Rootless(ref cg) => {
-                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
-                }
-            }
-        }
-        if let Some(ref net) = self.network {
-            crate::network::teardown_network(net);
-        }
-        if let Some(ref mut p) = self.pasta {
-            crate::network::teardown_pasta_network(p);
-        }
-        // Unmount fuse-overlayfs but keep the base dir intact.
-        if let Some(ref fuse_merged) = self.fuse_overlay_merged {
-            let merged_str = fuse_merged.to_string_lossy();
-            let unmounted = std::process::Command::new("fusermount3")
-                .args(["-u", &merged_str])
-                .status()
-                .is_ok_and(|s| s.success())
-                || std::process::Command::new("fusermount")
-                    .args(["-u", &merged_str])
-                    .status()
-                    .is_ok_and(|s| s.success());
-            if !unmounted {
-                log::warn!(
-                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
-                    merged_str
-                );
-            }
-        }
-        if let Some(ref mut fuse_child) = self.fuse_overlay_child {
-            match fuse_child.try_wait() {
-                Ok(Some(_)) => {}
-                _ => {
-                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
-                    let _ = fuse_child.kill();
-                }
-            }
-            let _ = fuse_child.wait();
-        }
-        // Capture the overlay base dir path but do NOT remove it.
+        // Capture the overlay base dir path before teardown consumes it.
         let overlay_base = self
             .overlay_merged_dir
             .as_ref()
             .and_then(|merged| merged.parent().map(|p| p.to_path_buf()));
-        if let Some(ref dir) = self.dns_temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        if let Some(ref dir) = self.hosts_temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        self.teardown_resources(true);
         Ok((ExitStatus { inner: status }, overlay_base))
     }
 
@@ -4655,76 +4548,20 @@ impl Child {
     /// Returns (exit_status, stdout_bytes, stderr_bytes).
     /// Only works if Stdio::Piped was set for stdout/stderr.
     /// If a cgroup was configured, it is deleted after the child exits.
-    pub fn wait_with_output(mut self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
-        let output = self.inner.wait_with_output().map_err(Error::Wait)?;
-        if let Some(cg) = self.cgroup {
-            match cg {
-                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
-                CgroupHandle::Rootless(ref cg) => {
-                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
-                }
-            }
+    pub fn wait_with_output(&mut self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
+        use std::io::Read;
+        // Drain stdout/stderr before waiting (avoids pipe deadlock on large output).
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        if let Some(mut out) = self.inner.stdout.take() {
+            let _ = out.read_to_end(&mut stdout_buf);
         }
-        // Tear down secondary networks before primary (veths before netns).
-        for net in &self.secondary_networks {
-            crate::network::teardown_secondary_network(net);
+        if let Some(mut err) = self.inner.stderr.take() {
+            let _ = err.read_to_end(&mut stderr_buf);
         }
-        if let Some(ref net) = self.network {
-            crate::network::teardown_network(net);
-        }
-        if let Some(ref mut p) = self.pasta {
-            crate::network::teardown_pasta_network(p);
-        }
-        // Unmount fuse-overlayfs before removing the overlay base dir.
-        if let Some(ref fuse_merged) = self.fuse_overlay_merged {
-            let merged_str = fuse_merged.to_string_lossy();
-            let unmounted = std::process::Command::new("fusermount3")
-                .args(["-u", &merged_str])
-                .status()
-                .is_ok_and(|s| s.success())
-                || std::process::Command::new("fusermount")
-                    .args(["-u", &merged_str])
-                    .status()
-                    .is_ok_and(|s| s.success());
-            if !unmounted {
-                log::warn!(
-                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
-                    merged_str
-                );
-            }
-        }
-        if let Some(ref mut fuse_child) = self.fuse_overlay_child {
-            // A successful fusermount causes the daemon to exit on its own.
-            // If unmount failed, the daemon is still alive — kill it so we
-            // don't block forever, but log so the user knows something is wrong.
-            match fuse_child.try_wait() {
-                Ok(Some(_)) => {} // already exited
-                _ => {
-                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
-                    let _ = fuse_child.kill();
-                }
-            }
-            let _ = fuse_child.wait();
-        }
-        if let Some(ref merged) = self.overlay_merged_dir {
-            // Remove the entire overlay base dir (merged + ephemeral upper/work).
-            if let Some(parent) = merged.parent() {
-                let _ = std::fs::remove_dir_all(parent);
-            }
-        }
-        if let Some(ref dir) = self.dns_temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        if let Some(ref dir) = self.hosts_temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        Ok((
-            ExitStatus {
-                inner: output.status,
-            },
-            output.stdout,
-            output.stderr,
-        ))
+        let status = self.inner.wait().map_err(Error::Wait)?;
+        self.teardown_resources(false);
+        Ok((ExitStatus { inner: status }, stdout_buf, stderr_buf))
     }
 
     /// Read current resource usage from the container's cgroup.
@@ -4752,6 +4589,86 @@ impl Child {
         } else {
             Ok(crate::cgroup::ResourceStats::default())
         }
+    }
+
+    /// Tear down all resources owned by this `Child`.
+    ///
+    /// Uses `take()` / `drain()` so the method is idempotent — calling it
+    /// twice (e.g. from `wait()` then `Drop`) is harmless.
+    ///
+    /// When `preserve_overlay` is true the overlay base directory is kept
+    /// intact (used by the build engine to extract upper-layer diffs).
+    fn teardown_resources(&mut self, preserve_overlay: bool) {
+        if let Some(cg) = self.cgroup.take() {
+            match cg {
+                CgroupHandle::Root(cg) => crate::cgroup::teardown_cgroup(cg),
+                CgroupHandle::Rootless(ref cg) => {
+                    crate::cgroup_rootless::teardown_rootless_cgroup(cg)
+                }
+            }
+        }
+        // Tear down secondary networks before primary (veths before netns).
+        for net in self.secondary_networks.drain(..) {
+            crate::network::teardown_secondary_network(&net);
+        }
+        if let Some(ref net) = self.network.take() {
+            crate::network::teardown_network(net);
+        }
+        if let Some(ref mut p) = self.pasta.take() {
+            crate::network::teardown_pasta_network(p);
+        }
+        // Unmount fuse-overlayfs before removing the overlay base dir.
+        if let Some(ref fuse_merged) = self.fuse_overlay_merged.take() {
+            let merged_str = fuse_merged.to_string_lossy();
+            let unmounted = std::process::Command::new("fusermount3")
+                .args(["-u", &*merged_str])
+                .status()
+                .is_ok_and(|s| s.success())
+                || std::process::Command::new("fusermount")
+                    .args(["-u", &*merged_str])
+                    .status()
+                    .is_ok_and(|s| s.success());
+            if !unmounted {
+                log::warn!(
+                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
+                    merged_str
+                );
+            }
+        }
+        if let Some(ref mut fuse_child) = self.fuse_overlay_child.take() {
+            match fuse_child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
+                    let _ = fuse_child.kill();
+                }
+            }
+            let _ = fuse_child.wait();
+        }
+        if !preserve_overlay {
+            if let Some(ref merged) = self.overlay_merged_dir.take() {
+                if let Some(parent) = merged.parent() {
+                    let _ = std::fs::remove_dir_all(parent);
+                }
+            }
+        }
+        if let Some(ref dir) = self.dns_temp_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(ref dir) = self.hosts_temp_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        // Kill the child process if still alive, then reap to avoid zombies.
+        let _ = self.inner.kill();
+        let _ = self.inner.wait();
+        // Teardown resources that wait() would normally clean up.
+        // All fields use take()/drain() so this is safe even if wait() already ran.
+        self.teardown_resources(false);
     }
 }
 

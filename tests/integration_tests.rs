@@ -294,7 +294,7 @@ mod core {
 
         // Fork 5 times via external `sleep 0` (not a builtin — forces fork+exec).
         // Count successes.  All 5 must succeed.
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&[
                 "-c",
                 r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#,
@@ -871,7 +871,7 @@ mod filesystem {
         let host_dir = tempfile::tempdir().expect("failed to create temp dir");
 
         // Attempt to write inside a read-only bind mount — should fail
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "touch /mnt/ro/newfile 2>/dev/null; echo exit=$?"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
@@ -907,7 +907,7 @@ mod filesystem {
         };
 
         // Even with a read-only rootfs, tmpfs at /tmp should be writable
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "touch /tmp/testfile && echo ok"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
@@ -1434,7 +1434,7 @@ mod networking {
 
         // with_network(Loopback) automatically adds Namespace::NET and brings up lo.
         // After lo is up, the kernel assigns 127.0.0.1 automatically.
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&[
                 "-c",
                 "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK",
@@ -1474,7 +1474,7 @@ mod networking {
         };
 
         // Named netns is fully configured before fork; eth0 is ready from the first instruction.
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&[
                 "-c",
                 "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK",
@@ -1654,7 +1654,7 @@ mod networking {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LO_OK"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -1693,7 +1693,7 @@ mod networking {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&[
                 "-c",
                 "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK",
@@ -2242,7 +2242,7 @@ mod networking {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "cat /etc/resolv.conf"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -2552,7 +2552,7 @@ mod networking {
             }
         }
 
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&["-c", "wget -q -T 5 --spider http://1.1.1.1/"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -3401,7 +3401,7 @@ mod rootless {
         // that makes the process appear as UID 0 inside the container.
         // Use /bin/ash to invoke id — Alpine's id lives at /usr/bin/id (busybox symlink),
         // not at /bin/id.
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "id"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
@@ -3438,7 +3438,7 @@ mod rootless {
         // Loopback networking works in rootless mode: the container gets a private
         // NET namespace (and USER namespace from auto-config) and lo is brought up.
         // lo shows 'state UNKNOWN' even when admin-UP; match the flags field instead.
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "ip addr show lo | grep -q 'LOOPBACK,UP' && echo ok"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
@@ -3505,7 +3505,7 @@ mod rootless {
             eprintln!("Skipping test_user_namespace_explicit: requires root");
             return;
         }
-        let child = Command::new("/usr/bin/id")
+        let mut child = Command::new("/usr/bin/id")
             .with_namespaces(Namespace::USER)
             .with_uid_maps(&[UidMap {
                 inside: 0,
@@ -3562,7 +3562,7 @@ mod rootless {
             }
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "sleep 1 && ip addr show"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -3625,7 +3625,7 @@ mod rootless {
             }
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "sleep 1 && ip addr show"])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -3691,7 +3691,7 @@ mod rootless {
         // sleep 2: give pasta time to attach the TAP and configure IP+routes via --config-net.
         // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
         // only has proc mounted, not a full /dev with device nodes).
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&[
                 "-c",
                 "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED",
@@ -3762,7 +3762,7 @@ mod linking {
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
         // Start container B linked to A.
-        let child_b = Command::new("/bin/cat")
+        let mut child_b = Command::new("/bin/cat")
             .args(&["/etc/hosts"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -3842,7 +3842,7 @@ mod linking {
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
         // Start container B linked to A with alias "db".
-        let child_b = Command::new("/bin/cat")
+        let mut child_b = Command::new("/bin/cat")
             .args(&["/etc/hosts"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -3927,7 +3927,7 @@ mod linking {
         std::fs::write(state_dir.join("state.json"), &state_json).unwrap();
 
         // Start container B: ping A by name.
-        let child_b = Command::new("/bin/ping")
+        let mut child_b = Command::new("/bin/ping")
             .args(&["-c1", "-W2", "link-ping-a"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -4018,7 +4018,7 @@ mod linking {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // Container B: connect to A by link name and read the response.
-        let child_b = Command::new("/bin/sh")
+        let mut child_b = Command::new("/bin/sh")
             .args(&["-c", "nc -w 2 link-tcp-a 8080"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -4241,7 +4241,7 @@ mod images {
         // layer_dirs: top-first
         let layers = vec![top.path().to_path_buf(), bottom.path().to_path_buf()];
 
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&["-c", "cat /layer-bottom && echo --- && cat /layer-top"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
@@ -4302,7 +4302,7 @@ mod images {
 
         let layers = vec![top.path().to_path_buf(), bottom.path().to_path_buf()];
 
-        let child = Command::new("/bin/cat")
+        let mut child = Command::new("/bin/cat")
             .args(&["/shadow-file"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
@@ -4428,7 +4428,7 @@ mod images {
         assert!(!layers.is_empty(), "alpine should have at least one layer");
 
         // Run a command inside the image.
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&["-c", "cat /etc/alpine-release"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
@@ -4578,7 +4578,7 @@ mod exec {
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped);
 
-        let exec_child = cmd.spawn().expect("exec spawn");
+        let mut exec_child = cmd.spawn().expect("exec spawn");
         let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
 
         // Clean up the container.
@@ -4642,7 +4642,7 @@ mod exec {
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped);
 
-        let exec_child = cmd.spawn().expect("exec spawn");
+        let mut exec_child = cmd.spawn().expect("exec spawn");
         let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
 
         // Clean up.
@@ -4723,7 +4723,7 @@ mod exec {
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped);
 
-        let exec_child = cmd.spawn().expect("exec spawn");
+        let mut exec_child = cmd.spawn().expect("exec spawn");
         let (status, stdout, stderr) = exec_child.wait_with_output().expect("exec wait");
 
         // Clean up.
@@ -4777,7 +4777,7 @@ mod dev {
             return;
         };
 
-        let child = Command::new("/bin/ls")
+        let mut child = Command::new("/bin/ls")
             .args(&["/dev/"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
@@ -4827,7 +4827,7 @@ mod dev {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "echo ok > /dev/null && echo pass"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
@@ -4862,7 +4862,7 @@ mod dev {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "head -c 4 /dev/zero | wc -c"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
@@ -4897,7 +4897,7 @@ mod dev {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&[
                 "-c",
                 "test -L /dev/fd && test -L /dev/stdin && test -L /dev/stdout && test -L /dev/stderr && echo ok",
@@ -4935,7 +4935,7 @@ mod dev {
             return;
         };
 
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "test -d /dev/pts && test -d /dev/shm && echo ok"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .with_chroot(&rootfs)
@@ -5560,7 +5560,7 @@ mod rootless_idmap {
 
         // Run stat on /etc/passwd — the file is owned by root:root (0:0) in the image.
         // With multi-UID mapping, it should show UID 0 (not 65534/nobody).
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "stat -c '%u' /etc/passwd"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
@@ -5600,7 +5600,7 @@ mod rootless_idmap {
 
         // Explicitly set a single-UID map (bypassing auto-config).
         // Verify the container still works with single-UID mapping.
-        let child = Command::new("/bin/ash")
+        let mut child = Command::new("/bin/ash")
             .args(&["-c", "id -u"])
             .env("PATH", ALPINE_PATH)
             .with_chroot(&rootfs)
@@ -6143,7 +6143,7 @@ mod multi_network {
         net.save().expect("save network");
 
         // Run container on the named network.
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&["-c", "ip addr show eth0 | grep 'inet '"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(name.to_string()))
@@ -6189,7 +6189,7 @@ mod multi_network {
             }
         };
 
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&["-c", "ip addr show eth0 | grep 'inet '"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
@@ -6269,7 +6269,7 @@ mod multi_network {
         create_test_network(net1, "10.99.1.0/24");
         create_test_network(net2, "10.99.2.0/24");
 
-        let child = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(&[
                 "-c",
                 "ip addr show eth0 | grep 'inet '; ip addr show eth1 | grep 'inet '",
@@ -6394,7 +6394,7 @@ mod multi_network {
         // C has interfaces on BOTH bridges, so the DROP rules don't block its
         // traffic (it talks to each peer via the local bridge, not cross-bridge).
         let test_cmd = format!("ping -c1 -W1 {} && ping -c1 -W1 {}", ip_a, ip_b);
-        let child_c = Command::new("/bin/sh")
+        let mut child_c = Command::new("/bin/sh")
             .args(&["-c", &test_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
@@ -6417,7 +6417,7 @@ mod multi_network {
         // Container D on net1 only — should NOT be able to reach container B on net2.
         // The iptables DROP rules block cross-bridge forwarding.
         let test_cmd_fail = format!("ping -c1 -W1 {}", ip_b);
-        let child_d = Command::new("/bin/sh")
+        let mut child_d = Command::new("/bin/sh")
             .args(&["-c", &test_cmd_fail])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net1.to_string()))
@@ -6618,7 +6618,7 @@ mod multi_network {
         .expect("write server state");
 
         // Client on net2 only — link should resolve to server's net2 IP.
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", "cat /etc/hosts"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
@@ -6758,7 +6758,7 @@ mod dns {
             "nslookup server-a {} 2>&1 || echo 'NSLOOKUP_FAILED'",
             net_def.gateway
         );
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
@@ -6853,7 +6853,7 @@ mod dns {
             "nslookup example.com {} 2>&1 || echo 'NSLOOKUP_FAILED'",
             net_def.gateway
         );
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
@@ -6969,7 +6969,7 @@ mod dns {
 
         // Container on net2 tries to resolve "alpha" (which is on net1) — should get NXDOMAIN.
         let resolve_cmd = format!("nslookup alpha {} 2>&1; echo EXIT=$?", net2_def.gateway);
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
@@ -6995,7 +6995,7 @@ mod dns {
 
         // But "beta" should resolve on net2.
         let resolve_beta = format!("nslookup beta {} 2>&1", net2_def.gateway);
-        let client2 = Command::new("/bin/sh")
+        let mut client2 = Command::new("/bin/sh")
             .args(&["-c", &resolve_beta])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
@@ -7101,7 +7101,7 @@ mod dns {
 
         // Container B on net2 resolves "multi-a" — should get net2 IP.
         let resolve_cmd = format!("nslookup multi-a {} 2>&1", net2_def.gateway);
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net2.to_string()))
@@ -7319,7 +7319,7 @@ mod dns {
             "nslookup dnsmasq-server {} 2>&1 || echo 'NSLOOKUP_FAILED'",
             net_def.gateway
         );
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
@@ -7419,7 +7419,7 @@ mod dns {
             "nslookup example.com {} 2>&1 || echo 'NSLOOKUP_FAILED'",
             net_def.gateway
         );
-        let client = Command::new("/bin/sh")
+        let mut client = Command::new("/bin/sh")
             .args(&["-c", &resolve_cmd])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
@@ -7562,4 +7562,66 @@ mod dns {
         cleanup_test_network(net_name);
         unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Drop cleanup tests
+// ---------------------------------------------------------------------------
+
+/// Verify that dropping a Child without calling wait() still cleans up the
+/// network namespace (netns mount under /run/netns/rem-*).
+#[test]
+#[serial]
+fn test_child_drop_cleans_up_netns() {
+    if !is_root() {
+        eprintln!("Skipping test_child_drop_cleans_up_netns (requires root)");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(r) => r,
+        None => {
+            eprintln!("Skipping test_child_drop_cleans_up_netns (no rootfs)");
+            return;
+        }
+    };
+
+    // Spawn a container with bridge networking — this creates a named netns.
+    let child = Command::new("/bin/sleep")
+        .args(["60"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::NET | Namespace::PID)
+        .with_proc_mount()
+        .with_network(NetworkMode::Bridge)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn container for drop test");
+
+    let ns_name = child
+        .netns_name()
+        .expect("bridge container should have netns name")
+        .to_string();
+
+    // Verify the netns exists before drop.
+    let netns_path = std::path::Path::new("/run/netns").join(&ns_name);
+    assert!(
+        netns_path.exists(),
+        "netns {} should exist before drop",
+        ns_name
+    );
+
+    // Drop without calling wait() — the Drop impl should clean up.
+    drop(child);
+
+    // Give a brief moment for cleanup to complete.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // The netns mount should be gone.
+    assert!(
+        !netns_path.exists(),
+        "netns {} should be removed after drop",
+        ns_name
+    );
 }

@@ -153,7 +153,7 @@ fn main() {
     // ------------------------------------------------------------------
     println!("[main] Starting server container ...");
 
-    let server = Command::new("/bin/sh")
+    let mut server = Command::new("/bin/sh")
         .args(&["-c", SERVER_SCRIPT])
         .stdin(Stdio::Null)
         .stdout(Stdio::Piped)
@@ -189,7 +189,7 @@ fn main() {
     // ------------------------------------------------------------------
     println!("[main] Starting client container ...\n");
 
-    let client = Command::new("/bin/sh")
+    let mut client = Command::new("/bin/sh")
         .args(&["-c", CLIENT_SCRIPT])
         .stdin(Stdio::Null)
         .stdout(Stdio::Piped)

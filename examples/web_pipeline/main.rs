@@ -220,7 +220,7 @@ fn main() {
     // ------------------------------------------------------------------
     println!("[main] Starting frontend container ...\n");
 
-    let frontend = Command::new("/bin/sh")
+    let mut frontend = Command::new("/bin/sh")
         .args(&["-c", FRONTEND_SCRIPT])
         .stdin(Stdio::Null)
         .stdout(Stdio::Piped)

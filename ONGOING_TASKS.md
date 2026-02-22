@@ -1,85 +1,34 @@
 # Ongoing Tasks
 
-## Current Task: Dual DNS Backend — builtin + dnsmasq
+## Completed: Fix stale netns mounts — Add Drop impl for Child
 
-### Context
+### Summary
 
-The embedded DNS server (`remora-dns`) works but is minimal — A-records only, no caching, no AAAA, blocking upstream forwarding, no EDNS/DNSSEC. Rather than building a full DNS server, support dnsmasq as an alternative backend. Keep the builtin for zero-dependency deployments.
+Added `impl Drop for Child` in `src/container.rs` so that dropping a `Child`
+without calling `wait()` still cleans up network namespaces, cgroups, overlay
+dirs, DNS temp dirs, pasta relays, and fuse-overlayfs mounts.
 
-**Default: builtin.** Users opt into dnsmasq via `--dns-backend dnsmasq` CLI flag or `REMORA_DNS_BACKEND=dnsmasq` env var.
+### Changes Made
 
-### Implementation Steps
+1. **`src/container.rs`**: Extracted shared teardown logic into `teardown_resources(&mut self, preserve_overlay: bool)` method. Refactored `wait()`, `wait_with_output()`, and `wait_preserve_overlay()` to use it. All fields use `take()`/`drain()` for idempotency. Added `impl Drop for Child` that kills+reaps the child process then calls `teardown_resources()`. Changed `wait_with_output` from `(mut self)` to `(&mut self)` since you can't move fields out of a type implementing Drop.
 
-#### Step 1: `src/paths.rs` — New path helpers
+2. **`src/cli/cleanup.rs`**: New `remora cleanup` subcommand that scans `/run/netns/rem-*`, `/run/remora/overlay-*`, `/run/remora/dns-*`, and `/run/remora/hosts-*` for orphaned entries whose owning PID is dead, and removes them.
 
-- `dns_backend_file()` → `<runtime>/dns/backend`
-- `dns_dnsmasq_conf()` → `<runtime>/dns/dnsmasq.conf`
-- `dns_hosts_file(network)` → `<runtime>/dns/hosts.<network>`
+3. **`src/cli/mod.rs`**: Added `cleanup` module.
 
-#### Step 2: `src/dns.rs` — Backend abstraction + dnsmasq support
+4. **`src/main.rs`**: Added `Cleanup` subcommand variant and wired to `cli::cleanup::cmd_cleanup()`.
 
-- Add `DnsBackend` enum (`Builtin`, `Dnsmasq`)
-- `active_backend()` reads `REMORA_DNS_BACKEND` env var (cached in OnceLock)
-- Extract existing `ensure_dns_daemon()` body → `ensure_builtin_daemon()`
-- Add: `generate_dnsmasq_conf()`, `regenerate_dnsmasq_hosts()`, `ensure_dnsmasq_daemon()`, `stop_daemon()`
-- Dispatch in `ensure_dns_daemon()`, `dns_add_entry()`, `dns_remove_entry()`
-- Backend consistency: write/check `<runtime>/dns/backend` file
-- Fallback: if dnsmasq not found, warn and use builtin
+5. **`tests/integration_tests.rs`**: Added `test_child_drop_cleans_up_netns` test. Updated all `wait_with_output()` callers from `let child` to `let mut child` (signature changed to `&mut self`).
 
-#### Step 3: `src/cli/run.rs` + `src/cli/build.rs` — CLI flag
+6. **`docs/INTEGRATION_TESTS.md`**: Documented the new test.
 
-- `--dns-backend <builtin|dnsmasq>` on RunArgs and BuildArgs
-- Set `REMORA_DNS_BACKEND` env var before DNS calls
+7. **Examples**: Updated `mut` bindings in `web_pipeline`, `full_stack_smoke`, `net_debug`.
 
-#### Step 4: Integration tests (3 new dnsmasq tests)
+### Bug Fix: wait_preserve_overlay missing secondary network teardown
 
-| Test | Asserts |
-|------|---------|
-| `test_dns_dnsmasq_resolves_container_name` | Same as builtin but with dnsmasq backend |
-| `test_dns_dnsmasq_upstream_forward` | Upstream forwarding via dnsmasq |
-| `test_dns_dnsmasq_lifecycle` | Daemon starts/stops with dnsmasq backend |
+`wait_preserve_overlay()` was missing teardown of secondary networks — now
+handled by the shared `teardown_resources()` method.
 
-Skip if dnsmasq not on PATH.
+## Next Task
 
-#### Step 5: Documentation
-
-- `docs/USER_GUIDE.md` — DNS Backend section
-- `docs/INTEGRATION_TESTS.md` — Document 3 new tests
-- `CLAUDE.md` — Update DNS section
-
-### Files Changed
-
-| File | Change |
-|------|--------|
-| `src/paths.rs` | Add `dns_backend_file()`, `dns_dnsmasq_conf()`, `dns_hosts_file()` |
-| `src/dns.rs` | DnsBackend enum, active_backend(), dnsmasq helpers, dispatch |
-| `src/cli/run.rs` | Add `--dns-backend` flag |
-| `src/cli/build.rs` | Add `--dns-backend` flag |
-| `tests/integration_tests.rs` | 3 new dnsmasq tests |
-| `docs/USER_GUIDE.md` | DNS backend section |
-| `docs/INTEGRATION_TESTS.md` | Document new tests |
-| `CLAUDE.md` | Update DNS docs |
-
----
-
-## Next Task: `remora compose`
-
-Declarative multi-container stacks from a YAML file — replacing manual shell
-scripts like `examples/web-stack/run.sh`.
-
----
-
-## Previously Completed
-
-### Embedded DNS Server (v0.4.x)
-- `remora-dns` daemon with A-record resolution, upstream forwarding, SIGHUP reload
-- Per-network config files, automatic lifecycle management
-- 5 integration tests
-
-### Multi-Network Containers (v0.4.0)
-- Containers join multiple bridge networks simultaneously
-- `attach_network_to_netns()` for secondary interfaces (eth1, eth2, ...)
-- Smart `--link` resolution across shared networks
-- 4 new integration tests
-
-### Full feature list in CLAUDE.md
+(No next task planned — awaiting user direction.)
