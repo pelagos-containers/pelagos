@@ -239,6 +239,8 @@ pub fn parse_cpus(s: &str) -> Result<(i64, u64), String> {
 }
 
 /// Parse --user "1000" or "1000:1000" → (uid, Option<gid>).
+/// Resolves symbolic names against the host /etc/passwd only.
+/// Use `parse_user_in_layers` when an image rootfs is available.
 pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
     if let Some((u, g)) = s.split_once(':') {
         let uid = resolve_uid(u.trim())?;
@@ -247,6 +249,121 @@ pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
     } else {
         let uid = resolve_uid(s.trim())?;
         Ok((uid, None))
+    }
+}
+
+/// Like `parse_user`, but for image-config users: resolves symbolic names
+/// from the container's own layer stack (/etc/passwd inside the image) before
+/// falling back to the host. When a bare username is given, also returns the
+/// primary gid from the image's /etc/passwd (matching OCI spec behaviour).
+pub fn parse_user_in_layers(
+    s: &str,
+    layer_dirs: &[std::path::PathBuf],
+) -> Result<(u32, Option<u32>), String> {
+    if let Some((u, g)) = s.split_once(':') {
+        let uid = resolve_uid_in_layers(u.trim(), layer_dirs)?;
+        let gid = resolve_gid_in_layers(g.trim(), layer_dirs)?;
+        Ok((uid, Some(gid)))
+    } else if let Ok(n) = s.trim().parse::<u32>() {
+        Ok((n, None))
+    } else {
+        lookup_user_in_layers(s.trim(), layer_dirs)
+    }
+}
+
+/// Look up a username in the container's layer stack and return (uid, gid).
+fn lookup_user_in_layers(
+    name: &str,
+    layer_dirs: &[std::path::PathBuf],
+) -> Result<(u32, Option<u32>), String> {
+    // Layers are applied last-wins, so search in reverse.
+    for layer_dir in layer_dirs.iter().rev() {
+        let passwd_path = layer_dir.join("etc/passwd");
+        if let Ok(contents) = std::fs::read_to_string(&passwd_path) {
+            for line in contents.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                // passwd format: name:password:uid:gid:...
+                if fields.len() >= 4 && fields[0] == name {
+                    if let (Ok(uid), Ok(gid)) = (fields[2].parse::<u32>(), fields[3].parse::<u32>())
+                    {
+                        return Ok((uid, Some(gid)));
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to host /etc/passwd.
+    use std::ffi::CString;
+    let cname = CString::new(name).map_err(|_| format!("invalid user name: {}", name))?;
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if pw.is_null() {
+        Err(format!(
+            "unknown user '{}': not found in container or host /etc/passwd",
+            name
+        ))
+    } else {
+        Ok(unsafe { ((*pw).pw_uid, Some((*pw).pw_gid)) })
+    }
+}
+
+fn resolve_uid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u32, String> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    for layer_dir in layer_dirs.iter().rev() {
+        let passwd_path = layer_dir.join("etc/passwd");
+        if let Ok(contents) = std::fs::read_to_string(&passwd_path) {
+            for line in contents.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 3 && fields[0] == s {
+                    if let Ok(uid) = fields[2].parse::<u32>() {
+                        return Ok(uid);
+                    }
+                }
+            }
+        }
+    }
+    use std::ffi::CString;
+    let cname = CString::new(s).map_err(|_| format!("invalid user name: {}", s))?;
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if pw.is_null() {
+        Err(format!(
+            "unknown user '{}': not found in container or host /etc/passwd",
+            s
+        ))
+    } else {
+        Ok(unsafe { (*pw).pw_uid })
+    }
+}
+
+fn resolve_gid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u32, String> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    for layer_dir in layer_dirs.iter().rev() {
+        let group_path = layer_dir.join("etc/group");
+        if let Ok(contents) = std::fs::read_to_string(&group_path) {
+            for line in contents.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                // group format: name:password:gid:...
+                if fields.len() >= 3 && fields[0] == s {
+                    if let Ok(gid) = fields[2].parse::<u32>() {
+                        return Ok(gid);
+                    }
+                }
+            }
+        }
+    }
+    use std::ffi::CString;
+    let cname = CString::new(s).map_err(|_| format!("invalid group name: {}", s))?;
+    let gr = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if gr.is_null() {
+        Err(format!(
+            "unknown group '{}': not found in container or host /etc/group",
+            s
+        ))
+    } else {
+        Ok(unsafe { (*gr).gr_gid })
     }
 }
 

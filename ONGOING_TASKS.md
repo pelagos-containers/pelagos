@@ -2,14 +2,15 @@
 
 ## Current State (Feb 23, 2026)
 
-### Stack: 6 services, committed, ready to run
+### Stack: 7 services, committed, ready to run
 
 ```
 snmp-exporter      :9116   MikroTik SNMP
 plex-exporter      :9594   Plex REST API
 mktxp              :49090  MikroTik RouterOS API (bandwidth, queues, DHCP, etc.)
 graphite-exporter  :9108   TrueNAS graphite push receiver (listens :2003)
-prometheus         :9090   scrapes all of the above
+alertmanager       :9093   Alert routing (null receiver; Pushover-ready)
+prometheus         :9090   scrapes all of the above + alerts to alertmanager
 grafana            :3000   dashboards
 ```
 
@@ -61,83 +62,60 @@ Graphite, set hostname to this machine's LAN IP (not localhost), port 2003.
 
 ---
 
-## Next Task 1: alertmanager
+## ✅ tmpfs support in compose — DONE
 
-All details are known. Straightforward — just create config and add service.
+### Why
+mktxp writes state files to `/config/` alongside its config. We can't use a
+read-only bind-mount for the conf dir. Rather than accepting a messy RW
+bind-mount, add proper `(tmpfs "/path")` support to compose.
 
-### Step 1 — create `config/alertmanager/alertmanager.yml`
+### Plan
 
-Start with null receiver (no Pushover credentials on hand):
+**`src/compose.rs`**
+1. Add `tmpfs_mounts: Vec<String>` to `ServiceSpec` (after `bind_mounts`)
+2. Initialize `tmpfs_mounts: Vec::new()` in `parse_service_spec` struct literal
+3. Add `"tmpfs"` match arm: `require_atom(list, 1, ...)` → `spec.tmpfs_mounts.push(path)`
+4. Add 3 unit tests: single path, multiple paths, missing path → MissingField error
 
-```yaml
-global:
-  resolve_timeout: 5m
-route:
-  group_by: ['alertname']
-  group_wait: 10s
-  group_interval: 10s
-  repeat_interval: 12h
-  receiver: 'null'
-receivers:
-- name: 'null'
-```
+**`src/cli/compose.rs`** — `spawn_service`
+5. After the bind-mount loop, add: `for path in &svc.tmpfs_mounts { cmd = cmd.with_tmpfs(path, ""); }`
 
-To add Pushover later: grab `user_key` and `token` from https://pushover.net,
-then replace the receiver with:
-```yaml
-- name: 'pushover'
-  pushover_configs:
-  - user_key: 'YOUR_USER_KEY'
-    token: 'YOUR_API_TOKEN'
-    priority: '{{ if eq .Status "firing" }}1{{ else }}0{{ end }}'
-```
+**`tests/integration_tests.rs`**
+6. Add `test_compose_tmpfs_parse_and_validate` (no root/rootfs needed)
+   - service with 1 tmpfs, service with 2 tmpfs, topo sort still correct
 
-### Step 2 — add to `config/prometheus/prometheus.yml`
+**`docs/INTEGRATION_TESTS.md`**
+7. Add entry for the new test
 
-Add `alerting:` block above `scrape_configs:`:
-```yaml
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ['alertmanager:9093']
-```
+**`home-monitoring/remora/compose.rem`** — after remora is built
+8. Update mktxp service: bind-mount conf dir back to `:ro`, add `(tmpfs "/config")`,
+   use shell wrapper to copy conf into tmpfs before starting
 
-### Step 3 — add service to `compose.rem`
-
-Insert before prometheus (alertmanager has no deps; prometheus depends-on it):
+### mktxp final service spec
 ```lisp
-(service alertmanager
-  (image "prom/alertmanager:latest")
+(service mktxp
+  (image "ghcr.io/akpw/mktxp:latest")
   (network monitoring)
-  (port 9093 9093)
-  (bind-mount "./config/alertmanager/alertmanager.yml" "/etc/alertmanager/alertmanager.yml" :ro)
-  (command
-    "/bin/alertmanager"
-    "--config.file=/etc/alertmanager/alertmanager.yml"
-    "--storage.path=/alertmanager"))
+  (port 49090 49090)
+  (bind-mount "./config/mktxp/mktxp.conf" "/conf/mktxp.conf" :ro)
+  (tmpfs "/config")
+  (command "sh" "-c" "cp /conf/mktxp.conf /config/mktxp.conf && mktxp --cfg-dir /config export"))
 ```
 
-Add to prometheus `depends-on`: `(alertmanager :ready-port 9093)`
+---
 
-### Step 4 — add to `start-monitoring.sh` image pull list
+## ✅ Task 1: alertmanager — DONE
 
-```bash
-"prom/alertmanager:latest"
-```
+Files changed (home-monitoring repo):
+- `remora/config/alertmanager/alertmanager.yml` — null receiver, Pushover-ready comments
+- `remora/config/prometheus/prometheus.yml` — added `alerting:` block
+- `remora/compose.rem` — added alertmanager service; prometheus depends-on alertmanager
+Files changed (remora repo):
+- `scripts/start-monitoring.sh` — added `prom/alertmanager:latest` to image pull list
 
-### Step 5 — add alert rules (optional, after alertmanager is running)
-
-Existing alert rules in the Helm chart:
-- `monitoring-setup/prometheus/disk-temp-alerts.yaml` — drive temperature
-- `monitoring-setup/prometheus/truenas-alerts.yaml` — pool health
-These are Kubernetes PrometheusRule CRDs; translate to standalone prometheus
-`rule_files:` format. Place in `config/prometheus/rules/` and add to
-prometheus.yml:
-```yaml
-rule_files:
-  - /etc/prometheus/rules/*.yml
-```
-Bind-mount the rules dir into prometheus.
+To enable Pushover when credentials are available: edit `config/alertmanager/alertmanager.yml`,
+replace null receiver, update `route.receiver: 'pushover'`.
+Get credentials at https://pushover.net.
 
 ---
 
@@ -229,9 +207,10 @@ Add prometheus scrape job:
   `monitoring-setup/.env`. Placeholder `YOUR_PLEX_TOKEN_HERE` is substituted
   at runtime.
 
-- **Symbolic user resolution uses host `/etc/passwd`** — works for `nobody`,
-  `root`, and numeric IDs. A user defined only inside the container image's
-  `/etc/passwd` won't resolve. Not a problem in practice for published images.
+- **Symbolic user resolution** — resolved against the container's own layer
+  stack (`/etc/passwd` inside the image) first, then falls back to the host.
+  This means image-internal users (e.g. `mktxp`, `nobody` from Alpine) work
+  correctly even when they don't exist on the host.
 
 - **TrueNAS graphite push** — port 2003 is host-mapped. TrueNAS must push
   to this machine's LAN IP (e.g. 192.168.88.X), not localhost.

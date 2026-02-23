@@ -1498,3 +1498,16 @@ the topological sort still orders dependents correctly.
 
 Failure means bind-mount entries would be silently dropped or misread, causing containers to
 start without their config files and then crash or produce wrong results.
+
+### `test_compose_tmpfs_parse_and_validate`
+**Requires:** nothing (no root, no rootfs, no image pull)
+
+Verifies that `(tmpfs "/path")` entries in a compose service spec parse into
+`ServiceSpec.tmpfs_mounts` as plain path strings, in declaration order. Asserts
+that a service with a single tmpfs entry carries exactly one path, that a service
+with two `(tmpfs ...)` entries carries both in order, and that tmpfs mounts coexist
+correctly with `depends-on` without disrupting topological sort.
+
+Failure means `(tmpfs ...)` entries would be silently dropped by the parser,
+causing containers to launch without the intended in-memory filesystems — for
+example, an app writing to a read-only path would fail immediately on startup.

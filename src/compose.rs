@@ -35,6 +35,7 @@ pub struct ServiceSpec {
     pub networks: Vec<String>,
     pub volumes: Vec<VolumeMount>,
     pub bind_mounts: Vec<BindMount>,
+    pub tmpfs_mounts: Vec<String>,
     pub env: HashMap<String, String>,
     pub ports: Vec<PortMapping>,
     pub depends_on: Vec<Dependency>,
@@ -259,6 +260,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         networks: Vec::new(),
         volumes: Vec::new(),
         bind_mounts: Vec::new(),
+        tmpfs_mounts: Vec::new(),
         env: HashMap::new(),
         ports: Vec::new(),
         depends_on: Vec::new(),
@@ -372,6 +374,10 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
                     container_path,
                     read_only,
                 });
+            }
+            "tmpfs" => {
+                let path = require_atom(list, 1, &format!("service '{}' tmpfs path", name))?;
+                spec.tmpfs_mounts.push(path);
             }
             other => {
                 return Err(ComposeError::SyntaxError(format!(
@@ -849,6 +855,47 @@ mod tests {
   (service app
     (image "alpine:latest")
     (bind-mount "/host/only")))
+"#;
+        let err = parse_compose(input).unwrap_err();
+        assert!(
+            matches!(err, ComposeError::MissingField(_)),
+            "expected MissingField, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_tmpfs_single() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (tmpfs "/tmp")))
+"#;
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(compose.services[0].tmpfs_mounts, vec!["/tmp"]);
+    }
+
+    #[test]
+    fn test_tmpfs_multiple() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (tmpfs "/tmp")
+    (tmpfs "/run")))
+"#;
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(compose.services[0].tmpfs_mounts, vec!["/tmp", "/run"]);
+    }
+
+    #[test]
+    fn test_tmpfs_missing_path() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (tmpfs)))
 "#;
         let err = parse_compose(input).unwrap_err();
         assert!(

@@ -8171,3 +8171,46 @@ fn test_compose_bind_mount_parse_and_validate() {
         "prometheus must start before grafana"
     );
 }
+
+#[test]
+fn test_compose_tmpfs_parse_and_validate() {
+    // Verifies that (tmpfs "/path") entries parse into ServiceSpec.tmpfs_mounts
+    // correctly and coexist with depends-on without disrupting topo sort.
+    // No root or image pull required.
+    let input = r#"
+(compose
+  (network cache (subnet "10.77.0.0/24"))
+
+  (service redis
+    (image "redis:7")
+    (network cache)
+    (tmpfs "/data"))
+
+  (service app
+    (image "my-app:latest")
+    (network cache)
+    (tmpfs "/tmp")
+    (tmpfs "/run")
+    (depends-on redis)))
+"#;
+    let compose = remora::compose::parse_compose(input).expect("should parse and validate");
+
+    assert_eq!(compose.services.len(), 2);
+
+    let redis = compose.services.iter().find(|s| s.name == "redis").unwrap();
+    assert_eq!(redis.tmpfs_mounts.len(), 1);
+    assert_eq!(redis.tmpfs_mounts[0], "/data");
+    assert!(redis.bind_mounts.is_empty());
+    assert!(redis.volumes.is_empty());
+
+    let app = compose.services.iter().find(|s| s.name == "app").unwrap();
+    assert_eq!(app.tmpfs_mounts.len(), 2);
+    assert_eq!(app.tmpfs_mounts[0], "/tmp");
+    assert_eq!(app.tmpfs_mounts[1], "/run");
+    assert_eq!(app.depends_on[0].service, "redis");
+
+    let order = remora::compose::topo_sort(&compose.services).unwrap();
+    let redis_pos = order.iter().position(|n| n == "redis").unwrap();
+    let app_pos = order.iter().position(|n| n == "app").unwrap();
+    assert!(redis_pos < app_pos, "redis must start before app");
+}

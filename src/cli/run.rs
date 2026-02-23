@@ -2,8 +2,8 @@
 
 use super::{
     check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
-    parse_memory, parse_ulimit, parse_user, rootfs_path, write_state, ContainerState,
-    ContainerStatus,
+    parse_memory, parse_ulimit, parse_user, parse_user_in_layers, rootfs_path, write_state,
+    ContainerState, ContainerStatus,
 };
 use remora::container::{Capability, Command, Namespace, Stdio, Volume};
 use remora::network::NetworkMode;
@@ -255,6 +255,7 @@ fn build_image_run(
     if layers.is_empty() {
         return Err("image has no layers".into());
     }
+    let layer_dirs = layers.clone();
 
     // Determine the command: CLI args override image Entrypoint+Cmd.
     let exe_and_args = if !cmd_args.is_empty() {
@@ -288,7 +289,7 @@ fn build_image_run(
 
     // Apply image config user as default (CLI --user overrides).
     if args.user.is_none() && !manifest.config.user.is_empty() {
-        let (uid, gid) = parse_user(&manifest.config.user)?;
+        let (uid, gid) = parse_user_in_layers(&manifest.config.user, &layer_dirs)?;
         cmd = cmd.with_uid(uid);
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);

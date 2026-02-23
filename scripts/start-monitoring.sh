@@ -124,6 +124,7 @@ IMAGES=(
     "ghcr.io/axsuul/plex-media-server-exporter:latest"
     "ghcr.io/akpw/mktxp:latest"
     "prom/graphite-exporter:latest"
+    "prom/alertmanager:latest"
     "prom/prometheus:latest"
     "grafana/grafana:latest"
 )
@@ -159,6 +160,7 @@ else
     echo "  sudo -E $REMORA compose logs -f $COMPOSE_FILE -p $PROJECT --follow"
     echo "  sudo -E $0 --down"
     echo ""
-    echo "  Grafana:    http://localhost:3000  (admin / prom-operator)"
-    echo "  Prometheus: http://localhost:9090"
+    echo "  Grafana:      http://localhost:3000  (admin / prom-operator)"
+    echo "  Prometheus:   http://localhost:9090"
+    echo "  Alertmanager: http://localhost:9093"
 fi

@@ -335,6 +335,7 @@ fn spawn_service(
     if layers.is_empty() {
         return Err(format!("service '{}': image has no layers", svc.name).into());
     }
+    let layer_dirs = layers.clone();
 
     // Determine command.
     let exe_and_args = if let Some(ref cmd) = svc.command {
@@ -368,7 +369,7 @@ fn spawn_service(
 
     // Apply image config user as default.
     if svc.user.is_none() && !manifest.config.user.is_empty() {
-        let (uid, gid) = super::parse_user(&manifest.config.user)?;
+        let (uid, gid) = super::parse_user_in_layers(&manifest.config.user, &layer_dirs)?;
         cmd = cmd.with_uid(uid);
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);
@@ -435,6 +436,11 @@ fn spawn_service(
         }
     }
 
+    // tmpfs mounts: in-memory writable filesystems (empty options = kernel defaults).
+    for path in &svc.tmpfs_mounts {
+        cmd = cmd.with_tmpfs(path, "");
+    }
+
     // Environment: service overrides, then a fallback PATH only if the image
     // didn't already supply one (to avoid clobbering bundler/gem/nvm paths).
     for (k, v) in &svc.env {
@@ -465,7 +471,7 @@ fn spawn_service(
 
     // User.
     if let Some(ref u) = svc.user {
-        let (uid, gid) = super::parse_user(u)?;
+        let (uid, gid) = super::parse_user_in_layers(u, &layer_dirs)?;
         cmd = cmd.with_uid(uid);
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);
