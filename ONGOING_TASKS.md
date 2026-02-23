@@ -2,125 +2,33 @@
 
 ## Current State (Feb 23, 2026)
 
-**remora** (`~/Projects/remora`): branch `master`, uncommitted build fixes
-**home-monitoring** (`~/Projects/home-monitoring`): branch `main`, last commit `80c0610`
+Both repos clean and pushed. Stack fully operational (6/6 Prometheus targets up).
+
+**remora** (`~/Projects/remora`): branch `master`, last commit `01fab2a`
+**home-monitoring** (`~/Projects/home-monitoring`): branch `main`, last commit `b937b16`
 
 ---
 
-## ⚠️ IMMEDIATE: Build truenas-api-exporter + add TrueNAS API key
-
-### Step 1 — Build the image (one-time, needs root + internet)
-
-This should now work — two build bugs were just fixed (see below).
+## To start/stop the stack
 
 ```bash
-sudo -E ~/Projects/remora/scripts/start-monitoring.sh
+sudo -E ~/Projects/remora/scripts/start-monitoring.sh          # start
+sudo -E ~/Projects/remora/scripts/start-monitoring.sh --down   # stop
+./scripts/check-monitoring.sh                                   # verify
 ```
 
-Or build directly:
-```bash
-sudo -E remora build \
-  --network bridge \
-  -t truenas-api-exporter:latest \
-  --file ~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/Remfile \
-  ~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/
-```
-
-### Step 2 — Add TrueNAS API key
-
-Log into http://192.168.88.30 → Credentials → API Keys → create/copy key.
-
-Add to `~/Projects/home-monitoring/monitoring-setup/.env`:
-```
-TRUENAS_API_KEY=your-key-here
-```
-
-Or pass inline at runtime:
-```bash
-sudo -E TRUENAS_API_KEY=yourkey ~/Projects/remora/scripts/start-monitoring.sh
-```
-
-**Until both steps are done:** the stack won't fully start — prometheus
-depends-on `truenas-api-exporter :ready-port 9109` and will block indefinitely
-if the service isn't up.
-
----
-
-## Recent fixes to `src/build.rs`
-
-### Bug 1: EINVAL when spawning build container (Debian/Python images)
-
-**Root cause:** `execute_run()` built `layer_dirs` without deduplicating digests.
-Debian-based images (e.g. `python:3.11-slim`) often include repeated layer
-digests (empty marker layers). The kernel overlayfs rejects a `lowerdir=` string
-containing the same path twice with EINVAL.
-
-**Fix:** Apply the same HashSet deduplication that `image::layer_dirs()` uses.
-
-### Bug 3: COPY destination `.` failed with EISDIR
-
-**Root cause:** `execute_copy` resolved `dest = "."` to the tempdir root (a
-directory), then called `std::fs::copy(src_file, dir)` → EISDIR (os error 21).
-
-Docker semantics: `COPY file.py .` means "copy into WORKDIR keeping the
-filename". Relative destinations (`.`, `./`, `subdir/`) must be resolved
-against WORKDIR, and any path ending with `/` (or being exactly `.`) means
-"copy INTO this directory, keeping the source basename".
-
-**Fix:** Added `resolve_copy_dest(dest, src_basename, working_dir)` helper and
-threaded `working_dir` through `execute_copy`, `execute_copy_from_stage`,
-`execute_add`, `execute_add_url`, and `execute_add_archive`.
-
-### Bug 2: WORKDIR didn't create the directory
-
-**Root cause:** `WORKDIR /app` only updated `config.working_dir`; it never
-created `/app` in a layer. After chroot, `set_current_dir("/app")` would fail.
-
-**Fix:** Added `execute_workdir()` — creates a minimal layer containing the
-target directory path, matching Docker's behaviour. The layer is only created
-if the directory isn't already present in an existing layer.
-
----
-
-## To start the stack
-
-```bash
-sudo -E ~/Projects/remora/scripts/start-monitoring.sh
-```
-
-The script builds remora from source (no-op if unchanged), pulls all images
-(skips locally-built ones), substitutes `PLEX_TOKEN` and `TRUENAS_API_KEY`
-from env or `.env`, cleans up previous state, and brings up all 8 services.
-
-### Stack: 8 services
-
-```
-snmp-exporter        :9116   MikroTik SNMP
-plex-exporter        :9594   Plex REST API
-mktxp                :49090  MikroTik RouterOS API (bandwidth, queues, DHCP)
-graphite-exporter    :9108   TrueNAS graphite push receiver (listens :2003)
-truenas-api-exporter :9109   TrueNAS SCALE REST API — ZFS pools, scrub, SMART
-alertmanager         :9093   Alert routing (null receiver; Pushover-ready)
-prometheus           :9090   scrapes all of the above
-grafana              :3000   dashboards  (admin / prom-operator)
-```
-
-### Dependency order (compose waits for each :ready-port before prometheus starts)
-
-```
-alertmanager, snmp-exporter, plex-exporter, mktxp,
-graphite-exporter, truenas-api-exporter  →  prometheus  →  grafana
-```
+See `docs/HOME_MONITORING_STACK.md` for full operational reference.
+See `docs/HOME_MONITORING_CONFIG_NOTES.md` for why configs are written the way they are.
 
 ---
 
 ## Next tasks
 
-### A. Alert rules (when ready)
+### A. Alert rules
 
 Translate Helm chart PrometheusRule CRDs to standalone `rule_files:` YAML.
 
-Source files:
+Source files (in home-monitoring repo):
 - `monitoring-setup/prometheus/disk-temp-alerts.yaml`
 - `monitoring-setup/prometheus/truenas-alerts.yaml`
 
@@ -134,10 +42,12 @@ rule_files:
 
 Bind-mount `./config/prometheus/rules` into the prometheus service in `compose.rem`.
 
-### B. Pushover alerts (when credentials are available)
+Hot-reload after: `curl -X POST http://localhost:9090/-/reload`
+
+### B. Pushover alerts
 
 Edit `remora/config/alertmanager/alertmanager.yml`:
-1. Replace the null receiver with:
+1. Replace null receiver with:
 ```yaml
 - name: 'pushover'
   pushover_configs:
@@ -147,7 +57,19 @@ Edit `remora/config/alertmanager/alertmanager.yml`:
 ```
 2. Update `route.receiver: 'pushover'`
 
-Get credentials at https://pushover.net.
+Credentials at https://pushover.net.
+
+### C. MikroTik credentials for mktxp
+
+`config/mktxp/mktxp.conf` needs a real RouterOS API username and password.
+Without them mktxp scrapes zero metrics (process is up, but all gauges are empty).
+
+### D. CRI compliance
+
+See `docs/CRI_COMPLIANCE.md` for the full roadmap (phases C1–C7).
+Short version: daemon → gRPC skeleton → ImageService → pod sandbox → CNI →
+container lifecycle → exec/logs/stats. The pod sandbox (C4) is the critical
+path item requiring the most new design work.
 
 ---
 
@@ -155,15 +77,15 @@ Get credentials at https://pushover.net.
 
 - **compose `(command ...)` replaces entire entrypoint+cmd** — to pass flags to
   an image's existing entrypoint, repeat the entrypoint binary as the first
-  element. See prometheus, graphite-exporter, alertmanager for the pattern.
+  element. See prometheus, graphite-exporter, alertmanager in `compose.rem`.
 
 - **TrueNAS graphite push** — port 2003 is host-mapped. TrueNAS must push to
-  this machine's LAN IP (e.g. 192.168.88.X), not localhost. Configure at:
+  this machine's LAN IP, not localhost. Configure at:
   TrueNAS SCALE → System → Advanced → Reporting → Graphite.
 
-- **Plex token** — resolved from `$PLEX_TOKEN` env var or `monitoring-setup/.env`.
-  Placeholder `YOUR_PLEX_TOKEN_HERE` is substituted at runtime by start-monitoring.sh.
+- **truenas-api-exporter is locally built** — built once by `start-monitoring.sh`
+  if not already cached. Rebuild after changes to `truenas_api_exporter.py` with:
+  `sudo remora image rm truenas-api-exporter:latest` then re-run the script.
 
-- **truenas-api-exporter is locally built** — `remora image pull` is skipped
-  for it. Must be built once with `remora build` (see step 1 above). Rebuild
-  after any changes to `truenas_api_exporter.py`.
+- **Plex token** — set in `monitoring-setup/.env` as `PLEX_TOKEN=...`.
+  The script substitutes it at runtime; the token never touches the compose file.
