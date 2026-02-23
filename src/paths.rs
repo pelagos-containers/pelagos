@@ -13,23 +13,30 @@ pub fn is_rootless() -> bool {
 
 /// Persistent data directory.
 ///
-/// - Root: `/var/lib/remora/`
-/// - Rootless: `$XDG_DATA_HOME/remora/` (default `~/.local/share/remora/`)
+/// - Root (or system store already initialised): `/var/lib/remora/`
+/// - Rootless with no system store: `$XDG_DATA_HOME/remora/` (default `~/.local/share/remora/`)
+///
+/// If `/var/lib/remora/` already exists we always use it, regardless of the
+/// current UID.  This means a non-root user can pull images into the same
+/// store that `sudo remora` uses, once root has initialised the directory
+/// (which happens automatically on the first root pull/run).
 pub fn data_dir() -> PathBuf {
-    if is_rootless() {
-        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-            if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("remora");
-            }
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".local/share/remora");
-        }
-        // Last resort: /tmp fallback (unlikely on any real system).
-        PathBuf::from(format!("/tmp/remora-data-{}", unsafe { libc::getuid() }))
-    } else {
-        PathBuf::from("/var/lib/remora")
+    let system_dir = PathBuf::from("/var/lib/remora");
+    // Use the system store if it already exists OR if we are root.
+    if system_dir.exists() || !is_rootless() {
+        return system_dir;
     }
+    // Pure rootless: system store has never been initialised, use XDG dir.
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("remora");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/share/remora");
+    }
+    // Last resort: /tmp fallback (unlikely on any real system).
+    PathBuf::from(format!("/tmp/remora-data-{}", unsafe { libc::getuid() }))
 }
 
 /// Ephemeral runtime directory.

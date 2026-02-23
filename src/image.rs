@@ -11,6 +11,27 @@ use std::path::{Path, PathBuf};
 // pub const IMAGES_DIR: &str = "/var/lib/remora/images";
 // pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
 
+/// Ensure the image store directories exist with world-writable permissions.
+///
+/// `images/` and `layers/` are set to 0o777 so that non-root users can pull
+/// images to the system store once root has initialised `/var/lib/remora/`.
+/// Content-addressed storage (sha256 digests) makes world-writable safe: a
+/// layer directory's name is its digest, so substituting content would require
+/// a hash collision.
+fn ensure_image_dirs() -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    for dir in [crate::paths::layers_dir(), crate::paths::images_dir()] {
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+        }
+    }
+    Ok(())
+}
+
 /// Image configuration extracted from the OCI config JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageConfig {
@@ -77,6 +98,7 @@ pub fn layer_exists(digest: &str) -> bool {
 ///
 /// Returns the path to the extracted layer directory.
 pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
+    ensure_image_dirs()?;
     let rootless = crate::paths::is_rootless();
     let dest = layer_dir(digest);
     if dest.is_dir() {
@@ -237,6 +259,7 @@ fn set_opaque_xattr_userxattr(dir: &Path) -> io::Result<()> {
 
 /// Persist an image manifest to disk.
 pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
+    ensure_image_dirs()?;
     let dir = image_dir(&manifest.reference);
     std::fs::create_dir_all(&dir)?;
     let json =
