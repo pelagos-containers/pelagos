@@ -241,21 +241,41 @@ pub fn parse_cpus(s: &str) -> Result<(i64, u64), String> {
 /// Parse --user "1000" or "1000:1000" → (uid, Option<gid>).
 pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
     if let Some((u, g)) = s.split_once(':') {
-        let uid = u
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| format!("invalid uid '{}': {}", u, e))?;
-        let gid = g
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| format!("invalid gid '{}': {}", g, e))?;
+        let uid = resolve_uid(u.trim())?;
+        let gid = resolve_gid(g.trim())?;
         Ok((uid, Some(gid)))
     } else {
-        let uid = s
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| format!("invalid uid '{}': {}", s, e))?;
+        let uid = resolve_uid(s.trim())?;
         Ok((uid, None))
+    }
+}
+
+fn resolve_uid(s: &str) -> Result<u32, String> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    // Symbolic name: look up via getpwnam.
+    use std::ffi::CString;
+    let name = CString::new(s).map_err(|_| format!("invalid user name: {}", s))?;
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        Err(format!("unknown user '{}': not found in /etc/passwd", s))
+    } else {
+        Ok(unsafe { (*pw).pw_uid })
+    }
+}
+
+fn resolve_gid(s: &str) -> Result<u32, String> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    use std::ffi::CString;
+    let name = CString::new(s).map_err(|_| format!("invalid group name: {}", s))?;
+    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
+    if gr.is_null() {
+        Err(format!("unknown group '{}': not found in /etc/group", s))
+    } else {
+        Ok(unsafe { (*gr).gr_gid })
     }
 }
 

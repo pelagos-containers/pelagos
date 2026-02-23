@@ -153,9 +153,9 @@ fn cmd_compose_up(
         let config = remora::paths::network_config_dir(&scoped).join("config.json");
         if !config.exists() {
             let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
-            if let Err(e) = super::network::cmd_network_create(&scoped, subnet) {
-                log::warn!("compose: failed to create network '{}': {}", scoped, e);
-            }
+            super::network::cmd_network_create(&scoped, subnet).map_err(|e| {
+                format!("compose: failed to create network '{}': {}", scoped, e)
+            })?;
         }
         created_networks.push(scoped);
     }
@@ -267,7 +267,8 @@ fn run_supervisor(
             svc_name,
             container_name
         );
-        let pid = spawn_service(project, svc, &container_name, compose)?;
+        let compose_dir = file.parent().unwrap_or(std::path::Path::new("."));
+        let pid = spawn_service(project, svc, &container_name, compose, compose_dir)?;
 
         // Read back container state to get IP.
         if let Ok(cstate) = super::read_state(&container_name) {
@@ -325,6 +326,7 @@ fn spawn_service(
     svc: &ServiceSpec,
     container_name: &str,
     compose: &ComposeFile,
+    compose_dir: &std::path::Path,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     // Resolve image layers.
     let image_ref = &svc.image;
@@ -350,6 +352,7 @@ fn spawn_service(
 
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
+
 
     let mut cmd = Command::new(exe).args(rest).with_image_layers(layers);
 
@@ -410,14 +413,46 @@ fn spawn_service(
         cmd = cmd.with_volume(&v, &vol.mount_path);
     }
 
-    // Environment.
+    // Bind mounts. Relative host paths are resolved against the compose file's directory.
+    for bm in &svc.bind_mounts {
+        let host = if std::path::Path::new(&bm.host_path).is_relative() {
+            compose_dir
+                .join(&bm.host_path)
+                .canonicalize()
+                .map_err(|e| {
+                    format!(
+                        "service '{}': bind-mount host path '{}': {}",
+                        svc.name, bm.host_path, e
+                    )
+                })?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            bm.host_path.clone()
+        };
+        if bm.read_only {
+            cmd = cmd.with_bind_mount_ro(&host, &bm.container_path);
+        } else {
+            cmd = cmd.with_bind_mount(&host, &bm.container_path);
+        }
+    }
+
+    // Environment: service overrides, then a fallback PATH only if the image
+    // didn't already supply one (to avoid clobbering bundler/gem/nvm paths).
     for (k, v) in &svc.env {
         cmd = cmd.env(k, v);
     }
-    cmd = cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    );
+    let image_sets_path = manifest
+        .config
+        .env
+        .iter()
+        .any(|e| e.starts_with("PATH="));
+    if !image_sets_path {
+        cmd = cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+    }
 
     // Port forwards.
     for port in &svc.ports {

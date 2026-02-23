@@ -8076,3 +8076,98 @@ fn test_compose_up_down_single_service() {
     // Clean up.
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+#[test]
+fn test_compose_bind_mount_parse_and_validate() {
+    // Validates that bind-mount fields round-trip through parse_compose correctly,
+    // including :ro flag, multiple mounts per service, and the compose-level validation
+    // pass.  No root or image pull required — this is a model correctness test.
+    let input = r#"
+(compose
+  (network monitoring (subnet "172.20.0.0/24"))
+  (volume grafana-data)
+
+  ; Prometheus: two read-only bind mounts (config + rules dir)
+  (service prometheus
+    (image "prom/prometheus:latest")
+    (network monitoring)
+    (port 9090 9090)
+    (bind-mount "./config/prometheus.yml" "/etc/prometheus/prometheus.yml" :ro)
+    (bind-mount "./config/rules" "/etc/prometheus/rules" :ro))
+
+  ; Grafana: named volume + read-only provisioning bind mount + rw data
+  (service grafana
+    (image "grafana/grafana:latest")
+    (network monitoring)
+    (port 3000 3000)
+    (volume grafana-data "/var/lib/grafana")
+    (bind-mount "./config/grafana/provisioning" "/etc/grafana/provisioning" :ro)
+    (env GF_SECURITY_ADMIN_PASSWORD "secret")
+    (depends-on (prometheus :ready-port 9090)))
+
+  ; SNMP exporter: single read-only config
+  (service snmp-exporter
+    (image "prom/snmp-exporter:v0.21.0")
+    (network monitoring)
+    (port 9116 9116)
+    (bind-mount "./config/snmp.yml" "/etc/snmp_exporter/snmp.yml" :ro)))
+"#;
+
+    let compose = remora::compose::parse_compose(input).expect("should parse and validate");
+
+    assert_eq!(compose.networks.len(), 1);
+    assert_eq!(compose.volumes, vec!["grafana-data"]);
+    assert_eq!(compose.services.len(), 3);
+
+    // Prometheus: two RO bind mounts, no named volumes.
+    let prom = compose
+        .services
+        .iter()
+        .find(|s| s.name == "prometheus")
+        .unwrap();
+    assert_eq!(prom.bind_mounts.len(), 2);
+    assert_eq!(prom.bind_mounts[0].host_path, "./config/prometheus.yml");
+    assert_eq!(
+        prom.bind_mounts[0].container_path,
+        "/etc/prometheus/prometheus.yml"
+    );
+    assert!(prom.bind_mounts[0].read_only, "prometheus.yml must be :ro");
+    assert_eq!(prom.bind_mounts[1].host_path, "./config/rules");
+    assert!(prom.bind_mounts[1].read_only);
+    assert!(prom.volumes.is_empty());
+
+    // Grafana: one named volume + one RO bind mount.
+    let grafana = compose
+        .services
+        .iter()
+        .find(|s| s.name == "grafana")
+        .unwrap();
+    assert_eq!(grafana.volumes.len(), 1);
+    assert_eq!(grafana.volumes[0].name, "grafana-data");
+    assert_eq!(grafana.bind_mounts.len(), 1);
+    assert!(grafana.bind_mounts[0].read_only);
+    assert_eq!(grafana.depends_on[0].service, "prometheus");
+    assert_eq!(grafana.depends_on[0].ready_port, Some(9090));
+
+    // SNMP exporter: single RO config mount, no volumes.
+    let snmp = compose
+        .services
+        .iter()
+        .find(|s| s.name == "snmp-exporter")
+        .unwrap();
+    assert_eq!(snmp.bind_mounts.len(), 1);
+    assert_eq!(
+        snmp.bind_mounts[0].container_path,
+        "/etc/snmp_exporter/snmp.yml"
+    );
+    assert!(snmp.bind_mounts[0].read_only);
+
+    // Topo sort: prometheus and snmp-exporter before grafana.
+    let order = remora::compose::topo_sort(&compose.services).unwrap();
+    let prom_pos = order.iter().position(|n| n == "prometheus").unwrap();
+    let grafana_pos = order.iter().position(|n| n == "grafana").unwrap();
+    assert!(
+        prom_pos < grafana_pos,
+        "prometheus must start before grafana"
+    );
+}

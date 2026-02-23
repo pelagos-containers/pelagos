@@ -1486,3 +1486,15 @@ directory, asserts it exists, then cleans it up. This exercises the compose path
 (`compose_project_dir`, `compose_state_file`).
 
 Failure means the compose state filesystem layout is broken.
+
+### `test_compose_bind_mount_parse_and_validate`
+**Requires:** nothing (no root, no rootfs, no image pull)
+
+Verifies that `(bind-mount host container)` and `(bind-mount host container :ro)` parse
+correctly through `parse_compose` in a realistic multi-service monitoring-stack compose file.
+Asserts that `BindMount` structs carry the right `host_path`, `container_path`, and
+`read_only` values, that named volumes and bind mounts coexist on the same service, and that
+the topological sort still orders dependents correctly.
+
+Failure means bind-mount entries would be silently dropped or misread, causing containers to
+start without their config files and then crash or produce wrong results.

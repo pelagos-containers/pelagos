@@ -280,8 +280,18 @@ pub fn remove_image(reference: &str) -> io::Result<()> {
 }
 
 /// Return layer directories in top-first order (as overlayfs expects for `lowerdir=`).
+///
+/// Duplicate digests (common in multi-stage builds that add empty layers) are
+/// removed — overlayfs rejects `lowerdir=` paths that appear more than once.
 pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf> {
-    manifest.layers.iter().rev().map(|d| layer_dir(d)).collect()
+    let mut seen = std::collections::HashSet::new();
+    manifest
+        .layers
+        .iter()
+        .rev()
+        .map(|d| layer_dir(d))
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
 }
 
 #[cfg(test)]

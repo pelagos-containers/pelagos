@@ -1857,12 +1857,29 @@ impl Command {
                         .to_string_lossy()
                         .into_owned()
                 };
-                Some((
+                let cstrings = (
                     std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
                     std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
                     std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
                     std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
-                ))
+                );
+                log::debug!(
+                    "overlay config: lowerdir={} upperdir={} workdir={} merged={}",
+                    cstrings.0.to_string_lossy(),
+                    cstrings.1.to_string_lossy(),
+                    cstrings.2.to_string_lossy(),
+                    cstrings.3.to_string_lossy(),
+                );
+                // Verify each lower dir exists before fork so the error is clear.
+                for lower_path in &ov.lower_dirs {
+                    if !lower_path.is_dir() {
+                        return Err(Error::Io(io::Error::other(format!(
+                            "overlay lowerdir does not exist: {}",
+                            lower_path.display()
+                        ))));
+                    }
+                }
+                Some(cstrings)
             }
             _ => None,
         };
@@ -2222,12 +2239,20 @@ impl Command {
                 if let Some(ref ns_path) = bridge_ns_path {
                     let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                     if fd < 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "open netns '{}': {}",
+                            ns_path.to_string_lossy(),
+                            io::Error::last_os_error()
+                        )));
                     }
                     let ret = libc::setns(fd, libc::CLONE_NEWNET);
                     libc::close(fd);
                     if ret != 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "setns netns '{}': {}",
+                            ns_path.to_string_lossy(),
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
@@ -2315,7 +2340,11 @@ impl Command {
                                 opts.as_ptr() as *const libc::c_void,
                             );
                             if ret != 0 {
-                                return Err(io::Error::last_os_error());
+                                return Err(io::Error::other(format!(
+                                    "overlay mount (lowerdir={}): {}",
+                                    lower.to_string_lossy(),
+                                    io::Error::last_os_error()
+                                )));
                             }
                             Some(merged)
                         }
@@ -2342,7 +2371,12 @@ impl Command {
                         libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
 
                     if result != 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "pivot_root({}, {}): {}",
+                            new_root.display(),
+                            put_old.display(),
+                            io::Error::last_os_error()
+                        )));
                     }
 
                     // Change to new root
@@ -2461,8 +2495,24 @@ impl Command {
                         // Target inside the effective root on the host side
                         let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
                         let host_target = effective_root.join(rel);
-                        std::fs::create_dir_all(&host_target)
-                            .map_err(|e| io::Error::other(format!("bind mount mkdir: {}", e)))?;
+                        // Linux requires the mount target to exist and be the same type
+                        // (file or directory) as the source.
+                        if bm.source.is_dir() {
+                            std::fs::create_dir_all(&host_target).map_err(|e| {
+                                io::Error::other(format!("bind mount mkdir: {}", e))
+                            })?;
+                        } else {
+                            if let Some(parent) = host_target.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkdir: {}", e))
+                                })?;
+                            }
+                            if !host_target.exists() {
+                                std::fs::File::create(&host_target).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkfile: {}", e))
+                                })?;
+                            }
+                        }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
                         // Step 1: establish the bind
@@ -2624,12 +2674,15 @@ impl Command {
                         .unwrap_or(std::path::Path::new("/"));
                     std::env::set_current_dir(cwd)
                         .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
+
                 }
 
                 // Step 4.5: Perform automatic mounts if requested.
                 // IMPORTANT: Use absolute paths for mount targets — cwd may not
                 // be "/" if the caller used with_cwd().
                 if mount_proc {
+                    // Ensure /proc exists — some minimal images omit it.
+                    let _ = std::fs::create_dir_all("/proc");
                     let proc_src = CString::new("proc").unwrap();
                     let proc_tgt = CString::new("/proc").unwrap();
                     let result = libc::mount(
@@ -2645,11 +2698,16 @@ impl Command {
                     // owned by our user namespace. With USER+PID (auto-added by spawn()),
                     // proc succeeds. Only skip errors in rootless mode.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "mount proc: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
                 if mount_sys {
+                    // Ensure /sys exists — some minimal images omit it.
+                    let _ = std::fs::create_dir_all("/sys");
                     // Bind mount /sys (from host) to /sys (in container)
                     let sys = CString::new("/sys").unwrap();
                     let sysfs = CString::new("sysfs").unwrap();
@@ -2662,7 +2720,10 @@ impl Command {
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "mount sys: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
@@ -3668,12 +3729,20 @@ impl Command {
                 if let Some(ref ns_path) = bridge_ns_path {
                     let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                     if fd < 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "open netns '{}': {}",
+                            ns_path.to_string_lossy(),
+                            io::Error::last_os_error()
+                        )));
                     }
                     let ret = libc::setns(fd, libc::CLONE_NEWNET);
                     libc::close(fd);
                     if ret != 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "setns netns '{}': {}",
+                            ns_path.to_string_lossy(),
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
@@ -3876,8 +3945,22 @@ impl Command {
                         use std::os::unix::ffi::OsStrExt as _;
                         let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
                         let host_target = effective_root.join(rel);
-                        std::fs::create_dir_all(&host_target)
-                            .map_err(|e| io::Error::other(format!("bind mount mkdir: {}", e)))?;
+                        if bm.source.is_dir() {
+                            std::fs::create_dir_all(&host_target).map_err(|e| {
+                                io::Error::other(format!("bind mount mkdir: {}", e))
+                            })?;
+                        } else {
+                            if let Some(parent) = host_target.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkdir: {}", e))
+                                })?;
+                            }
+                            if !host_target.exists() {
+                                std::fs::File::create(&host_target).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkfile: {}", e))
+                                })?;
+                            }
+                        }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
                         let r = libc::mount(
@@ -4030,6 +4113,8 @@ impl Command {
                 }
 
                 if mount_proc {
+                    // Ensure /proc exists — some minimal images omit it.
+                    let _ = std::fs::create_dir_all("/proc");
                     let proc_src = CString::new("proc").unwrap();
                     let proc_tgt = CString::new("/proc").unwrap();
                     let result = libc::mount(
@@ -4042,11 +4127,16 @@ impl Command {
                     // In rootless mode, proc mount fails without an owned PID namespace.
                     // With USER+PID (auto-added by spawn()), proc succeeds. Only skip in rootless.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "mount proc: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
                 if mount_sys {
+                    // Ensure /sys exists — some minimal images omit it.
+                    let _ = std::fs::create_dir_all("/sys");
                     let sys = CString::new("/sys").unwrap();
                     let sysfs = CString::new("sysfs").unwrap();
                     let result = libc::mount(
@@ -4058,7 +4148,10 @@ impl Command {
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!(
+                            "mount sys: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 

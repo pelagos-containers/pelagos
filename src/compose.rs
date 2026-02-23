@@ -34,6 +34,7 @@ pub struct ServiceSpec {
     pub image: String,
     pub networks: Vec<String>,
     pub volumes: Vec<VolumeMount>,
+    pub bind_mounts: Vec<BindMount>,
     pub env: HashMap<String, String>,
     pub ports: Vec<PortMapping>,
     pub depends_on: Vec<Dependency>,
@@ -49,6 +50,14 @@ pub struct ServiceSpec {
 pub struct VolumeMount {
     pub name: String,
     pub mount_path: String,
+}
+
+/// A bind mount: host path → container path, optionally read-only.
+#[derive(Debug, Clone)]
+pub struct BindMount {
+    pub host_path: String,
+    pub container_path: String,
+    pub read_only: bool,
 }
 
 /// A port mapping: host_port → container_port.
@@ -249,6 +258,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         image: String::new(),
         networks: Vec::new(),
         volumes: Vec::new(),
+        bind_mounts: Vec::new(),
         env: HashMap::new(),
         ports: Vec::new(),
         depends_on: Vec::new(),
@@ -347,6 +357,21 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
             }
             "user" => {
                 spec.user = Some(require_atom(list, 1, &format!("service '{}' user", name))?);
+            }
+            "bind-mount" => {
+                let host_path =
+                    require_atom(list, 1, &format!("service '{}' bind-mount host path", name))?;
+                let container_path = require_atom(
+                    list,
+                    2,
+                    &format!("service '{}' bind-mount container path", name),
+                )?;
+                let read_only = list[3..].iter().any(|e| e.as_atom() == Some(":ro"));
+                spec.bind_mounts.push(BindMount {
+                    host_path,
+                    container_path,
+                    read_only,
+                });
             }
             other => {
                 return Err(ComposeError::SyntaxError(format!(
@@ -767,6 +792,70 @@ mod tests {
         let compose = parse_compose(input).unwrap();
         assert_eq!(compose.services[1].depends_on[0].service, "db");
         assert_eq!(compose.services[1].depends_on[0].ready_port, None);
+    }
+
+    #[test]
+    fn test_bind_mount_rw() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (bind-mount "/host/data" "/data")))
+"#;
+        let compose = parse_compose(input).unwrap();
+        let bm = &compose.services[0].bind_mounts;
+        assert_eq!(bm.len(), 1);
+        assert_eq!(bm[0].host_path, "/host/data");
+        assert_eq!(bm[0].container_path, "/data");
+        assert!(!bm[0].read_only);
+    }
+
+    #[test]
+    fn test_bind_mount_ro() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (bind-mount "/etc/config.yml" "/etc/app/config.yml" :ro)))
+"#;
+        let compose = parse_compose(input).unwrap();
+        let bm = &compose.services[0].bind_mounts;
+        assert_eq!(bm.len(), 1);
+        assert_eq!(bm[0].host_path, "/etc/config.yml");
+        assert_eq!(bm[0].container_path, "/etc/app/config.yml");
+        assert!(bm[0].read_only);
+    }
+
+    #[test]
+    fn test_bind_mount_multiple() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (bind-mount "/cfg/a.yml" "/etc/a.yml" :ro)
+    (bind-mount "/data" "/var/data")))
+"#;
+        let compose = parse_compose(input).unwrap();
+        let bm = &compose.services[0].bind_mounts;
+        assert_eq!(bm.len(), 2);
+        assert!(bm[0].read_only);
+        assert!(!bm[1].read_only);
+    }
+
+    #[test]
+    fn test_bind_mount_missing_paths() {
+        let input = r#"
+(compose
+  (service app
+    (image "alpine:latest")
+    (bind-mount "/host/only")))
+"#;
+        let err = parse_compose(input).unwrap_err();
+        assert!(
+            matches!(err, ComposeError::MissingField(_)),
+            "expected MissingField, got: {}",
+            err
+        );
     }
 
     #[test]
