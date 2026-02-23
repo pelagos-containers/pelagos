@@ -11,22 +11,52 @@ use std::path::{Path, PathBuf};
 // pub const IMAGES_DIR: &str = "/var/lib/remora/images";
 // pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
 
-/// Ensure the image store directories exist with world-writable permissions.
+/// Look up the GID of the `remora` system group, if it exists.
+fn remora_group_gid() -> Option<libc::gid_t> {
+    let name = std::ffi::CString::new("remora").ok()?;
+    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
+    if gr.is_null() {
+        None
+    } else {
+        Some(unsafe { (*gr).gr_gid })
+    }
+}
+
+/// Ensure the image store directories exist with correct ownership and mode.
 ///
-/// `images/` and `layers/` are set to 0o777 so that non-root users can pull
-/// images to the system store once root has initialised `/var/lib/remora/`.
-/// Content-addressed storage (sha256 digests) makes world-writable safe: a
-/// layer directory's name is its digest, so substituting content would require
-/// a hash collision.
+/// If the `remora` system group exists (created by `scripts/setup.sh`):
+///   `images/`, `layers/`, `build-cache/` → root:remora 0775
+/// Otherwise (system not yet set up, or pure rootless):
+///   → root:root 0755 (root-only access)
+///
+/// Only acts when a directory doesn't exist yet; does not re-chmod existing
+/// directories (which would fail if called as a non-root group member).
 fn ensure_image_dirs() -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    for dir in [crate::paths::layers_dir(), crate::paths::images_dir()] {
+    let remora_gid = remora_group_gid();
+    let mode = if remora_gid.is_some() { 0o775 } else { 0o755 };
+
+    for dir in [
+        crate::paths::layers_dir(),
+        crate::paths::images_dir(),
+        crate::paths::build_cache_dir(),
+    ] {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
             #[cfg(unix)]
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+            {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;
+                if let Some(gid) = remora_gid {
+                    let path_cstr = std::ffi::CString::new(dir.as_os_str().as_bytes())
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    // u32::MAX == (uid_t)-1: POSIX "don't change owner".
+                    unsafe { libc::lchown(path_cstr.as_ptr(), u32::MAX as libc::uid_t, gid) };
+                }
+            }
         }
     }
     Ok(())
