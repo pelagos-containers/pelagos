@@ -94,9 +94,25 @@ if [ -z "${PLEX_TOKEN:-}" ] || [ "$PLEX_TOKEN" = "YOUR_PLEX_TOKEN_HERE" ]; then
     PLEX_TOKEN="YOUR_PLEX_TOKEN_HERE"
 fi
 
+# ── TrueNAS API key ────────────────────────────────────────────────────────────
+
+if [ -z "${TRUENAS_API_KEY:-}" ] && [ -f "$ENV_FILE" ]; then
+    TRUENAS_API_KEY="$(grep '^TRUENAS_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+fi
+
+if [ -z "${TRUENAS_API_KEY:-}" ] || [ "$TRUENAS_API_KEY" = "YOUR_TRUENAS_API_KEY_HERE" ]; then
+    warn "TRUENAS_API_KEY not set — truenas-api-exporter will exit immediately."
+    warn "Get key from TrueNAS SCALE: Credentials → API Keys"
+    warn "Set it with: sudo -E TRUENAS_API_KEY=yourkey $0"
+    TRUENAS_API_KEY="YOUR_TRUENAS_API_KEY_HERE"
+fi
+
 # Write the resolved compose file next to the original so ./config/... paths work.
 trap 'rm -f "$RESOLVED_COMPOSE"' EXIT
-sed "s/YOUR_PLEX_TOKEN_HERE/$PLEX_TOKEN/" "$COMPOSE_FILE" > "$RESOLVED_COMPOSE"
+sed \
+    -e "s/YOUR_PLEX_TOKEN_HERE/$PLEX_TOKEN/" \
+    -e "s/YOUR_TRUENAS_API_KEY_HERE/$TRUENAS_API_KEY/" \
+    "$COMPOSE_FILE" > "$RESOLVED_COMPOSE"
 
 # ── Clean up any leftover state from previous runs ─────────────────────────────
 

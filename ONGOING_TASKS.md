@@ -2,16 +2,17 @@
 
 ## Current State (Feb 23, 2026)
 
-### Stack: 7 services, committed, ready to run
+### Stack: 8 services (7 running + truenas-api-exporter pending build + API key)
 
 ```
-snmp-exporter      :9116   MikroTik SNMP
-plex-exporter      :9594   Plex REST API
-mktxp              :49090  MikroTik RouterOS API (bandwidth, queues, DHCP, etc.)
-graphite-exporter  :9108   TrueNAS graphite push receiver (listens :2003)
-alertmanager       :9093   Alert routing (null receiver; Pushover-ready)
-prometheus         :9090   scrapes all of the above + alerts to alertmanager
-grafana            :3000   dashboards
+snmp-exporter        :9116   MikroTik SNMP
+plex-exporter        :9594   Plex REST API
+mktxp                :49090  MikroTik RouterOS API (bandwidth, queues, DHCP, etc.)
+graphite-exporter    :9108   TrueNAS graphite push receiver (listens :2003)
+truenas-api-exporter :9109   TrueNAS SCALE REST API — ZFS pools, scrub, SMART (locally built)
+alertmanager         :9093   Alert routing (null receiver; Pushover-ready)
+prometheus           :9090   scrapes all of the above + alerts to alertmanager
+grafana              :3000   dashboards
 ```
 
 ### Git state (clean, both repos pushed)
@@ -119,7 +120,94 @@ Get credentials at https://pushover.net.
 
 ---
 
-## Next Task 2: truenas-api-exporter (Custom Python Remfile build)
+## ✅ truenas-api-exporter config — DONE (pending 2 manual steps)
+
+### ⚠️ Still needed before stack will run with this service
+
+**1. Build the image** (one-time, needs root + internet):
+```bash
+sudo -E remora build \
+  --network bridge \
+  -t truenas-api-exporter:latest \
+  --file ~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/Remfile \
+  ~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/
+```
+
+**2. Add TrueNAS API key to `.env`:**
+- Log into http://192.168.88.30 → Credentials → API Keys → create/copy key
+- Add to `~/Projects/home-monitoring/monitoring-setup/.env`:
+  ```
+  TRUENAS_API_KEY=your-key-here
+  ```
+- Or pass inline: `sudo -E TRUENAS_API_KEY=yourkey ~/Projects/remora/scripts/start-monitoring.sh`
+
+Until both are done: stack still starts but prometheus will be missing
+`truenas-api-exporter` (it's in `depends-on`, so prometheus won't start
+until the exporter is ready on :9109).
+
+---
+
+## Current Task (archived): truenas-api-exporter
+
+### Plan
+
+**Step 1** — Write `Remfile` at
+`~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/Remfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir prometheus-client==0.19.0 requests==2.31.0
+COPY truenas_api_exporter.py .
+CMD ["python", "-u", "/app/truenas_api_exporter.py"]
+```
+
+**Step 2** — User builds the image (requires root + bridge network for pip):
+```bash
+sudo -E remora build \
+  --network bridge \
+  -t truenas-api-exporter:latest \
+  --file ~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/Remfile \
+  ~/Projects/home-monitoring/monitoring-setup/truenas-graphite-exporter/
+```
+
+**Step 3** — Add service to `compose.rem` (port 9109 — avoids conflict with
+graphite-exporter on 9108; set via `EXPORTER_PORT` env var):
+```lisp
+(service truenas-api-exporter
+  (image "truenas-api-exporter:latest")
+  (network monitoring)
+  (port 9109 9109)
+  (env TRUENAS_HOST "http://192.168.88.30")
+  (env TRUENAS_API_KEY "YOUR_API_KEY_HERE")
+  (env TRUENAS_VERIFY_SSL "false")
+  (env EXPORTER_PORT "9109"))
+```
+
+**Step 4** — Add prometheus scrape job to `prometheus.yml`:
+```yaml
+- job_name: truenas_api
+  static_configs:
+    - targets: ['truenas-api-exporter:9109']
+  scrape_interval: 60s
+```
+
+**Step 5** — Add to prometheus `depends-on` in compose.rem:
+`(truenas-api-exporter :ready-port 9109)`
+
+**Step 6** — Get TrueNAS API key:
+Log into TrueNAS SCALE at http://192.168.88.30 → Credentials → API Keys → create/copy key.
+Replace `YOUR_API_KEY_HERE` in compose.rem (or pass as env var at runtime — see start-monitoring.sh pattern).
+
+### Notes
+- Port 9109 matches the original Dockerfile EXPOSE; avoids conflict with graphite-exporter (9108)
+- `EXPORTER_PORT` env var overrides the script default of 9108
+- No requirements.txt — deps are pinned directly in the Remfile RUN step
+- The script exits immediately if `TRUENAS_API_KEY` is empty — set it before running
+
+---
+
+## Next Task 2 (old): truenas-api-exporter (Custom Python Remfile build)
 
 ### Source files
 
