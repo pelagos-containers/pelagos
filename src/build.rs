@@ -6,9 +6,9 @@
 use crate::container::{Command, Namespace, Stdio};
 use crate::image::{self, ImageConfig, ImageManifest};
 use crate::network::NetworkMode;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -569,11 +569,13 @@ fn execute_stage(
                                 line: 0,
                                 message: format!("COPY --from={}: unknown stage", stage_name),
                             })?;
-                    let digest = execute_copy_from_stage(src, dest, stage_layers)?;
+                    let digest =
+                        execute_copy_from_stage(src, dest, stage_layers, &config.working_dir)?;
                     layers.push(digest);
                 } else {
                     eprintln!("Step {}/{}: COPY {} {}", step, total, src, dest);
-                    let digest = execute_copy(src, dest, context_dir, remignore)?;
+                    let digest =
+                        execute_copy(src, dest, context_dir, remignore, &config.working_dir)?;
                     layers.push(digest);
                 }
             }
@@ -590,6 +592,17 @@ fn execute_stage(
             Instruction::Workdir(ref path) => {
                 eprintln!("Step {}/{}: WORKDIR {}", step, total, path);
                 config.working_dir = path.clone();
+                // Create the directory as a layer if it doesn't already exist in
+                // any current layer (matches Docker behaviour: WORKDIR always
+                // ensures the directory is present).
+                let rel = path.trim_start_matches('/');
+                let already_exists = layers
+                    .iter()
+                    .any(|d| image::layer_dir(d).join(rel).is_dir());
+                if !already_exists {
+                    let digest = execute_workdir(path)?;
+                    layers.push(digest);
+                }
             }
             Instruction::Entrypoint(ref args) => {
                 eprintln!("Step {}/{}: ENTRYPOINT {:?}", step, total, args);
@@ -609,7 +622,7 @@ fn execute_stage(
             Instruction::Add { ref src, ref dest } => {
                 cache_active = false;
                 eprintln!("Step {}/{}: ADD {} {}", step, total, src, dest);
-                let digest = execute_add(src, dest, context_dir, remignore)?;
+                let digest = execute_add(src, dest, context_dir, remignore, &config.working_dir)?;
                 layers.push(digest);
             }
         }
@@ -629,6 +642,7 @@ fn execute_copy_from_stage(
     src: &str,
     dest: &str,
     stage_layers: &[String],
+    working_dir: &str,
 ) -> Result<String, BuildError> {
     let relative_src = src.strip_prefix('/').unwrap_or(src);
 
@@ -638,7 +652,12 @@ fn execute_copy_from_stage(
         let candidate = layer_dir.join(relative_src);
         if candidate.exists() {
             let tmp = tempfile::tempdir()?;
-            let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+            let src_basename = Path::new(src)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(src);
+            let resolved = resolve_copy_dest(dest, src_basename, working_dir);
+            let relative_dest = resolved.trim_start_matches('/');
             let dest_in_tmp = tmp.path().join(relative_dest);
 
             if let Some(parent) = dest_in_tmp.parent() {
@@ -789,11 +808,16 @@ fn execute_run(
     config: &ImageConfig,
     network_mode: NetworkMode,
 ) -> Result<Option<String>, BuildError> {
-    let layer_dirs = current_layers
+    // Deduplicate layer paths — overlayfs returns EINVAL if lowerdir contains
+    // duplicate entries, which can happen when a base image (e.g. Debian/Python)
+    // has repeated layer digests (empty marker layers are common).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let layer_dirs: Vec<PathBuf> = current_layers
         .iter()
         .rev()
         .map(|d| image::layer_dir(d))
-        .collect::<Vec<_>>();
+        .filter(|p| seen.insert(p.clone()))
+        .collect();
 
     // Note: with_image_layers sets Namespace::MOUNT internally, so we must
     // add UTS|IPC *before* it (with_namespaces does assignment, not |=).
@@ -857,6 +881,44 @@ fn execute_run(
     Ok(result)
 }
 
+/// Execute a WORKDIR instruction: create a layer that ensures the directory exists.
+///
+/// Docker's WORKDIR always creates the target directory if it is absent from
+/// any existing layer.  We materialise it as a minimal layer so that
+/// subsequent RUN steps can `chdir` into it after the chroot.
+fn execute_workdir(path: &str) -> Result<String, BuildError> {
+    let tmp = tempfile::tempdir().map_err(BuildError::Io)?;
+    let rel = path.trim_start_matches('/');
+    std::fs::create_dir_all(tmp.path().join(rel)).map_err(BuildError::Io)?;
+    create_layer_from_dir(tmp.path()).map_err(BuildError::Io)
+}
+
+/// Resolve a COPY/ADD destination path following Docker semantics.
+///
+/// - Absolute paths are used as-is.
+/// - Relative paths (including `.`) are resolved against `working_dir`.
+/// - If the resolved path ends with `/` (directory destination), `src_basename`
+///   is appended to produce the final file path.  Pass `""` for archive ADD where
+///   the destination is always a directory and no filename suffix is needed.
+fn resolve_copy_dest(dest: &str, src_basename: &str, working_dir: &str) -> String {
+    let abs = if dest.starts_with('/') {
+        dest.to_owned()
+    } else {
+        let wd = working_dir.trim_end_matches('/');
+        let wd = if wd.is_empty() { "/" } else { wd };
+        if dest == "." || dest == "./" {
+            format!("{}/", wd)
+        } else {
+            format!("{}/{}", wd, dest)
+        }
+    };
+    if !src_basename.is_empty() && abs.ends_with('/') {
+        format!("{}{}", abs, src_basename)
+    } else {
+        abs
+    }
+}
+
 /// Execute a COPY instruction: create a layer from context files.
 /// When `remignore` is `Some`, directory copies skip matched entries.
 fn execute_copy(
@@ -864,6 +926,7 @@ fn execute_copy(
     dest: &str,
     context_dir: &Path,
     remignore: Option<&ignore::gitignore::Gitignore>,
+    working_dir: &str,
 ) -> Result<String, BuildError> {
     let src_path = context_dir.join(src);
     if !src_path.exists() {
@@ -888,9 +951,13 @@ fn execute_copy(
 
     let tmp = tempfile::tempdir()?;
 
-    // Build the destination path structure inside temp dir.
-    // Strip leading '/' from dest to make it relative.
-    let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+    // Resolve destination: handle relative paths and directory destinations.
+    let src_basename = Path::new(src)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(src);
+    let resolved = resolve_copy_dest(dest, src_basename, working_dir);
+    let relative_dest = resolved.trim_start_matches('/');
     let dest_in_tmp = tmp.path().join(relative_dest);
 
     if let Some(parent) = dest_in_tmp.parent() {
@@ -947,25 +1014,29 @@ fn execute_add(
     dest: &str,
     context_dir: &Path,
     remignore: Option<&ignore::gitignore::Gitignore>,
+    working_dir: &str,
 ) -> Result<String, BuildError> {
     if is_url(src) {
-        execute_add_url(src, dest)
+        execute_add_url(src, dest, working_dir)
     } else if is_archive(src) {
-        execute_add_archive(src, dest, context_dir, remignore)
+        execute_add_archive(src, dest, context_dir, remignore, working_dir)
     } else {
         // Fall through to normal COPY behaviour.
-        execute_copy(src, dest, context_dir, remignore)
+        execute_copy(src, dest, context_dir, remignore, working_dir)
     }
 }
 
 /// Download a URL and place it at `dest` inside a new layer.
-fn execute_add_url(url: &str, dest: &str) -> Result<String, BuildError> {
+fn execute_add_url(url: &str, dest: &str, working_dir: &str) -> Result<String, BuildError> {
     let response = ureq::get(url)
         .call()
         .map_err(|e| BuildError::UrlDownload(format!("{}: {}", url, e)))?;
 
     let tmp = tempfile::tempdir()?;
-    let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+    // Use the URL's last path segment as the filename for directory destinations.
+    let url_basename = url.rsplit('/').next().unwrap_or("file");
+    let resolved = resolve_copy_dest(dest, url_basename, working_dir);
+    let relative_dest = resolved.trim_start_matches('/');
     let dest_in_tmp = tmp.path().join(relative_dest);
 
     if let Some(parent) = dest_in_tmp.parent() {
@@ -986,6 +1057,7 @@ fn execute_add_archive(
     dest: &str,
     context_dir: &Path,
     remignore: Option<&ignore::gitignore::Gitignore>,
+    working_dir: &str,
 ) -> Result<String, BuildError> {
     let src_path = context_dir.join(src);
     if !src_path.exists() {
@@ -1019,7 +1091,9 @@ fn execute_add_archive(
     }
 
     let tmp = tempfile::tempdir()?;
-    let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+    // Archives are always extracted INTO a directory; pass "" so no filename is appended.
+    let resolved = resolve_copy_dest(dest, "", working_dir);
+    let relative_dest = resolved.trim_start_matches('/');
     let dest_in_tmp = tmp.path().join(relative_dest);
     std::fs::create_dir_all(&dest_in_tmp)?;
 

@@ -2,17 +2,22 @@
 
 ## Current State (Feb 23, 2026)
 
-Both repos are clean and pushed.
-
-**remora** (`~/Projects/remora`): branch `master`, last commit `75d4949`
+**remora** (`~/Projects/remora`): branch `master`, uncommitted build fixes
 **home-monitoring** (`~/Projects/home-monitoring`): branch `main`, last commit `80c0610`
 
 ---
 
-## ⚠️ IMMEDIATE: Two manual steps to finish truenas-api-exporter
+## ⚠️ IMMEDIATE: Build truenas-api-exporter + add TrueNAS API key
 
 ### Step 1 — Build the image (one-time, needs root + internet)
 
+This should now work — two build bugs were just fixed (see below).
+
+```bash
+sudo -E ~/Projects/remora/scripts/start-monitoring.sh
+```
+
+Or build directly:
 ```bash
 sudo -E remora build \
   --network bridge \
@@ -38,6 +43,42 @@ sudo -E TRUENAS_API_KEY=yourkey ~/Projects/remora/scripts/start-monitoring.sh
 **Until both steps are done:** the stack won't fully start — prometheus
 depends-on `truenas-api-exporter :ready-port 9109` and will block indefinitely
 if the service isn't up.
+
+---
+
+## Recent fixes to `src/build.rs`
+
+### Bug 1: EINVAL when spawning build container (Debian/Python images)
+
+**Root cause:** `execute_run()` built `layer_dirs` without deduplicating digests.
+Debian-based images (e.g. `python:3.11-slim`) often include repeated layer
+digests (empty marker layers). The kernel overlayfs rejects a `lowerdir=` string
+containing the same path twice with EINVAL.
+
+**Fix:** Apply the same HashSet deduplication that `image::layer_dirs()` uses.
+
+### Bug 3: COPY destination `.` failed with EISDIR
+
+**Root cause:** `execute_copy` resolved `dest = "."` to the tempdir root (a
+directory), then called `std::fs::copy(src_file, dir)` → EISDIR (os error 21).
+
+Docker semantics: `COPY file.py .` means "copy into WORKDIR keeping the
+filename". Relative destinations (`.`, `./`, `subdir/`) must be resolved
+against WORKDIR, and any path ending with `/` (or being exactly `.`) means
+"copy INTO this directory, keeping the source basename".
+
+**Fix:** Added `resolve_copy_dest(dest, src_basename, working_dir)` helper and
+threaded `working_dir` through `execute_copy`, `execute_copy_from_stage`,
+`execute_add`, `execute_add_url`, and `execute_add_archive`.
+
+### Bug 2: WORKDIR didn't create the directory
+
+**Root cause:** `WORKDIR /app` only updated `config.working_dir`; it never
+created `/app` in a layer. After chroot, `set_current_dir("/app")` would fail.
+
+**Fix:** Added `execute_workdir()` — creates a minimal layer containing the
+target directory path, matching Docker's behaviour. The layer is only created
+if the directory isn't already present in an existing layer.
 
 ---
 
