@@ -143,6 +143,7 @@ IMAGES=(
     "prom/alertmanager:latest"
     "prom/prometheus:latest"
     "grafana/grafana:latest"
+    "python:3.11-slim"          # base image for truenas-api-exporter build
 )
 
 info "Pulling images (already-cached images will be skipped)..."
@@ -150,6 +151,25 @@ for img in "${IMAGES[@]}"; do
     info "  pull $img"
     "$REMORA" image pull "$img" || warn "pull failed for $img — will try to use cached version"
 done
+
+# ── Build locally-built images ─────────────────────────────────────────────────
+# truenas-api-exporter is not on any registry; build from source if not cached.
+
+TRUENAS_EXPORTER_REF="truenas-api-exporter:latest"
+TRUENAS_EXPORTER_REMFILE="$MONITORING_ROOT/monitoring-setup/truenas-graphite-exporter/Remfile"
+TRUENAS_EXPORTER_CTX="$MONITORING_ROOT/monitoring-setup/truenas-graphite-exporter"
+
+if "$REMORA" image ls | grep -q "^${TRUENAS_EXPORTER_REF}[[:space:]]"; then
+    info "truenas-api-exporter already built — skipping (use 'remora image rm ${TRUENAS_EXPORTER_REF}' to force rebuild)"
+else
+    info "Building ${TRUENAS_EXPORTER_REF}..."
+    "$REMORA" build \
+        --network bridge \
+        -t "$TRUENAS_EXPORTER_REF" \
+        --file "$TRUENAS_EXPORTER_REMFILE" \
+        "$TRUENAS_EXPORTER_CTX" \
+        || die "failed to build ${TRUENAS_EXPORTER_REF}"
+fi
 
 # ── Pre-create volumes with correct ownership ──────────────────────────────────
 # Grafana runs as UID 472 — the named volume must be owned by that user.
