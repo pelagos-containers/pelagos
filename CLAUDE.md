@@ -60,6 +60,17 @@ This is a hard requirement, not optional cleanup.
 3. Commit with a descriptive message
 4. Push to remote
 
+**"So Long and Thanks for all the Fish"** — Wrap up session, document state, commit, and push:
+1. Remove any ephemeral session files (temp scripts, test output, session resume files)
+2. Commit any untracked config or doc files in both `remora` and `home-monitoring` repos
+3. Update `ONGOING_TASKS.md` with:
+   - Current date and git SHA for both repos
+   - What was completed this session
+   - What remains pending, with enough detail to resume cold
+4. Commit the `ONGOING_TASKS.md` update
+5. Push both repos to remote
+6. Confirm both repos are clean and up to date with remote
+
 **"Engage!"** — Tag, release, and monitor:
 1. Create a git tag (ask user for version if unclear)
 2. Push the tag to trigger GitHub Actions release workflow

@@ -3,9 +3,11 @@
 ## Current State (Feb 23, 2026)
 
 Both repos clean and pushed. Stack fully operational (6/6 Prometheus targets up).
+TrueNAS API key set in `monitoring-setup/.env` — pool metrics flowing.
+Three Grafana dashboards provisioned: mktxp, Prometheus overview, TrueNAS (custom).
 
-**remora** (`~/Projects/remora`): branch `master`, last commit `01fab2a`
-**home-monitoring** (`~/Projects/home-monitoring`): branch `main`, last commit `b937b16`
+**remora** (`~/Projects/remora`): branch `master`, last commit `2ecd556`
+**home-monitoring** (`~/Projects/home-monitoring`): branch `main`, last commit `1135612`
 
 ---
 
@@ -22,9 +24,42 @@ See `docs/HOME_MONITORING_CONFIG_NOTES.md` for why configs are written the way t
 
 ---
 
+## Grafana dashboards
+
+All dashboards provisioned from files — no manual import needed.
+
+| Dashboard | Source | Status |
+|-----------|--------|--------|
+| Prometheus 2.0 Overview | Grafana.com #3662 | ✅ Live |
+| Mikrotik MKTXP Exporter | Grafana.com #13679 | ⏳ Empty until MikroTik credentials added |
+| TrueNAS | Custom-built | ✅ Pool panels live; graphite panels pending TrueNAS push config |
+
+Dashboard files: `home-monitoring/remora/config/grafana/provisioning/dashboards/`
+
+---
+
 ## Next tasks
 
-### A. Alert rules
+### A. TrueNAS graphite push
+
+TrueNAS is currently pushing collectd metrics to another Prometheus/Grafana host.
+TrueNAS SCALE only supports one graphite server target.
+
+**Decision pending:** move the push to this host (for testing), then either:
+- Decommission the other stack, OR
+- Add a carbon relay (e.g. `carbon-relay-ng`) as a compose service to fan out to both hosts
+
+To move: TrueNAS SCALE → System → Advanced → Reporting → Graphite server = this
+machine's LAN IP, port 2003.
+
+Once graphite data flows, verify the metric names against the TrueNAS dashboard
+queries. The memory metric suffix may differ between TrueNAS versions
+(`truenas_memory_used` vs `truenas_memory_memory_used`). Check with:
+```bash
+curl -s http://localhost:9108/metrics | grep "^truenas_memory" | head -10
+```
+
+### B. Alert rules
 
 Translate Helm chart PrometheusRule CRDs to standalone `rule_files:` YAML.
 
@@ -44,7 +79,7 @@ Bind-mount `./config/prometheus/rules` into the prometheus service in `compose.r
 
 Hot-reload after: `curl -X POST http://localhost:9090/-/reload`
 
-### B. Pushover alerts
+### C. Pushover alerts
 
 Edit `remora/config/alertmanager/alertmanager.yml`:
 1. Replace null receiver with:
@@ -59,17 +94,31 @@ Edit `remora/config/alertmanager/alertmanager.yml`:
 
 Credentials at https://pushover.net.
 
-### C. MikroTik credentials for mktxp
+### D. MikroTik credentials for mktxp
 
 `config/mktxp/mktxp.conf` needs a real RouterOS API username and password.
 Without them mktxp scrapes zero metrics (process is up, but all gauges are empty).
 
-### D. CRI compliance
+### E. CRI compliance
 
 See `docs/CRI_COMPLIANCE.md` for the full roadmap (phases C1–C7).
 Short version: daemon → gRPC skeleton → ImageService → pod sandbox → CNI →
 container lifecycle → exec/logs/stats. The pod sandbox (C4) is the critical
 path item requiring the most new design work.
+
+---
+
+## Completed this session
+
+- Fixed three build engine bugs (EINVAL dedup, WORKDIR mkdir, COPY dest resolution)
+- Added `scripts/check-monitoring.sh` endpoint health checker
+- Fixed Prometheus self-scrape (`localhost` → `prometheus` service name)
+- Added `--web.enable-lifecycle` to prometheus flags for hot-reload
+- Added Grafana dashboard provisioning (mktxp, Prometheus overview, TrueNAS)
+- TrueNAS dashboard custom-built against our metric names (no community dashboard matches)
+- Added docs: `ACCESS_PATTERNS.md`, `CRI_COMPLIANCE.md`, `HOME_MONITORING_CONFIG_NOTES.md`
+- Added macro: "So Long and Thanks for all the Fish" to CLAUDE.md
+- Committed previously untracked files: snmp.yml, datasources/prometheus.yaml, README.md
 
 ---
 
@@ -88,4 +137,9 @@ path item requiring the most new design work.
   `sudo remora image rm truenas-api-exporter:latest` then re-run the script.
 
 - **Plex token** — set in `monitoring-setup/.env` as `PLEX_TOKEN=...`.
-  The script substitutes it at runtime; the token never touches the compose file.
+
+- **TrueNAS API key** — set in `monitoring-setup/.env` as `TRUENAS_API_KEY=...`.
+
+- **TrueNAS graphite metric names** — derived from graphite_mapping.yaml regex
+  rules; exact suffixes depend on TrueNAS/collectd version. Verify once push
+  is flowing and adjust dashboard queries if needed.
