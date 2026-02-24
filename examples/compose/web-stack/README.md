@@ -1,12 +1,16 @@
 # Compose Web Stack Example
 
 The same 3-container blog stack as `examples/web-stack/`, but orchestrated
-with `remora compose` instead of imperative shell scripting.
+with `remora compose`. Two compose files are provided side by side:
 
-## The Compose File
+| File | Format | Features |
+|------|--------|---------|
+| `compose.rem` | Static S-expressions | Declarative baseline |
+| `compose.reml` | Lisp program | `define`, `env`, `on-ready` hooks |
 
-Everything that matters is in **`compose.rem`** — 50 lines of declarative
-S-expressions replacing 224 lines of bash:
+`run.sh` uses `compose.reml` by default.
+
+## Architecture
 
 ```
 frontend (10.88.1.0/24):  proxy ←→ app
@@ -16,27 +20,63 @@ backend  (10.88.2.0/24):           app ←→ redis
 | Service | Networks | Depends On | Ports | Role |
 |---------|----------|------------|-------|------|
 | **redis** | backend | — | — | Redis data store |
-| **app** | frontend + backend | redis:6379 | — | Python/Bottle REST API |
-| **proxy** | frontend | app:5000 | 8080:80 | nginx reverse proxy |
+| **app** | frontend + backend | redis:6379 (TCP) | — | Python/Bottle REST API |
+| **proxy** | frontend | app:5000 (TCP) | 8080→80 | nginx reverse proxy |
 
-The proxy and redis share no network — network isolation is enforced by
-the compose topology, not by firewall rules.
+The proxy and redis share no network — isolation is enforced by topology, not
+firewall rules.
 
-## What Compose Handles Automatically
+## What `compose.reml` Adds
 
-Things the old `run.sh` did manually that `compose.rem` declares:
+The `.reml` version is a Lisp program evaluated before the supervisor starts.
+It produces the same `ComposeFile` as the static `.rem` but through code:
 
-- **Network creation** — `(network frontend (subnet ...))` creates scoped
-  networks (`blog-frontend`, `blog-backend`)
-- **Volume creation** — `(volume notes-data)` creates `blog-notes-data`
-- **Dependency ordering** — redis starts first, app waits for redis:6379,
-  proxy waits for app:5000
-- **TCP readiness** — `:ready-port` polls until the port accepts connections
-- **DNS registration** — services find each other by name (`redis`, `app`)
-- **Multi-network attachment** — app bridges both networks automatically
-- **Resource limits** — memory and CPU per service
-- **Teardown** — `compose down -v` stops everything in reverse order and
-  removes networks, volumes, and state
+### `define` — named configuration
+
+All tuneable values live at the top of the file:
+
+```lisp
+(define host-port 8080)
+(define mem-redis "64m")
+(define mem-app   "128m")
+(define mem-proxy "32m")
+(define cpu-app   "0.5")
+```
+
+No magic numbers buried inside service blocks. Change one line to retune the
+whole stack.
+
+### `env` — runtime configuration without file editing
+
+The published host port is read from the environment at startup:
+
+```lisp
+(define host-port
+  (let ((p (env "BLOG_PORT")))
+    (if (null? p) 8080 (string->number p))))
+```
+
+```bash
+# Run on a non-default port — no file edit required
+BLOG_PORT=9090 sudo remora compose up -f compose.reml -p blog
+```
+
+### `on-ready` — observable tier transitions
+
+Two hooks make startup sequencing visible in the log:
+
+```lisp
+(on-ready "redis"
+  (lambda ()
+    (log "redis: datastore layer ready — application tier starting")))
+
+(on-ready "app"
+  (lambda ()
+    (log "app: application tier healthy — proxy starting")))
+```
+
+These fire after each service's TCP health check passes, immediately before
+the next tier is allowed to start.
 
 ## Running
 
@@ -46,24 +86,22 @@ cargo build --release
 export PATH=$PWD/target/release:$PATH
 
 # Run the demo (requires root)
-sudo ./examples/compose-web-stack/run.sh
+sudo ./examples/compose/web-stack/run.sh
 ```
 
 The script:
-1. Pulls alpine and builds the 3 images (reuses `web-stack/` Remfiles)
-2. Runs `remora compose up` in foreground
+1. Pulls `alpine:latest` and builds the 3 images (from `examples/web-stack/` Remfiles)
+2. Runs `remora compose up -f compose.reml` in foreground
 3. Waits for the stack to accept connections on port 8080
-4. Runs 5 verification tests (static page, health, CRUD, persistence)
+4. Runs 5 verification tests (static page, health check, CRUD, persistence)
 5. Tears down with `remora compose down -v`
 
 ## Comparison
 
-| | `web-stack/run.sh` | `compose-web-stack/compose.rem` |
-|---|---|---|
-| Network setup | 6 imperative commands | 2 declarations |
-| Volume setup | 1 command | 1 declaration |
-| Container start | 3 commands + sleep + liveness checks | 3 service blocks |
-| Dependency order | Implicit (script order + sleep) | Explicit (depends-on + readiness) |
-| Service discovery | `--link name:alias` flags | Automatic DNS |
-| Teardown | 12 cleanup commands | `compose down -v` |
-| Lines of orchestration | ~120 (bash) | ~45 (S-expressions) |
+| | `web-stack/run.sh` | `compose.rem` | `compose.reml` |
+|---|---|---|---|
+| Network setup | 6 commands | 2 declarations | 2 named constants + declarations |
+| Port configuration | Hardcoded | Hardcoded | `$BLOG_PORT` env var with default |
+| Startup visibility | `sleep` guards | Silent readiness polling | `on-ready` log messages |
+| Resource limits | Hardcoded flags | Inline values | Named constants at top |
+| Lines of orchestration | ~120 (bash) | ~45 | ~80 (with comments) |

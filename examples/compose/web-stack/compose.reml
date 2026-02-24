@@ -1,0 +1,97 @@
+; Remora Blog — web-stack in Lisp  (compose.reml)
+;
+; Architecture:
+;
+;   frontend (10.88.1.0/24):  proxy ←→ app
+;   backend  (10.88.2.0/24):           app ←→ redis
+;
+; Lisp features demonstrated vs. the static compose.rem:
+;
+;   define    — all tuneable values named at the top; no magic numbers buried
+;               inside service blocks
+;   env       — host port read from $BLOG_PORT at eval time, with a safe
+;               default; no rebuild or file edit needed to change it
+;   on-ready  — lifecycle hooks: a log message fires at each tier transition
+;               (redis→app, app→proxy) to make startup sequencing visible
+;   depends-on with port — (list 'depends-on "svc" N) generates a TCP
+;               readiness check, matching the :ready-port semantics of .rem
+
+;; ── Configuration ─────────────────────────────────────────────────
+;;
+;; All tuneable values in one place.
+;;
+;; Override the published host port without editing this file:
+;;   BLOG_PORT=9090 sudo remora compose up -f compose.reml -p blog
+
+(define host-port
+  (let ((p (env "BLOG_PORT")))
+    (if (null? p) 8080 (string->number p))))
+
+(define mem-redis "64m")
+(define mem-app   "128m")
+(define mem-proxy "32m")
+(define cpu-app   "0.5")
+
+;; ── Networks ──────────────────────────────────────────────────────
+;;
+;; Bound to variables so the names are written once and referenced
+;; symbolically everywhere else.
+
+(define net-frontend (network "frontend" '(subnet "10.88.1.0/24")))
+(define net-backend  (network "backend"  '(subnet "10.88.2.0/24")))
+
+;; ── Lifecycle hooks ───────────────────────────────────────────────
+;;
+;; on-ready fires after a service's startup health check passes,
+;; before the next tier is allowed to start.
+
+(on-ready "redis"
+  (lambda ()
+    (log "redis: datastore layer ready — application tier starting")))
+
+(on-ready "app"
+  (lambda ()
+    (log "app: application tier healthy — proxy starting")))
+
+;; ── Services ──────────────────────────────────────────────────────
+
+(define svc-redis
+  (service "redis"
+    '(image "web-stack-redis:latest")
+    (list 'network 'backend)
+    (list 'memory mem-redis)))
+
+(define svc-app
+  (service "app"
+    '(image "web-stack-app:latest")
+    (list 'network 'frontend)
+    (list 'network 'backend)
+    ; Wait for redis TCP port — equivalent to :ready-port 6379 in .rem
+    (list 'depends-on "redis" 6379)
+    (list 'env "REDIS_HOST" "redis")
+    (list 'env "REDIS_PORT" "6379")
+    (list 'memory mem-app)
+    (list 'cpus cpu-app)))
+
+(define svc-proxy
+  (service "proxy"
+    '(image "web-stack-proxy:latest")
+    (list 'network 'frontend)
+    ; Wait for app TCP port — equivalent to :ready-port 5000 in .rem
+    (list 'depends-on "app" 5000)
+    (list 'port host-port 80)
+    (list 'memory mem-proxy)))
+
+;; ── Assemble and run ──────────────────────────────────────────────
+;;
+;; compose flattens the network specs, volume, and service specs into
+;; a ComposeFile; compose-up hands it to the CLI supervisor.
+
+(compose-up
+  (compose
+    net-frontend
+    net-backend
+    (volume "notes-data")
+    svc-redis
+    svc-app
+    svc-proxy))

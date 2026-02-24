@@ -8418,3 +8418,175 @@ fn test_lisp_evaluator_tco_and_higher_order() {
     assert_eq!(items.len(), 5);
     assert_eq!(items[4], remora::lisp::Value::Int(25));
 }
+// ---------------------------------------------------------------------------
+// Lisp .reml fixture tests (no root required)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lisp_eval_file_web_stack_fixture() {
+    // Read the actual compose.reml fixture from disk via eval_file().
+    // Exercises the full path: file I/O → parse_all → eval → domain builtins.
+    // Does not start containers.
+    use remora::lisp::Interpreter;
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/compose/web-stack/compose.reml");
+
+    assert!(
+        fixture.exists(),
+        "fixture not found: {}",
+        fixture.display()
+    );
+
+    let mut interp = Interpreter::new();
+    interp
+        .eval_file(&fixture)
+        .unwrap_or_else(|e| panic!("eval_file failed: {}", e.message));
+
+    let pending = interp.take_pending().expect("compose-up was not called");
+    let spec = pending.spec.expect("no spec in pending");
+
+    // Two networks.
+    assert_eq!(spec.networks.len(), 2);
+    let net_names: Vec<&str> = spec.networks.iter().map(|n| n.name.as_str()).collect();
+    assert!(net_names.contains(&"frontend"), "missing frontend network");
+    assert!(net_names.contains(&"backend"), "missing backend network");
+
+    let frontend = spec.networks.iter().find(|n| n.name == "frontend").unwrap();
+    assert_eq!(
+        frontend.subnet.as_deref(),
+        Some("10.88.1.0/24"),
+        "frontend subnet wrong"
+    );
+
+    // One volume.
+    assert_eq!(spec.volumes, vec!["notes-data"]);
+
+    // Three services in dependency order: redis, app, proxy.
+    assert_eq!(spec.services.len(), 3);
+    let names: Vec<&str> = spec.services.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"redis"), "redis missing");
+    assert!(names.contains(&"app"), "app missing");
+    assert!(names.contains(&"proxy"), "proxy missing");
+
+    // redis: backend only, memory cap set.
+    let redis = spec.services.iter().find(|s| s.name == "redis").unwrap();
+    assert_eq!(redis.image, "web-stack-redis:latest");
+    assert_eq!(redis.networks, vec!["backend"]);
+    assert_eq!(redis.memory.as_deref(), Some("64m"));
+    assert!(redis.depends_on.is_empty());
+
+    // app: both networks, depends on redis with TCP port check.
+    let app = spec.services.iter().find(|s| s.name == "app").unwrap();
+    assert_eq!(app.networks, vec!["frontend", "backend"]);
+    assert_eq!(app.depends_on.len(), 1);
+    assert_eq!(app.depends_on[0].service, "redis");
+    assert!(
+        matches!(
+            app.depends_on[0].health_check,
+            Some(remora::compose::HealthCheck::Port(6379))
+        ),
+        "app should depend on redis:6379 TCP check"
+    );
+    assert_eq!(app.env.get("REDIS_HOST").map(String::as_str), Some("redis"));
+
+    // proxy: frontend only, depends on app:5000, host port 8080 (BLOG_PORT unset).
+    let proxy = spec.services.iter().find(|s| s.name == "proxy").unwrap();
+    assert_eq!(proxy.networks, vec!["frontend"]);
+    assert_eq!(proxy.depends_on.len(), 1);
+    assert_eq!(proxy.depends_on[0].service, "app");
+    assert!(
+        matches!(
+            proxy.depends_on[0].health_check,
+            Some(remora::compose::HealthCheck::Port(5000))
+        ),
+        "proxy should depend on app:5000 TCP check"
+    );
+    assert_eq!(proxy.ports.len(), 1);
+    assert_eq!(proxy.ports[0].host, 8080, "default host port should be 8080");
+    assert_eq!(proxy.ports[0].container, 80);
+
+    // Both on-ready hooks registered.
+    let hooks = interp.take_hooks();
+    assert!(hooks.contains_key("redis"), "on-ready hook for 'redis' missing");
+    assert!(hooks.contains_key("app"), "on-ready hook for 'app' missing");
+}
+
+#[test]
+fn test_lisp_depends_on_with_port() {
+    // Unit-level test for the (list 'depends-on "svc" N) → HealthCheck::Port(N)
+    // extension to the service builtin.
+    use remora::lisp::Interpreter;
+
+    let mut interp = Interpreter::new();
+    interp
+        .eval_str(
+            r#"
+            (compose-up
+              (compose
+                (service "worker"
+                  '(image "myapp:latest")
+                  (list 'depends-on "db" 5432)
+                  (list 'depends-on "cache"))))
+            "#,
+        )
+        .expect("eval failed");
+
+    let spec = interp
+        .take_pending()
+        .expect("no pending")
+        .spec
+        .expect("no spec");
+    let worker = spec.services.iter().find(|s| s.name == "worker").unwrap();
+
+    assert_eq!(worker.depends_on.len(), 2);
+
+    let dep_db = worker.depends_on.iter().find(|d| d.service == "db").unwrap();
+    assert!(
+        matches!(dep_db.health_check, Some(remora::compose::HealthCheck::Port(5432))),
+        "db dependency should have Port(5432)"
+    );
+
+    let dep_cache = worker
+        .depends_on
+        .iter()
+        .find(|d| d.service == "cache")
+        .unwrap();
+    assert!(
+        dep_cache.health_check.is_none(),
+        "cache dependency should have no health check"
+    );
+}
+
+#[test]
+fn test_lisp_env_fallback_and_override() {
+    // Verifies (env "VAR") returns Nil when unset, and that the fallback
+    // pattern (if (null? p) default ...) produces the default value.
+    use remora::lisp::Interpreter;
+
+    // Ensure the test var is absent.
+    std::env::remove_var("_REMORA_TEST_PORT");
+
+    let mut interp = Interpreter::new();
+
+    // With var unset: should use the default 9999.
+    let v = interp
+        .eval_str(
+            r#"(let ((p (env "_REMORA_TEST_PORT")))
+                 (if (null? p) 9999 (string->number p)))"#,
+        )
+        .expect("eval failed");
+    assert_eq!(v, remora::lisp::Value::Int(9999));
+
+    // With var set: should use the provided value.
+    std::env::set_var("_REMORA_TEST_PORT", "1234");
+    let v2 = interp
+        .eval_str(
+            r#"(let ((p (env "_REMORA_TEST_PORT")))
+                 (if (null? p) 9999 (string->number p)))"#,
+        )
+        .expect("eval failed");
+    assert_eq!(v2, remora::lisp::Value::Int(1234));
+
+    std::env::remove_var("_REMORA_TEST_PORT");
+}

@@ -1568,3 +1568,55 @@ Pure evaluator correctness and TCO stress test:
 
 Failure means either: (a) TCO is broken and the evaluator stack-overflows on deep tail
 recursion; or (b) `map`, `lambda`, arithmetic, or list construction is incorrect.
+
+
+### `test_lisp_eval_file_web_stack_fixture`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+Reads `examples/compose/web-stack/compose.reml` from disk via `Interpreter::eval_file()`.
+This is the primary test of the file-read path — all previous Lisp tests used inline strings
+via `eval_str()`.
+
+Asserts the full parsed and evaluated `ComposeFile` structure:
+- Two networks: `"frontend"` (subnet `10.88.1.0/24`) and `"backend"`
+- One volume: `"notes-data"`
+- Three services: `"redis"`, `"app"`, `"proxy"`
+- `redis`: image `web-stack-redis:latest`, network `backend`, memory `64m`, no deps
+- `app`: both networks, `depends-on redis` with `HealthCheck::Port(6379)`, `REDIS_HOST` env set
+- `proxy`: network `frontend`, `depends-on app` with `HealthCheck::Port(5000)`,
+  host port 8080 (default — `$BLOG_PORT` not set in test environment)
+- `on-ready` hooks registered for both `"redis"` and `"app"`
+
+Failure means the `eval_file()` path is broken, the `env`-with-fallback pattern
+evaluates incorrectly, named `define` variables don't compose correctly, or the
+`depends-on` port extension isn't wired through.
+
+### `test_lisp_depends_on_with_port`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+Unit test for the `(list 'depends-on "svc" N)` → `HealthCheck::Port(N)` extension
+added to `apply_service_opt`. Evaluates a service with two `depends-on` options: one
+with a port and one without. Asserts:
+- `depends-on "db" 5432` produces `Dependency { service: "db", health_check: Some(Port(5432)) }`
+- `depends-on "cache"` (no port) produces `Dependency { service: "cache", health_check: None }`
+
+Failure means the `.reml` format cannot express TCP readiness checks on dependencies,
+making the Lisp compose path weaker than the static `.rem` format.
+
+### `test_lisp_env_fallback_and_override`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+Tests the `(env "VAR")` builtin and the standard Lisp fallback pattern used in
+`compose.reml` for environment-driven configuration:
+
+```lisp
+(let ((p (env "VAR")))
+  (if (null? p) default-value (string->number p)))
+```
+
+Asserts that with the env var absent the expression returns the default, and with
+the var set it returns the parsed value. Tests the full round-trip through `env`,
+`null?`, `if`, `string->number`, and the `let` binding.
+
+Failure means operators cannot reliably use environment variables to configure their
+`.reml` stacks without modifying the file itself.

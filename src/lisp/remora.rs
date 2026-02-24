@@ -11,7 +11,7 @@ use std::rc::Rc;
 use super::env::Env;
 use super::eval::eval_apply;
 use super::value::{LispError, Value};
-use crate::compose::{ComposeFile, Dependency, NetworkSpec, PortMapping, ServiceSpec};
+use crate::compose::{ComposeFile, Dependency, HealthCheck, NetworkSpec, PortMapping, ServiceSpec};
 
 /// Zero-argument hook closure fired after a service becomes healthy.
 pub type HookFn = Rc<dyn Fn() -> Result<(), LispError>>;
@@ -344,13 +344,27 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
             spec.ports.push(PortMapping { host, container });
         }
         "depends-on" => {
-            for dep in vals {
-                let dep_name = str_or_sym("depends-on", dep)?;
-                spec.depends_on.push(Dependency {
-                    service: dep_name,
-                    health_check: None,
-                });
-            }
+            // Accepts one dependency per option call:
+            //   (list 'depends-on "svc")        — process-alive only
+            //   (list 'depends-on "svc" 6379)   — TCP port readiness check
+            let dep_name = str_or_sym_at("depends-on", vals, 0)?;
+            let health_check = match vals.get(1) {
+                Some(Value::Int(port)) => {
+                    let p = u16::try_from(*port)
+                        .map_err(|_| LispError::new("depends-on: port out of range"))?;
+                    Some(HealthCheck::Port(p))
+                }
+                Some(_) => {
+                    return Err(LispError::new(
+                        "depends-on: optional second arg must be a port number",
+                    ))
+                }
+                None => None,
+            };
+            spec.depends_on.push(Dependency {
+                service: dep_name,
+                health_check,
+            });
         }
         "memory" => {
             spec.memory = Some(str_or_sym_at("memory", vals, 0)?);

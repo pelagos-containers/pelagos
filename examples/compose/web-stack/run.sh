@@ -52,13 +52,13 @@ done
 # ── Compose Up ────────────────────────────────────────────────────
 # One command replaces 50 lines of network/volume/container setup.
 
-log "Starting stack with ${BOLD}remora compose up${NC}..."
-$REMORA compose up -f "$SCRIPT_DIR/compose.rem" -p blog --foreground &
+log "Starting stack with ${BOLD}remora compose up${NC} (compose.reml)..."
+$REMORA compose up -f "$SCRIPT_DIR/compose.reml" -p blog --foreground &
 COMPOSE_PID=$!
 
 cleanup() {
     log "Tearing down..."
-    $REMORA compose down -f "$SCRIPT_DIR/compose.rem" -p blog -v 2>/dev/null || true
+    $REMORA compose down -f "$SCRIPT_DIR/compose.reml" -p blog -v 2>/dev/null || true
     wait "$COMPOSE_PID" 2>/dev/null || true
     log "Done."
 }
@@ -133,7 +133,7 @@ fi
 # Test 6: Service list
 echo
 log "Service status:"
-$REMORA compose ps -f "$SCRIPT_DIR/compose.rem" -p blog
+$REMORA compose ps -f "$SCRIPT_DIR/compose.reml" -p blog
 
 # ── Summary ───────────────────────────────────────────────────────
 
@@ -142,9 +142,9 @@ echo -e "${BOLD}Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}"
 
 if [ "$fail" -gt 0 ]; then
     echo -e "\nCheck service logs:"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.rem -p blog redis"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.rem -p blog app"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.rem -p blog proxy"
+    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p blog redis"
+    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p blog app"
+    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p blog proxy"
     echo -e "\nPress Enter to tear down..."
     read -r
 fi
