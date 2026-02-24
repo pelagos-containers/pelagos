@@ -17,6 +17,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             artifact: remora-aarch64-linux
+            rustflags: "-C relocation-model=pic"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +28,8 @@ jobs:
         run: sudo apt-get install -y musl-tools cmake
       - name: Build release binary (musl static)
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
       - name: Prepare artifact
         run: |
           cp target/${{ matrix.target }}/release/remora ${{ matrix.artifact }}
