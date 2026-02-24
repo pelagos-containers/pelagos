@@ -8432,11 +8432,7 @@ fn test_lisp_eval_file_web_stack_fixture() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/compose/web-stack/compose.reml");
 
-    assert!(
-        fixture.exists(),
-        "fixture not found: {}",
-        fixture.display()
-    );
+    assert!(fixture.exists(), "fixture not found: {}", fixture.display());
 
     let mut interp = Interpreter::new();
     interp
@@ -8503,12 +8499,18 @@ fn test_lisp_eval_file_web_stack_fixture() {
         "proxy should depend on app:5000 TCP check"
     );
     assert_eq!(proxy.ports.len(), 1);
-    assert_eq!(proxy.ports[0].host, 8080, "default host port should be 8080");
+    assert_eq!(
+        proxy.ports[0].host, 8080,
+        "default host port should be 8080"
+    );
     assert_eq!(proxy.ports[0].container, 80);
 
     // Both on-ready hooks registered.
     let hooks = interp.take_hooks();
-    assert!(hooks.contains_key("redis"), "on-ready hook for 'redis' missing");
+    assert!(
+        hooks.contains_key("redis"),
+        "on-ready hook for 'redis' missing"
+    );
     assert!(hooks.contains_key("app"), "on-ready hook for 'app' missing");
 }
 
@@ -8541,9 +8543,16 @@ fn test_lisp_depends_on_with_port() {
 
     assert_eq!(worker.depends_on.len(), 2);
 
-    let dep_db = worker.depends_on.iter().find(|d| d.service == "db").unwrap();
+    let dep_db = worker
+        .depends_on
+        .iter()
+        .find(|d| d.service == "db")
+        .unwrap();
     assert!(
-        matches!(dep_db.health_check, Some(remora::compose::HealthCheck::Port(5432))),
+        matches!(
+            dep_db.health_check,
+            Some(remora::compose::HealthCheck::Port(5432))
+        ),
         "db dependency should have Port(5432)"
     );
 
