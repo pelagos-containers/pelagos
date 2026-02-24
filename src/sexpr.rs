@@ -60,16 +60,43 @@ impl fmt::Display for SExpr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub message: String,
+    /// Byte offset in the original input.
     pub position: usize,
+    /// 1-based line number.
+    pub line: usize,
+    /// 1-based column number (character, not byte).
+    pub col: usize,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "parse error at position {}: {}",
-            self.position, self.message
+            "parse error at {}:{}: {}",
+            self.line, self.col, self.message
         )
+    }
+}
+
+/// Convert a byte offset to a (line, col) pair (both 1-based).
+fn line_col(input: &str, pos: usize) -> (usize, usize) {
+    let prefix = &input[..pos.min(input.len())];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = prefix
+        .rfind('\n')
+        .map_or(prefix.len(), |n| prefix.len() - n - 1)
+        + 1;
+    (line, col)
+}
+
+/// Build a `ParseError` at `pos` with the given message.
+fn make_err(input: &str, pos: usize, message: impl Into<String>) -> ParseError {
+    let (line, col) = line_col(input, pos);
+    ParseError {
+        message: message.into(),
+        position: pos,
+        line,
+        col,
     }
 }
 
@@ -82,18 +109,12 @@ pub fn parse(input: &str) -> Result<SExpr, ParseError> {
     let mut pos = 0;
     skip_ws_and_comments(input, &mut pos);
     if pos >= input.len() {
-        return Err(ParseError {
-            message: "empty input".into(),
-            position: 0,
-        });
+        return Err(make_err(input, 0, "empty input"));
     }
     let expr = parse_sexpr(input, &mut pos)?;
     skip_ws_and_comments(input, &mut pos);
     if pos < input.len() {
-        return Err(ParseError {
-            message: "unexpected trailing input".into(),
-            position: pos,
-        });
+        return Err(make_err(input, pos, "unexpected trailing input"));
     }
     Ok(expr)
 }
@@ -101,20 +122,14 @@ pub fn parse(input: &str) -> Result<SExpr, ParseError> {
 fn parse_sexpr(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
     skip_ws_and_comments(input, pos);
     if *pos >= input.len() {
-        return Err(ParseError {
-            message: "unexpected end of input".into(),
-            position: *pos,
-        });
+        return Err(make_err(input, *pos, "unexpected end of input"));
     }
 
     let ch = input.as_bytes()[*pos];
     if ch == b'(' {
         parse_list(input, pos)
     } else if ch == b')' {
-        Err(ParseError {
-            message: "unexpected ')'".into(),
-            position: *pos,
-        })
+        Err(make_err(input, *pos, "unexpected ')'"))
     } else {
         parse_atom(input, pos)
     }
@@ -127,10 +142,7 @@ fn parse_list(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
     loop {
         skip_ws_and_comments(input, pos);
         if *pos >= input.len() {
-            return Err(ParseError {
-                message: "unmatched '('".into(),
-                position: open_pos,
-            });
+            return Err(make_err(input, open_pos, "unmatched '('"));
         }
         if input.as_bytes()[*pos] == b')' {
             *pos += 1; // skip ')'
@@ -154,14 +166,10 @@ fn parse_quoted_string(input: &str, pos: &mut usize) -> Result<SExpr, ParseError
     let mut s = String::new();
     let bytes = input.as_bytes();
     while *pos < bytes.len() {
-        let ch = bytes[*pos];
-        if ch == b'\\' {
+        if bytes[*pos] == b'\\' {
             *pos += 1;
             if *pos >= bytes.len() {
-                return Err(ParseError {
-                    message: "unterminated escape in string".into(),
-                    position: start,
-                });
+                return Err(make_err(input, start, "unterminated escape in string"));
             }
             match bytes[*pos] {
                 b'"' => s.push('"'),
@@ -170,21 +178,21 @@ fn parse_quoted_string(input: &str, pos: &mut usize) -> Result<SExpr, ParseError
                 b't' => s.push('\t'),
                 other => {
                     s.push('\\');
-                    s.push(other as char);
+                    s.push(other as char); // escape sequences are ASCII
                 }
             }
-        } else if ch == b'"' {
+            *pos += 1;
+        } else if bytes[*pos] == b'"' {
             *pos += 1; // skip closing '"'
             return Ok(SExpr::Atom(s));
         } else {
-            s.push(ch as char);
+            // Decode one full Unicode scalar value, advancing by its byte length.
+            let ch = input[*pos..].chars().next().unwrap();
+            s.push(ch);
+            *pos += ch.len_utf8();
         }
-        *pos += 1;
     }
-    Err(ParseError {
-        message: "unterminated string".into(),
-        position: start,
-    })
+    Err(make_err(input, start, "unterminated string"))
 }
 
 fn parse_bare_word(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
@@ -198,10 +206,7 @@ fn parse_bare_word(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
         *pos += 1;
     }
     if *pos == start {
-        return Err(ParseError {
-            message: "expected atom".into(),
-            position: start,
-        });
+        return Err(make_err(input, start, "expected atom"));
     }
     Ok(SExpr::Atom(input[start..*pos].to_string()))
 }
@@ -381,5 +386,35 @@ mod tests {
     fn test_as_list_on_atom() {
         let expr = parse("hello").unwrap();
         assert!(expr.as_list().is_none());
+    }
+
+    #[test]
+    fn test_quoted_string_utf8() {
+        // Multibyte UTF-8 characters must survive a round-trip through quoted strings.
+        let input = r#""héllo wörld 🎉""#;
+        let atom = parse(input).unwrap();
+        assert_eq!(atom.as_atom().unwrap(), "héllo wörld 🎉");
+    }
+
+    #[test]
+    fn test_error_line_col() {
+        // Error on line 2, column 3 (1-based).
+        let input = "(a\n  )x";
+        let err = parse(input).unwrap_err();
+        // The trailing 'x' is unexpected; confirm the Display uses line:col format.
+        let msg = err.to_string();
+        assert!(msg.contains(':'), "expected line:col in '{}'", msg);
+        assert_eq!(err.line, 2);
+        assert_eq!(err.col, 4); // '  )' is 3 chars; 'x' is col 4
+    }
+
+    #[test]
+    fn test_line_col_helper() {
+        let input = "line1\nline2\nline3";
+        assert_eq!(line_col(input, 0), (1, 1));
+        assert_eq!(line_col(input, 5), (1, 6)); // '\n' itself
+        assert_eq!(line_col(input, 6), (2, 1)); // first char of line2
+        assert_eq!(line_col(input, 11), (2, 6));
+        assert_eq!(line_col(input, 12), (3, 1));
     }
 }
