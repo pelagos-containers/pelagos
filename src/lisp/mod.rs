@@ -1,0 +1,603 @@
+//! Lisp interpreter for `.reml` compose files.
+//!
+//! Entry points:
+//! - [`Interpreter::new`] — create a fully-initialised interpreter with all
+//!   standard and Remora builtins registered.
+//! - [`Interpreter::eval_str`] — evaluate a string of Lisp source.
+//! - [`Interpreter::eval_file`] — read and evaluate a file.
+//! - [`Interpreter::take_pending`] — retrieve a `compose-up` invocation.
+//! - [`Interpreter::take_hooks`] — retrieve registered `on-ready` hooks.
+
+pub mod builtins;
+pub mod env;
+pub mod eval;
+pub mod remora;
+pub mod value;
+
+use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
+
+use crate::sexpr;
+pub use remora::{HookFn, HookMap, PendingCompose};
+pub use value::{LispError, Value};
+
+use builtins::register_builtins;
+use env::{Env, EnvFrame};
+use eval::eval;
+use remora::register_remora_builtins;
+
+/// A self-contained Lisp interpreter instance.
+pub struct Interpreter {
+    global_env: Env,
+    hooks: Rc<RefCell<HookMap>>,
+    pending: Rc<RefCell<PendingCompose>>,
+}
+
+impl Interpreter {
+    /// Create a new interpreter with all builtins registered.
+    pub fn new() -> Self {
+        let global_env = EnvFrame::new();
+        let hooks: Rc<RefCell<HookMap>> = Rc::new(RefCell::new(HookMap::new()));
+        let pending: Rc<RefCell<PendingCompose>> = Rc::new(RefCell::new(PendingCompose::default()));
+
+        register_builtins(&global_env);
+        register_remora_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
+
+        Interpreter {
+            global_env,
+            hooks,
+            pending,
+        }
+    }
+
+    /// Evaluate all top-level forms in `input`, returning the value of the last.
+    pub fn eval_str(&mut self, input: &str) -> Result<Value, LispError> {
+        let exprs = sexpr::parse_all(input).map_err(|e| LispError::at(e.message, e.line, e.col))?;
+        let mut result = Value::Nil;
+        for expr in exprs {
+            result = eval(expr, Rc::clone(&self.global_env))?;
+        }
+        Ok(result)
+    }
+
+    /// Read a `.reml` file and evaluate it.
+    pub fn eval_file(&mut self, path: &Path) -> Result<Value, LispError> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| LispError::new(format!("cannot read '{}': {}", path.display(), e)))?;
+        self.eval_str(&source)
+    }
+
+    /// Define an additional native function in the global environment.
+    pub fn register_native(&mut self, name: &str, f: value::NativeFn) {
+        self.global_env
+            .borrow_mut()
+            .define(name, Value::Native(name.to_string(), f));
+    }
+
+    /// Consume the pending `compose-up` invocation, if any.
+    pub fn take_pending(&self) -> Option<PendingCompose> {
+        let mut p = self.pending.borrow_mut();
+        if p.spec.is_some() {
+            let spec = p.spec.take();
+            let project = p.project.take();
+            let foreground = p.foreground;
+            *p = PendingCompose::default();
+            Some(PendingCompose {
+                spec,
+                project,
+                foreground,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Consume the registered `on-ready` hooks.
+    pub fn take_hooks(&self) -> HookMap {
+        std::mem::take(&mut self.hooks.borrow_mut())
+    }
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interp() -> Interpreter {
+        Interpreter::new()
+    }
+
+    fn eval_ok(interp: &mut Interpreter, src: &str) -> Value {
+        interp
+            .eval_str(src)
+            .unwrap_or_else(|e| panic!("eval error: {}", e))
+    }
+
+    fn eval_err(interp: &mut Interpreter, src: &str) -> String {
+        interp
+            .eval_str(src)
+            .err()
+            .unwrap_or_else(|| panic!("expected error"))
+            .message
+    }
+
+    // ── Self-evaluating ───────────────────────────────────────────────────
+    #[test]
+    fn test_integer() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "42"), Value::Int(42));
+        assert_eq!(eval_ok(&mut i, "-7"), Value::Int(-7));
+    }
+
+    #[test]
+    fn test_float() {
+        let mut i = interp();
+        assert!(matches!(eval_ok(&mut i, "3.14"), Value::Float(_)));
+    }
+
+    #[test]
+    fn test_string() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, r#""hello""#), Value::Str("hello".into()));
+    }
+
+    #[test]
+    fn test_bool() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "#t"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut i, "#f"), Value::Bool(false));
+    }
+
+    #[test]
+    fn test_nil() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "()"), Value::Nil);
+    }
+
+    // ── Arithmetic ────────────────────────────────────────────────────────
+    #[test]
+    fn test_add() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(+ 1 2 3)"), Value::Int(6));
+    }
+
+    #[test]
+    fn test_sub() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(- 10 3)"), Value::Int(7));
+    }
+
+    #[test]
+    fn test_mul() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(* 3 4)"), Value::Int(12));
+    }
+
+    #[test]
+    fn test_div_exact() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(/ 12 4)"), Value::Int(3));
+    }
+
+    #[test]
+    fn test_div_inexact() {
+        let mut i = interp();
+        assert!(matches!(eval_ok(&mut i, "(/ 1 3)"), Value::Float(_)));
+    }
+
+    #[test]
+    fn test_modulo() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(modulo 10 3)"), Value::Int(1));
+        assert_eq!(eval_ok(&mut i, "(modulo -10 3)"), Value::Int(2));
+    }
+
+    #[test]
+    fn test_expt() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(expt 2 10)"), Value::Int(1024));
+    }
+
+    // ── Comparison ────────────────────────────────────────────────────────
+    #[test]
+    fn test_numeric_comparison() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(< 1 2)"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut i, "(> 1 2)"), Value::Bool(false));
+        assert_eq!(eval_ok(&mut i, "(= 3 3)"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut i, "(<= 2 2)"), Value::Bool(true));
+    }
+
+    // ── Boolean ───────────────────────────────────────────────────────────
+    #[test]
+    fn test_not() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(not #f)"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut i, "(not 42)"), Value::Bool(false));
+    }
+
+    // ── Quote ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_quote_symbol() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "'foo"), Value::Symbol("foo".into()));
+    }
+
+    #[test]
+    fn test_quote_list() {
+        let mut i = interp();
+        let v = eval_ok(&mut i, "'(1 2 3)");
+        assert!(v.is_list());
+        let items = v.to_vec().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], Value::Int(1));
+    }
+
+    // ── If ────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_if_true() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(if #t 1 2)"), Value::Int(1));
+    }
+
+    #[test]
+    fn test_if_false() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(if #f 1 2)"), Value::Int(2));
+    }
+
+    // ── Define & Lambda ───────────────────────────────────────────────────
+    #[test]
+    fn test_define_and_use() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define x 42)");
+        assert_eq!(eval_ok(&mut i, "x"), Value::Int(42));
+    }
+
+    #[test]
+    fn test_define_function() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define (square n) (* n n))");
+        assert_eq!(eval_ok(&mut i, "(square 7)"), Value::Int(49));
+    }
+
+    #[test]
+    fn test_lambda() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, "((lambda (x y) (+ x y)) 3 4)"),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn test_variadic_lambda() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define (head . rest) (car rest))");
+        assert_eq!(eval_ok(&mut i, "(head 1 2 3)"), Value::Int(1));
+    }
+
+    // ── Let ───────────────────────────────────────────────────────────────
+    #[test]
+    fn test_let() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, "(let ((x 3) (y 4)) (+ x y))"),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn test_let_star() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, "(let* ((x 1) (y (+ x 1))) y)"),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn test_letrec() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(
+                &mut i,
+                "(letrec ((even? (lambda (n) (if (= n 0) #t (odd? (- n 1)))))
+                          (odd?  (lambda (n) (if (= n 0) #f (even? (- n 1))))))
+                   (even? 10))"
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    // ── Named let ─────────────────────────────────────────────────────────
+    #[test]
+    fn test_named_let() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(
+                &mut i,
+                "(let loop ((n 5) (acc 1))
+                   (if (= n 0) acc (loop (- n 1) (* acc n))))"
+            ),
+            Value::Int(120) // 5!
+        );
+    }
+
+    // ── TCO: deep recursion doesn't overflow ──────────────────────────────
+    #[test]
+    fn test_tco_does_not_overflow() {
+        let mut i = interp();
+        // 100 000 tail calls — would overflow without TCO.
+        eval_ok(
+            &mut i,
+            "(define (count-down n)
+               (if (= n 0) #t (count-down (- n 1))))
+             (count-down 100000)",
+        );
+    }
+
+    // ── Cond ──────────────────────────────────────────────────────────────
+    #[test]
+    fn test_cond() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, "(cond ((= 1 2) 'a) ((= 1 1) 'b) (else 'c))"),
+            Value::Symbol("b".into())
+        );
+    }
+
+    // ── And/Or ────────────────────────────────────────────────────────────
+    #[test]
+    fn test_and_short_circuit() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(and 1 #f 3)"), Value::Bool(false));
+        assert_eq!(eval_ok(&mut i, "(and 1 2 3)"), Value::Int(3));
+    }
+
+    #[test]
+    fn test_or_short_circuit() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(or #f #f 42)"), Value::Int(42));
+        assert_eq!(eval_ok(&mut i, "(or #f #f #f)"), Value::Bool(false));
+    }
+
+    // ── Quasiquote ────────────────────────────────────────────────────────
+    #[test]
+    fn test_quasiquote_basic() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define x 42)");
+        let v = eval_ok(&mut i, "`(a ,x c)");
+        let items = v.to_vec().unwrap();
+        assert_eq!(items[0], Value::Symbol("a".into()));
+        assert_eq!(items[1], Value::Int(42));
+        assert_eq!(items[2], Value::Symbol("c".into()));
+    }
+
+    #[test]
+    fn test_quasiquote_splicing() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define xs '(1 2 3))");
+        let v = eval_ok(&mut i, "`(a ,@xs b)");
+        let items = v.to_vec().unwrap();
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0], Value::Symbol("a".into()));
+        assert_eq!(items[1], Value::Int(1));
+        assert_eq!(items[4], Value::Symbol("b".into()));
+    }
+
+    // ── List operations ───────────────────────────────────────────────────
+    #[test]
+    fn test_map() {
+        let mut i = interp();
+        let v = eval_ok(&mut i, "(map (lambda (x) (* x x)) '(1 2 3 4))");
+        let items = v.to_vec().unwrap();
+        assert_eq!(
+            items,
+            vec![Value::Int(1), Value::Int(4), Value::Int(9), Value::Int(16)]
+        );
+    }
+
+    #[test]
+    fn test_filter() {
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            "(filter (lambda (x) (not (= (modulo x 2) 0))) '(1 2 3 4 5))",
+        );
+        let items = v.to_vec().unwrap();
+        assert_eq!(items, vec![Value::Int(1), Value::Int(3), Value::Int(5)]);
+    }
+
+    #[test]
+    fn test_odd_even_predicates() {
+        let mut i = interp();
+        // Define odd? and even? since they're not builtins
+        eval_ok(
+            &mut i,
+            "(define (odd? n) (not (= (modulo n 2) 0)))
+             (define (even? n) (= (modulo n 2) 0))",
+        );
+        assert_eq!(eval_ok(&mut i, "(odd? 3)"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut i, "(even? 4)"), Value::Bool(true));
+    }
+
+    #[test]
+    fn test_apply() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(apply + '(1 2 3))"), Value::Int(6));
+        assert_eq!(eval_ok(&mut i, "(apply + 1 2 '(3 4))"), Value::Int(10));
+    }
+
+    #[test]
+    fn test_fold_left() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, "(fold-left + 0 '(1 2 3 4 5))"),
+            Value::Int(15)
+        );
+    }
+
+    #[test]
+    fn test_iota() {
+        let mut i = interp();
+        let v = eval_ok(&mut i, "(iota 5)");
+        let items = v.to_vec().unwrap();
+        assert_eq!(
+            items,
+            vec![
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4)
+            ]
+        );
+    }
+
+    // ── Do loop ───────────────────────────────────────────────────────────
+    #[test]
+    fn test_do_loop() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(
+                &mut i,
+                "(do ((i 0 (+ i 1))
+                      (s 0 (+ s i)))
+                     ((= i 5) s))"
+            ),
+            Value::Int(10) // 0+1+2+3+4
+        );
+    }
+
+    // ── String operations ─────────────────────────────────────────────────
+    #[test]
+    fn test_string_append() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(string-append "hello" " " "world")"#),
+            Value::Str("hello world".into())
+        );
+    }
+
+    #[test]
+    fn test_string_length() {
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, r#"(string-length "héllo")"#), Value::Int(5));
+    }
+
+    #[test]
+    fn test_number_to_string() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, "(number->string 42)"),
+            Value::Str("42".into())
+        );
+    }
+
+    // ── Error handling ────────────────────────────────────────────────────
+    #[test]
+    fn test_unbound_variable() {
+        let mut i = interp();
+        let e = eval_err(&mut i, "undefined-var");
+        assert!(e.contains("unbound"), "got: {}", e);
+    }
+
+    #[test]
+    fn test_arity_error() {
+        let mut i = interp();
+        let e = eval_err(&mut i, "(car 1 2)");
+        assert!(e.contains("arity") || e.contains("argument"), "got: {}", e);
+    }
+
+    #[test]
+    fn test_not_a_procedure() {
+        let mut i = interp();
+        let e = eval_err(&mut i, "(42 1 2)");
+        assert!(e.contains("procedure") || e.contains("not a"), "got: {}", e);
+    }
+
+    // ── Remora builtins ───────────────────────────────────────────────────
+    #[test]
+    fn test_service_builtin() {
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            r#"(service "app"
+                 (list (quote image) "alpine:latest"))"#,
+        );
+        assert!(
+            matches!(&v, Value::ServiceSpec(s) if s.name == "app"),
+            "got: {}",
+            v
+        );
+    }
+
+    #[test]
+    fn test_compose_builtin_collects_specs() {
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            r#"(compose
+                  (service "db"
+                    (list (quote image) "postgres:16"))
+                  (service "app"
+                    (list (quote image) "myapp:latest")))"#,
+        );
+        match &v {
+            Value::ComposeSpec(c) => {
+                assert_eq!(c.services.len(), 2);
+                assert_eq!(c.services[0].name, "db");
+                assert_eq!(c.services[1].name, "app");
+            }
+            _ => panic!("expected ComposeSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_lisp_compose_basic() {
+        // Full mini-program: define a service factory, build a compose spec,
+        // then store it via compose-up. The compose spec must have 2 services.
+        let mut i = interp();
+        i.eval_str(
+            r#"
+            (define (mk-service name img)
+              (service name
+                (list 'image img)))
+
+            (compose-up
+              (compose
+                (mk-service "db"  "postgres:16")
+                (mk-service "app" "alpine:latest")))
+            "#,
+        )
+        .expect("eval failed");
+
+        let pending = i.take_pending().expect("no pending compose");
+        let spec = pending.spec.expect("no spec");
+        assert_eq!(spec.services.len(), 2);
+        assert_eq!(spec.services[0].name, "db");
+        assert_eq!(spec.services[0].image, "postgres:16");
+        assert_eq!(spec.services[1].name, "app");
+        assert_eq!(spec.services[1].image, "alpine:latest");
+    }
+
+    #[test]
+    fn test_on_ready_hook_registered() {
+        let mut i = interp();
+        eval_ok(&mut i, r#"(on-ready "db" (lambda () (log "db is ready")))"#);
+        let hooks = i.take_hooks();
+        assert!(hooks.contains_key("db"), "hook for 'db' not registered");
+        assert_eq!(hooks["db"].len(), 1);
+    }
+}

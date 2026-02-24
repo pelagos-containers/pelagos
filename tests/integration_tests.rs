@@ -8327,3 +8327,94 @@ fn test_compose_health_check_parse() {
     let base = compose.services.iter().find(|s| s.name == "base").unwrap();
     assert!(base.depends_on.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Lisp interpreter tests (no root required)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lisp_compose_basic() {
+    // Eval a .reml-style string: define a service factory, build a compose
+    // spec via compose-up, then assert the ComposeFile has the right structure.
+    // Does not spawn containers; exercises the parser + evaluator + domain
+    // builtins end-to-end.
+    use remora::lisp::Interpreter;
+
+    let mut interp = Interpreter::new();
+    interp
+        .eval_str(
+            r#"
+            ; Parameterised service factory
+            (define (mk-service name img net)
+              (service name
+                (list 'image img)
+                (list 'network net)))
+
+            ; Build three services with map
+            (define services
+              (map (lambda (pair)
+                     (mk-service (car pair) (cadr pair) "backend"))
+                   '(("db"  "postgres:16")
+                     ("api" "myapi:latest")
+                     ("web" "nginx:stable"))))
+
+            ; Register an on-ready hook
+            (on-ready "db" (lambda () (log "db ready")))
+
+            ; Store the spec via compose-up
+            (compose-up
+              (compose
+                (network "backend" (list 'subnet "10.90.0.0/24"))
+                services))
+            "#,
+        )
+        .expect("eval_str failed");
+
+    // Retrieve the pending compose spec.
+    let pending = interp.take_pending().expect("no pending compose");
+    let spec = pending.spec.expect("no spec in pending");
+
+    assert_eq!(spec.networks.len(), 1);
+    assert_eq!(spec.networks[0].name, "backend");
+
+    assert_eq!(spec.services.len(), 3);
+    let names: Vec<&str> = spec.services.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"db"), "db missing from {:?}", names);
+    assert!(names.contains(&"api"), "api missing from {:?}", names);
+    assert!(names.contains(&"web"), "web missing from {:?}", names);
+
+    let db = spec.services.iter().find(|s| s.name == "db").unwrap();
+    assert_eq!(db.image, "postgres:16");
+    assert_eq!(db.networks, vec!["backend"]);
+
+    // on-ready hook must have been registered.
+    let hooks = interp.take_hooks();
+    assert!(hooks.contains_key("db"), "no hook for 'db'");
+}
+
+#[test]
+fn test_lisp_evaluator_tco_and_higher_order() {
+    // Purely evaluator-level test: no domain builtins needed.
+    use remora::lisp::Interpreter;
+
+    let mut interp = Interpreter::new();
+
+    // Tail-recursive sum — exercises TCO.
+    let sum = interp
+        .eval_str(
+            "(define (sum-to n)
+               (let loop ((i n) (acc 0))
+                 (if (= i 0) acc (loop (- i 1) (+ acc i)))))
+             (sum-to 10000)",
+        )
+        .expect("eval failed");
+    assert_eq!(sum, remora::lisp::Value::Int(50005000));
+
+    // map + lambda.
+    let squares = interp
+        .eval_str("(map (lambda (x) (* x x)) '(1 2 3 4 5))")
+        .expect("map failed");
+    let items = squares.to_vec().expect("not a list");
+    assert_eq!(items.len(), 5);
+    assert_eq!(items[4], remora::lisp::Value::Int(25));
+}

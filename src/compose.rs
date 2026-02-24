@@ -415,7 +415,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
 
 fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, ComposeError> {
     match expr {
-        SExpr::Atom(name) => Ok(Dependency {
+        SExpr::Atom(name) | SExpr::Str(name) => Ok(Dependency {
             service: name.clone(),
             health_check: None,
         }),

@@ -1,180 +1,258 @@
 # Ongoing Tasks
 
-## Current Task: Composable Health Checks for `depends-on` (Feb 24, 2026)
+## Completed: Lisp Interpreter for Remora (Feb 24, 2026)
+
+**Branch:** `lisp-interpreter`
 
 ### Context
-Adding HTTP GET and exec-in-container health checks to the compose `depends-on` system,
-composable with `and`/`or` S-expression operators.
 
-### Target Syntax
+The compose DSL uses S-expressions as data, not code. As configs grow, users hit the
+limits of a fixed schema: no loops, no abstraction, no variables. This task adds a real
+Lisp interpreter that uses the existing S-expression parser as its reader and exposes
+remora's compose model as first-class values. Old `.rem` files continue to work unchanged;
+new `.reml` files are Lisp programs.
+
+**Decisions made:**
+- **Execution model**: Hybrid — `service`/`network`/`volume` return typed values;
+  `compose` collects them into a spec; `compose-up` runs the spec; `on-ready` registers
+  hooks that fire after a service becomes healthy.
+- **File detection**: Extension-based. `.rem` = old format unchanged. `.reml` = Lisp.
+  `compose up -f compose.reml` auto-dispatches. Default discovery: `compose.reml` first,
+  then `compose.rem`.
+- **Lisp scope**: Full Scheme subset — TCO, quasiquote/unquote-splicing, named let, do
+  loops, R5RS-ish core (~55 builtins).
+
+### Target `.reml` Syntax
+
 ```lisp
-(depends-on (db :ready-port 5432))                          ; backward compat unchanged
-(depends-on (api :ready (http "http://localhost:8080/healthz")))
-(depends-on (db  :ready (cmd "pg_isready -U postgres")))
-(depends-on (db  :ready (and (port 5432) (cmd "pg_isready -U postgres"))))
-(depends-on (api :ready (or  (http "http://localhost:8080/health") (port 8080))))
+; Define a parameterized service template
+(define (web-service name port)
+  (service name
+    (image "myapp:latest")
+    (network "backend")
+    (port port port)
+    (depends-on (db :ready (port 5432)))))
+
+; Scale out with map
+(define services
+  (map (lambda (pair)
+         (web-service (car pair) (cadr pair)))
+       '(("web" 8080) ("worker" 9090))))
+
+; on-ready hook fires after db health check passes
+(on-ready "db" (lambda ()
+  (log "db is ready — starting app tier")))
+
+; compose collects specs; compose-up runs them
+(compose-up
+  (compose
+    (network "backend" (subnet "10.89.0.0/24"))
+    (service "db"
+      (image "postgres:16")
+      (network "backend")
+      (env "POSTGRES_PASSWORD" "secret"))
+    services))   ; spliced list of ServiceSpec values
 ```
 
-### Files to Modify
+---
+
+### Architecture
+
+#### `src/lisp/value.rs` — Value type
+
+```rust
+pub type NativeFn = Rc<dyn Fn(&[Value]) -> Result<Value, LispError>>;
+
+pub enum Value {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Symbol(String),
+    Pair(Rc<(Value, Value)>),   // proper cons cells; lists are Pair-terminated-by-Nil
+    Lambda { params: Params, body: Vec<SExpr>, env: Env },
+    Native(String, NativeFn),
+    // Remora domain values
+    ServiceSpec(Box<remora::compose::ServiceSpec>),
+    NetworkSpec(Box<remora::compose::NetworkSpec>),
+    VolumeSpec(String),
+    ComposeSpec(Box<ComposeFile>),
+}
+
+pub enum Params {
+    Fixed(Vec<String>),              // (lambda (a b c) ...)
+    Variadic(Vec<String>, String),   // (lambda (a b . rest) ...)
+    Rest(String),                    // (lambda args ...)
+}
+
+pub struct LispError { pub message: String, pub line: usize, pub col: usize }
+```
+
+#### `src/lisp/env.rs` — Environment
+
+```rust
+pub type Env = Rc<RefCell<EnvFrame>>;
+
+pub struct EnvFrame {
+    bindings: HashMap<String, Value>,
+    parent: Option<Env>,
+}
+// Methods: lookup, define, set (walks up for set!), child (new frame)
+```
+
+#### `src/lisp/eval.rs` — Evaluator with TCO
+
+```rust
+enum Step { Done(Value), Tail(SExpr, Env) }
+fn eval_step(expr: SExpr, env: Env) -> Result<Step, LispError>
+
+pub fn eval(expr: SExpr, env: Env) -> Result<Value, LispError> {
+    let mut cur = (expr, env);
+    loop {
+        match eval_step(cur.0, cur.1)? {
+            Step::Done(v)      => return Ok(v),
+            Step::Tail(e, env) => cur = (e, env),
+        }
+    }
+}
+pub fn eval_apply(func: &Value, args: &[Value]) -> Result<Value, LispError>
+```
+
+Special forms: `quote`, `if`, `cond`, `when`, `unless`, `begin`, `define`, `set!`,
+`lambda`, `let`, `let*`, `letrec`, named-`let`, `and`, `or`, `quasiquote`
+(with `unquote`/`unquote-splicing`), `do` (desugars to named let).
+
+Tail positions: `if` branches, last form of `begin`/`let`/`letrec`, last `cond` clause.
+
+#### `src/lisp/builtins.rs` — ~55 standard functions
+
+| Category | Functions |
+|----------|-----------|
+| Arithmetic | `+` `-` `*` `/` `quotient` `remainder` `modulo` `abs` `min` `max` `expt` |
+| Comparison | `=` `<` `>` `<=` `>=` `equal?` `eqv?` `eq?` |
+| Boolean | `not` `boolean?` |
+| Pairs/Lists | `cons` `car` `cdr` `cadr` `caddr` `list` `null?` `pair?` `length` `append` `reverse` `list-ref` `iota` `assoc` |
+| Higher-order | `map` `filter` `for-each` `apply` `fold-left` `fold-right` |
+| Strings | `string?` `string-append` `string-length` `substring` `string->number` `number->string` `string-upcase` `string-downcase` `string=?` `string<?` |
+| Symbols | `symbol?` `symbol->string` `string->symbol` |
+| Type predicates | `number?` `procedure?` `list?` |
+| I/O | `display` `newline` `error` |
+
+#### `src/lisp/remora.rs` — Remora builtins + hook system
+
+```rust
+type HookMap = HashMap<String, Vec<Rc<dyn Fn() -> Result<(), LispError>>>>;
+
+pub fn register_remora_builtins(env: &Env, hooks: Rc<RefCell<HookMap>>)
+```
+
+| Function | Returns |
+|----------|---------|
+| `(service name opts...)` | `Value::ServiceSpec` |
+| `(network name opts...)` | `Value::NetworkSpec` |
+| `(volume name)` | `Value::VolumeSpec` |
+| `(compose items...)` | `Value::ComposeSpec` — flattens nested lists of specs |
+| `(compose-up spec [project] [foreground?])` | Runs compose, fires hooks |
+| `(on-ready "svc" lambda)` | Registers zero-arg hook closure |
+| `(env "VAR")` | `Value::Str` or `Value::Nil` |
+| `(log msg ...)` | `Value::Nil`; calls `log::info!` |
+
+`on-ready` wraps the lambda value in a Rust closure `move || eval_apply(lambda, &[], env)`
+and stores it in `HookMap` under the service name.
+
+#### `src/lisp/mod.rs` — Interpreter
+
+```rust
+pub struct Interpreter {
+    global_env: Env,
+    hooks: Rc<RefCell<HookMap>>,
+}
+impl Interpreter {
+    pub fn new() -> Self
+    pub fn eval_file(&mut self, path: &Path) -> Result<Value, LispError>
+    pub fn eval_str(&mut self, input: &str) -> Result<Value, LispError>
+}
+```
+
+#### Hook integration in `src/cli/compose.rs`
+
+Extract from `run_supervisor`:
+```rust
+pub fn run_compose_with_hooks(
+    compose: &ComposeFile,
+    compose_dir: &Path,
+    project: &str,
+    foreground: bool,
+    on_ready: &HookMap,
+) -> Result<(), Box<dyn std::error::Error>>
+```
+
+After `wait_for_dependency` passes and PID/IP recorded, fire hooks:
+```rust
+if let Some(hooks) = on_ready.get(svc_name) {
+    for hook in hooks { hook()?; }
+}
+```
+
+`.rem` path passes empty `HookMap` — zero behavioural change.
+
+---
+
+### Files To Create/Modify
+
 | File | Change |
 |------|--------|
-| `src/compose.rs` | Add `HealthCheck` enum; update `Dependency`; add `parse_health_expr`; update `parse_dependency` |
-| `src/cli/compose.rs` | Refactor `wait_for_dependency`; add `eval_health_check`, `try_tcp`, `try_http`, `try_exec` |
-| `src/cli/exec.rs` | Make `discover_namespaces` pub |
-| `docs/USER_GUIDE.md` | Document new `:ready` syntax |
-| `tests/integration_tests.rs` | New test for http and cmd health checks |
+| `src/lisp/mod.rs` | **NEW** |
+| `src/lisp/value.rs` | **NEW** |
+| `src/lisp/env.rs` | **NEW** |
+| `src/lisp/eval.rs` | **NEW** |
+| `src/lisp/builtins.rs` | **NEW** |
+| `src/lisp/remora.rs` | **NEW** |
+| `src/sexpr.rs` | Add `pub fn parse_all()` |
+| `src/lib.rs` | Add `pub mod lisp;` |
+| `src/cli/compose.rs` | `.reml` dispatch + `run_compose_with_hooks()` |
+| `src/main.rs` | Default discovery: `compose.reml` before `compose.rem` |
+| `tests/integration_tests.rs` | `test_lisp_compose_basic` |
+| `docs/USER_GUIDE.md` | New `.reml` section |
 | `docs/INTEGRATION_TESTS.md` | Document new test |
 
-### Key Design Decisions
-- `HealthCheck` enum: `Port(u16)`, `Http(String)`, `Cmd(Vec<String>)`, `And(Vec<HealthCheck>)`, `Or(Vec<HealthCheck>)`
-- `Dependency.ready_port: Option<u16>` → `Dependency.health_check: Option<HealthCheck>`
-- `:ready-port N` stays as sugar for `:ready (port N)`
-- HTTP: use `ureq` (already a dep); parse URL, replace host with container IP, check 2xx
-- Cmd: join container namespaces (reuse `discover_namespaces` from exec.rs), run command, check exit 0
-- Poll every 250ms, 60s timeout (unchanged from TCP check)
+### Implementation Order
+
+1. `src/sexpr.rs` — `parse_all()`
+2. `src/lisp/value.rs` — Value, LispError, Params, NativeFn
+3. `src/lisp/env.rs` — Env, EnvFrame
+4. `src/lisp/eval.rs` — core evaluator, TCO, all special forms, quasiquote
+5. `src/lisp/builtins.rs` — arithmetic, lists, strings, predicates
+6. `src/lisp/mod.rs` — Interpreter, unit tests
+7. **Checkpoint**: `cargo test --lib`
+8. `src/lisp/remora.rs` — domain builtins + hook system
+9. `src/cli/compose.rs` — extract `run_compose_with_hooks`, add `.reml` dispatch
+10. `src/main.rs` — default file discovery
+11. Tests + docs
+
+### Verification
+
+1. `cargo build` — clean
+2. `cargo test --lib` — all pass
+3. Manual: write `test.reml` using `define`/`lambda`/`map`, run `remora compose up -f test.reml`
+4. Verify `(on-ready "db" ...)` fires at the right moment in logs
+5. Verify existing `compose.rem` still works unchanged
+6. Integration test: eval a `.reml` string, assert `ComposeSpec` structure
+
+### Status
+
+**COMPLETE.** All files created, `cargo build` + `cargo clippy -- -D warnings` + `cargo fmt`
++ `cargo test --lib` (205 tests) all pass. Two integration tests pass:
+`test_lisp_compose_basic` and `test_lisp_evaluator_tco_and_higher_order`. Docs updated.
 
 ---
 
-## Previous State (Feb 23, 2026)
+### Notes / Risks
 
-Both repos clean and pushed. Stack fully operational (6/6 Prometheus targets up).
-TrueNAS API key set in `monitoring-setup/.env` — pool metrics flowing.
-Three Grafana dashboards provisioned: mktxp, Prometheus overview, TrueNAS (custom).
-
-**remora** (`~/Projects/remora`): branch `master`, last commit `2ecd556`
-**home-monitoring** (`~/Projects/home-monitoring`): branch `main`, last commit `1135612`
-
----
-
-## To start/stop the stack
-
-```bash
-sudo -E ~/Projects/remora/scripts/start-monitoring.sh          # start
-sudo -E ~/Projects/remora/scripts/start-monitoring.sh --down   # stop
-./scripts/check-monitoring.sh                                   # verify
-```
-
-See `docs/HOME_MONITORING_STACK.md` for full operational reference.
-See `docs/HOME_MONITORING_CONFIG_NOTES.md` for why configs are written the way they are.
-
----
-
-## Grafana dashboards
-
-All dashboards provisioned from files — no manual import needed.
-
-| Dashboard | Source | Status |
-|-----------|--------|--------|
-| Prometheus 2.0 Overview | Grafana.com #3662 | ✅ Live |
-| Mikrotik MKTXP Exporter | Grafana.com #13679 | ⏳ Empty until MikroTik credentials added |
-| TrueNAS | Custom-built | ✅ Pool panels live; graphite panels pending TrueNAS push config |
-
-Dashboard files: `home-monitoring/remora/config/grafana/provisioning/dashboards/`
-
----
-
-## Next tasks
-
-### A. TrueNAS graphite push
-
-TrueNAS is currently pushing collectd metrics to another Prometheus/Grafana host.
-TrueNAS SCALE only supports one graphite server target.
-
-**Decision pending:** move the push to this host (for testing), then either:
-- Decommission the other stack, OR
-- Add a carbon relay (e.g. `carbon-relay-ng`) as a compose service to fan out to both hosts
-
-To move: TrueNAS SCALE → System → Advanced → Reporting → Graphite server = this
-machine's LAN IP, port 2003.
-
-Once graphite data flows, verify the metric names against the TrueNAS dashboard
-queries. The memory metric suffix may differ between TrueNAS versions
-(`truenas_memory_used` vs `truenas_memory_memory_used`). Check with:
-```bash
-curl -s http://localhost:9108/metrics | grep "^truenas_memory" | head -10
-```
-
-### B. Alert rules
-
-Translate Helm chart PrometheusRule CRDs to standalone `rule_files:` YAML.
-
-Source files (in home-monitoring repo):
-- `monitoring-setup/prometheus/disk-temp-alerts.yaml`
-- `monitoring-setup/prometheus/truenas-alerts.yaml`
-
-Target: `remora/config/prometheus/rules/*.yml`
-
-Add to `prometheus.yml`:
-```yaml
-rule_files:
-  - /etc/prometheus/rules/*.yml
-```
-
-Bind-mount `./config/prometheus/rules` into the prometheus service in `compose.rem`.
-
-Hot-reload after: `curl -X POST http://localhost:9090/-/reload`
-
-### C. Pushover alerts
-
-Edit `remora/config/alertmanager/alertmanager.yml`:
-1. Replace null receiver with:
-```yaml
-- name: 'pushover'
-  pushover_configs:
-  - user_key: 'YOUR_USER_KEY'
-    token: 'YOUR_API_TOKEN'
-    priority: '{{ if eq .Status "firing" }}1{{ else }}0{{ end }}'
-```
-2. Update `route.receiver: 'pushover'`
-
-Credentials at https://pushover.net.
-
-### D. MikroTik credentials for mktxp
-
-`config/mktxp/mktxp.conf` needs a real RouterOS API username and password.
-Without them mktxp scrapes zero metrics (process is up, but all gauges are empty).
-
-### E. CRI compliance
-
-See `docs/CRI_COMPLIANCE.md` for the full roadmap (phases C1–C7).
-Short version: daemon → gRPC skeleton → ImageService → pod sandbox → CNI →
-container lifecycle → exec/logs/stats. The pod sandbox (C4) is the critical
-path item requiring the most new design work.
-
----
-
-## Completed this session
-
-- Fixed three build engine bugs (EINVAL dedup, WORKDIR mkdir, COPY dest resolution)
-- Added `scripts/check-monitoring.sh` endpoint health checker
-- Fixed Prometheus self-scrape (`localhost` → `prometheus` service name)
-- Added `--web.enable-lifecycle` to prometheus flags for hot-reload
-- Added Grafana dashboard provisioning (mktxp, Prometheus overview, TrueNAS)
-- TrueNAS dashboard custom-built against our metric names (no community dashboard matches)
-- Added docs: `ACCESS_PATTERNS.md`, `CRI_COMPLIANCE.md`, `HOME_MONITORING_CONFIG_NOTES.md`
-- Added macro: "So Long and Thanks for all the Fish" to CLAUDE.md
-- Committed previously untracked files: snmp.yml, datasources/prometheus.yaml, README.md
-
----
-
-## Known limitations / watch list
-
-- **compose `(command ...)` replaces entire entrypoint+cmd** — to pass flags to
-  an image's existing entrypoint, repeat the entrypoint binary as the first
-  element. See prometheus, graphite-exporter, alertmanager in `compose.rem`.
-
-- **TrueNAS graphite push** — port 2003 is host-mapped. TrueNAS must push to
-  this machine's LAN IP, not localhost. Configure at:
-  TrueNAS SCALE → System → Advanced → Reporting → Graphite.
-
-- **truenas-api-exporter is locally built** — built once by `start-monitoring.sh`
-  if not already cached. Rebuild after changes to `truenas_api_exporter.py` with:
-  `sudo remora image rm truenas-api-exporter:latest` then re-run the script.
-
-- **Plex token** — set in `monitoring-setup/.env` as `PLEX_TOKEN=...`.
-
-- **TrueNAS API key** — set in `monitoring-setup/.env` as `TRUENAS_API_KEY=...`.
-
-- **TrueNAS graphite metric names** — derived from graphite_mapping.yaml regex
-  rules; exact suffixes depend on TrueNAS/collectd version. Verify once push
-  is flowing and adjust dashboard queries if needed.
+- `Value` needs `Clone`; `Pair(Rc<...>)`, `Env(Rc<...>)`, `NativeFn(Rc<...>)` all clone cheaply.
+- `unquote-splicing` into pair structure: build right-to-left with `cons`.
+- `(compose ... services)` where `services` is a Lisp list of `ServiceSpec`: `compose` builtin flattens one level.
+- Hooks survive fork (heap Rc closures in child process). Correct.
+- `HookMap` pub-re-exported from `lisp::mod` so `cli::compose` doesn't need deep import path.
+- All existing `.rem` compose tests unaffected — they use the old path exclusively.

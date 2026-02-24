@@ -1532,3 +1532,39 @@ Also asserts that a service with no `depends-on` has an empty `depends_on` vec.
 Failure means the parser produces wrong `HealthCheck` variants, so `eval_health_check` would
 evaluate incorrect conditions and the compose supervisor would start services out of order or
 time out waiting for the wrong signal.
+
+
+### `test_lisp_compose_basic`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+End-to-end test of the Lisp interpreter path in the compose subsystem. Evaluates a
+`.reml`-style string that:
+1. Defines a parameterised service factory `(mk-service name img net)` using `define`
+2. Builds three `ServiceSpec` values with `map` and a lambda over a quoted list of pairs
+3. Registers an `on-ready` hook for the `"db"` service
+4. Calls `compose-up` with a `ComposeSpec` that includes one named network and the three services
+
+After evaluation, retrieves the `PendingCompose` via `Interpreter::take_pending()` and asserts:
+- Exactly one network named `"backend"` with subnet `"10.90.0.0/24"`
+- Exactly three services named `"db"`, `"api"`, `"web"`
+- `"db"` service has image `"postgres:16"` and network `"backend"`
+- At least one `on-ready` hook registered for `"db"` via `take_hooks()`
+
+Failure indicates a regression in: parser reader macros (quote/quasiquote), `define`/`lambda`,
+`map`, the `service`/`network`/`compose`/`compose-up` builtins, list flattening in `compose`,
+or the `on-ready` hook registration pipeline.
+
+### `test_lisp_evaluator_tco_and_higher_order`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+Pure evaluator correctness and TCO stress test:
+
+1. **TCO**: Defines a named-let loop `(sum-to n)` that accumulates a sum with a tail call.
+   Invokes `(sum-to 10000)` — 10,000 iterations that would overflow the stack without TCO.
+   Asserts the result equals `Value::Int(50005000)`.
+
+2. **map + lambda**: Evaluates `(map (lambda (x) (* x x)) '(1 2 3 4 5))` and asserts the
+   result is the Lisp list `(1 4 9 16 25)` represented as `Value::Pair` chains.
+
+Failure means either: (a) TCO is broken and the evaluator stack-overflows on deep tail
+recursion; or (b) `map`, `lambda`, arithmetic, or list construction is incorrect.

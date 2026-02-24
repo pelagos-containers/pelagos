@@ -7,28 +7,47 @@
 
 use std::fmt;
 
-/// A parsed S-expression: either an atom (string) or a list of sub-expressions.
+/// A parsed S-expression: either an atom, a quoted string, or a list of sub-expressions.
+///
+/// The distinction between `Atom` and `Str` matters for the Lisp evaluator:
+/// - `Atom` is a bare word; the evaluator treats it as a symbol to look up.
+/// - `Str` was written with double quotes; the evaluator treats it as a string literal.
+///
+/// The compose DSL does not care about this distinction — both `as_atom()` and `as_list()`
+/// behave identically to the old `Atom`-only world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SExpr {
+    /// An unquoted bare word: a symbol in Lisp context.
     Atom(String),
+    /// A double-quoted string literal.
+    Str(String),
     List(Vec<SExpr>),
 }
 
 impl SExpr {
-    /// Return the atom value, or `None` if this is a list.
+    /// Return the string value, or `None` if this is a list.
+    ///
+    /// Returns `Some` for both `Atom` and `Str` variants — callers that don't
+    /// distinguish between symbols and strings (e.g. the compose DSL) can use
+    /// this method unchanged.
     pub fn as_atom(&self) -> Option<&str> {
         match self {
-            SExpr::Atom(s) => Some(s),
+            SExpr::Atom(s) | SExpr::Str(s) => Some(s.as_str()),
             SExpr::List(_) => None,
         }
     }
 
-    /// Return the list contents, or `None` if this is an atom.
+    /// Return the list contents, or `None` if this is an atom or string.
     pub fn as_list(&self) -> Option<&[SExpr]> {
         match self {
-            SExpr::Atom(_) => None,
+            SExpr::Atom(_) | SExpr::Str(_) => None,
             SExpr::List(v) => Some(v),
         }
+    }
+
+    /// Returns `true` if this is a bare-word atom (not a quoted string).
+    pub fn is_symbol(&self) -> bool {
+        matches!(self, SExpr::Atom(_))
     }
 }
 
@@ -41,6 +60,19 @@ impl fmt::Display for SExpr {
                 } else {
                     write!(f, "{}", s)
                 }
+            }
+            SExpr::Str(s) => {
+                write!(f, "\"")?;
+                for c in s.chars() {
+                    match c {
+                        '"' => write!(f, "\\\"")?,
+                        '\\' => write!(f, "\\\\")?,
+                        '\n' => write!(f, "\\n")?,
+                        '\t' => write!(f, "\\t")?,
+                        c => write!(f, "{}", c)?,
+                    }
+                }
+                write!(f, "\"")
             }
             SExpr::List(items) => {
                 write!(f, "(")?;
@@ -119,6 +151,24 @@ pub fn parse(input: &str) -> Result<SExpr, ParseError> {
     Ok(expr)
 }
 
+/// Parse all top-level S-expressions from `input`.
+///
+/// Unlike [`parse`], this accepts zero or more expressions and returns them all.
+/// Whitespace and comments between expressions are ignored.
+/// Used by the Lisp interpreter to read a `.reml` program.
+pub fn parse_all(input: &str) -> Result<Vec<SExpr>, ParseError> {
+    let mut pos = 0;
+    let mut exprs = Vec::new();
+    loop {
+        skip_ws_and_comments(input, &mut pos);
+        if pos >= input.len() {
+            break;
+        }
+        exprs.push(parse_sexpr(input, &mut pos)?);
+    }
+    Ok(exprs)
+}
+
 fn parse_sexpr(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
     skip_ws_and_comments(input, pos);
     if *pos >= input.len() {
@@ -126,12 +176,36 @@ fn parse_sexpr(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
     }
 
     let ch = input.as_bytes()[*pos];
-    if ch == b'(' {
-        parse_list(input, pos)
-    } else if ch == b')' {
-        Err(make_err(input, *pos, "unexpected ')'"))
-    } else {
-        parse_atom(input, pos)
+    match ch {
+        b'(' => parse_list(input, pos),
+        b')' => Err(make_err(input, *pos, "unexpected ')'")),
+        // Reader macros: 'x → (quote x), `x → (quasiquote x),
+        //                ,@x → (unquote-splicing x), ,x → (unquote x)
+        b'\'' => {
+            *pos += 1;
+            let inner = parse_sexpr(input, pos)?;
+            Ok(SExpr::List(vec![SExpr::Atom("quote".into()), inner]))
+        }
+        b'`' => {
+            *pos += 1;
+            let inner = parse_sexpr(input, pos)?;
+            Ok(SExpr::List(vec![SExpr::Atom("quasiquote".into()), inner]))
+        }
+        b',' => {
+            *pos += 1;
+            if *pos < input.len() && input.as_bytes()[*pos] == b'@' {
+                *pos += 1;
+                let inner = parse_sexpr(input, pos)?;
+                Ok(SExpr::List(vec![
+                    SExpr::Atom("unquote-splicing".into()),
+                    inner,
+                ]))
+            } else {
+                let inner = parse_sexpr(input, pos)?;
+                Ok(SExpr::List(vec![SExpr::Atom("unquote".into()), inner]))
+            }
+        }
+        _ => parse_atom(input, pos),
     }
 }
 
@@ -184,7 +258,7 @@ fn parse_quoted_string(input: &str, pos: &mut usize) -> Result<SExpr, ParseError
             *pos += 1;
         } else if bytes[*pos] == b'"' {
             *pos += 1; // skip closing '"'
-            return Ok(SExpr::Atom(s));
+            return Ok(SExpr::Str(s));
         } else {
             // Decode one full Unicode scalar value, advancing by its byte length.
             let ch = input[*pos..].chars().next().unwrap();
@@ -200,7 +274,15 @@ fn parse_bare_word(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
     let bytes = input.as_bytes();
     while *pos < bytes.len() {
         let ch = bytes[*pos];
-        if ch.is_ascii_whitespace() || ch == b'(' || ch == b')' || ch == b';' || ch == b'"' {
+        if ch.is_ascii_whitespace()
+            || ch == b'('
+            || ch == b')'
+            || ch == b';'
+            || ch == b'"'
+            || ch == b'\''
+            || ch == b'`'
+            || ch == b','
+        {
             break;
         }
         *pos += 1;
@@ -240,7 +322,7 @@ mod tests {
     fn test_quoted_string() {
         assert_eq!(
             parse(r#""hello world""#).unwrap(),
-            SExpr::Atom("hello world".into())
+            SExpr::Str("hello world".into())
         );
     }
 
@@ -248,7 +330,7 @@ mod tests {
     fn test_quoted_string_escapes() {
         assert_eq!(
             parse(r#""say \"hi\" \\""#).unwrap(),
-            SExpr::Atom(r#"say "hi" \"#.into())
+            SExpr::Str(r#"say "hi" \"#.into())
         );
     }
 
@@ -393,7 +475,57 @@ mod tests {
         // Multibyte UTF-8 characters must survive a round-trip through quoted strings.
         let input = r#""héllo wörld 🎉""#;
         let atom = parse(input).unwrap();
+        assert_eq!(atom, SExpr::Str("héllo wörld 🎉".into()));
         assert_eq!(atom.as_atom().unwrap(), "héllo wörld 🎉");
+    }
+
+    #[test]
+    fn test_reader_macro_quote() {
+        let expr = parse("'foo").unwrap();
+        assert_eq!(
+            expr,
+            SExpr::List(vec![SExpr::Atom("quote".into()), SExpr::Atom("foo".into())])
+        );
+    }
+
+    #[test]
+    fn test_reader_macro_quasiquote() {
+        let expr = parse("`(a ,b ,@c)").unwrap();
+        let items = expr.as_list().unwrap();
+        assert_eq!(items[0].as_atom().unwrap(), "quasiquote");
+        let inner = items[1].as_list().unwrap();
+        assert_eq!(inner[0].as_atom().unwrap(), "a");
+        // ,b → (unquote b)
+        let unquote = inner[1].as_list().unwrap();
+        assert_eq!(unquote[0].as_atom().unwrap(), "unquote");
+        // ,@c → (unquote-splicing c)
+        let splice = inner[2].as_list().unwrap();
+        assert_eq!(splice[0].as_atom().unwrap(), "unquote-splicing");
+    }
+
+    #[test]
+    fn test_parse_all_empty() {
+        let exprs = parse_all("").unwrap();
+        assert!(exprs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_all_multiple() {
+        let exprs = parse_all("(define x 1) (define y 2) x").unwrap();
+        assert_eq!(exprs.len(), 3);
+        assert_eq!(exprs[0].as_list().unwrap()[0].as_atom().unwrap(), "define");
+        assert_eq!(exprs[2].as_atom().unwrap(), "x");
+    }
+
+    #[test]
+    fn test_bare_word_stops_at_reader_macros() {
+        // bare words should not swallow ', `, , characters
+        let expr = parse("(a 'b)").unwrap();
+        let items = expr.as_list().unwrap();
+        assert_eq!(items[0].as_atom().unwrap(), "a");
+        let quoted = items[1].as_list().unwrap();
+        assert_eq!(quoted[0].as_atom().unwrap(), "quote");
+        assert_eq!(quoted[1].as_atom().unwrap(), "b");
     }
 
     #[test]

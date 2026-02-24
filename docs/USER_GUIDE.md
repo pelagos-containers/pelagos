@@ -501,6 +501,135 @@ dependency process is alive. With a health check, Remora polls until the check p
 
 ---
 
+## Compose Lisp Files (`.reml`)
+
+For complex stacks — parameterised services, loops, conditionals, shared templates — write
+a `.reml` (Remora Lisp) file instead of a static `.rem` file. `compose up` auto-detects the
+format by file extension and dispatches accordingly. Default discovery tries `compose.reml`
+first, then falls back to `compose.rem`.
+
+```bash
+sudo remora compose up -f compose.reml
+sudo remora compose up                   # tries compose.reml, then compose.rem
+```
+
+### Language
+
+`.reml` is a Scheme-like Lisp with:
+
+- **`define`** — bind variables and define functions
+- **`lambda`** — first-class functions
+- **`let` / `let*` / `letrec`** — lexical scoping
+- **Named `let`** — idiomatic loops
+- **`do`** — imperative loops
+- **`if` / `cond` / `when` / `unless`** — conditionals
+- **`begin`** — sequence
+- **`and` / `or`** — short-circuit boolean
+- **Quasiquote** — `` ` ``, `,`, `,@` (splice)
+- **TCO** — tail calls don't grow the stack
+- **~55 standard builtins** — arithmetic, list operations, strings, higher-order functions
+
+### Domain Builtins
+
+These return typed values that `compose` collects:
+
+| Form | Returns |
+|------|---------|
+| `(service name opts...)` | `ServiceSpec` |
+| `(network name opts...)` | `NetworkSpec` |
+| `(volume name)` | `VolumeSpec` |
+| `(compose items...)` | `ComposeSpec` — flattens nested lists |
+| `(compose-up spec [project] [foreground?])` | runs the spec (deferred) |
+| `(on-ready "svc" lambda)` | registers hook fired when service becomes healthy |
+| `(env "VAR")` | string value or `()` if unset |
+| `(log msg ...)` | logs via `log::info!` |
+
+### Service Options
+
+Options are passed as Lisp lists with a symbol key:
+
+```lisp
+(service "db"
+  (list 'image   "postgres:16")
+  (list 'network "backend")
+  (list 'env     "POSTGRES_PASSWORD" "secret")
+  (list 'port    5432 5432)
+  (list 'memory  "512m")
+  (list 'depends-on "cache"))
+```
+
+Alternatively, use `quote` shorthand:
+
+```lisp
+(service "db"
+  '(image   "postgres:16")
+  '(network "backend"))
+```
+
+### Example: Parameterised Services
+
+```lisp
+; Service factory
+(define (web-service name port)
+  (service name
+    (list 'image   "myapp:latest")
+    (list 'network "backend")
+    (list 'port    port port)
+    (list 'depends-on "db")))
+
+; Scale out three replicas
+(define web-services
+  (map (lambda (pair)
+         (web-service (car pair) (cadr pair)))
+       '(("web-1" 8081) ("web-2" 8082) ("web-3" 8083))))
+
+; Hook: run migration after db is ready
+(on-ready "db"
+  (lambda ()
+    (log "db is ready — migrations would run here")))
+
+; Assemble and run
+(compose-up
+  (compose
+    (network "backend" (list 'subnet "10.89.0.0/24"))
+    (service "db"
+      (list 'image "postgres:16")
+      (list 'network "backend")
+      (list 'env "POSTGRES_PASSWORD" "secret"))
+    web-services))
+```
+
+### Example: Environment-driven Config
+
+```lisp
+(define db-password
+  (let ((p (env "DB_PASSWORD")))
+    (if (null? p)
+        (error "DB_PASSWORD must be set")
+        p)))
+
+(compose-up
+  (compose
+    (service "db"
+      (list 'image "postgres:16")
+      (list 'env "POSTGRES_PASSWORD" db-password))))
+```
+
+### `on-ready` Hooks
+
+Hooks fire in the compose supervisor after a service's health check passes and before
+dependent services start. Each hook is a zero-argument lambda:
+
+```lisp
+(on-ready "db"
+  (lambda ()
+    (log "running post-start initialisation")))
+```
+
+Multiple hooks may be registered for the same service; they fire in registration order.
+
+---
+
 ## Exec Into a Running Container
 
 Run a command inside an already-running container by joining its namespaces:

@@ -1,4 +1,5 @@
 //! `remora compose` — multi-service orchestration with S-expression compose files.
+//! Supports both `.rem` (static S-expression) and `.reml` (Lisp program) formats.
 
 use super::{
     check_liveness, container_dir, containers_dir, now_iso8601, write_state, ContainerState,
@@ -8,6 +9,7 @@ use remora::compose::{
     parse_compose, topo_sort, ComposeFile, Dependency, HealthCheck, ServiceSpec,
 };
 use remora::container::{Command, Stdio, Volume};
+use remora::lisp::{HookMap, Interpreter};
 use remora::network::NetworkMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -128,6 +130,26 @@ fn cmd_compose_up(
     project_name: Option<&str>,
     foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Default file discovery: when the canonical default "compose.rem" was
+    // specified (or doesn't exist), try "compose.reml" first.
+    let resolved: std::path::PathBuf;
+    let file = if file == std::path::Path::new("compose.rem") && !file.exists() {
+        let reml = std::path::Path::new("compose.reml");
+        if reml.exists() {
+            resolved = reml.to_path_buf();
+            &resolved
+        } else {
+            file
+        }
+    } else {
+        file
+    };
+
+    // Dispatch to the Lisp evaluator for .reml files.
+    if file.extension().and_then(|e| e.to_str()) == Some("reml") {
+        return cmd_compose_up_reml(file, project_name, foreground);
+    }
+
     let content = std::fs::read_to_string(file)
         .map_err(|e| format!("cannot read '{}': {}", file.display(), e))?;
     let compose = parse_compose(&content)?;
@@ -217,6 +239,227 @@ fn cmd_compose_up(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// .reml (Lisp) path
+// ---------------------------------------------------------------------------
+
+fn cmd_compose_up_reml(
+    file: &std::path::Path,
+    project_name: Option<&str>,
+    foreground: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut interp = Interpreter::new();
+    interp
+        .eval_file(file)
+        .map_err(|e| format!("{}: {}", file.display(), e))?;
+
+    let pending = interp
+        .take_pending()
+        .ok_or("reml file did not call (compose-up ...)")?;
+    let spec = pending.spec.ok_or("compose-up: missing spec")?;
+    let effective_foreground = pending.foreground || foreground;
+
+    // Honour explicit project override; fall back to spec or file-directory.
+    let project = if let Some(name) = project_name {
+        name.to_string()
+    } else if let Some(name) = pending.project {
+        name
+    } else {
+        derive_project_name(file, None)?
+    };
+
+    let hooks = interp.take_hooks();
+    let order = topo_sort(&spec.services)?;
+    let compose_dir = file.parent().unwrap_or(std::path::Path::new("."));
+
+    // Check for already-running project.
+    let state_file = remora::paths::compose_state_file(&project);
+    if state_file.exists() {
+        if let Ok(existing) = load_project_state(&project) {
+            if existing.supervisor_pid > 0 && check_liveness(existing.supervisor_pid) {
+                return Err(format!(
+                    "project '{}' is already running (supervisor PID {})",
+                    project, existing.supervisor_pid
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut created_networks = Vec::new();
+    for net in &spec.networks {
+        let scoped = scoped_network_name(&project, &net.name);
+        let config = remora::paths::network_config_dir(&scoped).join("config.json");
+        if !config.exists() {
+            let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
+            super::network::cmd_network_create(&scoped, subnet)
+                .map_err(|e| format!("compose: failed to create network '{}': {}", scoped, e))?;
+        }
+        created_networks.push(scoped);
+    }
+
+    let mut created_volumes = Vec::new();
+    for vol in &spec.volumes {
+        let scoped = scoped_volume_name(&project, vol);
+        let _ = Volume::open(&scoped).or_else(|_| Volume::create(&scoped));
+        created_volumes.push(scoped);
+    }
+
+    for net in &created_networks {
+        let dns_file = remora::paths::dns_network_file(net);
+        if dns_file.exists() {
+            let _ = std::fs::remove_file(&dns_file);
+        }
+    }
+
+    if effective_foreground {
+        run_compose_with_hooks(
+            &project,
+            file,
+            &spec,
+            &order,
+            &created_networks,
+            &created_volumes,
+            &hooks,
+            compose_dir,
+        )
+    } else {
+        let fork_result = unsafe { libc::fork() };
+        match fork_result {
+            -1 => Err(std::io::Error::last_os_error().into()),
+            0 => {
+                unsafe { libc::setsid() };
+                if let Err(e) = run_compose_with_hooks(
+                    &project,
+                    file,
+                    &spec,
+                    &order,
+                    &created_networks,
+                    &created_volumes,
+                    &hooks,
+                    compose_dir,
+                ) {
+                    log::error!("compose supervisor (.reml): {}", e);
+                    unsafe { libc::_exit(1) };
+                }
+                unsafe { libc::_exit(0) };
+            }
+            _child_pid => {
+                std::thread::sleep(Duration::from_millis(200));
+                println!("Project '{}' started", project);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Run compose supervision with optional `on-ready` hooks.
+///
+/// Called by both the `.rem` path (empty hook map) and the `.reml` path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compose_with_hooks(
+    project: &str,
+    file: &std::path::Path,
+    compose: &ComposeFile,
+    order: &[String],
+    created_networks: &[String],
+    created_volumes: &[String],
+    on_ready: &HookMap,
+    compose_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor_pid = unsafe { libc::getpid() };
+
+    let mut project_state = ComposeProject {
+        name: project.to_string(),
+        file_path: file.to_string_lossy().into_owned(),
+        services: HashMap::new(),
+        networks: created_networks.to_vec(),
+        volumes: created_volumes.to_vec(),
+        supervisor_pid,
+        started_at: now_iso8601(),
+    };
+    save_project_state(&project_state)?;
+
+    let svc_map: HashMap<&str, &ServiceSpec> = compose
+        .services
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+
+    let mut container_pids: HashMap<String, i32> = HashMap::new();
+    let mut container_ips: HashMap<String, String> = HashMap::new();
+
+    for svc_name in order {
+        let svc = svc_map[svc_name.as_str()];
+        let container_name = scoped_container_name(project, svc_name);
+
+        for dep in &svc.depends_on {
+            wait_for_dependency(project, dep, &container_pids, &container_ips)?;
+        }
+
+        log::info!(
+            "compose: starting service '{}' as '{}'",
+            svc_name,
+            container_name
+        );
+        let pid = spawn_service(project, svc, &container_name, compose, compose_dir)?;
+
+        if let Ok(cstate) = super::read_state(&container_name) {
+            if let Some(ip) = cstate.bridge_ip.as_ref() {
+                container_ips.insert(svc_name.clone(), ip.clone());
+            }
+            for (net, ip) in &cstate.network_ips {
+                container_ips.insert(svc_name.clone(), ip.clone());
+                let _ = net;
+            }
+        }
+
+        container_pids.insert(svc_name.clone(), pid);
+
+        // Fire on-ready hooks for this service.
+        if let Some(hooks) = on_ready.get(svc_name.as_str()) {
+            for hook in hooks {
+                hook().map_err(|e| format!("on-ready '{}': {}", svc_name, e))?;
+            }
+        }
+
+        project_state.services.insert(
+            svc_name.clone(),
+            ComposeServiceState {
+                container_name: container_name.clone(),
+                status: "running".into(),
+                pid,
+            },
+        );
+        save_project_state(&project_state)?;
+    }
+
+    println!("All services started for project '{}'", project);
+
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let mut all_exited = true;
+        for (svc_name, svc_state) in &mut project_state.services {
+            if svc_state.status == "exited" {
+                continue;
+            }
+            if check_liveness(svc_state.pid) {
+                all_exited = false;
+            } else {
+                log::info!("compose: service '{}' exited", svc_name);
+                svc_state.status = "exited".into();
+            }
+        }
+        save_project_state(&project_state)?;
+        if all_exited {
+            log::info!("compose: all services exited for project '{}'", project);
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 fn run_supervisor(
