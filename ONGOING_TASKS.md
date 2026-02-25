@@ -1,5 +1,27 @@
 # Ongoing Tasks
 
+## Session Summary (Feb 24, 2026) — git SHA 2b9bbc6
+
+### Completed this session
+
+- **Dotted pair syntax** — `SExpr::DottedList`, full round-trip through macro
+  expansion and `value_to_sexpr`; `define-service` handles both proper lists and
+  dotted pairs in value position; variadic lambda/define shorthand now uses
+  `DottedList` natively
+- **monitoring/ stack** — Prometheus + Loki + Grafana compose example; all 6
+  smoke tests pass; fixed Grafana startup (binary name, no ini file needed),
+  fixed `image rm` to try local ref first before docker.io normalization
+- **rust-builder/ stack** — Alpine + rustc + cargo + sccache; named volume mounts
+  for cargo registry and sccache cache; 7 smoke tests pass including sccache
+  cache activity; added `:volume`, `:bind`, `:bind-ro` Lisp service options
+- **215 lib tests** pass; `cargo clippy -D warnings` and `cargo fmt` clean
+
+### Remaining developer stack backlog
+
+Next: **`node-dev/`** → then **`forgejo/`** (see detail below).
+
+---
+
 ## Completed: `defmacro` + `define-service` + dotted pairs (Feb 24, 2026) ✅
 
 ### Context
