@@ -72,9 +72,9 @@
   :depends-on "prometheus" port-prometheus    ; waits for metrics backend
   :depends-on "loki"       port-loki          ; waits for log backend
   :env        ("GF_SECURITY_ADMIN_PASSWORD" . grafana-password)
-  :env        ("GF_USERS_ALLOW_SIGN_UP"     . "false")
-  :env        ("GF_AUTH_ANONYMOUS_ENABLED"  . "false")
-  :env        ("GF_PATHS_PROVISIONING"      . "/etc/grafana/provisioning")
+              ("GF_USERS_ALLOW_SIGN_UP"     . "false")
+              ("GF_AUTH_ANONYMOUS_ENABLED"  . "false")
+              ("GF_PATHS_PROVISIONING"      . "/etc/grafana/provisioning")
   :port       port-grafana 3000
   :memory     mem-grafana)
 

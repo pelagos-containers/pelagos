@@ -48,9 +48,9 @@
   :command "sleep" "infinity"       ; stays alive for remora exec
   :volume  "cargo-registry" "/root/.cargo/registry"
   :volume  "sccache-cache"  "/sccache-cache"
-  :env     ("RUSTC_WRAPPER"  . "sccache")
-  :env     ("SCCACHE_DIR"    . "/sccache-cache")
-  :env     ("RUST_EDITION"   . rust-edition)
+  :env     ("RUSTC_WRAPPER" . "sccache")
+           ("SCCACHE_DIR"   . "/sccache-cache")
+           ("RUST_EDITION"  . rust-edition)
   :memory  mem-builder
   :cpus    cpu-builder)
 
