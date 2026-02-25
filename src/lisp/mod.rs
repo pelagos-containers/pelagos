@@ -625,9 +625,9 @@ mod tests {
         eval_ok(
             &mut i,
             r#"(define-service svc "myapp"
-                 (:image   "myapp:latest")
-                 (:network "backend")
-                 (:memory  mem))"#,
+                 :image   "myapp:latest"
+                 :network "backend"
+                 :memory  mem)"#,
         );
         let v = eval_ok(&mut i, "svc");
         match v {
@@ -649,8 +649,8 @@ mod tests {
         eval_ok(
             &mut i,
             r#"(define-service svc "app"
-                 (:image "app:latest")
-                 (:port  my-port 80))"#,
+                 :image "app:latest"
+                 :port  my-port 80)"#,
         );
         let v = eval_ok(&mut i, "svc");
         match v {

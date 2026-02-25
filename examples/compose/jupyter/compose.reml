@@ -10,7 +10,7 @@
 ;   env             — JUPYTER_PORT read from host environment with safe default
 ;   on-ready        — hook fires when redis is healthy, before notebooks can cache
 ;   volume          — named volume persists notebooks across container restarts
-;   define-service  — macro: clean keyword-style service definitions
+;   define-service  — macro: flat keyword-style service definitions
 
 ;; ── Configuration ─────────────────────────────────────────────────
 ;;
@@ -40,23 +40,23 @@
 
 ;; ── Services ──────────────────────────────────────────────────────
 ;;
-;; Each option is a list (:keyword args...).
-;; Constants need no quoting; variables are evaluated at call-site.
+;; Flat keyword-value list.  Each :keyword introduces a new option; values
+;; run until the next :keyword.  Sublists under a keyword (like :env pairs)
+;; each become a separate service option.
 
 (define-service svc-redis "redis"
-  (:image   "jupyter-redis:latest")
-  (:network "jupyter-net")
-  (:memory  mem-redis))
+  :image   "jupyter-redis:latest"
+  :network "jupyter-net"
+  :memory  mem-redis)
 
 (define-service svc-jupyterlab "jupyterlab"
-  (:image      "jupyter-jupyterlab:latest")
-  (:network    "jupyter-net")
-  (:depends-on "redis" 6379)      ; TCP health check before kernel starts
-  (:env        "REDIS_HOST" "redis")
-  (:env        "REDIS_PORT" "6379")
-  (:port       jupyter-port 8888) ; host port from env var or default 8888
-  (:memory     mem-jupyter)
-  (:cpus       cpu-jupyter))
+  :image      "jupyter-jupyterlab:latest"
+  :network    "jupyter-net"
+  :depends-on "redis" 6379           ; TCP health check before kernel starts
+  :env        ("REDIS_HOST" "redis") ("REDIS_PORT" "6379")
+  :port       jupyter-port 8888      ; host port from env var or default 8888
+  :memory     mem-jupyter
+  :cpus       cpu-jupyter)
 
 ;; ── Assemble and run ──────────────────────────────────────────────
 
