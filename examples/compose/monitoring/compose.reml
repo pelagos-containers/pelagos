@@ -57,13 +57,13 @@
 (define-service svc-prometheus "prometheus"
   :image   "monitoring-prometheus:latest"
   :network "monitoring-net"
-  :port    port-prometheus 9090
+  :port    (port-prometheus . 9090)
   :memory  mem-prometheus)
 
 (define-service svc-loki "loki"
   :image   "monitoring-loki:latest"
   :network "monitoring-net"
-  :port    port-loki 3100
+  :port    (port-loki . 3100)
   :memory  mem-loki)
 
 (define-service svc-grafana "grafana"
@@ -75,7 +75,7 @@
               ("GF_USERS_ALLOW_SIGN_UP"     . "false")
               ("GF_AUTH_ANONYMOUS_ENABLED"  . "false")
               ("GF_PATHS_PROVISIONING"      . "/etc/grafana/provisioning")
-  :port       port-grafana 3000
+  :port       (port-grafana . 3000)
   :memory     mem-grafana)
 
 ;; ── Assemble and run ──────────────────────────────────────────────

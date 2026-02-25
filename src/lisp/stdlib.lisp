@@ -5,8 +5,9 @@
 ;; (define-service var-name "svc-name"
 ;;   :image    "img"
 ;;   :network  "net"
-;;   :port     host-var container
-;;   :env      ("KEY1" "val1") ("KEY2" "val2")
+;;   :port     (host-var . container)        ; host maps to container
+;;   :port     (8080 . 80) (2003 . 2003)     ; multiple ports under one :port
+;;   :env      ("KEY1" . "val1") ("KEY2" . val-var)
 ;;   :memory   mem-var)
 ;;
 ;; The options are a flat keyword-value list.  Each :keyword introduces a new

@@ -54,7 +54,7 @@
   :network    "jupyter-net"
   :depends-on "redis" 6379           ; TCP health check before kernel starts
   :env        ("REDIS_HOST" . "redis") ("REDIS_PORT" . "6379")
-  :port       jupyter-port 8888      ; host port from env var or default 8888
+  :port       (jupyter-port . 8888)   ; host port from env var or default 8888
   :memory     mem-jupyter
   :cpus       cpu-jupyter)
 
