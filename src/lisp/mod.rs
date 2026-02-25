@@ -671,4 +671,132 @@ mod tests {
         assert!(hooks.contains_key("db"), "hook for 'db' not registered");
         assert_eq!(hooks["db"].len(), 1);
     }
+
+    // ── Compose fixture: monitoring stack ────────────────────────────────────
+
+    #[test]
+    fn test_lisp_eval_file_monitoring_fixture() {
+        // Evaluate the monitoring compose.reml fixture and verify the resulting
+        // ComposeSpec matches the declared architecture:
+        //   - 3 services: prometheus, loki, grafana
+        //   - 1 network:  monitoring-net  (10.89.1.0/24)
+        //   - 2 volumes:  prometheus-data, grafana-data
+        //   - grafana depends on prometheus:9090 AND loki:3100
+        //   - grafana has GF_SECURITY_ADMIN_PASSWORD = "admin" (default)
+        //   - 2 on-ready hooks (prometheus, loki)
+        //
+        // This test exercises: define, env+fallback, on-ready, multiple
+        // depends-on, dotted-pair :env with variable values, define-service.
+        let src = include_str!("../../examples/compose/monitoring/compose.reml");
+        let mut i = interp();
+        i.eval_str(src)
+            .expect("monitoring compose.reml failed to eval");
+
+        // ── compose spec ──────────────────────────────────────────────────
+        let pending = i
+            .take_pending()
+            .expect("no pending compose from compose-up");
+        let spec = pending.spec.expect("compose-up produced no spec");
+
+        assert_eq!(spec.services.len(), 3, "expected 3 services");
+
+        // Services appear in definition order
+        assert_eq!(spec.services[0].name, "prometheus");
+        assert_eq!(spec.services[1].name, "loki");
+        assert_eq!(spec.services[2].name, "grafana");
+
+        // Images
+        assert_eq!(spec.services[0].image, "monitoring-prometheus:latest");
+        assert_eq!(spec.services[1].image, "monitoring-loki:latest");
+        assert_eq!(spec.services[2].image, "monitoring-grafana:latest");
+
+        // Network
+        assert_eq!(spec.networks.len(), 1);
+        assert_eq!(spec.networks[0].name, "monitoring-net");
+        assert_eq!(spec.networks[0].subnet.as_deref(), Some("10.89.1.0/24"));
+        for svc in &spec.services {
+            assert!(
+                svc.networks.contains(&"monitoring-net".to_string()),
+                "service '{}' not on monitoring-net",
+                svc.name
+            );
+        }
+
+        // Volumes
+        assert_eq!(spec.volumes.len(), 2);
+        assert!(spec.volumes.contains(&"prometheus-data".to_string()));
+        assert!(spec.volumes.contains(&"grafana-data".to_string()));
+
+        // Grafana depends on both prometheus:9090 and loki:3100
+        let grafana = &spec.services[2];
+        assert_eq!(
+            grafana.depends_on.len(),
+            2,
+            "grafana should have 2 depends-on entries"
+        );
+        let dep_names: Vec<&str> = grafana
+            .depends_on
+            .iter()
+            .map(|d| d.service.as_str())
+            .collect();
+        assert!(
+            dep_names.contains(&"prometheus"),
+            "grafana missing prometheus dep"
+        );
+        assert!(dep_names.contains(&"loki"), "grafana missing loki dep");
+
+        let prom_dep = grafana
+            .depends_on
+            .iter()
+            .find(|d| d.service == "prometheus")
+            .unwrap();
+        let prom_check = prom_dep
+            .health_check
+            .as_ref()
+            .expect("prometheus dep has no health check");
+        assert!(
+            matches!(prom_check, crate::compose::HealthCheck::Port(9090)),
+            "expected Port(9090) health check for prometheus dep, got: {:?}",
+            prom_check
+        );
+
+        let loki_dep = grafana
+            .depends_on
+            .iter()
+            .find(|d| d.service == "loki")
+            .unwrap();
+        let loki_check = loki_dep
+            .health_check
+            .as_ref()
+            .expect("loki dep has no health check");
+        assert!(
+            matches!(loki_check, crate::compose::HealthCheck::Port(3100)),
+            "expected Port(3100) health check for loki dep, got: {:?}",
+            loki_check
+        );
+
+        // Grafana env: GF_SECURITY_ADMIN_PASSWORD should be "admin" (default)
+        let admin_pass = grafana
+            .env
+            .get("GF_SECURITY_ADMIN_PASSWORD")
+            .map(|v| v.as_str());
+        assert_eq!(
+            admin_pass,
+            Some("admin"),
+            "grafana-password should default to 'admin'"
+        );
+
+        // Ports
+        assert_eq!(spec.services[0].ports[0].host, 9090);
+        assert_eq!(spec.services[1].ports[0].host, 3100);
+        assert_eq!(spec.services[2].ports[0].host, 3000);
+
+        // ── on-ready hooks ────────────────────────────────────────────────
+        let hooks = i.take_hooks();
+        assert!(
+            hooks.contains_key("prometheus"),
+            "no on-ready hook for prometheus"
+        );
+        assert!(hooks.contains_key("loki"), "no on-ready hook for loki");
+    }
 }

@@ -1,0 +1,90 @@
+; Remora Monitoring Stack — compose.reml
+;
+; Architecture:
+;
+;   monitoring-net (10.89.1.0/24):  prometheus ←→ grafana
+;                                   loki       ←→ grafana
+;
+; Lisp features demonstrated:
+;
+;   define          — all ports and resource limits named at the top
+;   env             — GRAFANA_PASSWORD read from host with safe default
+;   on-ready        — hooks fire when prometheus and loki pass TCP checks
+;   depends-on      — grafana waits for both prometheus:9090 and loki:3100
+;   dotted pairs    — :env ("KEY" . value) where value can be a variable
+;   define-service  — macro: flat keyword-style service definitions
+
+;; ── Configuration ─────────────────────────────────────────────────
+;;
+;; Override the Grafana admin password without editing this file:
+;;   GRAFANA_PASSWORD=secret sudo remora compose up -f compose.reml -p monitoring
+
+(define grafana-password
+  (let ((p (env "GRAFANA_PASSWORD")))
+    (if (null? p) "admin" p)))
+
+(define port-prometheus 9090)
+(define port-grafana    3000)
+(define port-loki       3100)
+
+(define mem-prometheus "256m")
+(define mem-grafana    "256m")
+(define mem-loki       "128m")
+
+;; ── Network ───────────────────────────────────────────────────────
+
+(define net-monitoring (network "monitoring-net" '(subnet "10.89.1.0/24")))
+
+;; ── Lifecycle hooks ───────────────────────────────────────────────
+;;
+;; on-ready fires once the TCP port check passes, guaranteeing that
+;; Grafana's datasource queries can connect on the first attempt.
+
+(on-ready "prometheus"
+  (lambda ()
+    (log "prometheus: metrics backend ready — Grafana can scrape")))
+
+(on-ready "loki"
+  (lambda ()
+    (log "loki: log aggregation ready — Grafana can query")))
+
+;; ── Services ──────────────────────────────────────────────────────
+;;
+;; Flat keyword-value list.  Each :keyword introduces a new option.
+;; :env accepts dotted pairs ("KEY" . value) — value is evaluated at
+;; call-site, so variables like grafana-password resolve correctly.
+
+(define-service svc-prometheus "prometheus"
+  :image   "monitoring-prometheus:latest"
+  :network "monitoring-net"
+  :port    port-prometheus 9090
+  :memory  mem-prometheus)
+
+(define-service svc-loki "loki"
+  :image   "monitoring-loki:latest"
+  :network "monitoring-net"
+  :port    port-loki 3100
+  :memory  mem-loki)
+
+(define-service svc-grafana "grafana"
+  :image      "monitoring-grafana:latest"
+  :network    "monitoring-net"
+  :depends-on "prometheus" port-prometheus    ; waits for metrics backend
+  :depends-on "loki"       port-loki          ; waits for log backend
+  :env        ("GF_SECURITY_ADMIN_PASSWORD" . grafana-password)
+  :env        ("GF_USERS_ALLOW_SIGN_UP"     . "false")
+  :env        ("GF_AUTH_ANONYMOUS_ENABLED"  . "false")
+  :env        ("GF_PATHS_PROVISIONING"      . "/etc/grafana/provisioning")
+  :port       port-grafana 3000
+  :memory     mem-grafana)
+
+;; ── Assemble and run ──────────────────────────────────────────────
+
+(compose-up
+  (compose
+    net-monitoring
+    (volume "prometheus-data")
+    (volume "grafana-data")
+    svc-prometheus
+    svc-loki
+    svc-grafana))

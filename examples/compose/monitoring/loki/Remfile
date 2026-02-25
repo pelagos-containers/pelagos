@@ -1,0 +1,7 @@
+FROM alpine:latest
+RUN echo "https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories \
+    && apk add --no-cache loki \
+    && mkdir -p /tmp/loki/chunks /tmp/loki/index /tmp/loki/rules /etc/loki
+COPY loki-config.yml /etc/loki/loki-config.yml
+EXPOSE 3100
+CMD ["loki", "-config.file=/etc/loki/loki-config.yml"]

@@ -1682,3 +1682,21 @@ bound to `9090`. Asserts `ports[0].host == 9090` and `ports[0].container == 80`.
 Verifies that multi-argument options with variables work correctly through the
 macro expansion: the variable is not quoted in the expansion, so it evaluates to
 its value when the generated `(list 'port my-port 80)` is executed.
+
+### `test_lisp_eval_file_monitoring_fixture` (unit test in `src/lisp/mod.rs`)
+**Requires:** nothing
+
+Evaluates `examples/compose/monitoring/compose.reml` using `include_str!` and
+inspects the resulting `ComposeSpec`. Asserts:
+
+- 3 services in order: prometheus, loki, grafana
+- Correct image tags for all three
+- Single network `monitoring-net` with subnet `10.89.1.0/24`; all services attached
+- 2 volumes: `prometheus-data`, `grafana-data`
+- Grafana has exactly 2 `depends_on` entries: prometheus with `Port(9090)` and loki with `Port(3100)`
+- Grafana env `GF_SECURITY_ADMIN_PASSWORD` equals `"admin"` (the default fallback)
+- Port mappings: prometheus→9090, loki→3100, grafana→3000
+- 2 `on-ready` hooks registered for "prometheus" and "loki"
+
+Failure indicates a regression in: multiple `depends-on` per service, dotted-pair
+`:env` with variable values, `env` built-in fallback, or `on-ready` hook registration.

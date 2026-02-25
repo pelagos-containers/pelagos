@@ -120,8 +120,8 @@ network: jupyter-net (10.89.0.0/24)
 
 ---
 
-#### 2. `monitoring/` — Prometheus + Grafana + Loki  ⬅ CURRENT
-**Status:** Not started
+#### 2. `monitoring/` — Prometheus + Grafana + Loki
+**Status:** COMPLETE ✅ (Feb 25, 2026)  ⬅ CURRENT was this
 
 **Architecture:**
 ```
@@ -153,7 +153,7 @@ network: monitoring-net (10.89.1.0/24)
 
 ---
 
-#### 3. `rust-builder/` — Rust build environment with sccache
+#### 3. `rust-builder/` — Rust build environment with sccache  ⬅ NEXT
 **Status:** Not started
 
 **Architecture:**
