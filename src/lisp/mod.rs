@@ -799,4 +799,86 @@ mod tests {
         );
         assert!(hooks.contains_key("loki"), "no on-ready hook for loki");
     }
+
+    // ── Compose fixture: rust-builder stack ───────────────────────────────
+
+    #[test]
+    fn test_lisp_eval_file_rust_builder_fixture() {
+        // Evaluate the rust-builder compose.reml fixture and verify the
+        // resulting ComposeSpec matches the declared architecture:
+        //   - 1 service:  rust-builder  (image "rust-builder:latest")
+        //   - 0 networks  (no inter-service communication needed)
+        //   - 2 compose volumes: cargo-registry, sccache-cache
+        //   - service mounts both volumes
+        //   - service env: RUSTC_WRAPPER=sccache, SCCACHE_DIR=/sccache-cache
+        //   - service command: ["sleep", "infinity"]
+        //
+        // This test exercises: define, env+fallback, :volume service option,
+        // :command, dotted-pair :env, define-service.
+        let src = include_str!("../../examples/compose/rust-builder/compose.reml");
+        let mut i = interp();
+        i.eval_str(src)
+            .expect("rust-builder compose.reml failed to eval");
+
+        let pending = i
+            .take_pending()
+            .expect("no pending compose from compose-up");
+        let spec = pending.spec.expect("compose-up produced no spec");
+
+        // Single service, no network
+        assert_eq!(spec.services.len(), 1, "expected 1 service");
+        assert_eq!(spec.networks.len(), 0, "expected 0 networks");
+
+        // Compose-level volumes
+        assert_eq!(spec.volumes.len(), 2, "expected 2 volumes");
+        assert!(
+            spec.volumes.contains(&"cargo-registry".to_string()),
+            "missing cargo-registry volume"
+        );
+        assert!(
+            spec.volumes.contains(&"sccache-cache".to_string()),
+            "missing sccache-cache volume"
+        );
+
+        let svc = &spec.services[0];
+        assert_eq!(svc.name, "rust-builder");
+        assert_eq!(svc.image, "rust-builder:latest");
+
+        // Command: sleep infinity
+        let cmd = svc.command.as_ref().expect("service has no command");
+        assert_eq!(cmd, &vec!["sleep".to_string(), "infinity".to_string()]);
+
+        // Service-level volume mounts
+        assert_eq!(svc.volumes.len(), 2, "expected 2 volume mounts on service");
+        let registry_mount = svc
+            .volumes
+            .iter()
+            .find(|v| v.name == "cargo-registry")
+            .expect("cargo-registry mount missing");
+        assert_eq!(registry_mount.mount_path, "/root/.cargo/registry");
+
+        let sccache_mount = svc
+            .volumes
+            .iter()
+            .find(|v| v.name == "sccache-cache")
+            .expect("sccache-cache mount missing");
+        assert_eq!(sccache_mount.mount_path, "/sccache-cache");
+
+        // Environment variables
+        assert_eq!(
+            svc.env.get("RUSTC_WRAPPER").map(|s| s.as_str()),
+            Some("sccache"),
+            "RUSTC_WRAPPER should be 'sccache'"
+        );
+        assert_eq!(
+            svc.env.get("SCCACHE_DIR").map(|s| s.as_str()),
+            Some("/sccache-cache"),
+            "SCCACHE_DIR should be '/sccache-cache'"
+        );
+        assert_eq!(
+            svc.env.get("RUST_EDITION").map(|s| s.as_str()),
+            Some("2021"),
+            "RUST_EDITION should be '2021'"
+        );
+    }
 }

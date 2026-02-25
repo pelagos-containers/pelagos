@@ -11,7 +11,10 @@ use std::rc::Rc;
 use super::env::Env;
 use super::eval::eval_apply;
 use super::value::{LispError, Value};
-use crate::compose::{ComposeFile, Dependency, HealthCheck, NetworkSpec, PortMapping, ServiceSpec};
+use crate::compose::{
+    BindMount, ComposeFile, Dependency, HealthCheck, NetworkSpec, PortMapping, ServiceSpec,
+    VolumeMount,
+};
 
 /// Zero-argument hook closure fired after a service becomes healthy.
 pub type HookFn = Rc<dyn Fn() -> Result<(), LispError>>;
@@ -378,6 +381,29 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
                     .map(|v| str_or_sym("command arg", v))
                     .collect::<Result<_, _>>()?,
             );
+        }
+        "volume" => {
+            let name = str_or_sym_at("volume name", vals, 0)?;
+            let mount_path = str_or_sym_at("volume mount_path", vals, 1)?;
+            spec.volumes.push(VolumeMount { name, mount_path });
+        }
+        "bind" => {
+            let host_path = str_or_sym_at("bind host_path", vals, 0)?;
+            let container_path = str_or_sym_at("bind container_path", vals, 1)?;
+            spec.bind_mounts.push(BindMount {
+                host_path,
+                container_path,
+                read_only: false,
+            });
+        }
+        "bind-ro" => {
+            let host_path = str_or_sym_at("bind-ro host_path", vals, 0)?;
+            let container_path = str_or_sym_at("bind-ro container_path", vals, 1)?;
+            spec.bind_mounts.push(BindMount {
+                host_path,
+                container_path,
+                read_only: true,
+            });
         }
         "workdir" => {
             spec.workdir = Some(str_or_sym_at("workdir", vals, 0)?);

@@ -1,0 +1,63 @@
+; Remora Rust Builder Stack — compose.reml
+;
+; Architecture:
+;
+;   (no network — single interactive build container)
+;   rust-builder — cargo registry + sccache disk cache via named volumes
+;
+; Lisp features demonstrated:
+;
+;   define          — edition, memory, and cpu limits named at the top
+;   env             — SCCACHE_BUCKET for optional S3 distributed cache
+;   volume          — named volumes persist cargo registry and sccache across restarts
+;   define-service  — macro: flat keyword-style service definition
+
+;; ── Configuration ─────────────────────────────────────────────────
+;;
+;; Override memory/CPU without editing this file:
+;;   MEM=8g CPU=8.0 sudo remora compose up -f compose.reml -p rust-builder
+;;
+;; Optional: point sccache at an S3 bucket for distributed caching:
+;;   SCCACHE_BUCKET=my-cache sudo remora compose up -f compose.reml -p rust-builder
+
+(define rust-edition "2021")
+
+(define mem-builder
+  (let ((m (env "MEM")))
+    (if (null? m) "4g" m)))
+
+(define cpu-builder
+  (let ((c (env "CPU")))
+    (if (null? c) "4.0" c)))
+
+;; When SCCACHE_BUCKET is set, sccache will use S3 for shared distributed
+;; caching across multiple machines.  Leave empty for local disk cache only.
+(define sccache-bucket
+  (let ((b (env "SCCACHE_BUCKET")))
+    (if (null? b) "" b)))
+
+;; ── Service ───────────────────────────────────────────────────────
+;;
+;; The container runs `sleep infinity` so that `remora exec` can be used
+;; to run builds interactively:
+;;
+;;   remora exec rust-builder-rust-builder cargo build --release
+
+(define-service svc-builder "rust-builder"
+  :image   "rust-builder:latest"
+  :command "sleep" "infinity"       ; stays alive for remora exec
+  :volume  "cargo-registry" "/root/.cargo/registry"
+  :volume  "sccache-cache"  "/sccache-cache"
+  :env     ("RUSTC_WRAPPER"  . "sccache")
+  :env     ("SCCACHE_DIR"    . "/sccache-cache")
+  :env     ("RUST_EDITION"   . rust-edition)
+  :memory  mem-builder
+  :cpus    cpu-builder)
+
+;; ── Assemble and run ──────────────────────────────────────────────
+
+(compose-up
+  (compose
+    (volume "cargo-registry")
+    (volume "sccache-cache")
+    svc-builder))

@@ -1700,3 +1700,20 @@ inspects the resulting `ComposeSpec`. Asserts:
 
 Failure indicates a regression in: multiple `depends-on` per service, dotted-pair
 `:env` with variable values, `env` built-in fallback, or `on-ready` hook registration.
+
+### `test_lisp_eval_file_rust_builder_fixture` (unit test in `src/lisp/mod.rs`)
+**Requires:** nothing
+
+Evaluates `examples/compose/rust-builder/compose.reml` using `include_str!` and
+inspects the resulting `ComposeSpec`. Asserts:
+
+- 1 service: `rust-builder` with image `rust-builder:latest`
+- 0 networks (single-service stack needs no inter-service communication)
+- 2 compose-level volumes: `cargo-registry`, `sccache-cache`
+- Service has 2 volume mounts: `cargo-registry → /root/.cargo/registry`, `sccache-cache → /sccache-cache`
+- Service command is `["sleep", "infinity"]`
+- Service env: `RUSTC_WRAPPER=sccache`, `SCCACHE_DIR=/sccache-cache`, `RUST_EDITION=2021`
+
+Failure indicates a regression in: the new `:volume` Lisp service option,
+`:command` multi-value option, dotted-pair `:env` with literal values, or
+`env` built-in with null fallback.

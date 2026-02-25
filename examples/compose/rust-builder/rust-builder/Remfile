@@ -1,0 +1,23 @@
+FROM alpine:latest
+
+# Install Rust toolchain and build dependencies.
+# sccache is available in Alpine community (enabled by default).
+RUN apk add --no-cache \
+    rust \
+    cargo \
+    musl-dev \
+    build-base \
+    openssl-dev \
+    pkgconf \
+    sccache
+
+# Create directories for the compiler cache and workspace.
+RUN mkdir -p /sccache-cache /workspace /root/.cargo/registry
+
+# Wire sccache as the Rust compiler wrapper.
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache-cache
+ENV CARGO_HOME=/root/.cargo
+
+WORKDIR /workspace
+CMD ["/bin/sh"]

@@ -153,8 +153,8 @@ network: monitoring-net (10.89.1.0/24)
 
 ---
 
-#### 3. `rust-builder/` — Rust build environment with sccache  ⬅ NEXT
-**Status:** Not started
+#### 3. `rust-builder/` — Rust build environment with sccache
+**Status:** COMPLETE ✅ (Feb 24, 2026)
 
 **Architecture:**
 ```
@@ -183,7 +183,7 @@ network: (none needed — single service)
 
 ---
 
-#### 4. `node-dev/` — Node.js app with hot reload + PostgreSQL
+#### 4. `node-dev/` — Node.js app with hot reload + PostgreSQL  ⬅ NEXT
 **Status:** Not started
 
 **Architecture:**
