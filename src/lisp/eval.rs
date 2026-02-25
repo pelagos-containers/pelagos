@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::sexpr::SExpr;
 
 use super::env::{Env, EnvFrame};
-use super::value::{LispError, Params, Value};
+use super::value::{value_to_sexpr, LispError, Params, Value};
 
 // ---------------------------------------------------------------------------
 // TCO driver
@@ -118,6 +118,7 @@ fn eval_list(items: Vec<SExpr>, env: Env) -> Result<Step, LispError> {
             "define" => return eval_define(tail, env),
             "set!" => return eval_set(tail, env),
             "lambda" => return eval_lambda(tail, env),
+            "defmacro" => return eval_defmacro(tail, env),
             "let" => return eval_let(tail, env),
             "let*" => return eval_let_star(tail, env),
             "letrec" => return eval_letrec(tail, env),
@@ -126,8 +127,26 @@ fn eval_list(items: Vec<SExpr>, env: Env) -> Result<Step, LispError> {
         }
     }
 
-    // Function application: evaluate all sub-expressions, then apply.
+    // Function application: evaluate the head, then check for macro before args.
     let func = eval(head, Rc::clone(&env))?;
+
+    // Macro expansion: pass args unevaluated; eval the expansion in caller env.
+    if let Value::Macro {
+        params,
+        body,
+        env: mac_env,
+        ..
+    } = func.clone()
+    {
+        let raw_args: Vec<Value> = tail.iter().map(sexpr_to_datum).collect();
+        let mac_frame = EnvFrame::child(&mac_env);
+        bind_params(&params, &raw_args, &mac_frame)?;
+        let expansion = eval_body(&body, mac_frame)?;
+        let expansion_sexpr = value_to_sexpr(expansion)
+            .map_err(|e| LispError::new(format!("macro expansion error: {}", e.message)))?;
+        return Ok(Step::Tail(expansion_sexpr, env));
+    }
+
     let args: Vec<Value> = tail
         .iter()
         .map(|e| eval(e.clone(), Rc::clone(&env)))
@@ -392,6 +411,33 @@ fn eval_lambda(tail: &[SExpr], env: Env) -> Result<Step, LispError> {
     let params = parse_params(&tail[0])?;
     let body = tail[1..].to_vec();
     Ok(Step::Done(Value::Lambda { params, body, env }))
+}
+
+/// `(defmacro name (params...) body...)` — define a macro in the current environment.
+///
+/// Like `lambda` but stores a `Value::Macro`.  When the macro is later called,
+/// its arguments are passed unevaluated; the body is evaluated to produce an
+/// expansion which is then evaluated in the caller's environment.
+fn eval_defmacro(tail: &[SExpr], env: Env) -> Result<Step, LispError> {
+    if tail.len() < 2 {
+        return Err(LispError::new(
+            "defmacro: expected name, parameter list, and body",
+        ));
+    }
+    let name = match &tail[0] {
+        SExpr::Atom(s) => s.clone(),
+        _ => return Err(LispError::new("defmacro: name must be a symbol")),
+    };
+    let params = parse_params(&tail[1])?;
+    let body = tail[2..].to_vec();
+    let mac = Value::Macro {
+        name: name.clone(),
+        params,
+        body,
+        env: Rc::clone(&env),
+    };
+    env.borrow_mut().define(&name, mac);
+    Ok(Step::Done(Value::Nil))
 }
 
 fn eval_let(tail: &[SExpr], env: Env) -> Result<Step, LispError> {

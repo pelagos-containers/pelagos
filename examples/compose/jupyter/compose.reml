@@ -6,10 +6,11 @@
 ;
 ; Lisp features demonstrated:
 ;
-;   define    — all ports and resource limits named at the top
-;   env       — JUPYTER_PORT read from host environment with safe default
-;   on-ready  — hook fires when redis is healthy, before notebooks can cache
-;   volume    — named volume persists notebooks across container restarts
+;   define          — all ports and resource limits named at the top
+;   env             — JUPYTER_PORT read from host environment with safe default
+;   on-ready        — hook fires when redis is healthy, before notebooks can cache
+;   volume          — named volume persists notebooks across container restarts
+;   define-service  — macro: clean keyword-style service definitions
 
 ;; ── Configuration ─────────────────────────────────────────────────
 ;;
@@ -20,9 +21,9 @@
   (let ((p (env "JUPYTER_PORT")))
     (if (null? p) 8888 (string->number p))))
 
-(define mem-redis      "64m")
-(define mem-jupyter    "512m")
-(define cpu-jupyter    "1.0")
+(define mem-redis   "64m")
+(define mem-jupyter "512m")
+(define cpu-jupyter "1.0")
 
 ;; ── Network ───────────────────────────────────────────────────────
 
@@ -30,34 +31,32 @@
 
 ;; ── Lifecycle hooks ───────────────────────────────────────────────
 ;;
-;; on-ready fires after redis's TCP port check passes.
-;; This guarantees the redis Python client in notebooks will connect
-;; successfully on the first attempt.
+;; on-ready fires after redis's TCP port check passes, guaranteeing the
+;; redis Python client in notebooks will connect on the first attempt.
 
 (on-ready "redis"
   (lambda ()
     (log "redis: cache layer ready — JupyterLab kernel can connect")))
 
 ;; ── Services ──────────────────────────────────────────────────────
+;;
+;; Each option is a list (:keyword args...).
+;; Constants need no quoting; variables are evaluated at call-site.
 
-(define svc-redis
-  (service "redis"
-    '(image "jupyter-redis:latest")
-    (list 'network "jupyter-net")
-    (list 'memory mem-redis)))
+(define-service svc-redis "redis"
+  (:image   "jupyter-redis:latest")
+  (:network "jupyter-net")
+  (:memory  mem-redis))
 
-(define svc-jupyterlab
-  (service "jupyterlab"
-    '(image "jupyter-jupyterlab:latest")
-    (list 'network "jupyter-net")
-    ; Wait for redis TCP port before starting the kernel
-    (list 'depends-on "redis" 6379)
-    ; Redis connection info available to notebook code
-    (list 'env "REDIS_HOST" "redis")
-    (list 'env "REDIS_PORT" "6379")
-    (list 'port jupyter-port 8888)
-    (list 'memory mem-jupyter)
-    (list 'cpus cpu-jupyter)))
+(define-service svc-jupyterlab "jupyterlab"
+  (:image      "jupyter-jupyterlab:latest")
+  (:network    "jupyter-net")
+  (:depends-on "redis" 6379)      ; TCP health check before kernel starts
+  (:env        "REDIS_HOST" "redis")
+  (:env        "REDIS_PORT" "6379")
+  (:port       jupyter-port 8888) ; host port from env var or default 8888
+  (:memory     mem-jupyter)
+  (:cpus       cpu-jupyter))
 
 ;; ── Assemble and run ──────────────────────────────────────────────
 

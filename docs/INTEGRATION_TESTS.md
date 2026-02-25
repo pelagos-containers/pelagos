@@ -1646,3 +1646,39 @@ Failure indicates a regression in the Lisp interpreter, the `depends-on` port
 parsing, the `on-ready` hook registration, or the `env`/fallback pipeline — any
 of which would make the Jupyter stack silently broken before containers are even
 started.
+
+### `test_defmacro_basic` (unit test in `src/lisp/mod.rs`)
+**Requires:** nothing
+
+Defines a simple `my-swap` macro via `defmacro` and calls it. Asserts that the
+two arguments are exchanged in the output list. Verifies the core macro expansion
+pipeline: unevaluated args → quasiquote template → `value_to_sexpr` → re-eval.
+
+### `test_defmacro_generates_define` (unit test in `src/lisp/mod.rs`)
+**Requires:** nothing
+
+Defines a macro `def-42` that generates a `(define ...)` form. After calling it,
+asserts that the named variable is bound in the environment. This is the minimal
+proof that a macro can introduce new bindings — the key capability `define-service`
+relies on.
+
+### `test_define_service_macro` (unit test in `src/lisp/mod.rs`)
+**Requires:** nothing
+
+Calls `define-service` (the stdlib macro loaded at interpreter startup) with
+`:image`, `:network`, and `:memory mem` where `mem` is a variable. Asserts that
+the bound `ServiceSpec` has the correct name, image, network, and that the `mem`
+variable was evaluated at call-site (not captured as a symbol).
+
+Failure means the `define-service` macro itself is broken or `stdlib.lisp` fails
+to load at startup, which would make every `.reml` file using `define-service` fail.
+
+### `test_define_service_with_port_variable` (unit test in `src/lisp/mod.rs`)
+**Requires:** nothing
+
+Calls `define-service` with `(:port my-port 80)` where `my-port` is a variable
+bound to `9090`. Asserts `ports[0].host == 9090` and `ports[0].container == 80`.
+
+Verifies that multi-argument options with variables work correctly through the
+macro expansion: the variable is not quoted in the expansion, so it evaluates to
+its value when the generated `(list 'port my-port 80)` is executed.

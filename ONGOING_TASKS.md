@@ -1,6 +1,81 @@
 # Ongoing Tasks
 
-## Current Task: Developer Stack Examples (Feb 24, 2026)
+## Current Task: `defmacro` + `define-service` (Feb 24, 2026)
+
+### Context
+
+Add a general macro system to the Lisp interpreter, then implement `define-service`
+as a Lisp macro so service definitions are concise and keyword-driven:
+
+```lisp
+(define-service svc-jupyterlab "jupyterlab"
+  (:image      "jupyter-jupyterlab:latest")
+  (:network    "jupyter-net")
+  (:depends-on "redis" 6379)
+  (:env        "REDIS_HOST" "redis")
+  (:port       jupyter-port 8888)
+  (:memory     mem-jupyter)
+  (:cpus       cpu-jupyter))
+```
+
+### Design
+
+**Syntax**: each option is a sublist `(:keyword args...)`. The macro strips `:`
+and generates `(list 'keyword args...)` per option. Variables in value positions
+are NOT quoted — they evaluate at call-site.
+
+**`defmacro` special form** (like `lambda` but creates `Value::Macro`):
+- Receives args unevaluated (via existing `sexpr_to_datum()`)
+- Evaluates body → expansion `Value`
+- Converts expansion to `SExpr` via new `value_to_sexpr()`
+- TCO-evaluates result in caller's env
+
+**`define-service`** written as a Lisp macro in `src/lisp/stdlib.lisp`,
+embedded with `include_str!` and loaded at `Interpreter::new()`.
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/lisp/value.rs` | Add `Value::Macro { name, params, body, env }`; add `value_to_sexpr()` |
+| `src/lisp/eval.rs` | Add `defmacro` special form; macro-expansion path in `eval_list` |
+| `src/lisp/mod.rs` | Eval stdlib at startup with `include_str!("stdlib.lisp")` |
+| `src/lisp/stdlib.lisp` | **NEW** — `define-service` macro |
+| `examples/compose/jupyter/compose.reml` | Rewrite using `define-service` |
+| `tests/integration_tests.rs` | `test_define_service_macro` (no-root) |
+| `docs/INTEGRATION_TESTS.md` | Document new test |
+
+### Key Implementation Details
+
+`value_to_sexpr` maps: `Nil→List([])`, `Bool→Atom("#t"/"#f")`, `Int→Atom(n.to_string())`,
+`Float→Atom(f.to_string())`, `Str→Str`, `Symbol→Atom`, `Pair→List(recurse)`;
+errors on domain values (ServiceSpec etc.).
+
+`defmacro` in eval.rs matches on `"defmacro"` string same as other special forms.
+Macro application: evaluate head, if `Value::Macro` → convert args to data via
+`sexpr_to_datum`, bind params, eval body, `value_to_sexpr`, `Step::Tail` in caller env.
+
+`define-service` macro body:
+```lisp
+(defmacro define-service (var-name svc-name . opts)
+  (define (expand-opt opt)
+    (let* ((kw   (car opt))
+           (sym  (string->symbol (substring (symbol->string kw) 1)))
+           (args (cdr opt)))
+      `(list ',sym ,@args)))
+  `(define ,var-name
+     (service ,svc-name ,@(map expand-opt opts))))
+```
+
+### Verification
+
+1. `cargo test --lib` — 207+ tests pass
+2. `cargo test --test integration_tests test_lisp` — all lisp tests pass
+3. `cargo clippy -- -D warnings` + `cargo fmt --check` — clean
+
+---
+
+## Pending: Developer Stack Examples (Feb 24, 2026)
 
 ### Context
 

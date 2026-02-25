@@ -44,11 +44,15 @@ impl Interpreter {
         register_builtins(&global_env);
         register_remora_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
 
-        Interpreter {
+        let mut interp = Interpreter {
             global_env,
             hooks,
             pending,
-        }
+        };
+        interp
+            .eval_str(include_str!("stdlib.lisp"))
+            .expect("stdlib.lisp failed to load — this is a bug");
+        interp
     }
 
     /// Evaluate all top-level forms in `input`, returning the value of the last.
@@ -590,6 +594,73 @@ mod tests {
         assert_eq!(spec.services[0].image, "postgres:16");
         assert_eq!(spec.services[1].name, "app");
         assert_eq!(spec.services[1].image, "alpine:latest");
+    }
+
+    // ── defmacro / define-service ─────────────────────────────────────────
+    #[test]
+    fn test_defmacro_basic() {
+        // A simple macro that swaps two expressions in a list.
+        let mut i = interp();
+        eval_ok(&mut i, "(defmacro my-swap (a b) `(list ,b ,a))");
+        let v = eval_ok(&mut i, "(let ((x 1) (y 2)) (my-swap x y))");
+        let items = v.to_vec().unwrap();
+        assert_eq!(items, vec![Value::Int(2), Value::Int(1)]);
+    }
+
+    #[test]
+    fn test_defmacro_generates_define() {
+        // Macro that generates a (define ...) form — the basis of define-service.
+        let mut i = interp();
+        eval_ok(&mut i, "(defmacro def-42 (name) `(define ,name 42))");
+        eval_ok(&mut i, "(def-42 answer)");
+        assert_eq!(eval_ok(&mut i, "answer"), Value::Int(42));
+    }
+
+    #[test]
+    fn test_define_service_macro() {
+        // define-service (from stdlib.lisp) produces a bound ServiceSpec whose
+        // fields match the keyword options, including variable evaluation.
+        let mut i = interp();
+        eval_ok(&mut i, r#"(define mem "128m")"#);
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 (:image   "myapp:latest")
+                 (:network "backend")
+                 (:memory  mem))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.name, "myapp");
+                assert_eq!(s.image, "myapp:latest");
+                assert!(s.networks.contains(&"backend".to_string()));
+                assert_eq!(s.memory.as_deref(), Some("128m"));
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_with_port_variable() {
+        // Variable in (:port ...) must be evaluated at call-site, not at macro-definition time.
+        let mut i = interp();
+        eval_ok(&mut i, "(define my-port 9090)");
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "app"
+                 (:image "app:latest")
+                 (:port  my-port 80))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.ports.len(), 1);
+                assert_eq!(s.ports[0].host, 9090);
+                assert_eq!(s.ports[0].container, 80);
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
     }
 
     #[test]

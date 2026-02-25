@@ -29,6 +29,15 @@ pub enum Value {
         body: Vec<SExpr>,
         env: Env,
     },
+    /// A user-defined macro created by `defmacro`.  Like a `Lambda` but receives
+    /// its arguments unevaluated; the body is evaluated and its result is then
+    /// evaluated in the caller's environment (macro expansion).
+    Macro {
+        name: String,
+        params: Params,
+        body: Vec<SExpr>,
+        env: Env,
+    },
     Native(String, NativeFn),
     // ── Remora domain values ──────────────────────────────────────────────
     ServiceSpec(Box<crate::compose::ServiceSpec>),
@@ -128,6 +137,7 @@ impl Value {
             Value::Symbol(_) => "symbol",
             Value::Pair(_) => "pair",
             Value::Lambda { .. } => "lambda",
+            Value::Macro { .. } => "macro",
             Value::Native(_, _) => "procedure",
             Value::ServiceSpec(_) => "service-spec",
             Value::NetworkSpec(_) => "network-spec",
@@ -202,6 +212,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Lambda { .. } => write!(f, "#<lambda>"),
+            Value::Macro { name, .. } => write!(f, "#<macro:{}>", name),
             Value::Native(name, _) => write!(f, "#<procedure:{}>", name),
             Value::ServiceSpec(s) => write!(f, "#<service:{}>", s.name),
             Value::NetworkSpec(n) => write!(f, "#<network:{}>", n.name),
@@ -214,6 +225,39 @@ impl fmt::Display for Value {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self)
+    }
+}
+
+/// Convert a Lisp `Value` back to an `SExpr` for macro expansion.
+///
+/// Only pure-data values can be serialised.  Procedural values (`Lambda`,
+/// `Macro`, `Native`) and Remora domain values (`ServiceSpec`, etc.) cannot
+/// appear in a macro expansion — return an error if they do.
+///
+/// Note: `SExpr` has no numeric variants; numbers and booleans are stored as
+/// `Atom` strings and re-parsed by the evaluator on the next pass.
+pub fn value_to_sexpr(v: Value) -> Result<SExpr, LispError> {
+    match v {
+        Value::Nil => Ok(SExpr::List(vec![])),
+        Value::Bool(true) => Ok(SExpr::Atom("#t".into())),
+        Value::Bool(false) => Ok(SExpr::Atom("#f".into())),
+        Value::Int(n) => Ok(SExpr::Atom(n.to_string())),
+        Value::Float(f) => Ok(SExpr::Atom(f.to_string())),
+        Value::Str(s) => Ok(SExpr::Str(s)),
+        Value::Symbol(s) => Ok(SExpr::Atom(s)),
+        Value::Pair(_) => {
+            let items = v.to_vec()?;
+            Ok(SExpr::List(
+                items
+                    .into_iter()
+                    .map(value_to_sexpr)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        other => Err(LispError::new(format!(
+            "macro expansion produced non-serialisable value: {}",
+            other.type_name()
+        ))),
     }
 }
 
