@@ -314,6 +314,8 @@ structural one.
 | Linear chain; next step depends on previous value | `resolve` |
 | Short pipeline, no need to name intermediate futures | `resolve` |
 | Static topology + one conditional branch | `run` — see below |
+| Step-by-step with immediate results; no future graph | `container-start` |
+| Parallel start without declarative graph | `container-start-bg` + `container-join` |
 
 ### Mixing static and conditional execution
 
@@ -338,6 +340,59 @@ other future; its lambda chooses which container to start at runtime.
 Cycle detection covers the static portion.  The dynamic tail (the future
 returned by the lambda) is structurally acyclic — a lambda cannot close
 over a future that does not yet exist.
+
+---
+
+## Eager (Imperative) Execution
+
+The graph model (`start`/`run`) is declarative: you describe *what* depends on
+*what*, and the executor decides *when* to run each node.  The eager model is
+imperative: you start containers by calling functions and receive handles
+immediately, writing ordinary sequential or parallel Lisp code.
+
+### `(container-start svc [:env list])`
+
+Spawns a container synchronously and returns a `ContainerHandle`.  The optional
+`:env` argument is a list of `(KEY . value)` pairs merged into the service env
+before spawning — values are already-resolved strings or numbers (not lambdas).
+
+```lisp
+(define db  (container-start svc-db))
+(define url (format "postgres://...@~a/db" (container-ip db)))
+(define app (container-start svc-app :env (list (cons "DATABASE_URL" url))))
+```
+
+### `(container-start-bg svc [:env list])`
+
+Spawns a container in a background thread and returns a `PendingContainer`
+**immediately** — the calling thread is not blocked.  The same optional `:env`
+argument is supported.
+
+### `(container-join pending)`
+
+Blocks until the background container finishes starting and returns a
+`ContainerHandle`.  Raises an error if the start failed.  Calling `join` a
+second time on the same pending handle raises `"already joined"`.
+
+#### Sequential vs parallel eager
+
+```lisp
+;; Sequential — start db, wait, derive url, start app.
+(define db  (container-start svc-db))
+(define url (format "postgres://...@~a/db" (container-ip db)))
+(define app (container-start svc-app :env (list (cons "DATABASE_URL" url))))
+
+;; Parallel — kick off db and cache simultaneously.
+(define db-p    (container-start-bg svc-db))
+(define cache-p (container-start-bg svc-cache))
+;; Both are starting.  Do other work here if desired.
+(define db    (container-join db-p))
+(define cache (container-join cache-p))
+```
+
+The parallel eager model restores the original intent of the async contract:
+put work in motion, do other things, collect results later.  It does not
+provide upfront cycle detection — that is a property of the graph model.
 
 ---
 

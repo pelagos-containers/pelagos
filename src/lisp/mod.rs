@@ -1267,6 +1267,55 @@ mod tests {
         );
     }
 
+    // ── container-start-bg / container-join ─────────────────────────
+
+    #[test]
+    fn test_container_start_bg_returns_pending() {
+        // container-start-bg returns a pending-container without blocking.
+        // (No real image needed — we just check the type before joining.)
+        let mut i = runtime_interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "db" :image "alpine:latest" :network "net")"#,
+        );
+        let v = eval_ok(&mut i, "(container-start-bg svc)");
+        assert_eq!(
+            v.type_name(),
+            "pending-container",
+            "container-start-bg should return a pending-container immediately"
+        );
+    }
+
+    #[test]
+    fn test_container_join_errors_on_bad_arg() {
+        // container-join rejects non-pending-container arguments.
+        let mut i = runtime_interp();
+        let err = eval_err(&mut i, r#"(container-join "not-a-pending")"#);
+        assert!(
+            err.contains("pending-container"),
+            "expected type error mentioning pending-container, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_container_start_bg_join_propagates_error() {
+        // Joining a failed background start surfaces the error message.
+        let mut i = runtime_interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "db" :image "no-such-image:latest" :network "net")"#,
+        );
+        eval_ok(&mut i, "(define pending (container-start-bg svc))");
+        // The background thread will fail; joining should surface the error.
+        let err = eval_err(&mut i, "(container-join pending)");
+        // Any non-empty error is sufficient — the image doesn't exist.
+        assert!(
+            !err.is_empty(),
+            "expected an error from failed container start"
+        );
+    }
+
     // ── run parallel keyword parsing ─────────────────────────────────
 
     #[test]

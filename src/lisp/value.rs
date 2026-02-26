@@ -3,6 +3,14 @@
 use crate::sexpr::SExpr;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+/// Channel receiver used by [`Value::PendingContainer`].
+///
+/// The inner `Option` allows `container-join` to `take()` the receiver,
+/// turning a second join into a detectable error rather than a deadlock.
+pub type PendingRx =
+    Arc<Mutex<Option<std::sync::mpsc::Receiver<Result<(String, i32, Option<String>), String>>>>>;
 
 use super::env::Env;
 
@@ -53,16 +61,21 @@ pub enum Value {
         /// Primary bridge IP assigned to the container, if any.
         ip: Option<String>,
     },
-    /// A lazy future created by `container-start-async` or `then`.
+    /// A container being started in the background via `container-start-bg`.
     ///
-    /// Nothing executes until `(await future ...)`, `(run-all ...)`, or
-    /// `(resolve ...)` is called.
+    /// Call `(container-join handle)` to block until the container is ready
+    /// and obtain a `ContainerHandle`.  Joining a second time returns an error.
+    PendingContainer(PendingRx),
+    /// A lazy future created by `start` or `then`.
     ///
-    /// - `run-all` — static executor: receives the full graph upfront, topo-sorts
-    ///   it, detects cycles, and executes serially (parallel dispatch planned).
+    /// Nothing executes until `(run ...)` or `(resolve ...)` is called.
+    ///
+    /// - `run` — static executor: receives a list of *terminal* futures,
+    ///   discovers transitive `:needs` dependencies automatically, topo-sorts,
+    ///   and executes serially or in parallel tiers.
     /// - `resolve` — dynamic executor: walks the chain recursively from the tip;
-    ///   if a `Transform` lambda returns another `Future`, it is executed
-    ///   automatically (monadic flatten / Promise chaining).
+    ///   if a `then` lambda returns another `Future`, it is resolved too
+    ///   (monadic flatten).
     Future {
         /// Unique ID assigned at creation — used for deduplication in executors.
         id: u64,
@@ -217,6 +230,7 @@ impl Value {
             Value::VolumeSpec(_) => "volume-spec",
             Value::ComposeSpec(_) => "compose-spec",
             Value::ContainerHandle { .. } => "container",
+            Value::PendingContainer(_) => "pending-container",
             Value::Future { .. } => "future",
         }
     }
@@ -304,6 +318,7 @@ impl fmt::Display for Value {
             Value::VolumeSpec(v) => write!(f, "#<volume:{}>", v),
             Value::ComposeSpec(_) => write!(f, "#<compose-spec>"),
             Value::ContainerHandle { name, .. } => write!(f, "#<container {}>", name),
+            Value::PendingContainer(_) => write!(f, "#<pending-container>"),
             Value::Future { name, after, .. } => {
                 if after.is_empty() {
                     write!(f, "#<future:{}>", name)

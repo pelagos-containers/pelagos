@@ -1,0 +1,111 @@
+;;; compose-eager.reml — eager (imperative) orchestration example.
+;;;
+;;; This file demonstrates the *eager* execution models:
+;;;
+;;;   1. Sequential eager  — start containers one by one, use each result
+;;;      immediately before starting the next.
+;;;
+;;;   2. Parallel eager    — kick off several containers simultaneously with
+;;;      `container-start-bg`, do other work while they start, then collect
+;;;      the handles with `container-join`.
+;;;
+;;; Compare with compose.reml which uses the *declarative graph* model
+;;; (start / then / run).  Both approaches produce the same outcome; the
+;;; choice depends on how much parallelism and upfront cycle-detection you want.
+
+;;; ── Service definitions ─────────────────────────────────────────────────────
+
+(define-service svc-db "db"
+  :image   "postgres:16"
+  :network "app-net"
+  :env     ("POSTGRES_PASSWORD" . "secret")
+           ("POSTGRES_DB"       . "appdb")
+  :port    (5432 . 5432))
+
+(define-service svc-cache "cache"
+  :image   "redis:7"
+  :network "app-net"
+  :port    (6379 . 6379))
+
+(define-service svc-migrate "migrate"
+  :image   "flyway/flyway:10"
+  :network "app-net")
+
+(define-service svc-app "app"
+  :image   "myapp:latest"
+  :network "app-net"
+  :port    (8080 . 8080))
+
+;;; ── Model A: Sequential eager ───────────────────────────────────────────────
+;;;
+;;; Each container is started and its result used immediately.  The sequence is
+;;; strictly serial: db → (derive url) → migrate → (derive url) → app.
+;;;
+;;; Use this when each step's configuration depends on the previous step's
+;;; resolved value and parallelism is not a concern.
+
+(define db    (container-start svc-db))
+(define db-ip (container-ip db))
+(define db-url (format "postgres://app:secret@~a/appdb" db-ip))
+(logf "db started at ~a" db-ip)
+
+(define migrate
+  (container-start svc-migrate
+    :env (list (cons "DATABASE_URL" db-url))))
+(define exit-code (container-wait migrate))
+(when (not (= exit-code 0))
+  (container-stop db)
+  (error (format "migrations failed with exit code ~a" exit-code)))
+(logf "migrations complete (exit ~a)" exit-code)
+
+(define app
+  (container-start svc-app
+    :env (list (cons "DATABASE_URL" db-url))))
+(logf "app started (pid ~a)" (container-ip app))
+
+(container-wait app)
+(container-stop db)
+(log "Sequential eager done")
+
+;;; ── Model B: Parallel eager ─────────────────────────────────────────────────
+;;;
+;;; db and cache are started simultaneously.  The script continues immediately
+;;; after container-start-bg returns, then blocks at container-join only when
+;;; the resolved value is actually needed.
+;;;
+;;; Use this when independent services can be started concurrently and you want
+;;; to overlap startup latency.
+
+(define db-pending    (container-start-bg svc-db))
+(define cache-pending (container-start-bg svc-cache))
+
+;; Both containers are now starting in background threads.
+;; Do other work here if desired, e.g. validate config, prepare volumes.
+
+(define db2    (container-join db-pending))
+(define cache2 (container-join cache-pending))
+
+(define db-ip2    (container-ip db2))
+(define cache-ip2 (container-ip cache2))
+(define db-url2    (format "postgres://app:secret@~a/appdb" db-ip2))
+(define cache-url2 (format "redis://~a:6379"                cache-ip2))
+(logf "db at ~a, cache at ~a" db-ip2 cache-ip2)
+
+(define migrate2
+  (container-start svc-migrate
+    :env (list (cons "DATABASE_URL" db-url2))))
+(define exit-code2 (container-wait migrate2))
+(when (not (= exit-code2 0))
+  (container-stop cache2)
+  (container-stop db2)
+  (error (format "migrations failed with exit code ~a" exit-code2)))
+
+(define app2
+  (container-start svc-app
+    :env (list (cons "DATABASE_URL"  db-url2)
+               (cons "CACHE_URL"     cache-url2))))
+
+(container-wait app2)
+(container-stop cache2)
+(container-stop db2)
+(log "Parallel eager done")

@@ -7,7 +7,9 @@
 //!
 //! | Function | Signature | Description |
 //! |----------|-----------|-------------|
-//! | `container-start`  | `(svc-spec)` → ContainerHandle | Spawn a container immediately |
+//! | `container-start`    | `(svc-spec [:env list])` → ContainerHandle | Spawn a container immediately |
+//! | `container-start-bg` | `(svc-spec [:env list])` → PendingContainer | Spawn in background; returns immediately |
+//! | `container-join`     | `(pending)` → ContainerHandle | Block until background container is ready |
 //! | `start`            | `(svc-spec [:needs list] [:env lambda])` → Future | Declare a lazy container start; nothing runs |
 //! | `then`           | `(future lambda)` → Future | Compute a value from a future's resolved result |
 //! | `then-all`       | `((list fut...) lambda)` → Future | Join multiple futures, then compute |
@@ -78,20 +80,125 @@ pub fn register_runtime_builtins(
     let compose_dir = Rc::new(compose_dir);
 
     // ── container-start ────────────────────────────────────────────────────
+    // Immediately spawns a container and returns a ContainerHandle.
+    // Optional :env applies a list of (KEY . value) pairs to the service env.
     {
         let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "container-start", move |args| {
-            if args.len() != 1 {
+            if args.is_empty() {
                 return Err(LispError::new(
-                    "container-start: expected 1 argument (service-spec)",
+                    "container-start: expected (service-spec [:env list])",
                 ));
             }
-            let svc = extract_service_spec("container-start", &args[0])?;
+            let mut svc = extract_service_spec("container-start", &args[0])?;
+            let mut i = 1;
+            while i < args.len() {
+                match &args[i] {
+                    Value::Symbol(s) if s == ":env" => {
+                        i += 1;
+                        let env_list = args
+                            .get(i)
+                            .ok_or_else(|| LispError::new("container-start: :env requires a list"))?
+                            .clone();
+                        apply_inject_env(&mut svc, env_list, "container-start")?;
+                        i += 1;
+                    }
+                    other => {
+                        return Err(LispError::new(format!(
+                            "container-start: unexpected argument: {}",
+                            other
+                        )))
+                    }
+                }
+            }
             do_container_start(svc, &project, &compose_dir, &registry)
         });
     }
+
+    // ── container-start-bg ─────────────────────────────────────────────────
+    // Spawns a container in a background thread and returns a PendingContainer
+    // immediately.  Call (container-join pending) to block and get a handle.
+    // Optional :env applies (KEY . value) pairs before spawning.
+    {
+        let registry = Arc::clone(&registry);
+        let project = Rc::clone(&project);
+        let compose_dir = Rc::clone(&compose_dir);
+        native(env, "container-start-bg", move |args| {
+            if args.is_empty() {
+                return Err(LispError::new(
+                    "container-start-bg: expected (service-spec [:env list])",
+                ));
+            }
+            let mut svc = extract_service_spec("container-start-bg", &args[0])?;
+            let mut i = 1;
+            while i < args.len() {
+                match &args[i] {
+                    Value::Symbol(s) if s == ":env" => {
+                        i += 1;
+                        let env_list = args
+                            .get(i)
+                            .ok_or_else(|| {
+                                LispError::new("container-start-bg: :env requires a list")
+                            })?
+                            .clone();
+                        apply_inject_env(&mut svc, env_list, "container-start-bg")?;
+                        i += 1;
+                    }
+                    other => {
+                        return Err(LispError::new(format!(
+                            "container-start-bg: unexpected argument: {}",
+                            other
+                        )))
+                    }
+                }
+            }
+            let registry2 = Arc::clone(&registry);
+            let project_str = (*project).clone();
+            let compose_dir_path = compose_dir.to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result =
+                    do_container_start_inner(svc, &project_str, &compose_dir_path, &registry2)
+                        .map(|r| (r.name, r.pid, r.ip))
+                        .map_err(|e| e.message);
+                let _ = tx.send(result);
+            });
+            use crate::lisp::value::{PendingRx, Value as V};
+            let pending: PendingRx = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+            Ok(V::PendingContainer(pending))
+        });
+    }
+
+    // ── container-join ─────────────────────────────────────────────────────
+    // Blocks until a background container (from container-start-bg) finishes
+    // starting and returns a ContainerHandle.  Errors if already joined.
+    native(env, "container-join", |args| {
+        if args.len() != 1 {
+            return Err(LispError::new(
+                "container-join: expected 1 argument (pending-container)",
+            ));
+        }
+        match &args[0] {
+            Value::PendingContainer(arc) => {
+                let rx = arc
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| LispError::new("container-join: already joined"))?;
+                let (name, pid, ip) = rx
+                    .recv()
+                    .map_err(|_| LispError::new("container-join: background thread panicked"))?
+                    .map_err(LispError::new)?;
+                Ok(Value::ContainerHandle { name, pid, ip })
+            }
+            other => Err(LispError::new(format!(
+                "container-join: expected pending-container, got {}",
+                other.type_name()
+            ))),
+        }
+    });
 
     // ── start ─────────────────────────────────────────────
     // Returns a Future — nothing starts.  Keywords:

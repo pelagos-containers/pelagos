@@ -761,19 +761,55 @@ where each step's next container depends on the previous step's value:
 `resolve` does not support `:parallel` or upfront cycle detection.  Prefer
 `run` when the full graph is known upfront.
 
-### Choosing between `run` and `resolve`
+### Eager (imperative) execution
+
+The graph model describes *what* depends on *what*; the executor decides *when*
+to run each node.  The eager model is imperative: you call functions and receive
+results immediately, writing ordinary sequential or parallel Lisp code.
+
+**`(container-start svc [:env list])`** — starts a container synchronously and
+returns a `ContainerHandle`.  `:env` is an optional list of `(KEY . value)` pairs
+merged into the service environment:
+
+```lisp
+(define db  (container-start svc-db))
+(define url (format "postgres://...@~a/db" (container-ip db)))
+(define app (container-start svc-app :env (list (cons "DATABASE_URL" url))))
+```
+
+**`(container-start-bg svc [:env list])`** — starts a container in a background
+thread and returns a `PendingContainer` *immediately*.  The calling thread is
+not blocked.
+
+**`(container-join pending)`** — blocks until the background container is ready
+and returns a `ContainerHandle`.  The first join consumes the pending handle;
+a second join raises `"already joined"`.
+
+```lisp
+;; Parallel eager — overlap startup latency of db and cache.
+(define db-p    (container-start-bg svc-db))
+(define cache-p (container-start-bg svc-cache))
+;; Both are starting now.
+(define db    (container-join db-p))
+(define cache (container-join cache-p))
+(logf "db at ~a, cache at ~a" (container-ip db) (container-ip cache))
+```
+
+### Choosing between executors
 
 | Situation | Use |
 |-----------|-----|
-| Multiple independent services (db ∥ cache) | `run` |
+| Multiple independent services (db ∥ cache) | `run :parallel` |
 | Upfront cycle detection | `run` |
-| Parallel dispatch | `run :parallel` |
+| Parallel dispatch across tiers | `run :parallel` |
 | Linear chain; next step determined by previous value | `resolve` |
-| Short pipeline, no need to name every intermediate | `resolve` |
+| Short pipeline, no intermediate names needed | `resolve` |
+| Sequential imperative; immediate results | `container-start` |
+| Parallel imperative without declarative graph | `container-start-bg` + `container-join` |
 
 See `docs/REML_EXECUTOR_MODEL.md` for the full design reference: transitive
-discovery details, hybrid static+conditional patterns, threading model, and
-error message behaviour.
+discovery, hybrid static+conditional patterns, threading model, eager execution,
+and error message behaviour.
 
 ---
 
