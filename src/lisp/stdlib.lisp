@@ -141,12 +141,33 @@
 
 ;; ── Future helpers ────────────────────────────────────────────────────────
 
-;; (define-future name svc-spec [:after list] [:inject lambda])
+;; (define-future name svc-spec [:after (p...) :inject body])
 ;; Shorthand for (define name-fut (container-start-async svc-spec ...)).
-;; The variable bound is name-fut; the service name comes from svc-spec.
+;; :after (p...) — p... are parameter names; macro appends -fut to each for
+;;   the actual dependency list and reuses them as the :inject lambda params.
+;; :inject body  — body expression (NOT a lambda); macro wraps it as
+;;   (lambda (p...) body) using the :after params as the parameter list.
 (defmacro define-future (name svc . opts)
   (define fut-name (string->symbol (string-append (symbol->string name) "-fut")))
-  `(define ,fut-name (container-start-async ,svc ,@opts)))
+  (define (sym-fut s) (string->symbol (string-append (symbol->string s) "-fut")))
+  ;; Walk opts, rewriting :after (params) → :after (list param-fut ...)
+  ;; and :inject body → :inject (lambda (params) body), where params comes
+  ;; from the immediately preceding :after clause.
+  (define (rewrite opts after-params)
+    (cond
+      ((null? opts) '())
+      ((eq? (car opts) ':after)
+       (let ((params (cadr opts)))
+         (cons ':after
+           (cons (cons 'list (map sym-fut params))
+             (rewrite (cddr opts) params)))))
+      ((eq? (car opts) ':inject)
+       (cons ':inject
+         (cons (list 'lambda after-params (cadr opts))
+           (rewrite (cddr opts) after-params))))
+      (else
+       (cons (car opts) (rewrite (cdr opts) after-params)))))
+  `(define ,fut-name (container-start-async ,svc ,@(rewrite opts '()))))
 
 ;; (define-futures (name svc-spec) ...)
 ;; Batch form of define-future; expands each clause independently.

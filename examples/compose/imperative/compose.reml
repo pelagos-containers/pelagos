@@ -13,8 +13,11 @@
 ;;; :inject wires derived values into the service env at execution time.
 ;;;
 ;;; Naming convention (enforced by macros):
-;;;   (define-future name svc)           binds name-fut
-;;;   (define-transform name upstream …) reads upstream-fut, binds name-fut
+;;;   (define-future name svc)                    binds name-fut
+;;;   (define-future name svc :after (p…) :inject body)
+;;;                                               p… name both upstream-fut deps
+;;;                                               and the inject body's parameters
+;;;   (define-transform name upstream body)       reads upstream-fut, binds name-fut
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
@@ -59,19 +62,15 @@
   (format "redis://~a:6379" (container-ip cache)))
 
 ;; Migrations: depend on db-url; :inject wires it into the container env
-(define migrate-fut
-  (container-start-async svc-migrate
-    :after  (list db-url-fut)
-    :inject (lambda (db-url)
-              `(("DATABASE_URL" . ,db-url)))))
+(define-future migrate svc-migrate
+  :after  (db-url)
+  :inject `(("DATABASE_URL" . ,db-url)))
 
 ;; Application: depends on both URLs; :inject wires both into the container env
-(define app-fut
-  (container-start-async svc-app
-    :after  (list db-url-fut cache-url-fut)
-    :inject (lambda (db-url cache-url)
-              `(("DATABASE_URL" . ,db-url)
-                ("CACHE_URL"    . ,cache-url)))))
+(define-future app svc-app
+  :after  (db-url cache-url)
+  :inject `(("DATABASE_URL" . ,db-url)
+            ("CACHE_URL"    . ,cache-url)))
 
 ;; ── Execute: tier-parallel run ───────────────────────────────────────────
 ;;

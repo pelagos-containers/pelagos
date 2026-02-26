@@ -1296,6 +1296,39 @@ mod tests {
     }
 
     #[test]
+    fn test_define_future_with_after_inject() {
+        // (define-future migrate svc :after (db-url) :inject body)
+        // should bind migrate-fut and rewrite :after / :inject correctly.
+        // Stub container-start-async as a function (not macro) that records its args.
+        let mut i = Interpreter::new();
+        eval_ok(&mut i, "(define svc-migrate '())");
+        eval_ok(&mut i, "(define db-url-fut \"pg://host/db\")");
+        // Stub: capture the :after list and :inject lambda into globals for inspection.
+        eval_ok(&mut i, r#"
+            (define captured-after #f)
+            (define captured-inject #f)
+            (define (container-start-async svc . rest)
+              (set! captured-after  (cadr rest))
+              (set! captured-inject (cadr (cddr rest)))
+              'stub-handle)
+        "#);
+        eval_ok(&mut i, r#"
+            (define-future migrate svc-migrate
+              :after  (db-url)
+              :inject (string-append "url:" db-url))
+        "#);
+        // migrate-fut should be bound
+        assert_eq!(eval_ok(&mut i, "migrate-fut"), Value::Symbol("stub-handle".into()));
+        // :after list should contain db-url-fut's value
+        assert_eq!(eval_ok(&mut i, "(car captured-after)"), Value::Str("pg://host/db".into()));
+        // :inject lambda should receive db-url and produce the right string
+        assert_eq!(
+            eval_ok(&mut i, "(captured-inject \"my-url\")"),
+            Value::Str("url:my-url".into()),
+        );
+    }
+
+    #[test]
     fn test_define_results_macro() {
         // (define-results alist db cache) binds db and cache from the alist.
         let mut i = Interpreter::new();
