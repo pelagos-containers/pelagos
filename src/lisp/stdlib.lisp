@@ -164,3 +164,12 @@
   (define fut-name  (string->symbol (string-append (symbol->string name)     "-fut")))
   (define up-name   (string->symbol (string-append (symbol->string upstream) "-fut")))
   `(define ,fut-name (then ,up-name (lambda (,upstream) ,@body))))
+
+;; (define-results alist-var name ...)
+;; Shorthand for a batch of (define name (result-ref alist-var "name")) calls.
+;; Each name is bound to its resolved value from the run-all alist.
+(defmacro define-results (alist-var . names)
+  `(begin
+     ,@(map (lambda (name)
+              `(define ,name (result-ref ,alist-var ,(symbol->string name))))
+            names)))

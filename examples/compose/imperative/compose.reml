@@ -89,9 +89,7 @@
 
 ;; ── Post-execution ────────────────────────────────────────────────────────
 
-(define db    (result-ref results "db"))
-(define cache (result-ref results "cache"))
-(define app   (result-ref results "app"))
+(define-results results db cache app)
 
 (logf "db-url:    ~a" (result-ref results "db-then"))
 (logf "cache-url: ~a" (result-ref results "cache-then"))

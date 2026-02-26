@@ -1296,6 +1296,20 @@ mod tests {
     }
 
     #[test]
+    fn test_define_results_macro() {
+        // (define-results alist db cache) binds db and cache from the alist.
+        let mut i = Interpreter::new();
+        eval_ok(&mut i, r#"
+            (define results
+              (list (cons "db"    "db-handle")
+                    (cons "cache" "cache-handle")))
+        "#);
+        eval_ok(&mut i, "(define-results results db cache)");
+        assert_eq!(eval_ok(&mut i, "db"),    Value::Str("db-handle".into()));
+        assert_eq!(eval_ok(&mut i, "cache"), Value::Str("cache-handle".into()));
+    }
+
+    #[test]
     fn test_define_future_macro() {
         // (define-future db svc) should bind db-fut in the environment.
         let mut i = Interpreter::new();
