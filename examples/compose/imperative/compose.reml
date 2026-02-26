@@ -1,8 +1,8 @@
 ;;; Imperative compose example — full graph model
 ;;;
 ;;; The entire dependency graph is declared before any execution begins.
-;;; run-all executes futures in topological order; a parallel executor
-;;; would run independent futures concurrently — no changes to this file.
+;;; run-all executes futures in dependency (topological) order.
+;;; Pass :parallel to run independent futures within each tier concurrently.
 ;;;
 ;;; Dependency graph:
 ;;;
@@ -72,15 +72,19 @@
               (list (cons "DATABASE_URL" db-url)
                     (cons "CACHE_URL"    cache-url)))))
 
-;; ── Execute: serial executor runs in topological order ───────────────────
+;; ── Execute: tier-parallel run ───────────────────────────────────────────
 ;;
-;; Execution order resolved from the graph:
-;;   db → cache → db-url → cache-url → migrate → app
+;; Execution tiers resolved from the graph:
+;;   Tier 1: db ∥ cache  (no dependencies — start concurrently)
+;;   Tier 2: db-url ∥ cache-url  (depend only on tier-1 results)
+;;   Tier 3: migrate  (depends on db-url)
+;;   Tier 4: app  (depends on db-url + cache-url)
 ;;
-;; A parallel executor would run: (db ∥ cache) → (db-url ∥ cache-url) → migrate → app
+;; :parallel runs all futures within each tier concurrently.
+;; All dependency ordering is still respected — tiers execute sequentially.
 
 (define results
-  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut)))
+  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut) :parallel))
 
 ;; ── Post-execution ────────────────────────────────────────────────────────
 

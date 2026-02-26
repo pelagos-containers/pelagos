@@ -59,6 +59,16 @@ a daemon and without CNI plugins.
 - **Daemonless:** Buildah-style — each RUN step snapshots the overlay upper dir as a layer
 - **Path safety:** COPY rejects sources outside the build context
 
+### Multi-Service Orchestration
+- **`remora compose up`:** parse a `.reml` file, create networks/volumes, start services in
+  dependency order with TCP readiness polling
+- **S-expression format:** `(compose (network ...) (service ...))` — Lisp, not YAML
+- **Imperative scripting:** the `.reml` Lisp interpreter is the primary programming interface;
+  use `container-start`, `await-port`, `guard`, and `with-cleanup` for custom deploy logic
+- **Futures graph:** `container-start-async` + `then` + `then-all` declare a dependency graph
+  before any execution begins; `run-all :parallel` executes independent futures concurrently
+  within each topological tier; `resolve` executes a monadic chain depth-first
+
 ### Rootless Containers
 - **Auto-detection:** `getuid() != 0` triggers rootless mode automatically — no flag needed
 - **Image pull/run:** `remora image pull alpine && remora run alpine /bin/sh` works without root
@@ -225,6 +235,7 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Port mapping | ✅ TCP | — | ✅ |
 | DNS | ✅ resolv.conf | ✅ | ✅ |
 | Image build | ✅ Remfile | — | ✅ Dockerfile |
+| Multi-service compose | ✅ Lisp DSL + parallel graph executor | — | ✅ YAML |
 | OCI compliant | ✅ Phase 1 | ✅ | ✅ |
 | Rootless | ✅ (pull, build, run, overlay, pasta) | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
@@ -239,6 +250,7 @@ and `docs/ROADMAP.md` for what's next.
 |------|----------|
 | `docs/DESIGN_PRINCIPLES.md` | Non-negotiable design principles |
 | `docs/USER_GUIDE.md` | CLI and API user guide |
+| `docs/REML_EXECUTOR_MODEL.md` | Futures graph model, `run-all`, `resolve`, parallel execution |
 | `docs/ROADMAP.md` | What's done and what's next |
 | `docs/RUNTIME_COMPARISON.md` | Full feature matrix vs runc/Docker |
 | `docs/INTEGRATION_TESTS.md` | Every integration test documented |

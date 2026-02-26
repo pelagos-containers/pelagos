@@ -7,9 +7,13 @@
 //!
 //! | Function | Signature | Description |
 //! |----------|-----------|-------------|
-//! | `container-start`       | `(svc-spec)` → ContainerHandle | Spawn a container |
-//! | `container-start-async` | `(svc-spec)` → Future | Create a lazy future; nothing starts |
-//! | `await`                 | `(future [:port P] [:timeout T])` → ContainerHandle | Run future to completion |
+//! | `container-start`       | `(svc-spec)` → ContainerHandle | Spawn a container immediately |
+//! | `container-start-async` | `(svc-spec [:after list] [:inject lambda])` → Future | Create a lazy future; nothing starts |
+//! | `then`                  | `(future lambda)` → Future | Transform a future's resolved value |
+//! | `then-all`              | `((list fut...) lambda)` → Future | Join multiple futures, then transform |
+//! | `run-all`               | `((list fut...) [:parallel] [:max-parallel N])` → alist | Execute graph; serial or tier-parallel |
+//! | `resolve`               | `(future)` → value | Execute a monadic chain depth-first |
+//! | `await`                 | `(future [:port P] [:timeout T])` → ContainerHandle | Await a single Container future |
 //! | `container-stop`        | `(handle)` → `()` | Send SIGTERM to a container |
 //! | `container-wait`        | `(handle)` → Int | Wait for a container to exit |
 //! | `container-run`         | `(svc-spec)` → Int | Start + wait; returns exit code |
@@ -20,12 +24,20 @@
 //! ## Executor model
 //!
 //! `container-start-async` returns a [`Value::Future`] — a pure description of
-//! work (the service spec) with no side effects.  `await` is the executor: it
-//! accepts a future and runs it to completion before returning.  Today the
-//! executor is **serial** — each `await` call blocks until the container is up.
-//! A future parallel executor would accept futures, inspect their dependency
-//! graph, and dispatch to threads; all `.reml` files written against this API
-//! would work unchanged.
+//! work (the service spec) with no side effects.  Two executors are provided:
+//!
+//! - **`run-all`** — static graph executor.  Accepts a flat list of futures,
+//!   topologically sorts them by their `:after` dependencies, and executes them
+//!   in order.  Pass `:parallel` to run independent futures within each tier
+//!   concurrently; the executor blocks between tiers to enforce ordering.
+//!   Use `:max-parallel N` to cap the number of simultaneous threads per tier.
+//!   Returns an alist of `(name . resolved-value)` pairs.
+//!
+//! - **`resolve`** — dynamic (monadic) executor.  Executes a single future
+//!   depth-first: resolves all upstreams recursively before calling transforms.
+//!   If a `then` lambda returns a new Future, that Future is resolved too
+//!   (monadic flatten).  Use this for chains where the next step is only known
+//!   after the previous one resolves.
 
 use std::io::Read;
 use std::net::TcpStream;
