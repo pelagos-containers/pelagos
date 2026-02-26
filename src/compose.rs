@@ -28,7 +28,7 @@ pub struct NetworkSpec {
 }
 
 /// A service declaration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServiceSpec {
     pub name: String,
     pub image: String,

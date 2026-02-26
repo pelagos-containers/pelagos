@@ -232,9 +232,9 @@ using `compose-up`.
   (error "postgres did not come up"))
 
 (define migrate-exit (container-run svc-migrate))
-(when (not (= migrate-exit 0))
+(unless (zero? migrate-exit)
   (container-stop db)
-  (error (format "migrations failed: exit ~s" migrate-exit)))
+  (errorf "migrations failed: exit ~s" migrate-exit))
 
 (with-cleanup (lambda () (container-stop db))
   (define app (container-start svc-app))

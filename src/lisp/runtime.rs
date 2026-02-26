@@ -7,20 +7,39 @@
 //!
 //! | Function | Signature | Description |
 //! |----------|-----------|-------------|
-//! | `container-start` | `(svc-spec)` → ContainerHandle | Spawn a container |
-//! | `container-stop`  | `(handle)` → `()` | Send SIGTERM to a container |
-//! | `container-wait`  | `(handle)` → Int | Wait for a container to exit |
-//! | `container-run`   | `(svc-spec)` → Int | Start + wait; returns exit code |
-//! | `container-ip`    | `(handle)` → Str\|Nil | Primary IP of container |
-//! | `container-status`| `(handle)` → Str | `"running"` or `"exited"` |
-//! | `await-port`      | `(host port [timeout-secs])` → Bool | TCP connect loop |
+//! | `container-start`       | `(svc-spec)` → ContainerHandle | Spawn a container |
+//! | `container-start-async` | `(svc-spec)` → Future | Create a lazy future; nothing starts |
+//! | `await`                 | `(future [:port P] [:timeout T])` → ContainerHandle | Run future to completion |
+//! | `container-stop`        | `(handle)` → `()` | Send SIGTERM to a container |
+//! | `container-wait`        | `(handle)` → Int | Wait for a container to exit |
+//! | `container-run`         | `(svc-spec)` → Int | Start + wait; returns exit code |
+//! | `container-ip`          | `(handle)` → Str\|Nil | Primary IP of container |
+//! | `container-status`      | `(handle)` → Str | `"running"` or `"exited"` |
+//! | `await-port`            | `(host port [timeout-secs])` → Bool | TCP connect loop |
+//!
+//! ## Executor model
+//!
+//! `container-start-async` returns a [`Value::Future`] — a pure description of
+//! work (the service spec) with no side effects.  `await` is the executor: it
+//! accepts a future and runs it to completion before returning.  Today the
+//! executor is **serial** — each `await` call blocks until the container is up.
+//! A future parallel executor would accept futures, inspect their dependency
+//! graph, and dispatch to threads; all `.reml` files written against this API
+//! would work unchanged.
 
 use std::cell::RefCell;
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static FUTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_future_id() -> u64 {
+    FUTURE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 use crate::compose::ServiceSpec;
 use crate::container::{Command, Stdio, Volume};
@@ -59,6 +78,512 @@ pub fn register_runtime_builtins(
             }
             let svc = extract_service_spec("container-start", &args[0])?;
             do_container_start(svc, &project, &compose_dir, &registry)
+        });
+    }
+
+    // ── container-start-async ─────────────────────────────────────────────
+    // Returns a Future — nothing starts.  Keywords:
+    //   :after  (list fut...)   ordering dependencies
+    //   :inject (lambda ...)    called with resolved :after values; returns
+    //                           a list of (key . value) env pairs to merge
+    native(env, "container-start-async", |args| {
+        if args.is_empty() {
+            return Err(LispError::new(
+                "container-start-async: expected (svc [:after list] [:inject lambda])",
+            ));
+        }
+        let svc = extract_service_spec("container-start-async", &args[0])?;
+        let mut after: Vec<Value> = Vec::new();
+        let mut inject: Option<Box<Value>> = None;
+        let mut i = 1;
+        while i < args.len() {
+            match &args[i] {
+                Value::Symbol(s) if s == ":after" => {
+                    i += 1;
+                    let deps = args
+                        .get(i)
+                        .ok_or_else(|| {
+                            LispError::new("container-start-async: :after requires a list")
+                        })?
+                        .to_vec()
+                        .map_err(|_| {
+                            LispError::new("container-start-async: :after requires a list")
+                        })?;
+                    for dep in deps {
+                        match &dep {
+                            Value::Future { .. } => after.push(dep),
+                            other => {
+                                return Err(LispError::new(format!(
+                                    "container-start-async: :after requires futures, got {}",
+                                    other.type_name()
+                                )))
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                Value::Symbol(s) if s == ":inject" => {
+                    i += 1;
+                    let f = args
+                        .get(i)
+                        .ok_or_else(|| {
+                            LispError::new("container-start-async: :inject requires a lambda")
+                        })?
+                        .clone();
+                    match &f {
+                        Value::Lambda { .. } | Value::Native(_, _) => {}
+                        other => {
+                            return Err(LispError::new(format!(
+                                "container-start-async: :inject requires a lambda, got {}",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                    inject = Some(Box::new(f));
+                    i += 1;
+                }
+                other => {
+                    return Err(LispError::new(format!(
+                        "container-start-async: unexpected argument: {}",
+                        other
+                    )))
+                }
+            }
+        }
+        use crate::lisp::value::FutureKind;
+        Ok(Value::Future {
+            id: next_future_id(),
+            name: svc.name.clone(),
+            kind: FutureKind::Container {
+                spec: Box::new(svc),
+                inject,
+            },
+            after,
+        })
+    });
+
+    // ── then ───────────────────────────────────────────────────────────────
+    // (then upstream-future (lambda (v) derived-value))
+    // Creates a Transform future whose resolved value is the result of
+    // applying the lambda to the upstream future's resolved value.
+    // The new future declares :after the upstream automatically.
+    native(env, "then", |args| {
+        if args.len() != 2 {
+            return Err(LispError::new("then: expected (future transform-lambda)"));
+        }
+        let upstream_name = match &args[0] {
+            Value::Future { name, .. } => name.clone(),
+            other => {
+                return Err(LispError::new(format!(
+                    "then: expected future, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        match &args[1] {
+            Value::Lambda { .. } | Value::Native(_, _) => {}
+            other => {
+                return Err(LispError::new(format!(
+                    "then: expected lambda, got {}",
+                    other.type_name()
+                )))
+            }
+        }
+        use crate::lisp::value::FutureKind;
+        let upstream = args[0].clone();
+        Ok(Value::Future {
+            id: next_future_id(),
+            name: format!("{}-then", upstream_name),
+            kind: FutureKind::Transform {
+                upstream: Box::new(upstream.clone()),
+                transform: Box::new(args[1].clone()),
+            },
+            after: vec![upstream],
+        })
+    });
+
+    // ── then-all ───────────────────────────────────────────────────────────
+    // (then-all (list f1 f2 ...) (lambda (v1 v2 ...) result))
+    // Creates a Join future: waits for all listed futures, then calls the
+    // lambda with all their resolved values in order.  If the lambda returns
+    // a Future it is flattened automatically (same rule as then).
+    native(env, "then-all", |args| {
+        if args.len() != 2 {
+            return Err(LispError::new(
+                "then-all: expected (list-of-futures lambda)",
+            ));
+        }
+        let futures_list = args[0]
+            .to_vec()
+            .map_err(|_| LispError::new("then-all: first argument must be a list of futures"))?;
+        let mut upstreams: Vec<Value> = Vec::new();
+        let mut name_parts: Vec<String> = Vec::new();
+        for f in futures_list {
+            match &f {
+                Value::Future { name, .. } => {
+                    name_parts.push(name.clone());
+                    upstreams.push(f);
+                }
+                other => {
+                    return Err(LispError::new(format!(
+                        "then-all: expected futures in list, got {}",
+                        other.type_name()
+                    )))
+                }
+            }
+        }
+        match &args[1] {
+            Value::Lambda { .. } | Value::Native(_, _) => {}
+            other => {
+                return Err(LispError::new(format!(
+                    "then-all: expected lambda, got {}",
+                    other.type_name()
+                )))
+            }
+        }
+        use crate::lisp::value::FutureKind;
+        Ok(Value::Future {
+            id: next_future_id(),
+            name: format!("join({})", name_parts.join(",")),
+            kind: FutureKind::Join {
+                transform: Box::new(args[1].clone()),
+            },
+            after: upstreams,
+        })
+    });
+
+    // ── run-all ────────────────────────────────────────────────────────────
+    // Graph-aware serial executor.  Topologically sorts futures by :after,
+    // executes each in order, maintains a resolved-values map for :inject
+    // and Transform futures, returns an alist of (name . resolved-value).
+    //
+    // Transform futures resolve to their lambda's return value (not a handle).
+    // Container futures resolve to a ContainerHandle.
+    //
+    // Deps not in the list are treated as already satisfied (resolved externally).
+    {
+        let registry = Rc::clone(&registry);
+        let project = Rc::clone(&project);
+        let compose_dir = Rc::clone(&compose_dir);
+        native(env, "run-all", move |args| {
+            if args.len() != 1 {
+                return Err(LispError::new("run-all: expected (list future ...)"));
+            }
+            let future_list = args[0]
+                .to_vec()
+                .map_err(|_| LispError::new("run-all: argument must be a list of futures"))?;
+
+            use super::eval::eval_apply;
+            use crate::lisp::value::FutureKind;
+
+            struct Entry {
+                id: u64,
+                name: String,
+                kind: FutureKind,
+                /// Dependency IDs extracted from the `after: Vec<Value>` field.
+                after_ids: Vec<u64>,
+            }
+
+            let mut entries: Vec<Entry> = Vec::new();
+            for v in future_list {
+                match v {
+                    Value::Future {
+                        id,
+                        name,
+                        kind,
+                        after,
+                    } => {
+                        let after_ids = after.iter().filter_map(Value::future_id).collect();
+                        entries.push(Entry {
+                            id,
+                            name,
+                            kind,
+                            after_ids,
+                        });
+                    }
+                    other => {
+                        return Err(LispError::new(format!(
+                            "run-all: expected futures, got {}",
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+
+            // Kahn's topological sort.
+            let n = entries.len();
+            let id_to_idx: std::collections::HashMap<u64, usize> =
+                entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+            let mut in_degree = vec![0usize; n];
+            let mut dependents: Vec<Vec<usize>> = vec![vec![]; n];
+            for (i, e) in entries.iter().enumerate() {
+                for dep_id in &e.after_ids {
+                    if let Some(&dep_idx) = id_to_idx.get(dep_id) {
+                        in_degree[i] += 1;
+                        dependents[dep_idx].push(i);
+                    }
+                }
+            }
+            let mut queue: std::collections::VecDeque<usize> =
+                (0..n).filter(|&i| in_degree[i] == 0).collect();
+            let mut order: Vec<usize> = Vec::with_capacity(n);
+            while let Some(i) = queue.pop_front() {
+                order.push(i);
+                for &j in &dependents[i] {
+                    in_degree[j] -= 1;
+                    if in_degree[j] == 0 {
+                        queue.push_back(j);
+                    }
+                }
+            }
+            if order.len() != n {
+                return Err(LispError::new("run-all: dependency cycle detected"));
+            }
+
+            // Execute in topological order; track resolved values for inject/transform.
+            let mut resolved: std::collections::HashMap<u64, Value> =
+                std::collections::HashMap::new();
+            let mut pairs: Vec<Value> = Vec::with_capacity(n);
+
+            for idx in order {
+                let e = &entries[idx];
+                let result = match &e.kind {
+                    FutureKind::Container { spec, inject } => {
+                        let mut spec = *spec.clone();
+                        // If :inject is present, call it with resolved :after values.
+                        if let Some(inject_fn) = inject {
+                            let dep_vals: Vec<Value> = e
+                                .after_ids
+                                .iter()
+                                .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
+                                .collect();
+                            let env_list = eval_apply(inject_fn, &dep_vals)?;
+                            for pair in env_list.to_vec()? {
+                                match pair {
+                                    Value::Pair(p) => {
+                                        let k = match &p.0 {
+                                            Value::Str(s) => s.clone(),
+                                            Value::Symbol(s) => s.clone(),
+                                            other => {
+                                                return Err(LispError::new(format!(
+                                                "run-all: inject env key must be string, got {}",
+                                                other.type_name()
+                                            )))
+                                            }
+                                        };
+                                        let v = match &p.1 {
+                                            Value::Str(s) => s.clone(),
+                                            other => format!("{}", other),
+                                        };
+                                        spec.env.insert(k, v);
+                                    }
+                                    other => {
+                                        return Err(LispError::new(format!(
+                                        "run-all: inject must return (key . value) pairs, got {}",
+                                        other.type_name()
+                                    )))
+                                    }
+                                }
+                            }
+                        }
+                        do_container_start(spec, &project, &compose_dir, &registry)?
+                    }
+                    FutureKind::Transform {
+                        upstream,
+                        transform,
+                    } => {
+                        let upstream_id = upstream.future_id().unwrap_or(0);
+                        let upstream_val =
+                            resolved.get(&upstream_id).cloned().unwrap_or(Value::Nil);
+                        let result = eval_apply(transform, &[upstream_val])?;
+                        // Monadic flatten: if the lambda returns a Future (conditional
+                        // branch), resolve it dynamically using our resolved map so
+                        // already-computed values are shared and not re-executed.
+                        // This is the bridge between static and dynamic execution:
+                        // the static graph runs with full topo-sort; any conditional
+                        // tail resolves inline without dragging the whole graph into
+                        // dynamic mode.
+                        match result {
+                            Value::Future { .. } => resolve_dynamic(
+                                result,
+                                &mut resolved,
+                                &project,
+                                &compose_dir,
+                                &registry,
+                            )?,
+                            other => other,
+                        }
+                    }
+                    FutureKind::Join { transform } => {
+                        let upstream_vals: Vec<Value> = e
+                            .after_ids
+                            .iter()
+                            .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
+                            .collect();
+                        let result = eval_apply(transform, &upstream_vals)?;
+                        match result {
+                            Value::Future { .. } => resolve_dynamic(
+                                result,
+                                &mut resolved,
+                                &project,
+                                &compose_dir,
+                                &registry,
+                            )?,
+                            other => other,
+                        }
+                    }
+                };
+                resolved.insert(e.id, result.clone());
+                pairs.push(Value::Pair(Rc::new((Value::Str(e.name.clone()), result))));
+            }
+
+            Ok(Value::list(pairs.into_iter()))
+        });
+    }
+
+    // ── resolve ────────────────────────────────────────────────────────────
+    // Dynamic (monadic) executor.  Resolves a single future chain recursively:
+    //
+    //   1. Container future   → spawn the container, return ContainerHandle.
+    //   2. Transform future   → resolve the upstream first, then call the
+    //      lambda.  If the lambda returns *another* Future, resolve that too
+    //      (monadic flatten / Promise chaining).  Repeat until a non-Future
+    //      value is produced.
+    //
+    // Unlike run-all, the full graph need not be declared upfront: the graph
+    // emerges as lambdas execute.  Trade-off: no upfront cycle detection and
+    // no tier-based parallel dispatch.  Use run-all when the full graph is
+    // known; use resolve for linear pipelines or when the next step depends
+    // on the runtime value of the previous one.
+    {
+        let registry = Rc::clone(&registry);
+        let project = Rc::clone(&project);
+        let compose_dir = Rc::clone(&compose_dir);
+        native(env, "resolve", move |args| {
+            if args.len() != 1 {
+                return Err(LispError::new("resolve: expected (future)"));
+            }
+            match &args[0] {
+                Value::Future { .. } => {}
+                other => {
+                    return Err(LispError::new(format!(
+                        "resolve: expected future, got {}",
+                        other.type_name()
+                    )))
+                }
+            }
+            let mut resolved = std::collections::HashMap::new();
+            resolve_dynamic(
+                args[0].clone(),
+                &mut resolved,
+                &project,
+                &compose_dir,
+                &registry,
+            )
+        });
+    }
+
+    // ── await ──────────────────────────────────────────────────────────────
+    // Single-future serial executor.  Runs a Container future to completion,
+    // optionally waiting for a TCP port.  Keywords: :port <int>, :timeout <num>.
+    // Transform futures are not supported by await (use run-all or resolve).
+    {
+        let registry = Rc::clone(&registry);
+        let project = Rc::clone(&project);
+        let compose_dir = Rc::clone(&compose_dir);
+        native(env, "await", move |args| {
+            if args.is_empty() {
+                return Err(LispError::new(
+                    "await: expected (future [:port P] [:timeout T])",
+                ));
+            }
+            use crate::lisp::value::FutureKind;
+            let svc =
+                match &args[0] {
+                    Value::Future {
+                        kind: FutureKind::Container { spec, .. },
+                        ..
+                    } => *spec.clone(),
+                    Value::Future {
+                        kind: FutureKind::Transform { .. } | FutureKind::Join { .. },
+                        ..
+                    } => return Err(LispError::new(
+                        "await: Transform and Join futures must be executed via run-all or resolve",
+                    )),
+                    other => {
+                        return Err(LispError::new(format!(
+                            "await: expected future, got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+
+            let mut port: Option<u16> = None;
+            let mut timeout_secs = 60.0f64;
+            let mut i = 1;
+            while i < args.len() {
+                match &args[i] {
+                    Value::Symbol(s) if s == ":port" => {
+                        i += 1;
+                        port = Some(match args.get(i) {
+                            Some(Value::Int(n)) => *n as u16,
+                            _ => return Err(LispError::new("await: :port requires an integer")),
+                        });
+                        i += 1;
+                    }
+                    Value::Symbol(s) if s == ":timeout" => {
+                        i += 1;
+                        timeout_secs = match args.get(i) {
+                            Some(Value::Int(n)) => *n as f64,
+                            Some(Value::Float(f)) => *f,
+                            _ => return Err(LispError::new("await: :timeout requires a number")),
+                        };
+                        i += 1;
+                    }
+                    other => {
+                        return Err(LispError::new(format!(
+                            "await: unexpected argument: {}",
+                            other
+                        )))
+                    }
+                }
+            }
+
+            let handle = do_container_start(svc, &project, &compose_dir, &registry)?;
+
+            if let Some(p) = port {
+                let ip = match &handle {
+                    Value::ContainerHandle { ip: Some(ip), .. } => ip.clone(),
+                    _ => "127.0.0.1".to_string(),
+                };
+                let container_name = match &handle {
+                    Value::ContainerHandle { name, .. } => name.clone(),
+                    _ => "unknown".to_string(),
+                };
+                let addr = format!("{}:{}", ip, p);
+                let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+                loop {
+                    if TcpStream::connect_timeout(
+                        &addr.parse().map_err(|e| {
+                            LispError::new(format!("await: invalid address '{}': {}", addr, e))
+                        })?,
+                        Duration::from_millis(250),
+                    )
+                    .is_ok()
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(LispError::new(format!(
+                            "await: '{}' port {} did not open within {}s",
+                            container_name, p, timeout_secs
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+
+            Ok(handle)
         });
     }
 
@@ -216,6 +741,118 @@ pub fn register_runtime_builtins(
             std::thread::sleep(Duration::from_millis(250));
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic executor
+// ---------------------------------------------------------------------------
+
+/// Recursively resolve `future` using a work-list deduplication map.
+///
+/// - Container futures spawn a container and return its [`Value::ContainerHandle`].
+/// - Transform futures resolve their upstream first, then apply the lambda.
+///   If the lambda returns another `Future`, that future is resolved too
+///   (monadic flatten): this is what enables Promise-style chain syntax where
+///   `(then ...)` lambdas return further `(container-start-async ...)` calls.
+/// - Plain (non-Future) values are returned as-is.
+///
+/// The `resolved` map acts as a memo table: a future whose ID is already in
+/// the map is not executed again, enabling shared upstreams without redundant
+/// work.
+fn resolve_dynamic(
+    future: Value,
+    resolved: &mut std::collections::HashMap<u64, Value>,
+    project: &str,
+    compose_dir: &std::path::Path,
+    registry: &Rc<RefCell<Vec<(String, i32)>>>,
+) -> Result<Value, LispError> {
+    use super::eval::eval_apply;
+    use crate::lisp::value::FutureKind;
+
+    match future {
+        Value::Future {
+            id, kind, after, ..
+        } => {
+            // Deduplication: if already resolved, return cached value.
+            if let Some(cached) = resolved.get(&id) {
+                return Ok(cached.clone());
+            }
+
+            // Resolve :after deps first (needed for :inject).
+            let mut after_vals: Vec<Value> = Vec::new();
+            for dep_fut in after {
+                let val = resolve_dynamic(dep_fut, resolved, project, compose_dir, registry)?;
+                after_vals.push(val);
+            }
+
+            let result = match kind {
+                FutureKind::Container { spec, inject } => {
+                    let mut spec = *spec;
+                    if let Some(inj) = inject {
+                        let env_list = eval_apply(&inj, &after_vals)?;
+                        for pair in env_list.to_vec()? {
+                            match pair {
+                                Value::Pair(p) => {
+                                    let k = match &p.0 {
+                                        Value::Str(s) => s.clone(),
+                                        Value::Symbol(s) => s.clone(),
+                                        other => {
+                                            return Err(LispError::new(format!(
+                                                "resolve: inject env key must be string, got {}",
+                                                other.type_name()
+                                            )))
+                                        }
+                                    };
+                                    let v = match &p.1 {
+                                        Value::Str(s) => s.clone(),
+                                        other => format!("{}", other),
+                                    };
+                                    spec.env.insert(k, v);
+                                }
+                                other => {
+                                    return Err(LispError::new(format!(
+                                        "resolve: inject must return (key . value) pairs, got {}",
+                                        other.type_name()
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    do_container_start(spec, project, compose_dir, registry)?
+                }
+                FutureKind::Transform {
+                    upstream,
+                    transform,
+                } => {
+                    let upstream_val =
+                        resolve_dynamic(*upstream, resolved, project, compose_dir, registry)?;
+                    let result = eval_apply(&transform, &[upstream_val])?;
+                    // Monadic flatten: lambda may return a Future — resolve it.
+                    match result {
+                        Value::Future { .. } => {
+                            resolve_dynamic(result, resolved, project, compose_dir, registry)?
+                        }
+                        other => other,
+                    }
+                }
+                FutureKind::Join { transform } => {
+                    // after_vals holds resolved values for all upstreams in order.
+                    let result = eval_apply(&transform, &after_vals)?;
+                    match result {
+                        Value::Future { .. } => {
+                            resolve_dynamic(result, resolved, project, compose_dir, registry)?
+                        }
+                        other => other,
+                    }
+                }
+            };
+
+            resolved.insert(id, result.clone());
+            Ok(result)
+        }
+        // Plain value — already resolved, return as-is.
+        other => Ok(other),
+    }
 }
 
 // ---------------------------------------------------------------------------

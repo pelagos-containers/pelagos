@@ -78,11 +78,63 @@
   `(define ,var-name
      (service ,svc-name ,@(apply append (map expand-opt (split-opts opts))))))
 
-;; (with-cleanup cleanup-thunk body...)
-;; Runs body; calls cleanup-thunk on any exit (normal or error).
-;; Equivalent to try/finally.
+;; (assoc key alist) — find first pair in alist whose car equals key (string=?).
+;; Returns the pair (key . value) or #f if not found.
+(define (assoc key lst)
+  (cond ((null? lst) #f)
+        ((string=? key (car (car lst))) (car lst))
+        (else (assoc key (cdr lst)))))
+
+;; (result-ref results name) — extract a handle from a run-all alist by service name.
+(define (result-ref results name)
+  (let ((entry (assoc name results)))
+    (if entry
+      (cdr entry)
+      (errorf "result-ref: no result for '~a'" name))))
+
+;; (zero? x) — true if x is equal to 0.
+(define (zero? x) (= x 0))
+
+;; (logf fmt arg...) — format a string and log it.
+;; Equivalent to (log (format fmt arg...)).
+(defmacro logf (fmt . args)
+  `(log (format ,fmt ,@args)))
+
+;; (errorf fmt arg...) — format a string and raise it as an error.
+;; Equivalent to (error (format fmt arg...)).
+(defmacro errorf (fmt . args)
+  `(error (format ,fmt ,@args)))
+
+;; (unless condition body...)
+;; Runs body when condition is false.  Equivalent to (when (not condition) body...).
+(defmacro unless (condition . body)
+  `(when (not ,condition) ,@body))
+
+;; ── Result type ───────────────────────────────────────────────────────────
+;;
+;; A lightweight Result<T,E> type represented as a tagged list.
+;;
+;;   (ok value)    — success; wraps a return value
+;;   (err reason)  — failure; wraps an error string
+;;
+;; Predicates: (ok? r)  (err? r)
+;; Accessors:  (ok-value r)  (err-reason r)
+
+(define (ok  value)  (list 'ok  value))
+(define (err reason) (list 'err reason))
+
+(define (ok?  r) (and (pair? r) (eq? (car r) 'ok)))
+(define (err? r) (and (pair? r) (eq? (car r) 'err)))
+
+(define (ok-value   r) (cadr r))
+(define (err-reason r) (cadr r))
+
+;; (with-cleanup cleanup body...)
+;; Runs body; calls (cleanup result) on any exit where result is either
+;; (ok value) on normal exit or (err reason) on error exit.
+;; The error is re-raised after cleanup so it still propagates.
 (defmacro with-cleanup (cleanup . body)
-  `(guard (exn (#t (,cleanup) (error exn)))
+  `(guard (exn (#t (,cleanup (err exn)) (error exn)))
      (let ((result (begin ,@body)))
-       (,cleanup)
+       (,cleanup (ok result))
        result)))

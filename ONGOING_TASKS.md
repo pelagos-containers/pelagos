@@ -1,68 +1,253 @@
 # Ongoing Tasks
 
-## Current Task: Imperative Runtime Builtins (Feb 25, 2026)
+## Current Task: Dual Executor Model Complete (Feb 25, 2026) ✅
 
 ### Context
 
-Remora's `.reml` Lisp model adds imperative container orchestration on top of the
-declarative `compose-up` model. After this task, a `.reml` file can directly call
-`container-start`, `await-port`, `container-stop`, etc. instead of only using
-`compose-up`.
+The previous session (Feb 25, 2026) completed the Future/Executor model for
+declarative container orchestration. The session ended mid-design-discussion
+about how `then` should behave when its lambda returns a Future (monadic bind
+style, a.k.a. Promise chaining).
 
-### Scope
+The open question: **static graph** (full graph declared upfront, topo-sortable
+before any execution) vs **dynamic graph** (lazy unfolding — `then`'s lambda
+is not called until its upstream resolves, so returned Futures are discovered at
+runtime).
 
-**Phase 1 — Language additions** (no runtime deps) ✅
-- `(format fmt arg...)` — `~a` display / `~s` write style formatting → returns string
-- `(sleep secs)` — thread sleep; accepts int or float → returns `()`
-- `(guard (var clause...) body...)` — SRFI-34 error handling; catches `LispError`,
-  binds message to `var`, dispatches clauses like `cond`, re-raises if no match
-- `(with-cleanup cleanup-thunk body...)` — try/finally macro (stdlib.lisp)
+The user confirmed interest in the dynamic/monadic approach:
+> "yes, I believe 'then's lambda would return a Future' describes it.
+>  Let's play with that"
+> "I have questions around dynamic resolution vs static upfront evaluation"
+
+---
+
+### What was completed this session (Feb 25, 2026)
+
+All work is on `main`. No tag yet — waiting for design to stabilise.
+
+#### stdlib quality-of-life macros
+
+- `unless` — `(unless test body...)` → `(when (not test) body...)`
+- `zero?` — `(zero? x)` → `(= x 0)`
+- `logf` — `(logf fmt arg...)` → `(log (format fmt arg...))` (reduces `(log (format ...))` noise)
+- `errorf` — `(errorf fmt arg...)` → `(error (format fmt arg...))` (same for errors)
+- Updated all usages in stdlib and example files
+
+#### Result type (stdlib.lisp)
+
+Tagged list ADT, like Rust's `Result<T,E>`:
+
+```lisp
+(define (ok  v) (list 'ok  v))
+(define (err r) (list 'err r))
+(define (ok?  r) (and (pair? r) (eq? (car r) 'ok)))
+(define (err? r) (and (pair? r) (eq? (car r) 'err)))
+(define (ok-value  r) (cadr r))
+(define (err-reason r) (cadr r))
+```
+
+#### `with-cleanup` updated signature
+
+Cleanup lambda now receives a `Result` (not a zero-arg thunk):
+
+```lisp
+(defmacro with-cleanup (cleanup . body)
+  `(guard (exn (#t (,cleanup (err exn)) (error exn)))
+     (let ((result (begin ,@body)))
+       (,cleanup (ok result))
+       result)))
+```
+
+#### Self-evaluating keywords (eval.rs)
+
+Symbols starting with `:` now evaluate to themselves (like Clojure keywords).
+This was required for `:after`, `:inject`, `:port`, `:timeout` to work in
+`container-start-async` / `await` calls without being looked up in the env.
+
+```rust
+// in eval.rs, atom eval branch:
+if s.starts_with(':') {
+    return Ok(Step::Done(Value::Symbol(s.clone())));
+}
+```
+
+#### `Value::Future` and `FutureKind` (value.rs)
+
+```rust
+pub enum FutureKind {
+    Container {
+        spec:   Box<crate::compose::ServiceSpec>,
+        inject: Option<Box<Value>>,          // Boxed to break recursive cycle
+    },
+    Transform {
+        upstream_id: u64,
+        transform:   Box<Value>,             // Boxed to break recursive cycle
+    },
+}
+
+// Value::Future variant:
+Future {
+    id:    u64,
+    name:  String,
+    kind:  FutureKind,
+    after: Vec<u64>,
+}
+```
+
+#### `container-start-async`, `then`, `run-all`, `await` (runtime.rs)
+
+- `container-start-async svc [:after list] [:inject lambda]` → `Value::Future`
+- `then future lambda` → `Value::Future { kind: Transform }`, auto `:after` upstream
+- `run-all (list fut ...)` → alist of `(name . resolved-value)`, Kahn topo-sort
+- `await future [:port P] [:timeout T]` → `ContainerHandle`, errors on Transform futures
+
+#### `result-ref` and `assoc` (stdlib.lisp)
+
+- `assoc` — standard alist lookup
+- `result-ref` — `(result-ref results "name")` extracts from `run-all` alist; errors if missing
+
+#### examples/compose/imperative/compose.reml
+
+Full graph model:
+```lisp
+(define db-url-fut
+  (then db-fut
+    (lambda (db)
+      (format "postgres://app:secret@~a/appdb" (container-ip db)))))
+
+(define app-fut
+  (container-start-async svc-app
+    :after  (list db-url-fut cache-url-fut)
+    :inject (lambda (db-url cache-url)
+              (list (cons "DATABASE_URL" db-url)
+                    (cons "CACHE_URL"    cache-url)))))
+
+(define results
+  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut)))
+```
+
+#### docs/REML_EXECUTOR_MODEL.md (NEW)
+
+Design doc covering: motivation, Futures/Executors model, π-calculus connection,
+FutureKind API reference, execution order (serial vs parallel), design principles,
+roadmap.
+
+---
+
+### Open Design Question: Static vs Dynamic `then`
+
+**Current model (static):**
+- `then`'s lambda returns a plain value (string, number, etc.)
+- The entire graph is declared before `run-all` is called
+- Topo-sort sees all futures upfront; cycle detection is complete
+- Parallel executor could be added without changing `.reml` files
+
+**Proposed model (dynamic/monadic):**
+- `then`'s lambda returns a Future (or a plain value — the executor checks)
+- When a Transform future resolves to another Future, that Future is added to
+  the work queue dynamically
+- Graph is discovered lazily: you don't see futures in `run-all` until their
+  upstream completes
+
+**Chain syntax the user envisions:**
+
+```lisp
+;; Monadic chain: db → migrate → app, with URL threading
+(define pipeline
+  (then db-fut
+    (lambda (db)
+      (let ((db-url (format "postgres://...@~a/appdb" (container-ip db))))
+        (then (container-start-async svc-migrate
+                :env (list (cons "DATABASE_URL" db-url)))
+          (lambda (_)
+            (container-start-async svc-app
+              :env (list (cons "DATABASE_URL" db-url)))))))))
+```
+
+**Key trade-offs to discuss:**
+
+| | Static graph | Dynamic (monadic) |
+|---|---|---|
+| Upfront cycle detection | ✅ yes | ❌ no |
+| Parallel dispatch (known tiers) | ✅ yes | ⚠️ harder |
+| `then-all` join (multi-upstream) | ✅ trivial | ⚠️ needs design |
+| Chain syntax | ❌ no (names needed) | ✅ yes |
+| Graph introspection | ✅ yes | ❌ not upfront |
+| Incremental disclosure | ❌ no | ✅ yes |
+
+**Proposed resolution:**
+Support both — a `resolve` entry point that executes a single chain dynamically,
+plus `run-all` for static graphs. The two can coexist: `run-all` remains the
+preferred form for complex multi-service graphs where upfront analysis is valuable;
+monadic `then` enables simple pipelines without requiring explicit `run-all`.
+
+---
+
+### What was completed (Feb 25, 2026)
+
+Both executors now implemented and documented:
+
+**Data model change:**
+- `after: Vec<u64>` → `after: Vec<Value>` in `Value::Future` — futures now store
+  their upstream futures as values, enabling recursive graph traversal without a
+  registry
+- `upstream_id: u64` → `upstream: Box<Value>` in `FutureKind::Transform` — same
+  reason; allows `resolve` to walk chains recursively
+- Added `Value::future_id() -> Option<u64>` helper for extracting IDs
+- `run-all` topo-sort updated to extract IDs via `filter_map(Value::future_id)`
+
+**`resolve` builtin added (runtime.rs):**
+- Free function `resolve_dynamic` implements recursive depth-first execution
+- Container futures: spawns container, returns `ContainerHandle`
+- Transform futures: resolves upstream first, calls lambda; if result is a `Future`,
+  resolves that too (monadic flatten)
+- Deduplication map prevents re-executing shared upstreams
+
+**New example:** `examples/compose/imperative/compose-chain.reml`
+- Same 3-service stack as compose.reml but using monadic chain style
+- Annotated to explain when to use `resolve` vs `run-all`
+
+**Docs:** `docs/REML_EXECUTOR_MODEL.md` updated
+- Comparison table: static vs dynamic
+- `(resolve ...)` API reference with chain example
+- "Choosing an Executor" section with decision guide
+
+**Tests:** 232 passing, clippy clean, fmt clean
+
+### Next steps
+
+- Tag v0.13.0
+- Add `then-all` join operator (future): `(then-all (list f1 f2) (lambda (v1 v2) ...))`
+  for multi-upstream joins in the monadic style
+- Developer stack examples: `node-dev/` and `forgejo/` (can now use imperative style)
+
+---
+
+## Previous Session: Imperative Runtime Builtins (Feb 25, 2026) ✅
+
+### Completed
+
+**Phase 1 — Language additions** ✅
+- `(format fmt arg...)` — `~a` / `~s` formatting → string
+- `(sleep secs)` — thread sleep; int or float → `()`
+- `(guard (var clause...) body...)` — SRFI-34 error handling
+- `(with-cleanup cleanup-thunk body...)` — try/finally stdlib macro
 
 **Phase 2 — `Value::ContainerHandle`** ✅
-- New variant in `src/lisp/value.rs`: `ContainerHandle { name, pid, ip }`
-- `type_name` → `"container"`, `is_truthy` → `true` (via wildcard), `Display` → `#<container name>`
+- `ContainerHandle { name, pid, ip }` in `value.rs`
 
 **Phase 3 — `src/lisp/runtime.rs`** ✅
-- New file in the **library crate** (not binary)
-- Implements container spawning directly using `crate::image`, `crate::container`,
-  `crate::network`, `crate::dns` — no cross-crate dependency needed
-- Registers: `container-start`, `container-stop`, `container-wait`, `container-run`,
+- `container-start`, `container-stop`, `container-wait`, `container-run`,
   `container-ip`, `container-status`, `await-port`
-- `container-start` scopes network/volume names to project; spawns log sink + DNS
-  waiter threads; registers in registry; returns `ContainerHandle`
-- `container-wait` polls `kill(pid,0)` until ESRCH (waiter thread owns waitpid)
 
 **Phase 4 — `Interpreter::new_with_runtime(project, compose_dir)`** ✅
-- Added `container_registry: Rc<RefCell<Vec<(String, i32)>>>` field
-- `new_with_runtime(project: String, compose_dir: PathBuf)` registers runtime builtins
-- `Drop` impl: sends SIGTERM to all registry entries on interpreter drop
+- `container_registry` field; `Drop` impl sends SIGTERM on interpreter drop
 
 **Phase 5 — CLI update** ✅
-- `cmd_compose_up_reml` uses `Interpreter::new_with_runtime(preliminary_project, compose_dir)`
-- Handles purely imperative scripts (no `compose-up` call) by returning `Ok(())`
+- `cmd_compose_up_reml` uses `new_with_runtime`
 
 **Phase 6 — Tests + example** ✅
-- 8 new unit tests: `test_format_*`, `test_sleep_*`, `test_guard_*`, `test_with_cleanup_*`
-- `examples/compose/imperative/compose.reml` demonstrates the full API
-
-### Files Modified
-
-| File | Change |
-|------|--------|
-| `src/lisp/value.rs` | `ContainerHandle` variant |
-| `src/lisp/mod.rs` | `container_registry`, `new_with_runtime`, `Drop`, `mod runtime` |
-| `src/lisp/builtins.rs` | `format`, `sleep` |
-| `src/lisp/eval.rs` | `guard` special form |
-| `src/lisp/stdlib.lisp` | `with-cleanup` macro |
-| `src/lisp/runtime.rs` | **NEW** — `register_runtime_builtins` + all imperative fns |
-| `src/cli/compose.rs` | `cmd_compose_up_reml` uses `new_with_runtime`; handles no-pending case |
-| `examples/compose/imperative/compose.reml` | **NEW** — imperative example |
-
-### Verification
-
-1. `cargo test --lib` — all 215+ existing tests pass; 8 new tests pass
-2. `cargo clippy -- -D warnings` — clean
-3. `cargo fmt --check` — clean
+- 8 new unit tests; `examples/compose/imperative/compose.reml`
 
 ---
 

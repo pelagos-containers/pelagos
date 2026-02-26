@@ -53,6 +53,70 @@ pub enum Value {
         /// Primary bridge IP assigned to the container, if any.
         ip: Option<String>,
     },
+    /// A lazy future created by `container-start-async` or `then`.
+    ///
+    /// Nothing executes until `(await future ...)`, `(run-all ...)`, or
+    /// `(resolve ...)` is called.
+    ///
+    /// - `run-all` — static executor: receives the full graph upfront, topo-sorts
+    ///   it, detects cycles, and executes serially (parallel dispatch planned).
+    /// - `resolve` — dynamic executor: walks the chain recursively from the tip;
+    ///   if a `Transform` lambda returns another `Future`, it is executed
+    ///   automatically (monadic flatten / Promise chaining).
+    Future {
+        /// Unique ID assigned at creation — used for deduplication in executors.
+        id: u64,
+        /// Name — for display, error messages, and the `run-all` result alist.
+        name: String,
+        /// What work this future performs when executed.
+        kind: FutureKind,
+        /// Futures that must complete before this one starts.
+        ///
+        /// Stored as values (not just IDs) so `resolve` can walk upstream
+        /// without a separate registry.  `run-all` extracts IDs via
+        /// `Value::future_id()` for topological sorting.
+        after: Vec<Value>,
+    },
+}
+
+/// The two kinds of work a [`Value::Future`] can perform.
+#[derive(Clone)]
+pub enum FutureKind {
+    /// Spawn a container.  Optional `:inject` lambda receives the resolved
+    /// values of all `:after` dependencies (in order) and returns a list of
+    /// `(key . value)` pairs merged into the service env before spawning.
+    Container {
+        spec: Box<crate::compose::ServiceSpec>,
+        /// Boxed to break the `Value → FutureKind → Value` recursive cycle.
+        inject: Option<Box<Value>>,
+    },
+    /// Apply a pure transform to a single upstream future's resolved value.
+    /// Created by `(then upstream-future (lambda (v) ...))`.
+    ///
+    /// The upstream future is stored as a `Value` (not just its ID) so that
+    /// `resolve` can walk the chain recursively without a separate registry.
+    /// If the transform lambda returns another `Value::Future`, the dynamic
+    /// executor (`resolve`) flattens it automatically (monadic bind).
+    Transform {
+        /// The upstream future whose resolved value is passed to `transform`.
+        /// Boxed to break the `Value → FutureKind → Value` recursive cycle.
+        upstream: Box<Value>,
+        /// Boxed to break the `Value → FutureKind → Value` recursive cycle.
+        transform: Box<Value>,
+    },
+    /// Wait for multiple upstream futures and pass all their resolved values
+    /// to a lambda.  Created by `(then-all (list f1 f2 ...) (lambda (v1 v2 ...) ...))`.
+    ///
+    /// The upstreams are stored in `Value::Future { after: Vec<Value> }` — no
+    /// duplication in `kind` is needed.  The lambda receives the resolved
+    /// values of all `after` futures in declaration order.
+    ///
+    /// If the lambda returns a `Future`, it is flattened automatically by both
+    /// executors (same rule as `Transform`).
+    Join {
+        /// Boxed to break the `Value → FutureKind → Value` recursive cycle.
+        transform: Box<Value>,
+    },
 }
 
 /// Lambda parameter specification.
@@ -153,6 +217,17 @@ impl Value {
             Value::VolumeSpec(_) => "volume-spec",
             Value::ComposeSpec(_) => "compose-spec",
             Value::ContainerHandle { .. } => "container",
+            Value::Future { .. } => "future",
+        }
+    }
+
+    /// Return the `id` of this future, or `None` if not a `Future`.
+    ///
+    /// Used by executors to extract dependency IDs from `after: Vec<Value>`.
+    pub fn future_id(&self) -> Option<u64> {
+        match self {
+            Value::Future { id, .. } => Some(*id),
+            _ => None,
         }
     }
 
@@ -229,6 +304,13 @@ impl fmt::Display for Value {
             Value::VolumeSpec(v) => write!(f, "#<volume:{}>", v),
             Value::ComposeSpec(_) => write!(f, "#<compose-spec>"),
             Value::ContainerHandle { name, .. } => write!(f, "#<container {}>", name),
+            Value::Future { name, after, .. } => {
+                if after.is_empty() {
+                    write!(f, "#<future:{}>", name)
+                } else {
+                    write!(f, "#<future:{} after:{}>", name, after.len())
+                }
+            }
         }
     }
 }

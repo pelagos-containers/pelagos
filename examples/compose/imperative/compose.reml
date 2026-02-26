@@ -1,58 +1,98 @@
-;;; Imperative compose example
+;;; Imperative compose example — full graph model
 ;;;
-;;; Demonstrates container-start, await-port, with-cleanup, guard, and format.
-;;; This file runs containers directly without (compose-up ...).
+;;; The entire dependency graph is declared before any execution begins.
+;;; run-all executes futures in topological order; a parallel executor
+;;; would run independent futures concurrently — no changes to this file.
+;;;
+;;; Dependency graph:
+;;;
+;;;   db-fut ──→ db-url-fut ──→ app-fut
+;;;   cache-fut ─────────────→ app-fut
+;;;
+;;; Data flows through (then ...) transforms rather than imperative steps.
+;;; :inject wires derived values into the service env at execution time.
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
 
-;; ── Service definitions ───────────────────────────────────────────────────
+;; ── Service declarations ──────────────────────────────────────────────────
 
 (define-service svc-db "db"
   :image   "postgres:16"
   :network "app-net"
   :env     ("POSTGRES_PASSWORD" . "secret")
-           ("POSTGRES_DB" . "appdb"))
+           ("POSTGRES_DB"       . "appdb")
+           ("POSTGRES_USER"     . "app"))
+
+(define-service svc-cache "cache"
+  :image   "redis:7-alpine"
+  :network "app-net")
+
+(define-service svc-migrate "migrate"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command (list "/bin/sh" "-c"
+             "echo \"migrating ${DATABASE_URL}\"; exit 0"))
 
 (define-service svc-app "app"
   :image   "alpine:latest"
   :network "app-net"
-  :command (list "/bin/sh" "-c" "echo 'app ready'; sleep 30"))
+  :command (list "/bin/sh" "-c"
+             "echo \"db=${DATABASE_URL} cache=${CACHE_URL}\"; sleep 5; echo done"))
 
-;; ── Imperative orchestration ──────────────────────────────────────────────
+;; ── Declare the graph — nothing executes yet ─────────────────────────────
 
-;; Start the database.
-(log (format "Starting database..."))
-(define db (container-start svc-db))
-(log (format "DB started at ~a (pid ~s)" (container-ip db) (container-status db)))
+;; Tier 1: independent services
+(define db-fut    (container-start-async svc-db))
+(define cache-fut (container-start-async svc-cache))
 
-;; Wait for the DB port to be available (up to 60 seconds).
-(define db-ready (await-port "localhost" 5432 60))
-(when (not db-ready)
-  (error "database did not become ready within 60 seconds"))
-(log "Database is ready — running migrations")
+;; Derive connection strings from resolved handles via (then ...)
+(define db-url-fut
+  (then db-fut
+    (lambda (db)
+      (format "postgres://app:secret@~a/appdb" (container-ip db)))))
 
-;; Run the migration step as a one-shot container; exit code must be 0.
-(define-service svc-migrate "migrate"
-  :image   "alpine:latest"
-  :network "app-net"
-  :command (list "/bin/sh" "-c" "echo 'migrations ok'; exit 0"))
+(define cache-url-fut
+  (then cache-fut
+    (lambda (cache)
+      (format "redis://~a:6379" (container-ip cache)))))
 
-(define migration-exit (container-run svc-migrate))
-(when (not (= migration-exit 0))
-  (container-stop db)
-  (error (format "migrations failed with exit code ~s" migration-exit)))
-(log "Migrations complete")
+;; Migrations: depend on db-url; :inject wires it into the container env
+(define migrate-fut
+  (container-start-async svc-migrate
+    :after  (list db-url-fut)
+    :inject (lambda (db-url)
+              (list (cons "DATABASE_URL" db-url)))))
 
-;; Start the application tier with cleanup on error.
-(with-cleanup
-  (lambda ()
-    (log "Cleanup: stopping db")
-    (container-stop db))
-  (begin
-    (define app (container-start svc-app))
-    (log (format "App started: ~a" (container-status app)))
+;; Application: depends on both URLs; :inject wires both into the container env
+(define app-fut
+  (container-start-async svc-app
+    :after  (list db-url-fut cache-url-fut)
+    :inject (lambda (db-url cache-url)
+              (list (cons "DATABASE_URL" db-url)
+                    (cons "CACHE_URL"    cache-url)))))
 
-    ;; Wait for the app to exit (in production, you'd await-port here instead).
-    (container-wait app)
-    (log (format "App exited — status: ~a" (container-status app)))))
+;; ── Execute: serial executor runs in topological order ───────────────────
+;;
+;; Execution order resolved from the graph:
+;;   db → cache → db-url → cache-url → migrate → app
+;;
+;; A parallel executor would run: (db ∥ cache) → (db-url ∥ cache-url) → migrate → app
+
+(define results
+  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut)))
+
+;; ── Post-execution ────────────────────────────────────────────────────────
+
+(define db    (result-ref results "db"))
+(define cache (result-ref results "cache"))
+(define app   (result-ref results "app"))
+
+(logf "db-url:    ~a" (result-ref results "db-then"))
+(logf "cache-url: ~a" (result-ref results "cache-then"))
+
+;; Wait for app to finish, then stop dependencies
+(container-wait app)
+(container-stop cache)
+(container-stop db)
+(log "Done")

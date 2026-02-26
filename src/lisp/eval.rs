@@ -81,6 +81,10 @@ fn eval_step(expr: SExpr, env: Env) -> Result<Step, LispError> {
                     return Ok(Step::Done(Value::Float(f)));
                 }
             }
+            // Keyword symbols (starting with ':') are self-evaluating.
+            if s.starts_with(':') {
+                return Ok(Step::Done(Value::Symbol(s.clone())));
+            }
             // Symbol lookup
             let val = env.borrow().lookup(s)?;
             Ok(Step::Done(val))
