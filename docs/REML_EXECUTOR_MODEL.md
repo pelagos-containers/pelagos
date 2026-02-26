@@ -425,6 +425,48 @@ provide upfront cycle detection — that is a property of the graph model.
 
 ---
 
+## Topology-Aware Teardown
+
+The same dependency graph that governs startup governs shutdown.
+
+`run` records the transitive container dependencies of each terminal future
+into the resulting `ContainerHandle` as a `deps` list, ordered from
+latest-started to earliest-started (reverse topological order).  When you
+call `container-wait` or `container-stop` on a terminal handle, the runtime
+cascades `SIGTERM` through the dependency chain automatically — no manual
+stop calls needed.
+
+```
+app
+ ├── cache  (via cache-url → cache)
+ └── db     (via db-url → db)
+```
+
+`(container-wait app-handle)` blocks until `app` exits, then stops
+`cache`, then stops `db` — in that order.
+
+**Scope of cascade:** only container futures that are transitive
+dependencies of the handle being waited/stopped are auto-stopped.
+Services that are *not* in the dependency chain (e.g. `migrate`, which
+depends on `db-url` but is not depended on by `app`) must be stopped
+explicitly if needed.
+
+```lisp
+;; No explicit stop calls needed for cache or db — both are transitive
+;; deps of app and will be stopped automatically after app exits.
+(with-cleanup (lambda (result)
+                (if (ok? result)
+                  (logf "app exited cleanly (code ~a)" (ok-value result))
+                  (logf "app failed: ~a" (err-reason result))))
+  (container-wait app-handle))
+```
+
+**Handles from `container-start` / `resolve`:** these carry an empty `deps`
+list — cascade is a graph-model concern.  Imperative code stops containers
+manually.
+
+---
+
 ## Error Messages and Debugability
 
 Future names appear in error messages.  The naming rules are:
@@ -460,6 +502,11 @@ receives those typed values and wires them into containers.
 **Executor policy is separate from graph structure.** The `.reml` file
 declares what depends on what.  The executor decides when and how to run
 it.  Swapping executors does not require changing the graph.
+
+**Startup and teardown are symmetric.** The dependency graph that governs
+execution order on the way up also governs shutdown order on the way down.
+`container-wait` and `container-stop` cascade through `deps` automatically;
+the cleanup lambda expresses only *outcome* logic, not orchestration.
 
 **Binding names surface in errors.** `define-then` names futures after
 their Lisp bindings.  Error messages reference the user's vocabulary, not
