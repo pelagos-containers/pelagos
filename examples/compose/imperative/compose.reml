@@ -60,14 +60,14 @@
 ;; Migrations: depend on db-url; :inject wires it into the container env
 (define migrate-fut
   (container-start-async svc-migrate
-    :after  `(,db-url-fut)
+    :after  (list db-url-fut)
     :inject (lambda (db-url)
               `(("DATABASE_URL" . ,db-url)))))
 
 ;; Application: depends on both URLs; :inject wires both into the container env
 (define app-fut
   (container-start-async svc-app
-    :after  `(,db-url-fut ,cache-url-fut)
+    :after  (list db-url-fut cache-url-fut)
     :inject (lambda (db-url cache-url)
               `(("DATABASE_URL" . ,db-url)
                 ("CACHE_URL"    . ,cache-url)))))
@@ -84,7 +84,7 @@
 ;; All dependency ordering is still respected — tiers execute sequentially.
 
 (define results
-  (run-all `(,db-fut ,cache-fut ,db-url-fut ,cache-url-fut ,migrate-fut ,app-fut) :parallel))
+  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut) :parallel))
 
 ;; ── Post-execution ────────────────────────────────────────────────────────
 
