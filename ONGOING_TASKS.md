@@ -1,51 +1,43 @@
 # Ongoing Tasks
 
-## Last Completed: REML Orchestration DSL Refinement (Feb 26, 2026)
+## Last Completed: Eager Async Model (Feb 26, 2026)
 
-### What shipped in v0.14.0
+### What shipped (post-v0.14.0, unreleased)
 
-A significant refinement of the `.reml` imperative orchestration DSL.  The
-API is now cleaner, more concise, and produces better error messages.
+**Restored the original async contract**: `container-start-bg` + `container-join`
+let a `.reml` script kick off multiple containers simultaneously without the
+declarative graph, then collect the handles when their values are actually needed.
 
-**Renamed primitives (breaking change):**
+**New primitives:**
 
-| Old | New |
-|-----|-----|
-| `derive` | `then` |
-| `derive-all` | `then-all` |
-| `:after` (in `start`) | `:needs` |
+| Primitive | Signature | Description |
+|-----------|-----------|-------------|
+| `container-start` (updated) | `(svc [:env list])` → ContainerHandle | Now accepts `:env` (list of dotted pairs) for dynamic env injection |
+| `container-start-bg` | `(svc [:env list])` → PendingContainer | Spawns in background thread; returns immediately |
+| `container-join` | `(pending)` → ContainerHandle | Blocks until background start completes |
 
-**New stdlib macros:**
+**New `Value::PendingContainer`** — wraps `Arc<Mutex<Option<Receiver>>>`, is
+`Clone`-safe (Arc), and allows double-join detection via the `Option::take()`.
 
-| Macro | Purpose |
-|-------|---------|
-| `define-nodes (var svc) ...` | Declare multiple lazy start nodes at once |
-| `define-then name upstream (param) body...` | Combined define + then with binding-name future |
-| `define-results results (var "key") ...` | Destructure a `run` alist into named bindings |
+**New example:** `examples/compose/imperative/compose-eager.reml` — shows both
+sequential eager (db → url → app) and parallel eager (start-bg + join).
 
-**`run` now discovers transitive dependencies automatically.**  The terminal
-list states intent ("I need these handles") rather than enumerating the full
-graph.  `db-url` and `cache-url` no longer need to appear in the run list.
+**Docs updated:** `REML_EXECUTOR_MODEL.md` (new "Eager Execution" section +
+updated executor table), `USER_GUIDE.md` (eager model prose + table).
 
-**Error messages now reference binding names.**  `define-then` passes the
-binding name as `:name` to `then`, so future names in errors match the Lisp
-source (`"db-url"` not `"db-then"`).
-
-**Docs fully updated:** `REML_EXECUTOR_MODEL.md` rewritten, `USER_GUIDE.md`
-imperative section replaced.  All old vocabulary (`container-start-async`,
-`run-all`, `:after`, `:inject`) removed from docs.
-
-### State as of v0.14.0
+### State as of post-v0.14.0
 
 - Git SHA (remora): see `git log -1`
-- 245 unit tests passing
-- `compose.reml` and `compose-chain.reml` examples updated and correct
+- 248 unit tests passing
+- Both executor models documented and exemplified
 
 ### Next steps
 
 No active tasks.  Candidates for future work:
 
-- Streaming results from `run` (push to channel as futures complete)
+- Cut v0.15.0 release with the eager model
+- Integration test for `container-start-bg` + `container-join` with real containers
+  (verifies parallel startup overlap and error propagation)
+- `define-then-all` macro for multi-upstream joins in the graph model
 - Per-`run` cancellation scope (SIGTERM on failure, scoped to that run)
-- `define-then-all` macro for multi-upstream joins
-- Integration test for transitive dependency discovery with real containers
+- Streaming results from `run` (push to channel as futures complete)
