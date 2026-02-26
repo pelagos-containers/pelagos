@@ -65,13 +65,11 @@
              ("CACHE_URL"    . ,cache-url)))))
 
 ;; ── Execute and bind ──────────────────────────────────────────────────────
-;;
-;; All futures — containers and transforms alike — resolve to their values.
-;; :parallel runs independent nodes within each tier concurrently.
 
-;; Only bind what you need.  db and cache execute as transitive deps of app
-;; and are stopped automatically by the cascade — no handles required.
-;; To inspect or manually stop them, add e.g. (db-handle db) here.
+;; Only bind what you need.  Containers (app) resolve to handles; transforms
+;; (db-url, cache-url) resolve to their computed values — both work the same way.
+;; db and cache execute as transitive deps and stop automatically via the cascade;
+;; add e.g. (db-handle db) here to inspect or manually stop them.
 (define-run :parallel
   (app-handle app)
   (db-url     db-url)
