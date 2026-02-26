@@ -13,11 +13,12 @@
 ;;; :inject wires derived values into the service env at execution time.
 ;;;
 ;;; Naming convention (enforced by macros):
-;;;   (define-future name svc)                    binds name-fut
+;;;   (define-future name svc)                        binds name-fut
 ;;;   (define-future name svc :after (p…) :inject body)
-;;;                                               p… name both upstream-fut deps
-;;;                                               and the inject body's parameters
-;;;   (define-transform name upstream body)       reads upstream-fut, binds name-fut
+;;;                                                   p… name both upstream-fut deps
+;;;                                                   and the inject body's parameters
+;;;   (define-transform name upstream body)           reads upstream-fut, binds name-fut
+;;;   (define-run alist (binds…) (futures…) opts…)   run + extract in one form
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
@@ -83,12 +84,8 @@
 ;; :parallel runs all futures within each tier concurrently.
 ;; All dependency ordering is still respected — tiers execute sequentially.
 
-(define results
-  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut) :parallel))
-
-;; ── Post-execution ────────────────────────────────────────────────────────
-
-(define-results results db cache app)
+(define-run results (db cache app)
+  (db cache db-url cache-url migrate app) :parallel)
 
 (logf "db-url:    ~a" (result-ref results "db-then"))
 (logf "cache-url: ~a" (result-ref results "cache-then"))

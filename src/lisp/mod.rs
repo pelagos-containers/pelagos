@@ -1329,6 +1329,26 @@ mod tests {
     }
 
     #[test]
+    fn test_define_run_macro() {
+        // (define-run results (db) ()) with empty futures binds results=nil.
+        // Then verify define-results extraction works via a manual alist.
+        let mut i = runtime_interp();
+        // Empty futures — run-all returns nil.
+        eval_ok(&mut i, "(define-run results () ())");
+        assert_eq!(eval_ok(&mut i, "results"), Value::Nil);
+        // Verify -fut suffix: (define-run r () (db)) should call (list db-fut).
+        // Stub run-all to capture its argument.
+        eval_ok(&mut i, "(define captured #f)");
+        eval_ok(&mut i, "(define db-fut \"db-handle\")");
+        eval_ok(&mut i, r#"
+            (defmacro run-all (futs . rest)
+              (list 'begin (list 'set! 'captured futs) (quote (quote stub-alist))))
+        "#);
+        eval_ok(&mut i, "(define-run r () (db))");
+        assert_eq!(eval_ok(&mut i, "(car captured)"), Value::Str("db-handle".into()));
+    }
+
+    #[test]
     fn test_define_results_macro() {
         // (define-results alist db cache) binds db and cache from the alist.
         let mut i = Interpreter::new();

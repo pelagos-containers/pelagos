@@ -224,3 +224,16 @@
      ,@(map (lambda (name)
               `(define ,name (result-ref ,alist-var ,(symbol->string name))))
             names)))
+
+;; (define-run alist-var (bind-name ...) (future-name ...) run-all-opts...)
+;; Combines run-all and define-results into one form.
+;;   alist-var        — name for the full result alist (accessible after for result-ref)
+;;   (bind-name ...)  — names to extract and bind from the alist
+;;   (future-name ...) — bare names; macro appends -fut for the run-all call
+;;   run-all-opts...  — extra options passed to run-all (e.g. :parallel)
+(defmacro define-run (alist-var binds futures . opts)
+  (define (sym-fut s) (string->symbol (string-append (symbol->string s) "-fut")))
+  `(begin
+     (define ,alist-var
+       (run-all (list ,@(map sym-fut futures)) ,@opts))
+     (define-results ,alist-var ,@binds)))
