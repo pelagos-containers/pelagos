@@ -1289,7 +1289,10 @@ mod tests {
         let mut i = Interpreter::new();
         eval_ok(&mut i, "(defmacro then (fut lam) lam)");
         eval_ok(&mut i, "(define db-fut 'ignored)");
-        eval_ok(&mut i, "(define-transform db-url db (string-append \"url:\" (symbol->string db)))");
+        eval_ok(
+            &mut i,
+            "(define-transform db-url db (string-append \"url:\" (symbol->string db)))",
+        );
         // db-url-fut should be a lambda; apply it to verify the param binding.
         let v = eval_ok(&mut i, "(db-url-fut 'myhost)");
         assert_eq!(v, Value::Str("url:myhost".into()));
@@ -1304,23 +1307,35 @@ mod tests {
         eval_ok(&mut i, "(define svc-migrate '())");
         eval_ok(&mut i, "(define db-url-fut \"pg://host/db\")");
         // Stub: capture the :after list and :inject lambda into globals for inspection.
-        eval_ok(&mut i, r#"
+        eval_ok(
+            &mut i,
+            r#"
             (define captured-after #f)
             (define captured-inject #f)
             (define (container-start-async svc . rest)
               (set! captured-after  (cadr rest))
               (set! captured-inject (cadddr rest))
               'stub-handle)
-        "#);
-        eval_ok(&mut i, r#"
+        "#,
+        );
+        eval_ok(
+            &mut i,
+            r#"
             (define-future migrate svc-migrate
               :after  (db-url)
               :inject (string-append "url:" db-url))
-        "#);
+        "#,
+        );
         // migrate-fut should be bound
-        assert_eq!(eval_ok(&mut i, "migrate-fut"), Value::Symbol("stub-handle".into()));
+        assert_eq!(
+            eval_ok(&mut i, "migrate-fut"),
+            Value::Symbol("stub-handle".into())
+        );
         // :after list should contain db-url-fut's value
-        assert_eq!(eval_ok(&mut i, "(car captured-after)"), Value::Str("pg://host/db".into()));
+        assert_eq!(
+            eval_ok(&mut i, "(car captured-after)"),
+            Value::Str("pg://host/db".into())
+        );
         // :inject lambda should receive db-url and produce the right string
         assert_eq!(
             eval_ok(&mut i, "(captured-inject \"my-url\")"),
@@ -1340,25 +1355,34 @@ mod tests {
         // Stub run-all to capture its argument.
         eval_ok(&mut i, "(define captured #f)");
         eval_ok(&mut i, "(define db-fut \"db-handle\")");
-        eval_ok(&mut i, r#"
+        eval_ok(
+            &mut i,
+            r#"
             (defmacro run-all (futs . rest)
               (list 'begin (list 'set! 'captured futs) (quote (quote stub-alist))))
-        "#);
+        "#,
+        );
         eval_ok(&mut i, "(define-run r () (db))");
-        assert_eq!(eval_ok(&mut i, "(car captured)"), Value::Str("db-handle".into()));
+        assert_eq!(
+            eval_ok(&mut i, "(car captured)"),
+            Value::Str("db-handle".into())
+        );
     }
 
     #[test]
     fn test_define_results_macro() {
         // (define-results alist db cache) binds db and cache from the alist.
         let mut i = Interpreter::new();
-        eval_ok(&mut i, r#"
+        eval_ok(
+            &mut i,
+            r#"
             (define results
               (list (cons "db"    "db-handle")
                     (cons "cache" "cache-handle")))
-        "#);
+        "#,
+        );
         eval_ok(&mut i, "(define-results results db cache)");
-        assert_eq!(eval_ok(&mut i, "db"),    Value::Str("db-handle".into()));
+        assert_eq!(eval_ok(&mut i, "db"), Value::Str("db-handle".into()));
         assert_eq!(eval_ok(&mut i, "cache"), Value::Str("cache-handle".into()));
     }
 
@@ -1367,9 +1391,12 @@ mod tests {
         // (define-future db svc) should bind db-fut in the environment.
         let mut i = Interpreter::new();
         eval_ok(&mut i, "(define svc '())");
-        eval_ok(&mut i, r#"
+        eval_ok(
+            &mut i,
+            r#"
             (defmacro container-start-async (svc . rest) (list 'quote 'fake-future))
-        "#);
+        "#,
+        );
         eval_ok(&mut i, "(define-future db svc)");
         let v = eval_ok(&mut i, "db-fut");
         assert_eq!(v, Value::Symbol("fake-future".into()));
@@ -1381,11 +1408,17 @@ mod tests {
         let mut i = Interpreter::new();
         eval_ok(&mut i, "(define svc-db '())");
         eval_ok(&mut i, "(define svc-cache '())");
-        eval_ok(&mut i, r#"
+        eval_ok(
+            &mut i,
+            r#"
             (defmacro container-start-async (svc . rest) (list 'quote svc))
-        "#);
+        "#,
+        );
         eval_ok(&mut i, "(define-futures (db svc-db) (cache svc-cache))");
-        assert_eq!(eval_ok(&mut i, "db-fut"),    Value::Symbol("svc-db".into()));
-        assert_eq!(eval_ok(&mut i, "cache-fut"), Value::Symbol("svc-cache".into()));
+        assert_eq!(eval_ok(&mut i, "db-fut"), Value::Symbol("svc-db".into()));
+        assert_eq!(
+            eval_ok(&mut i, "cache-fut"),
+            Value::Symbol("svc-cache".into())
+        );
     }
 }

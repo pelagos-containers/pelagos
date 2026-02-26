@@ -1,5 +1,97 @@
 # Ongoing Tasks
 
+## Open Design Question: stdlib Orchestration Macros (Feb 26, 2026)
+
+### Context
+
+This session (Feb 26, 2026) shipped v0.13.0 and then spent time exploring
+syntax-reduction macros for `.reml` compose files. The work is committed and
+tests pass, but the overall design direction needs a rethink before going
+further.
+
+### What shipped this session (git SHA 2d8e5f0)
+
+**v0.13.0 released** — tag pushed, GitHub Actions built static musl binaries
+for x86_64 and aarch64, release published at:
+https://github.com/skeptomai/remora/releases/tag/v0.13.0
+
+**Documentation polish** (pre-release):
+- `src/lisp/runtime.rs` doc comment: expanded function table to include
+  `then`, `then-all`, `run-all [:parallel] [:max-parallel N]`, `resolve`;
+  rewrote "Executor model" section to accurately describe the parallel
+  tier executor rather than the old aspirational "future work" description.
+- `examples/compose/imperative/compose.reml`: updated comments and `run-all`
+  call to use `:parallel` (was still treating parallel as future work).
+- `README.md`: added "Multi-Service Orchestration" section under Features,
+  added compose row to comparison table, added `REML_EXECUTOR_MODEL.md`
+  to the documentation index.
+
+**Style preferences applied to compose.reml**:
+- `(list ...)` for all-variable lists; `'(...)` for all-literal lists;
+  quasiquote only for templates with mixed literal/runtime values.
+- `(cons k v)` → dotted pair literal `(k . v)` style.
+
+**stdlib orchestration macros** (all in `src/lisp/stdlib.lisp`):
+
+| Macro | What it does |
+|-------|-------------|
+| `(define-future name svc)` | Binds `name-fut = (container-start-async svc)` |
+| `(define-future name svc :after (p…) :inject body)` | `:after` params become `-fut` deps AND lambda params for the inject body |
+| `(define-futures (name svc) …)` | Batch form of `define-future` |
+| `(define-transform name upstream body…)` | `name-fut = (then upstream-fut (lambda (upstream) body…))` |
+| `(define-results alist name …)` | Batch `(define name (result-ref alist "name"))` |
+| `(define-run alist (binds…) (futures…) opts…)` | `run-all` + `define-results` in one form; appends `-fut` to future names |
+
+**R7RS `c[ad]+r` family**: full set through 4 levels added to stdlib
+(2-level forms and `caddr` remain as Rust builtins; everything else is stdlib).
+
+**247 lib tests pass; clippy clean; fmt clean.**
+
+---
+
+### Open Design Question
+
+The macros above were built incrementally in response to "this feels clunky"
+observations on `compose.reml`. The result is functional and the example is
+compact, but the overall approach needs a principled rethink before more macros
+are added. Key tensions identified:
+
+**Syntax reduction vs debuggability:**
+- Generated names (`db-url-fut`, `migrate-fut`) don't appear in source; error
+  messages referencing them require mental macro reversal.
+- `define-future` with `:after/:inject` hides the lambda structure entirely —
+  a runtime error inside the inject body points into generated code.
+- `define-run` hides the full futures list; if `run-all` errors, the failing
+  future name is not visible in the source form.
+
+**Readability cost:**
+- The convention (bare name → `-fut` suffix) is load-bearing and documented
+  only in a comment block. New readers must understand it before the code
+  makes sense.
+- `define-future app svc-app :after (db-url cache-url) :inject \`(...)` is
+  doing three things implicitly (dependency, lambda params, name mangling).
+
+**What's worth keeping:**
+- `define-futures` — thin, mechanical, the batch benefit is clear.
+- `define-transform` — reads as a data-flow declaration; the name convention
+  is predictable.
+- `define-results` — thin batch extraction, no hidden logic.
+- `c[ad]+r` family — standard, no controversy.
+
+**What needs rethinking:**
+- `define-future` with `:after/:inject` — too much implicit in one form.
+- `define-run` — hides the futures list; may want explicit `-fut` names back.
+
+**Possible directions to explore tomorrow:**
+1. Drop `define-future :after/:inject` and `define-run`; keep the thin macros.
+2. Keep them but require explicit `-fut` names in `:after` (no name mangling).
+3. Introduce a different notation that makes the graph structure more visible
+   (e.g. a dedicated graph DSL rather than function-call syntax).
+4. Accept the current macros but improve error reporting so generated names
+   map back to source forms.
+
+---
+
 ## Parallel Execution in `run-all` — COMPLETE (Feb 25, 2026) ✅
 
 ### What shipped
