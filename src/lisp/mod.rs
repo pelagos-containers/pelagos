@@ -1309,7 +1309,7 @@ mod tests {
             (define captured-inject #f)
             (define (container-start-async svc . rest)
               (set! captured-after  (cadr rest))
-              (set! captured-inject (cadr (cddr rest)))
+              (set! captured-inject (cadddr rest))
               'stub-handle)
         "#);
         eval_ok(&mut i, r#"
