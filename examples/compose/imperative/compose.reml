@@ -6,8 +6,9 @@
 ;;;
 ;;; Dependency graph:
 ;;;
+;;;   db ──→ db-url ──→ migrate
 ;;;   db ──→ db-url ──→ app
-;;;   cache ──────────→ app
+;;;   cache ──→ cache-url ──→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
@@ -40,12 +41,16 @@
 ;; ── Declare the graph — nothing executes yet ─────────────────────────────
 
 ;; Independent services: no dependencies, eligible to start in parallel
-(define db    (start svc-db))
-(define cache (start svc-cache))
+(define-nodes
+  (db    svc-db)
+  (cache svc-cache))
 
-;; Derive connection strings once each container is up
-(define db-url    (derive db    (lambda (h) (format "postgres://app:secret@~a/appdb" (container-ip h)))))
-(define cache-url (derive cache (lambda (h) (format "redis://~a:6379" (container-ip h)))))
+;; Compute connection strings once each container is up
+(define-then db-url db (h)
+  (format "postgres://app:secret@~a/appdb" (container-ip h)))
+
+(define-then cache-url cache (h)
+  (format "redis://~a:6379" (container-ip h)))
 
 ;; Migration: needs db-url injected into its environment
 (define migrate (start svc-migrate
@@ -61,29 +66,27 @@
 
 ;; ── Execute ───────────────────────────────────────────────────────────────
 ;;
-;; Execution tiers resolved from the graph:
-;;   Tier 1: db ∥ cache       (no dependencies)
-;;   Tier 2: db-url ∥ cache-url
-;;   Tier 3: migrate
-;;   Tier 4: app
-;;
-;; :parallel runs all nodes within each tier concurrently.
-;; The list is a first-class value — it can be built conditionally or
-;; passed from a function before being handed to run.
+;; List the containers whose handles you need after execution.  run walks
+;; :needs transitively so db-url and cache-url are discovered and executed
+;; automatically — no need to enumerate intermediate computed values.
+;; :parallel runs independent nodes within each tier concurrently.
 
-(define nodes   (list db cache db-url cache-url migrate app))
-(define results (run nodes :parallel))
+(define results (run (list db cache app) :parallel))
 
 ;; ── Post-execution ────────────────────────────────────────────────────────
 
-(define db-handle  (result-ref results "db"))
-(define app-handle (result-ref results "app"))
+(define-results results
+  (db-handle    "db")
+  (cache-handle "cache")
+  (app-handle   "app"))
 
-(logf "db-url:    ~a" (result-ref results "db-derive"))
-(logf "cache-url: ~a" (result-ref results "cache-derive"))
+;; Reconstruct URLs from the container IPs — no need to thread intermediate
+;; computed values through the results alist.
+(logf "db-url:    postgres://app:secret@~a/appdb" (container-ip db-handle))
+(logf "cache-url: redis://~a:6379"                (container-ip cache-handle))
 
 ;; Wait for app to finish, then stop dependencies
 (container-wait app-handle)
-(container-stop (result-ref results "cache"))
+(container-stop cache-handle)
 (container-stop db-handle)
 (log "Done")

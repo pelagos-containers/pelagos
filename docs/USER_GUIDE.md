@@ -632,133 +632,148 @@ Multiple hooks may be registered for the same service; they fire in registration
 
 ## Imperative Orchestration with Futures
 
-`.reml` files can go beyond declarative `compose-up` to express imperative
-orchestration: start containers, wait for them, derive URLs from their assigned
-IPs, thread data between steps, and run containers in parallel — all from
-plain Lisp.
+`.reml` files can express imperative orchestration: start containers in
+dependency order, compute connection strings from assigned IPs, thread data
+between services, and run independent services in parallel — all from plain
+Lisp.
 
 ### Futures and Executors
 
 The model separates **what** from **when**:
 
-- **Futures** (`container-start-async`, `then`, `then-all`) are pure descriptions
-  of work.  Nothing starts when a future is created.
-- **Executors** (`run-all`, `resolve`) decide when and how to run the work.
+- **Futures** (`start`, `then`, `then-all`) are pure descriptions of work.
+  Nothing executes when a future is created.
+- **Executors** (`run`, `resolve`) decide when and how to run the work.
+
+### The `define-*` macro family
+
+Four macros cover the common patterns without boilerplate:
+
+| Macro | Purpose |
+|-------|---------|
+| `(define-service var "name" opts...)` | Declare a service spec (no container starts) |
+| `(define-nodes (var svc) ...)` | Declare multiple lazy start nodes at once |
+| `(define-then name upstream (param) body...)` | Compute a value once `upstream` resolves |
+| `(define-results results (var "key") ...)` | Destructure a `run` result alist |
+
+### A complete example
 
 ```lisp
-;; Declare the graph — nothing starts yet
-(define db-fut    (container-start-async svc-db))
-(define cache-fut (container-start-async svc-cache))
+;; ── Service declarations ──────────────────────────────────────────────
+(define-service svc-db "db"
+  :image   "postgres:16"
+  :network "app-net"
+  :env     ("POSTGRES_PASSWORD" . "secret")
+           ("POSTGRES_DB"       . "appdb"))
 
-;; Derive URLs from resolved handles (Transform futures)
-(define db-url-fut
-  (then db-fut
-    (lambda (db) (format "postgres://app:secret@~a/appdb" (container-ip db)))))
+(define-service svc-cache "cache"
+  :image   "redis:7-alpine"
+  :network "app-net")
 
-(define app-fut
-  (container-start-async svc-app
-    :after  (list db-url-fut)
-    :inject (lambda (db-url)
-              (list (cons "DATABASE_URL" db-url)))))
+(define-service svc-app "app"
+  :image   "myapp:latest"
+  :network "app-net")
 
-;; Execute the graph — this is where containers actually start
-(define results (run-all (list db-fut db-url-fut app-fut)))
+;; ── Declare the graph — nothing executes yet ─────────────────────────
+(define-nodes
+  (db    svc-db)
+  (cache svc-cache))
+
+;; Compute connection strings once each container is up
+(define-then db-url db (h)
+  (format "postgres://app:secret@~a/appdb" (container-ip h)))
+
+(define-then cache-url cache (h)
+  (format "redis://~a:6379" (container-ip h)))
+
+;; App needs both URLs injected into its environment
+(define app (start svc-app
+  :needs (list db-url cache-url)
+  :env   (lambda (db-url cache-url)
+           `(("DATABASE_URL" . ,db-url)
+             ("CACHE_URL"    . ,cache-url)))))
+
+;; ── Execute ───────────────────────────────────────────────────────────
+;; List the containers whose handles you need.  run discovers db-url and
+;; cache-url automatically from app's :needs — no need to enumerate them.
+(define results (run (list db cache app) :parallel))
+
+;; ── Post-execution ────────────────────────────────────────────────────
+(define-results results
+  (db-handle    "db")
+  (cache-handle "cache")
+  (app-handle   "app"))
+
+(container-wait app-handle)
+(container-stop cache-handle)
+(container-stop db-handle)
 ```
 
-### `run-all` — the static executor
+### `run` — the static executor
 
-`run-all` receives the complete future list, topologically sorts it by `:after`
-dependencies (Kahn's algorithm), detects cycles, then executes futures in order.
-It returns an alist of `(name . resolved-value)` pairs.
+`run` receives a list of *terminal* futures (the ones whose handles you need),
+discovers all transitive `:needs` dependencies automatically, topologically
+sorts the full graph, detects cycles, and executes in order.  Returns an alist
+of `("name" . resolved-value)` pairs for the listed futures only.
 
 ```lisp
-(run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut))
+(run (list db cache app))                    ; serial
+(run (list db cache app) :parallel)          ; tier-parallel
+(run (list db cache app) :parallel           ; capped at 4 simultaneous
+     :max-parallel 4)
 ```
 
-Use `result-ref` to extract a specific result:
-
-```lisp
-(define app (result-ref results "app"))
-(container-wait app)
-```
-
-#### Parallel execution with `run-all`
-
-The topo-sort naturally produces **tiers**: groups of futures that have no
-dependency on each other within the same level.  With `:parallel`, all futures
-in a tier are spawned concurrently.  The executor **blocks between tiers** — no
-future in tier N+1 starts until every future in tier N has completed.  The
-full dependency graph is always respected.
-
-```lisp
-;; Serial (default — unchanged from existing .reml files)
-(run-all (list db-fut cache-fut app-fut))
-
-;; Parallel — independent futures in each tier run concurrently
-(run-all (list db-fut cache-fut app-fut) :parallel)
-
-;; Parallel with a concurrency cap — at most 4 container spawns at once
-(run-all (list db-fut cache-fut app-fut) :parallel :max-parallel 4)
-```
-
-Given the dependency graph:
+With `:parallel`, independent futures in each tier run concurrently.  The
+executor blocks between tiers — dependencies are always respected.
 
 ```
-db-fut ──→ db-url-fut ──→ app-fut
-cache-fut → cache-url-fut → app-fut
+Tier 1:  db ∥ cache                    (no dependencies)
+Tier 2:  db-url ∥ cache-url            (unblocked after tier 1)
+Tier 3:  app                            (unblocked after tier 2)
 ```
 
-Parallel execution order:
-
-```
-Tier 1:  db ∥ cache          (both start simultaneously — no deps)
-Tier 2:  db-url ∥ cache-url  (unblocked after tier 1 completes)
-Tier 3:  app                  (unblocked after both tier 2 futures complete)
-```
-
-`:max-parallel N` caps concurrency within each tier using fixed-size chunks.
-Useful for wide tiers (many independent services) where you want to throttle
-system load.
-
-The `.reml` graph declaration is unchanged between serial and parallel
-execution; `:parallel` is purely an execution-policy keyword.
+The graph declaration is unchanged between serial and parallel execution.
+`:parallel` is an execution-policy keyword, not a structural one.
 
 ### `resolve` — the dynamic executor
 
-`resolve` executes a single future chain recursively without needing the full
-graph upfront.  Use it for linear pipelines where each step's next container
-depends on the runtime value from the previous one:
+`resolve` walks a single future chain depth-first, without needing the full
+graph declared upfront.  If a `then` lambda returns a new `Future`, `resolve`
+executes it automatically (**monadic flatten**).  Use this for linear pipelines
+where each step's next container depends on the previous step's value:
 
 ```lisp
 (define pipeline
-  (then db-fut
-    (lambda (db)
-      (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db))))
-        ;; Return a Future — resolve flattens it automatically (monadic bind)
-        (then (container-start-async svc-migrate
-                :inject (lambda (_) (list (cons "DATABASE_URL" db-url))))
+  (then db
+    (lambda (db-handle)
+      (let ((db-url (format "postgres://...@~a/db" (container-ip db-handle))))
+        (then (start svc-migrate
+                :needs (list db)
+                :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))
           (lambda (_)
-            (container-start-async svc-app
-              :inject (lambda (_) (list (cons "DATABASE_URL" db-url))))))))))
+            (start svc-app
+              :needs (list db)
+              :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))))))))
 
 (define app (resolve pipeline))
 ```
 
-`resolve` does not perform upfront cycle detection and does not support
-`:parallel`.  Prefer `run-all` when the full graph is known.
+`resolve` does not support `:parallel` or upfront cycle detection.  Prefer
+`run` when the full graph is known upfront.
 
-### Choosing between `run-all` and `resolve`
+### Choosing between `run` and `resolve`
 
 | Situation | Use |
 |-----------|-----|
-| Multiple independent services | `run-all` |
-| Want upfront cycle detection | `run-all` |
-| Want parallel dispatch | `run-all :parallel` |
-| Linear chain; next step depends on previous value | `resolve` |
-| Short pipeline, no need to name intermediate futures | `resolve` |
+| Multiple independent services (db ∥ cache) | `run` |
+| Upfront cycle detection | `run` |
+| Parallel dispatch | `run :parallel` |
+| Linear chain; next step determined by previous value | `resolve` |
+| Short pipeline, no need to name every intermediate | `resolve` |
 
-See `docs/REML_EXECUTOR_MODEL.md` for the full design reference, including
-the hybrid static+conditional pattern and threading model details.
+See `docs/REML_EXECUTOR_MODEL.md` for the full design reference: transitive
+discovery details, hybrid static+conditional patterns, threading model, and
+error message behaviour.
 
 ---
 

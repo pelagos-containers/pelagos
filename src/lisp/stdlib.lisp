@@ -169,3 +169,50 @@
        (,cleanup (ok result))
        result)))
 
+;; (define-nodes (var1 svc1) (var2 svc2) ...)
+;;
+;; Declare multiple lazy start nodes in one form.  Each (var svc) pair
+;; expands to (define var (start svc)).  Nothing executes until `run` is called.
+;;
+;;   (define-nodes
+;;     (db    svc-db)
+;;     (cache svc-cache))
+;;
+;; Expands to: (define db (start svc-db)) (define cache (start svc-cache))
+(defmacro define-nodes bindings
+  `(begin
+     ,@(map (lambda (b) `(define ,(car b) (start ,(cadr b))))
+            bindings)))
+
+;; (define-results results-var (var1 "key1") (var2 "key2") ...)
+;;
+;; Destructure an alist returned by `run` into named bindings.
+;;
+;;   (define-results results
+;;     (db-handle  "db")
+;;     (app-handle "app"))
+;;
+;; Expands to individual (define var (result-ref results-var key)) forms.
+(defmacro define-results (results-var . bindings)
+  `(begin
+     ,@(map (lambda (b) `(define ,(car b) (result-ref ,results-var ,(cadr b))))
+            bindings)))
+
+;; (define-then name upstream (param) body...)
+;;
+;; Combined define + then: define `name` as the node whose value is computed
+;; by applying body to the resolved value of `upstream`, with the handle bound
+;; to `param`.
+;;
+;;   (define-then db-url db (h)
+;;     (format "postgres://app:secret@~a/appdb" (container-ip h)))
+;;
+;; Expands to: (define db-url (then db (lambda (h) body...) :name "db-url"))
+;;
+;; The :name argument makes the future's internal name match the Lisp binding,
+;; so error messages reference "db-url" rather than the generated "db-then".
+;;
+;; For multi-upstream joins use `then-all` directly.
+(defmacro define-then (name upstream params . body)
+  `(define ,name (then ,upstream (lambda ,params ,@body) :name ,(symbol->string name))))
+

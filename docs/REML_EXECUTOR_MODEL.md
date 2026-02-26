@@ -1,23 +1,21 @@
 # Remora Lisp Executor Model
 
-**Status:** Implemented (v0.13.x)
-**Location:** `src/lisp/runtime.rs`, `src/lisp/value.rs`, `src/lisp/stdlib.lisp`
+**Status:** Implemented (v0.13.x+)
+**Location:** `src/lisp/runtime.rs`, `src/lisp/stdlib.lisp`
 
 ---
 
 ## Motivation
 
-Static compose formats (YAML, TOML, JSON) express *what* containers to run but
-not *how* they relate at runtime.  Relationships that require runtime values —
-connection strings derived from assigned IPs, migration steps that must
-complete before the app starts, health checks that gate dependent services —
-cannot be expressed declaratively.  They require a programming language.
+Static compose formats express *what* containers to run but not *how* they
+relate at runtime.  Connection strings derived from assigned IPs, migration
+steps that must complete before an app starts, health checks that gate
+dependent services — none of these can be expressed declaratively.  They
+require a programming language.
 
-Remora's `.reml` format is that language.  Earlier versions of the runtime
-exposed imperative primitives (`container-start`, `container-wait`) that worked
-but forced sequential execution and buried the dependency structure in
-evaluation order.  This document describes the current model, which makes the
-dependency graph explicit and separable from its execution policy.
+Remora's `.reml` format is that language.  This document describes the
+executor model: how dependency graphs are declared, how data flows between
+nodes, and how the two executors differ.
 
 ---
 
@@ -25,279 +23,264 @@ dependency graph explicit and separable from its execution policy.
 
 The model separates two concerns:
 
-- **Futures** — pure descriptions of work, with no side effects on creation
-- **Executors** — policies for *when* and *how* to run that work
+- **Futures** — pure descriptions of work.  Nothing happens when a future is
+  created.  A future is a first-class `Value` that can be passed to functions,
+  stored in lists, and composed with `then`.
 
-A future is created by `container-start-async` or `then`.  It captures a
-service spec, optional dependency declarations, and optional data
-transformations.  Nothing happens when a future is created.
-
-Remora ships two executors:
-
-| Executor | Form | Graph model | Cycle detection | Parallel | Best for |
-|----------|------|-------------|-----------------|----------|----------|
-| Static | `run-all` | Full graph declared upfront | ✅ Yes (Kahn's) | ✅ `:parallel` / `:max-parallel N` | Complex multi-service graphs, independent services |
-| Dynamic monadic | `resolve` | Graph unfolds lazily | ❌ No | ❌ Sequential by design | Linear pipelines, next step depends on previous value |
+- **Executors** — policies for *when* and *how* to run the work.
 
 ```
-.reml file           futures (descriptions of work)
-     │                     │
-     ▼                     ▼
-(container-start-async)  Value::Future { id, kind, after: Vec<Value> }
-(then)                   Value::Future { id, kind: Transform, after }
-     │                     │
-     ▼                     ▼
-(run-all)            (resolve)
- static, topo-sort    dynamic, recursive walk, monadic flatten
- cycle detection      no cycle detection, but simpler chain syntax
- :parallel dispatch   sequential by design
+.reml declaration         Value::Future in Lisp heap
+      │                         │
+      ▼                         ▼
+(start svc)             { id, name, kind: Container, after: [] }
+(define-then x f ...)   { id, name: "x", kind: Transform, after: [f] }
+      │                         │
+      ▼                         ▼
+(run  (list ...))       static executor  — topo-sort, cycle detection, :parallel
+(resolve future)        dynamic executor — recursive walk, monadic flatten
 ```
 
 ---
 
-## Connection to π-Calculus
+## The `define-*` Macro Family
 
-The model is a simplified version of the π-calculus.  In π-calculus,
-processes communicate by sending and receiving values on named channels.
-The dependency structure of a concurrent computation *is* its communication
-pattern — you don't declare a graph, the graph emerges from which names are
-bound and where they are consumed.
+These macros are the primary user-facing API.  They are defined in
+`src/lisp/stdlib.lisp` and available in every `.reml` file without import.
 
-In Remora's model:
+### `(define-service var "name" opts...)`
 
-| π-calculus concept | Remora equivalent |
-|--------------------|-------------------|
-| Process            | `container-start-async` future |
-| Channel            | Lisp name binding (`define`) |
-| Send               | Future resolving to a value |
-| Receive / block    | `:after` dependency + `:inject` |
-| Value on channel   | `ContainerHandle`, URL string, etc. |
+Declares a service specification.  No container starts; this is purely a
+data declaration.
 
-`db-url` is not just a string — it is the value communicated between the
-database future and the downstream futures that need it.  The executor
-discovers the graph by observing which futures appear in `:after` declarations,
-and which resolved values flow through `:inject` lambdas.
+```lisp
+(define-service svc-db "db"
+  :image   "postgres:16"
+  :network "app-net"
+  :env     ("POSTGRES_PASSWORD" . "secret")
+           ("POSTGRES_DB"       . "appdb")
+  :port    (5432 . 5432))
+```
+
+Options: `:image`, `:network`, `:env`, `:port`, `:bind`, `:bind-rw`,
+`:tmpfs`, `:command`, `:memory`.
+
+Multiple values under one keyword are written as dotted pairs (key–value)
+or bare values (port numbers, memory strings).
+
+### `(define-nodes (var svc) ...)`
+
+Declares multiple lazy `start` nodes in one form.  Each `(var svc)` pair
+expands to `(define var (start svc))`.  Nothing executes.
+
+```lisp
+(define-nodes
+  (db    svc-db)
+  (cache svc-cache))
+```
+
+Use `define-nodes` for independent services with no `:needs` or `:env`.
+Services that require options use `(define name (start svc :needs ... :env
+...))` directly.
+
+### `(define-then name upstream (param) body...)`
+
+Defines `name` as a Transform future whose value is computed from
+`upstream`'s resolved value, with the result bound to `param`.
+
+```lisp
+(define-then db-url db (h)
+  (format "postgres://app:secret@~a/appdb" (container-ip h)))
+```
+
+The future is named `"db-url"` (the binding name, not an auto-generated
+string), so error messages reference `db-url` directly.
+
+Expands to:
+```lisp
+(define db-url
+  (then db (lambda (h) (format ...)) :name "db-url"))
+```
+
+### `(define-results results-var (var "key") ...)`
+
+Destructures the alist returned by `run` into named bindings.
+
+```lisp
+(define-results results
+  (db-handle    "db")
+  (cache-handle "cache")
+  (app-handle   "app"))
+```
+
+Expands to individual `(define var (result-ref results-var key))` forms.
 
 ---
 
-## Future Kinds
+## Primitive Functions
 
-### `FutureKind::Container`
-
-Created by `container-start-async`.  When executed, spawns a container and
-resolves to a `ContainerHandle`.
-
-Optional `:inject` lambda: called with the resolved values of all `:after`
-dependencies (in declaration order).  Returns a list of `(key . value)` pairs
-merged into the service environment before spawning.  This is how data
-produced by upstream futures flows into downstream containers.
-
-### `FutureKind::Transform`
-
-Created by `then`.  When executed, calls a lambda with the resolved value
-of its single upstream future.  Resolves to whatever the lambda returns — no
-container is spawned.
-
-The lambda can return either a plain value or another `Future`:
-
-- **Plain value** — the typical case.  Use this to derive connection strings,
-  port numbers, or config blobs from a `ContainerHandle` before passing them
-  to downstream containers via `:inject`.
-- **Another `Future`** — use this when the next container to start depends on
-  a value only known at runtime (e.g. a schema version that determines whether
-  migrations need to run).  The executor resolves the returned future
-  automatically and uses its result as the transform's resolved value.
-
-### `FutureKind::Join`
-
-Created by `then-all`.  Like `Transform` but waits for multiple upstreams and
-passes all their resolved values to the lambda.  The upstreams are stored in
-`Value::Future { after: Vec<Value> }` — no duplication in the kind is needed.
-Both executors resolve all `after` futures first, then call the lambda with the
-results in declaration order.  If the lambda returns a `Future`, it is flattened
-automatically.
-
----
-
-## API Reference
-
-### `(container-start-async svc [:after list] [:inject lambda])`
+### `(start svc [:needs list] [:env lambda])`
 
 Returns a `Future` — nothing starts.
 
-- `svc` — a `ServiceSpec` value (from `define-service`)
-- `:after (list fut ...)` — futures that must complete before this one starts
-- `:inject (lambda (dep1 dep2 ...) ...)` — called at execution time with
-  resolved `:after` values; return value must be a list of `(key . value)` pairs
+- `:needs (list fut ...)` — futures that must resolve before this one
+  starts; their values are passed positionally to the `:env` lambda
+- `:env (lambda (dep1 dep2 ...) ...)` — called at execution time with
+  resolved `:needs` values; must return a list of `("KEY" . value)` pairs
+  merged into the container environment
 
 ```lisp
-(define app-fut
-  (container-start-async svc-app
-    :after  (list db-url-fut cache-url-fut)
-    :inject (lambda (db-url cache-url)
-              (list (cons "DATABASE_URL" db-url)
-                    (cons "CACHE_URL"    cache-url)))))
+(define app (start svc-app
+  :needs (list db-url cache-url)
+  :env   (lambda (db-url cache-url)
+           `(("DATABASE_URL" . ,db-url)
+             ("CACHE_URL"    . ,cache-url)))))
 ```
 
-### `(then future lambda)`
+The `:env` lambda receives the *resolved values* of its `:needs` futures
+(strings, numbers, etc.) — not the futures themselves.
 
-Returns a `Transform` future that applies `lambda` to the resolved value of
-`future`.  Automatically declares `:after` the upstream future.
+### `(then future lambda [:name "label"])`
 
-```lisp
-(define db-url-fut
-  (then db-fut
-    (lambda (db)
-      (format "postgres://app:secret@~a/appdb" (container-ip db)))))
-```
+Returns a Transform future that applies `lambda` to the resolved value of
+`future`.  Automatically declares `:needs` the upstream.
 
-### `(run-all (list fut ...) [:parallel] [:max-parallel N])`
-
-Topologically sorts futures by `:after` dependencies (Kahn's algorithm),
-executes each in order, passes resolved values to `:inject` and `then`
-transforms.  Returns an alist of `(name . resolved-value)` pairs.
-
-Futures not in the list whose IDs appear in `:after` declarations are treated
-as already resolved — they were executed by a prior `await` or `run-all` call.
-
-Raises an error if a dependency cycle is detected.
-
-**Serial mode (default):**
-```lisp
-(run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut))
-```
-
-**Parallel mode** — independent futures in each tier are spawned concurrently.
-The dependency graph is the same; only the execution policy changes:
-```lisp
-(run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut) :parallel)
-```
-
-**Parallel with concurrency cap** — at most N container spawns active at once
-within each tier:
-```lisp
-(run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut)
-         :parallel :max-parallel 4)
-```
-`:max-parallel N` implies `:parallel`; you don't need both.
-
-**Threading model:** `Transform` and `Join` futures always evaluate on the main
-thread (their lambdas capture `Rc` values that are `!Send`).  Only the raw
-container spawn (`do_container_start_inner`) runs in worker threads.  Each
-worker gets owned data (`ServiceSpec`, `String`, `PathBuf`, `Arc<Mutex<...>>`),
-all of which are `Send`.  Results are merged in declaration order before being
-stored in the resolved-values map and the output alist.
-
-### `(await future [:port P] [:timeout T])`
-
-Single-future serial executor for `Container` futures.  Starts the container
-and optionally waits for a TCP port to accept connections.  Raises an error
-(not `#f`) on timeout — if you are awaiting a service, it is required.
-
-Only works with `Container` futures; `Transform` futures must go through
-`run-all`.
+The optional `:name "label"` overrides the auto-generated name
+(`"<upstream>-then"`).  `define-then` uses this automatically; manual
+`then` calls use the default.
 
 ```lisp
-(define db (await db-fut :port 5432 :timeout 60))
-```
+;; Raw form — future named "db-then"
+(define db-url (then db (lambda (h) (format "..." (container-ip h)))))
 
-### `(result-ref results "name")`
-
-Extract a resolved value from a `run-all` alist by service name.  Raises an
-error if the name is not found.
-
-```lisp
-(define app (result-ref results "app"))
+;; Via define-then — future named "db-url"
+(define-then db-url db (h)
+  (format "..." (container-ip h)))
 ```
 
 ### `(then-all (list fut ...) lambda)`
 
-Returns a `Join` future.  When executed, waits for all listed futures to
-resolve, then calls `lambda` with their resolved values in declaration order.
-If the lambda returns a `Future`, it is resolved automatically (same rule as
-`then`).
-
-Use `then-all` when a downstream step genuinely requires the values from
-multiple independent upstreams — for example, an app container that needs both
-a database URL and a cache URL before it can be configured.
+Returns a Join future.  Waits for all listed futures, then calls `lambda`
+with their resolved values in declaration order.  If the lambda returns a
+`Future`, it is resolved automatically (same monadic flatten as `then`).
 
 ```lisp
-;; db and cache resolve independently; app needs both URLs.
-(define db-url-fut    (then db-fut    (lambda (db)    (format "postgres://...@~a/db"    (container-ip db)))))
-(define cache-url-fut (then cache-fut (lambda (cache) (format "redis://~a:6379"         (container-ip cache)))))
-
-(define app-fut
-  (then-all (list db-url-fut cache-url-fut)
-    (lambda (db-url cache-url)
-      (container-start-async svc-app
-        :inject (lambda (_) (list (cons "DATABASE_URL" db-url)
-                                  (cons "CACHE_URL"    cache-url)))))))
-
-(define app (resolve app-fut))
+(define both
+  (then-all (list db-url cache-url)
+    (lambda (db cache)
+      (format "db=~a cache=~a" db cache))))
 ```
 
-In a `run-all` graph, include all futures in the list and `then-all` fits
-naturally into the topo-sort — its `:after` edges point to both upstreams:
+### `(run (list fut ...) [:parallel] [:max-parallel N])`
+
+Static graph executor.
+
+**The list is a *terminal* futures list** — the containers whose handles
+you need after execution.  `run` walks each future's `:needs` transitively
+to discover the full dependency graph automatically.  You do not need to
+enumerate intermediate computed values.
+
+Returns an alist of `("name" . resolved-value)` pairs for the explicitly
+listed futures only.  Transitive dependencies are executed but not
+surfaced.
 
 ```lisp
-(define results
-  (run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut)))
+;; db-url and cache-url are discovered automatically from app's :needs.
+(define results (run (list db cache app) :parallel))
 ```
+
+Raises an error if a dependency cycle is detected (Kahn's algorithm).
+
+**Modes:**
+```lisp
+(run (list db cache app))                    ; serial
+(run (list db cache app) :parallel)          ; tier-parallel
+(run (list db cache app) :parallel           ; capped at 4 simultaneous
+     :max-parallel 4)
+```
+
+`:max-parallel N` implies `:parallel`.
+
+**Threading model:** Transform and Join futures always run on the main
+thread (their lambdas capture `Rc` values that are `!Send`).  Only raw
+container spawns run in worker threads via `std::thread::spawn`.
 
 ### `(resolve future)`
 
-Dynamic executor.  Resolves `future` recursively:
+Dynamic (monadic) executor.  Resolves `future` depth-first:
 
-1. **Container future** — spawns the container; returns a `ContainerHandle`.
-2. **Transform future** — resolves the upstream first, then calls the
-   transform lambda with its value.  If the lambda returns another
-   `Future`, that future is resolved too (**monadic flatten**).  Repeats
-   until a non-`Future` value is produced.
+1. **Container future** — spawns the container; returns `ContainerHandle`.
+2. **Transform future** — resolves the upstream, calls the lambda.  If
+   the lambda returns another `Future`, resolves that too (monadic
+   flatten).
 3. **Plain value** — returned as-is.
 
-A deduplication map prevents re-execution when two chains share an upstream.
+A deduplication map prevents re-executing shared upstreams.
 
-Unlike `run-all`, the full graph need not be declared upfront.  Use `resolve`
-for linear pipelines where the *value* produced by one step determines what
-the next step is.
+Does not perform upfront cycle detection and does not support `:parallel`.
+Use for linear pipelines where each step's future is determined by the
+previous step's value.
+
+### `(result-ref results "name")`
+
+Extracts a resolved value from a `run` alist by service name.  Raises an
+error if the name is not found.
+
+---
+
+## Transitive Dependency Discovery
+
+`run` automatically walks `:needs` recursively before executing.  You list
+only the futures whose results you need; everything upstream is discovered
+and executed in the correct order.
+
+Given this graph:
+
+```
+db ──→ db-url ──→ migrate
+db ──→ db-url ──→ app
+cache ──→ cache-url ──→ app
+```
+
+You only list the containers you need handles for:
 
 ```lisp
-(define pipeline
-  (then db-fut
-    (lambda (db)
-      (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db))))
-        ;; Returning a Future here — resolve flattens it automatically.
-        (then (container-start-async svc-migrate
-                :inject (lambda (_) (list (cons "DATABASE_URL" db-url))))
-          (lambda (_)
-            (container-start-async svc-app
-              :inject (lambda (_) (list (cons "DATABASE_URL" db-url))))))))))
-
-(define app (resolve pipeline))
+(define results (run (list db cache app) :parallel))
 ```
+
+`migrate` ran (it's a transitive dependency of `app` via `db-url`), but
+its handle is not needed so it is not listed.  `db-url` and `cache-url`
+are intermediate computations — they execute as needed but are not in the
+output alist.
+
+This keeps the terminal list as a statement of *intent* ("I need these
+handles") rather than a manual transcription of the dependency graph.
 
 ---
 
 ## Execution Order
 
-The serial executor resolves execution order from the `:after` graph.
-Given this declaration:
+Given:
 
 ```lisp
-(define db-fut        (container-start-async svc-db))
-(define cache-fut     (container-start-async svc-cache))
-(define db-url-fut    (then db-fut    (lambda (db)    ...)))
-(define cache-url-fut (then cache-fut (lambda (cache) ...)))
-(define migrate-fut   (container-start-async svc-migrate :after (list db-url-fut)))
-(define app-fut       (container-start-async svc-app     :after (list db-url-fut cache-url-fut)))
-```
+(define-nodes
+  (db    svc-db)
+  (cache svc-cache))
 
-The dependency graph is:
+(define-then db-url    db    (h) (format "postgres://...@~a/db"   (container-ip h)))
+(define-then cache-url cache (h) (format "redis://~a:6379"        (container-ip h)))
 
-```
-db-fut ──────────→ db-url-fut ──────────→ migrate-fut
-                               └─────────→ app-fut
-cache-fut ───────→ cache-url-fut ─────────→ app-fut
+(define migrate (start svc-migrate
+  :needs (list db-url)
+  :env   (lambda (url) `(("DATABASE_URL" . ,url)))))
+
+(define app (start svc-app
+  :needs (list db-url cache-url)
+  :env   (lambda (db-url cache-url)
+           `(("DATABASE_URL" . ,db-url)
+             ("CACHE_URL"    . ,cache-url)))))
+
+(define results (run (list db cache app) :parallel))
 ```
 
 Serial execution order (one valid topological sort):
@@ -306,205 +289,131 @@ Serial execution order (one valid topological sort):
 db → cache → db-url → cache-url → migrate → app
 ```
 
-Parallel execution order with `(run-all ... :parallel)`:
+Parallel execution order:
 
 ```
-Tier 1:  db ∥ cache                   (both start simultaneously)
-Tier 2:  db-url ∥ cache-url           (unblocked after tier 1 completes)
-Tier 3:  migrate                       (unblocked after db-url)
-Tier 4:  app                           (unblocked after migrate + cache-url)
+Tier 1:  db ∥ cache                    (no dependencies)
+Tier 2:  db-url ∥ cache-url            (unblocked after tier 1)
+Tier 3:  migrate                        (unblocked after db-url)
+Tier 4:  app                            (unblocked after migrate + cache-url)
 ```
 
-**No changes to the `.reml` file are needed to switch between serial and
-parallel execution.**  The graph is fully specified by the declarations;
-the executor policy is a single keyword on the `run-all` call.
-
----
-
-## Complete Example
-
-```lisp
-;; Service declarations
-(define-service svc-db    "db"    :image "postgres:16"    :network "app-net" ...)
-(define-service svc-cache "cache" :image "redis:7-alpine" :network "app-net")
-(define-service svc-app   "app"   :image "myapp:latest"   :network "app-net")
-
-;; Declare the graph — nothing executes yet
-(define db-fut    (container-start-async svc-db))
-(define cache-fut (container-start-async svc-cache))
-
-(define db-url-fut
-  (then db-fut
-    (lambda (db) (format "postgres://app:secret@~a/appdb" (container-ip db)))))
-
-(define cache-url-fut
-  (then cache-fut
-    (lambda (cache) (format "redis://~a:6379" (container-ip cache)))))
-
-(define app-fut
-  (container-start-async svc-app
-    :after  (list db-url-fut cache-url-fut)
-    :inject (lambda (db-url cache-url)
-              (list (cons "DATABASE_URL" db-url)
-                    (cons "CACHE_URL"    cache-url)))))
-
-;; Execute the graph
-(define results
-  (run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut)))
-
-;; Use resolved handles
-(define app (result-ref results "app"))
-(container-wait app)
-```
+No changes to the graph declaration are needed to switch between serial
+and parallel.  `:parallel` is an execution-policy keyword, not a
+structural one.
 
 ---
 
 ## Choosing an Executor
 
-| Situation | Recommended executor |
-|-----------|----------------------|
-| Multiple independent services (db ∥ cache ∥ redis) | `run-all` |
-| You want upfront cycle detection | `run-all` |
-| A future parallel executor matters to you | `run-all` (graph is already complete) |
-| Linear pipeline: each step's future is determined by the previous value | `resolve` |
-| Short chains without a name for every intermediate future | `resolve` |
-| Mix: static topology + one conditional branch | `run-all` — see below |
+| Situation | Use |
+|-----------|-----|
+| Multiple independent services (db ∥ cache) | `run` |
+| Upfront cycle detection | `run` |
+| Parallel dispatch across tiers | `run :parallel` |
+| Linear chain; next step depends on previous value | `resolve` |
+| Short pipeline, no need to name intermediate futures | `resolve` |
+| Static topology + one conditional branch | `run` — see below |
 
-Both executors share the same `Value::Future` type and the same
-`container-start-async` / `then` vocabulary — you can switch between them
-or mix them freely.
+### Mixing static and conditional execution
+
+A `then` lambda can return a `Future` instead of a plain value.  Both
+executors detect this and resolve the returned future automatically
+(**monadic flatten**).  This is the bridge between the static graph and
+conditional branches: include the decision step in the `run` list like any
+other future; its lambda chooses which container to start at runtime.
+
+```lisp
+(define migration-gate
+  (then db-url
+    (lambda (url)
+      (if (need-migrations? url)
+          (start svc-migrate :needs (list db-url)
+                             :env   (lambda (u) `(("DATABASE_URL" . ,u))))
+          (start svc-noop)))))
+
+(define results (run (list db migration-gate app) :parallel))
+```
+
+Cycle detection covers the static portion.  The dynamic tail (the future
+returned by the lambda) is structurally acyclic — a lambda cannot close
+over a future that does not yet exist.
 
 ---
 
-## Mixing Static and Conditional Execution
+## Error Messages and Debugability
 
-Most graphs are fully known upfront and belong entirely in `run-all`.  But
-sometimes one step needs to choose *which* container to start based on a value
-only available at runtime — a schema version, a feature flag, a health check
-result.
+Future names appear in error messages.  The naming rules are:
 
-You do not need to split this into two executor calls.  A single `run-all`
-handles it: include the decision step in the list like any other future.
-When its lambda runs and returns a `Future` instead of a plain value, the
-executor resolves that future inline and stores the result.  Every downstream
-future in the static graph sees the result normally.
+| Form | Future name |
+|------|-------------|
+| `(define-service svc-db "db" ...)` + `(start svc-db)` | `"db"` |
+| `(define-then db-url db ...)` | `"db-url"` (the binding name) |
+| `(then upstream lambda)` (raw) | `"<upstream>-then"` |
+| `(then upstream lambda :name "label")` | `"label"` |
 
-```
-Static graph (topo-sorted upfront)
-     │
-     ├── db-fut ──→ db-url-fut ────────────────────────────────┐
-     │                                                         │
-     └── check-fut (then db-url-fut ...)                       │
-             lambda inspects db-url at runtime:                │
-               if migrations needed → returns migrate-fut      │
-               else                 → returns noop-fut         │
-                    │                                          │
-                    │  resolved inline, result stored          │
-                    ▼                                          ▼
-            (migrate or noop runs)                      app-fut depends
-                    │                                   on both ↑
-                    └───────────────────────────────────────────┘
-```
-
-The decision step — `check-fut` — is declared in the `run-all` list like any
-other future.  Its lambda is a normal `if` expression.  No special syntax
-marks it as conditional.
-
-```lisp
-;; Service declarations
-(define-service svc-db      "db"      :image "postgres:16"   :network "app-net" ...)
-(define-service svc-migrate "migrate" :image "myapp-migrate" :network "app-net")
-(define-service svc-noop    "noop"    :image "alpine:latest" :network "app-net"
-  :command (list "/bin/true"))
-(define-service svc-app     "app"     :image "myapp:latest"  :network "app-net")
-
-;; Static futures — full graph known upfront
-(define db-fut (container-start-async svc-db))
-
-(define db-url-fut
-  (then db-fut
-    (lambda (db) (format "postgres://app:secret@~a/appdb" (container-ip db)))))
-
-;; Gateway: Transform whose lambda returns a Future (conditional branch).
-;; run-all resolves this inline using the dynamic executor.
-(define migration-gate-fut
-  (then db-url-fut
-    (lambda (db-url)
-      (if (need-migrations? db-url)
-        (container-start-async svc-migrate
-          :after  (list db-url-fut)
-          :inject (lambda (url) (list (cons "DATABASE_URL" url))))
-        (container-start-async svc-noop)))))
-
-;; App depends on both the gateway result and db-url — static declaration.
-(define app-fut
-  (container-start-async svc-app
-    :after  (list migration-gate-fut db-url-fut)
-    :inject (lambda (_gate db-url)
-              (list (cons "DATABASE_URL" db-url)))))
-
-;; Single run-all call — handles static, conditional, and downstream together.
-(define results
-  (run-all (list db-fut db-url-fut migration-gate-fut app-fut)))
-
-(define app (result-ref results "app"))
-(container-wait app)
-```
-
-**Trade-offs of the hybrid approach:**
-
-- Cycle detection still covers the static portion of the graph (everything
-  declared in the `run-all` list).  The dynamic tail is not cycle-checked
-  upfront, but dynamic tails created by `then` lambdas are structurally
-  acyclic — a lambda cannot close over a future that does not yet exist.
-- The parallel executor (`:parallel` on `run-all`) dispatches static tiers as
-  batches.  A gateway future's dynamic tail runs after the gateway, so the tail
-  is sequential relative to the gateway but not relative to other independent
-  static futures.
-- Prefer the hybrid form (single `run-all`) over two separate executor calls
-  when the conditional branch is a leaf or short tail.  Use two calls
-  (`run-all` then `resolve`) when the conditional portion is complex enough
-  to benefit from being reasoned about independently.
+`define-then` passes `(symbol->string name)` as `:name` at macro expansion
+time, so the future's internal name matches the Lisp binding.  Errors
+reference `"db-url"`, not `"db-then"`.
 
 ---
 
 ## Design Principles
 
-**Futures are values.**  A future is just a `Value::Future` in the Lisp heap.
-It can be passed to functions, stored in lists, and composed with `then`.
-There is no special syntax — futures participate in the normal Lisp value
-model.
+**Futures are values.** A future is a first-class `Value::Future` in the
+Lisp heap.  It can be passed to functions, stored in lists, and composed
+with `then`.  There is no special syntax.
 
-**The graph is complete before execution.**  `run-all` receives the entire
-set of futures and can inspect all edges before running anything.  This is
-what enables topological sorting, cycle detection, and — eventually —
-parallel dispatch.
+**The terminal list states intent.** `run` receives the futures whose
+results you need, not the full graph.  Transitive discovery closes the gap
+between "what I declared" and "what the executor needs to run."
 
-**Data flow is typed.**  `then` transforms produce typed values (strings,
-numbers, lists) rather than requiring callers to destructure raw handles.
-`:inject` receives those typed values and wires them into containers.  The
-`ContainerHandle` type is an implementation detail that leaks only where
-needed (e.g., `container-ip`, `container-stop`).
+**Data flow is typed.** `then` transforms produce typed values (strings,
+numbers) rather than requiring callers to destructure raw handles.  `:env`
+receives those typed values and wires them into containers.
+`ContainerHandle` leaks only where needed (`container-ip`, `container-stop`).
 
-**Executor policy is separate from graph structure.**  The `.reml` file
-declares what depends on what.  The executor decides when and how to run it.
-Swapping executors is a runtime concern, not a language concern.
+**Executor policy is separate from graph structure.** The `.reml` file
+declares what depends on what.  The executor decides when and how to run
+it.  Swapping executors does not require changing the graph.
+
+**Binding names surface in errors.** `define-then` names futures after
+their Lisp bindings.  Error messages reference the user's vocabulary, not
+generated internal names.
+
+---
+
+## Connection to π-Calculus
+
+The model is a simplified π-calculus.  Processes communicate by sending
+and receiving values on named channels; the dependency structure *is* the
+communication pattern.
+
+| π-calculus concept | Remora equivalent |
+|--------------------|-------------------|
+| Process | `start` future |
+| Channel | Lisp name binding (`define`) |
+| Send | Future resolving to a value |
+| Receive / block | `:needs` dependency + `:env` |
+| Value on channel | `ContainerHandle`, URL string, etc. |
+
+`db-url` is not just a string — it is the value communicated between the
+database future and the downstream futures that consume it.
 
 ---
 
 ## Roadmap
 
-1. **Parallel `run-all`** — ✅ **Implemented.**  `:parallel` and `:max-parallel N`
-   keywords dispatch independent tiers concurrently via `std::thread`.
-   Transform/Join futures remain on the main thread; only container spawns go
-   to workers.  Registry uses `Arc<Mutex<...>>` for thread-safe access.
+1. **Parallel `run`** — ✅ Implemented.  `:parallel` and `:max-parallel N`
+   dispatch independent tiers concurrently via `std::thread`.
+   Transform/Join futures remain on the main thread (they capture `Rc`);
+   only container spawns run in workers.
 
-2. **Streaming results** — rather than returning a complete alist at the end,
-   expose a channel that futures push results onto as they complete.  Enables
-   reactive patterns (e.g., start logging from a container as soon as it
-   starts, without waiting for the whole graph).
+2. **Streaming results** — expose a channel that futures push results onto
+   as they complete, enabling reactive patterns (log a container as soon as
+   it starts without waiting for the full graph).
 
-3. **Cancellation** — if any future in a `run-all` fails, send SIGTERM to all
-   running containers from that execution set.  The interpreter's `Drop` impl
-   already handles this for the global registry; a per-`run-all` registry
-   would scope it correctly.
+3. **Cancellation** — if any future in a `run` call fails, SIGTERM all
+   running containers from that execution set.  The interpreter `Drop` impl
+   already handles this for the global registry; a per-`run` registry would
+   scope it correctly.

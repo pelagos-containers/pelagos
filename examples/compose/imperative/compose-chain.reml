@@ -8,7 +8,7 @@
 ;;;   compose.reml       — static: full graph declared before execution;
 ;;;                        run topo-sorts and cycle-detects upfront.
 ;;;
-;;;   compose-chain.reml — dynamic: each (derive ...) lambda returns the
+;;;   compose-chain.reml — dynamic: each (then ...) lambda returns the
 ;;;                        *next* node; the graph unfolds as execution
 ;;;                        proceeds.  No upfront graph declaration needed.
 ;;;
@@ -24,7 +24,7 @@
 ;;;
 ;;; Dependency graph (same as compose.reml):
 ;;;
-;;;   db ──→ (derive db-url) ──→ migrate ──→ (derive) ──→ app
+;;;   db ──→ (then db-url) ──→ migrate ──→ (then) ──→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose-chain.reml -p chain-demo
@@ -55,7 +55,7 @@
 ;; When (resolve ...) is called it walks upstream recursively:
 ;;
 ;;   1. resolve db              → ContainerHandle
-;;   2. derive db-url string    → "postgres://app:secret@<ip>/appdb"
+;;   2. then: compute db-url    → "postgres://app:secret@<ip>/appdb"
 ;;   3. resolve migrate         → ContainerHandle  (:env wires DATABASE_URL)
 ;;   4. lambda returns app node → another node! resolve flattens it
 ;;   5. resolve app             → ContainerHandle  (:env wires DATABASE_URL)
@@ -67,13 +67,13 @@
 (define db (start svc-db))
 
 (define pipeline
-  (derive db
+  (then db
     (lambda (db-handle)
       (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db-handle))))
-        ;; Start migrate, injecting the db-url we just derived.
-        (derive (start svc-migrate
-                  :needs (list db)
-                  :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))
+        ;; Start migrate, injecting the db-url we just computed.
+        (then (start svc-migrate
+                :needs (list db)
+                :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))
           (lambda (_migrate)
             ;; migrate finished — now start app with the same db-url.
             ;; Returning a node here triggers the monadic flatten in resolve.

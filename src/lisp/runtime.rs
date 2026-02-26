@@ -9,8 +9,8 @@
 //! |----------|-----------|-------------|
 //! | `container-start`  | `(svc-spec)` → ContainerHandle | Spawn a container immediately |
 //! | `start`            | `(svc-spec [:needs list] [:env lambda])` → Future | Declare a lazy container start; nothing runs |
-//! | `derive`           | `(future lambda)` → Future | Derive a value from a future's resolved result |
-//! | `derive-all`       | `((list fut...) lambda)` → Future | Join multiple futures, then derive |
+//! | `then`           | `(future lambda)` → Future | Compute a value from a future's resolved result |
+//! | `then-all`       | `((list fut...) lambda)` → Future | Join multiple futures, then compute |
 //! | `run`              | `((list fut...) [:parallel] [:max-parallel N])` → alist | Execute graph; serial or tier-parallel |
 //! | `resolve`          | `(future)` → value | Execute a monadic chain depth-first |
 //! | `await`            | `(future [:port P] [:timeout T])` → ContainerHandle | Await a single Container future |
@@ -26,16 +26,16 @@
 //! `start` returns a [`Value::Future`] — a pure description of work (the
 //! service spec) with no side effects.  Two executors are provided:
 //!
-//! - **`run`** — static graph executor.  Accepts a flat list of futures,
-//!   topologically sorts them by their `:needs` dependencies, and executes
-//!   them in order.  Pass `:parallel` to run independent futures within each
-//!   tier concurrently; the executor blocks between tiers to enforce ordering.
-//!   Use `:max-parallel N` to cap the number of simultaneous threads per tier.
-//!   Returns an alist of `(name . resolved-value)` pairs.
+//! - **`run`** — static graph executor.  Accepts a list of *terminal* futures
+//!   (the ones whose results you care about); transitive `:needs` dependencies
+//!   are discovered automatically and executed in the correct order.  Pass
+//!   `:parallel` to run independent futures within each tier concurrently.
+//!   Use `:max-parallel N` to cap threads per tier.  Returns an alist of
+//!   `(name . resolved-value)` pairs for the explicitly listed futures only.
 //!
 //! - **`resolve`** — dynamic (monadic) executor.  Executes a single future
 //!   depth-first: resolves all upstreams recursively before calling transforms.
-//!   If a `derive` lambda returns a new Future, that Future is resolved too
+//!   If a `then` lambda returns a new Future, that Future is resolved too
 //!   (monadic flatten).  Use this for chains where the next step is only known
 //!   after the previous one resolves.
 
@@ -168,20 +168,26 @@ pub fn register_runtime_builtins(
         })
     });
 
-    // ── derive ───────────────────────────────────────────────────────────────
-    // (derive upstream-future (lambda (v) derived-value))
+    // ── then ───────────────────────────────────────────────────────────────
+    // (then upstream-future (lambda (v) computed-value) [:name "label"])
     // Creates a Transform future whose resolved value is the result of
     // applying the lambda to the upstream future's resolved value.
     // The new future declares :needs the upstream automatically.
-    native(env, "derive", |args| {
-        if args.len() != 2 {
-            return Err(LispError::new("derive: expected (future transform-lambda)"));
+    //
+    // The optional :name "label" argument overrides the auto-generated name
+    // ("<upstream>-then").  define-then uses this to name the future after
+    // the Lisp binding, so error messages reference the user's variable name.
+    native(env, "then", |args| {
+        if args.len() < 2 {
+            return Err(LispError::new(
+                "then: expected (future transform-lambda [:name string])",
+            ));
         }
         let upstream_name = match &args[0] {
             Value::Future { name, .. } => name.clone(),
             other => {
                 return Err(LispError::new(format!(
-                    "derive: expected future, got {}",
+                    "then: expected future, got {}",
                     other.type_name()
                 )))
             }
@@ -190,16 +196,25 @@ pub fn register_runtime_builtins(
             Value::Lambda { .. } | Value::Native(_, _) => {}
             other => {
                 return Err(LispError::new(format!(
-                    "derive: expected lambda, got {}",
+                    "then: expected lambda, got {}",
                     other.type_name()
                 )))
             }
         }
+        // Optional :name override.
+        let name = if args.len() >= 4 {
+            match (&args[2], &args[3]) {
+                (Value::Symbol(k), Value::Str(n)) if k == ":name" => n.clone(),
+                _ => format!("{}-then", upstream_name),
+            }
+        } else {
+            format!("{}-then", upstream_name)
+        };
         use crate::lisp::value::FutureKind;
         let upstream = args[0].clone();
         Ok(Value::Future {
             id: next_future_id(),
-            name: format!("{}-derive", upstream_name),
+            name,
             kind: FutureKind::Transform {
                 upstream: Box::new(upstream.clone()),
                 transform: Box::new(args[1].clone()),
@@ -208,20 +223,20 @@ pub fn register_runtime_builtins(
         })
     });
 
-    // ── derive-all ───────────────────────────────────────────────────────────
-    // (derive-all (list f1 f2 ...) (lambda (v1 v2 ...) result))
+    // ── then-all ───────────────────────────────────────────────────────────
+    // (then-all (list f1 f2 ...) (lambda (v1 v2 ...) result))
     // Creates a Join future: waits for all listed futures, then calls the
     // lambda with all their resolved values in order.  If the lambda returns
-    // a Future it is flattened automatically (same rule as derive).
-    native(env, "derive-all", |args| {
+    // a Future it is flattened automatically (same rule as then).
+    native(env, "then-all", |args| {
         if args.len() != 2 {
             return Err(LispError::new(
-                "derive-all: expected (list-of-futures lambda)",
+                "then-all: expected (list-of-futures lambda)",
             ));
         }
         let futures_list = args[0]
             .to_vec()
-            .map_err(|_| LispError::new("derive-all: first argument must be a list of futures"))?;
+            .map_err(|_| LispError::new("then-all: first argument must be a list of futures"))?;
         let mut upstreams: Vec<Value> = Vec::new();
         let mut name_parts: Vec<String> = Vec::new();
         for f in futures_list {
@@ -232,7 +247,7 @@ pub fn register_runtime_builtins(
                 }
                 other => {
                     return Err(LispError::new(format!(
-                        "derive-all: expected futures in list, got {}",
+                        "then-all: expected futures in list, got {}",
                         other.type_name()
                     )))
                 }
@@ -242,7 +257,7 @@ pub fn register_runtime_builtins(
             Value::Lambda { .. } | Value::Native(_, _) => {}
             other => {
                 return Err(LispError::new(format!(
-                    "derive-all: expected lambda, got {}",
+                    "then-all: expected lambda, got {}",
                     other.type_name()
                 )))
             }
@@ -333,29 +348,61 @@ pub fn register_runtime_builtins(
                 after_ids: Vec<u64>,
             }
 
+            // Validate the explicitly listed items up front.
+            for v in &future_list {
+                if !matches!(v, Value::Future { .. }) {
+                    return Err(LispError::new(format!(
+                        "run: expected futures, got {}",
+                        v.type_name()
+                    )));
+                }
+            }
+
+            // Track which futures were explicitly listed — only these appear in
+            // the output alist.  Transitive dependencies are executed as needed
+            // but are not surfaced to the caller.
+            let terminal_ids: std::collections::HashSet<u64> =
+                future_list.iter().filter_map(Value::future_id).collect();
+
+            // Walk :needs transitively so the caller only needs to list terminal
+            // futures; the full dependency graph is discovered automatically.
+            fn collect_transitive(
+                v: &Value,
+                seen: &mut std::collections::HashSet<u64>,
+                all: &mut Vec<Value>,
+            ) {
+                if let Value::Future { id, after, .. } = v {
+                    if seen.insert(*id) {
+                        for dep in after {
+                            collect_transitive(dep, seen, all);
+                        }
+                        all.push(v.clone());
+                    }
+                }
+            }
+
+            let mut all_futures: Vec<Value> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for v in &future_list {
+                collect_transitive(v, &mut seen_ids, &mut all_futures);
+            }
+
             let mut entries: Vec<Entry> = Vec::new();
-            for v in future_list {
-                match v {
-                    Value::Future {
+            for v in all_futures {
+                if let Value::Future {
+                    id,
+                    name,
+                    kind,
+                    after,
+                } = v
+                {
+                    let after_ids = after.iter().filter_map(Value::future_id).collect();
+                    entries.push(Entry {
                         id,
                         name,
                         kind,
-                        after,
-                    } => {
-                        let after_ids = after.iter().filter_map(Value::future_id).collect();
-                        entries.push(Entry {
-                            id,
-                            name,
-                            kind,
-                            after_ids,
-                        });
-                    }
-                    other => {
-                        return Err(LispError::new(format!(
-                            "run: expected futures, got {}",
-                            other.type_name()
-                        )))
-                    }
+                        after_ids,
+                    });
                 }
             }
 
@@ -463,7 +510,9 @@ pub fn register_runtime_builtins(
                             }
                         };
                         resolved.insert(e.id, result.clone());
-                        pairs.push(Value::Pair(Rc::new((Value::Str(e.name.clone()), result))));
+                        if terminal_ids.contains(&e.id) {
+                            pairs.push(Value::Pair(Rc::new((Value::Str(e.name.clone()), result))));
+                        }
                     }
                 }
             } else {
@@ -595,10 +644,12 @@ pub fn register_runtime_builtins(
                     tier_results.sort_by_key(|(idx, _)| *idx);
                     for (idx, val) in tier_results {
                         resolved.insert(entries[idx].id, val.clone());
-                        pairs.push(Value::Pair(Rc::new((
-                            Value::Str(entries[idx].name.clone()),
-                            val,
-                        ))));
+                        if terminal_ids.contains(&entries[idx].id) {
+                            pairs.push(Value::Pair(Rc::new((
+                                Value::Str(entries[idx].name.clone()),
+                                val,
+                            ))));
+                        }
                     }
                 }
             }
