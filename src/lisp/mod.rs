@@ -18,6 +18,7 @@ pub mod value;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::sexpr;
 pub use remora::{HookFn, HookMap, PendingCompose};
@@ -36,7 +37,8 @@ pub struct Interpreter {
     /// Registry of containers started via `container-start`.
     /// Entries are `(container_name, pid)`.
     /// The `Drop` impl sends SIGTERM to any still-running containers.
-    pub(crate) container_registry: Rc<RefCell<Vec<(String, i32)>>>,
+    /// `Arc<Mutex<...>>` so that parallel worker threads can register entries.
+    pub(crate) container_registry: Arc<Mutex<Vec<(String, i32)>>>,
 }
 
 impl Interpreter {
@@ -45,7 +47,7 @@ impl Interpreter {
         let global_env = EnvFrame::new();
         let hooks: Rc<RefCell<HookMap>> = Rc::new(RefCell::new(HookMap::new()));
         let pending: Rc<RefCell<PendingCompose>> = Rc::new(RefCell::new(PendingCompose::default()));
-        let container_registry: Rc<RefCell<Vec<(String, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let container_registry: Arc<Mutex<Vec<(String, i32)>>> = Arc::new(Mutex::new(Vec::new()));
 
         register_builtins(&global_env);
         register_remora_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
@@ -70,7 +72,7 @@ impl Interpreter {
     /// to resolve relative bind-mount host paths.
     pub fn new_with_runtime(project: String, compose_dir: std::path::PathBuf) -> Self {
         let interp = Self::new();
-        let registry = Rc::clone(&interp.container_registry);
+        let registry = Arc::clone(&interp.container_registry);
         runtime::register_runtime_builtins(&interp.global_env, registry, project, compose_dir);
         interp
     }
@@ -131,7 +133,7 @@ impl Default for Interpreter {
 
 impl Drop for Interpreter {
     fn drop(&mut self) {
-        for (name, pid) in self.container_registry.borrow().iter() {
+        for (name, pid) in self.container_registry.lock().unwrap().iter() {
             log::info!("interpreter cleanup: stopping '{}' (pid {})", name, pid);
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(*pid),
@@ -1208,5 +1210,75 @@ mod tests {
         );
         let err = eval_err(&mut i, r#"(then-all (list f) "not-a-lambda")"#);
         assert!(err.contains("expected lambda"), "got: {}", err);
+    }
+
+    // ── run-all parallel keyword parsing ─────────────────────────────────
+
+    #[test]
+    fn test_run_all_accepts_parallel_keyword() {
+        // :parallel on an empty list is valid — returns empty alist (Nil).
+        let mut i = runtime_interp();
+        let v = eval_ok(&mut i, "(run-all (list) :parallel)");
+        assert_eq!(
+            v,
+            Value::Nil,
+            "empty parallel run should return Nil (empty alist)"
+        );
+    }
+
+    #[test]
+    fn test_run_all_accepts_max_parallel_keyword() {
+        // :max-parallel implies :parallel; empty list is fine.
+        let mut i = runtime_interp();
+        let v = eval_ok(&mut i, "(run-all (list) :max-parallel 4)");
+        assert_eq!(v, Value::Nil);
+    }
+
+    #[test]
+    fn test_run_all_max_parallel_without_explicit_parallel_flag() {
+        // :max-parallel alone (no explicit :parallel) should also work.
+        let mut i = runtime_interp();
+        let v = eval_ok(&mut i, "(run-all (list) :max-parallel 2)");
+        assert_eq!(v, Value::Nil);
+    }
+
+    #[test]
+    fn test_run_all_rejects_zero_max_parallel() {
+        let mut i = runtime_interp();
+        let err = eval_err(&mut i, "(run-all (list) :max-parallel 0)");
+        assert!(err.contains("positive"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_run_all_rejects_unknown_keyword() {
+        let mut i = runtime_interp();
+        let err = eval_err(&mut i, "(run-all (list) :unknown)");
+        assert!(err.contains("unexpected"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_run_all_parallel_executes_transform_futures() {
+        // Transform futures (lambda-only, no container spawn) work in parallel mode.
+        // The upstream Container future is NOT in the run-all list, so its resolved
+        // value defaults to Nil; the transform lambda still executes on the main
+        // thread and returns the expected derived value.
+        let mut i = runtime_interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "db" :image "alpine:latest" :network "net")
+               (define db-fut  (container-start-async svc))
+               (define url-fut (then db-fut (lambda (x) "postgres://localhost/db")))"#,
+        );
+        // Run only url-fut in parallel mode; db-fut not in list → upstream = Nil.
+        let v = eval_ok(&mut i, "(run-all (list url-fut) :parallel)");
+        let items = v.to_vec().unwrap();
+        assert_eq!(items.len(), 1, "expected one result pair");
+        match &items[0] {
+            Value::Pair(p) => {
+                assert_eq!(p.0, Value::Str("db-then".into()));
+                assert_eq!(p.1, Value::Str("postgres://localhost/db".into()));
+            }
+            other => panic!("expected pair, got: {}", other),
+        }
     }
 }

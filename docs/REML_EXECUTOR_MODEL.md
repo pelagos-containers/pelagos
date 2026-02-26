@@ -34,10 +34,10 @@ transformations.  Nothing happens when a future is created.
 
 Remora ships two executors:
 
-| Executor | Form | Graph model | Cycle detection | Best for |
-|----------|------|-------------|-----------------|----------|
-| Serial static | `run-all` | Full graph declared upfront | ✅ Yes (Kahn's) | Complex multi-service graphs, independent services |
-| Dynamic monadic | `resolve` | Graph unfolds lazily | ❌ No | Linear pipelines, next step depends on previous value |
+| Executor | Form | Graph model | Cycle detection | Parallel | Best for |
+|----------|------|-------------|-----------------|----------|----------|
+| Static | `run-all` | Full graph declared upfront | ✅ Yes (Kahn's) | ✅ `:parallel` / `:max-parallel N` | Complex multi-service graphs, independent services |
+| Dynamic monadic | `resolve` | Graph unfolds lazily | ❌ No | ❌ Sequential by design | Linear pipelines, next step depends on previous value |
 
 ```
 .reml file           futures (descriptions of work)
@@ -50,7 +50,7 @@ Remora ships two executors:
 (run-all)            (resolve)
  static, topo-sort    dynamic, recursive walk, monadic flatten
  cycle detection      no cycle detection, but simpler chain syntax
- future: parallel     future: parallel work-queue
+ :parallel dispatch   sequential by design
 ```
 
 ---
@@ -151,21 +151,42 @@ Returns a `Transform` future that applies `lambda` to the resolved value of
       (format "postgres://app:secret@~a/appdb" (container-ip db)))))
 ```
 
-### `(run-all (list fut ...))`
+### `(run-all (list fut ...) [:parallel] [:max-parallel N])`
 
-Serial executor.  Topologically sorts futures by `:after` dependencies (Kahn's
-algorithm), executes each in order, passes resolved values to `:inject` and
-`then` transforms.  Returns an alist of `(name . resolved-value)` pairs.
+Topologically sorts futures by `:after` dependencies (Kahn's algorithm),
+executes each in order, passes resolved values to `:inject` and `then`
+transforms.  Returns an alist of `(name . resolved-value)` pairs.
 
 Futures not in the list whose IDs appear in `:after` declarations are treated
 as already resolved — they were executed by a prior `await` or `run-all` call.
 
 Raises an error if a dependency cycle is detected.
 
+**Serial mode (default):**
 ```lisp
-(define results
-  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut)))
+(run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut))
 ```
+
+**Parallel mode** — independent futures in each tier are spawned concurrently.
+The dependency graph is the same; only the execution policy changes:
+```lisp
+(run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut) :parallel)
+```
+
+**Parallel with concurrency cap** — at most N container spawns active at once
+within each tier:
+```lisp
+(run-all (list db-fut cache-fut db-url-fut cache-url-fut app-fut)
+         :parallel :max-parallel 4)
+```
+`:max-parallel N` implies `:parallel`; you don't need both.
+
+**Threading model:** `Transform` and `Join` futures always evaluate on the main
+thread (their lambdas capture `Rc` values that are `!Send`).  Only the raw
+container spawn (`do_container_start_inner`) runs in worker threads.  Each
+worker gets owned data (`ServiceSpec`, `String`, `PathBuf`, `Arc<Mutex<...>>`),
+all of which are `Send`.  Results are merged in declaration order before being
+stored in the resolved-values map and the output alist.
 
 ### `(await future [:port P] [:timeout T])`
 
@@ -285,18 +306,18 @@ Serial execution order (one valid topological sort):
 db → cache → db-url → cache-url → migrate → app
 ```
 
-Parallel execution order (with a parallel executor):
+Parallel execution order with `(run-all ... :parallel)`:
 
 ```
-Round 1:  db ∥ cache
-Round 2:  db-url ∥ cache-url          (unblocked after round 1)
-Round 3:  migrate                      (unblocked after db-url)
-Round 4:  app                          (unblocked after migrate + cache-url)
+Tier 1:  db ∥ cache                   (both start simultaneously)
+Tier 2:  db-url ∥ cache-url           (unblocked after tier 1 completes)
+Tier 3:  migrate                       (unblocked after db-url)
+Tier 4:  app                           (unblocked after migrate + cache-url)
 ```
 
 **No changes to the `.reml` file are needed to switch between serial and
 parallel execution.**  The graph is fully specified by the declarations;
-the executor policy is external.
+the executor policy is a single keyword on the `run-all` call.
 
 ---
 
@@ -436,9 +457,9 @@ marks it as conditional.
   declared in the `run-all` list).  The dynamic tail is not cycle-checked
   upfront, but dynamic tails created by `then` lambdas are structurally
   acyclic — a lambda cannot close over a future that does not yet exist.
-- The parallel executor (future work) will dispatch static tiers as batches.
-  A gateway future's dynamic tail runs after the gateway, so the tail is
-  sequential relative to the gateway but not relative to other independent
+- The parallel executor (`:parallel` on `run-all`) dispatches static tiers as
+  batches.  A gateway future's dynamic tail runs after the gateway, so the tail
+  is sequential relative to the gateway but not relative to other independent
   static futures.
 - Prefer the hybrid form (single `run-all`) over two separate executor calls
   when the conditional branch is a leaf or short tail.  Use two calls
@@ -473,13 +494,10 @@ Swapping executors is a runtime concern, not a language concern.
 
 ## Roadmap
 
-The serial executor is complete.  The next step toward a parallel executor:
-
-1. **Parallel `run-all`** — for each "ready" tier (futures with all deps
-   resolved), spawn one `std::thread` per future and join them before
-   proceeding to the next tier.  Container futures are naturally parallel
-   since `do_container_start` is self-contained.  Transform futures are
-   pure functions and trivially parallelisable.
+1. **Parallel `run-all`** — ✅ **Implemented.**  `:parallel` and `:max-parallel N`
+   keywords dispatch independent tiers concurrently via `std::thread`.
+   Transform/Join futures remain on the main thread; only container spawns go
+   to workers.  Registry uses `Arc<Mutex<...>>` for thread-safe access.
 
 2. **Streaming results** — rather than returning a complete alist at the end,
    expose a channel that futures push results onto as they complete.  Enables

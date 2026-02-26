@@ -27,12 +27,12 @@
 //! graph, and dispatch to threads; all `.reml` files written against this API
 //! would work unchanged.
 
-use std::cell::RefCell;
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static FUTURE_ID: AtomicU64 = AtomicU64::new(1);
@@ -58,7 +58,7 @@ use super::value::{LispError, Value};
 /// Called by [`super::Interpreter::new_with_runtime`].
 pub fn register_runtime_builtins(
     env: &Env,
-    registry: Rc<RefCell<Vec<(String, i32)>>>,
+    registry: Arc<Mutex<Vec<(String, i32)>>>,
     project: String,
     compose_dir: PathBuf,
 ) {
@@ -67,7 +67,7 @@ pub fn register_runtime_builtins(
 
     // ── container-start ────────────────────────────────────────────────────
     {
-        let registry = Rc::clone(&registry);
+        let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "container-start", move |args| {
@@ -253,25 +253,68 @@ pub fn register_runtime_builtins(
     });
 
     // ── run-all ────────────────────────────────────────────────────────────
-    // Graph-aware serial executor.  Topologically sorts futures by :after,
-    // executes each in order, maintains a resolved-values map for :inject
-    // and Transform futures, returns an alist of (name . resolved-value).
+    // Graph-aware executor.  Topologically sorts futures by :after, produces
+    // tiers of independent futures, then executes serially or (with :parallel)
+    // spawns threads for Container futures within each tier.
     //
-    // Transform futures resolve to their lambda's return value (not a handle).
-    // Container futures resolve to a ContainerHandle.
+    // Syntax:
+    //   (run-all futures-list)                    ; serial (default)
+    //   (run-all futures-list :parallel)           ; parallel tiers
+    //   (run-all futures-list :parallel :max-parallel N) ; parallel, ≤N at once
+    //   (run-all futures-list :max-parallel N)    ; :max-parallel implies :parallel
+    //
+    // Transform/Join futures always execute on the main thread (lambdas capture
+    // Rc values which are !Send).  Only the raw container-spawn step runs in
+    // worker threads; their results are converted to ContainerHandles on return.
     //
     // Deps not in the list are treated as already satisfied (resolved externally).
     {
-        let registry = Rc::clone(&registry);
+        let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "run-all", move |args| {
-            if args.len() != 1 {
-                return Err(LispError::new("run-all: expected (list future ...)"));
+            if args.is_empty() {
+                return Err(LispError::new(
+                    "run-all: expected (futures-list [:parallel] [:max-parallel N])",
+                ));
             }
             let future_list = args[0]
                 .to_vec()
                 .map_err(|_| LispError::new("run-all: argument must be a list of futures"))?;
+
+            // Parse optional keywords.
+            let mut parallel = false;
+            let mut max_parallel: Option<usize> = None;
+            let mut ki = 1;
+            while ki < args.len() {
+                match &args[ki] {
+                    Value::Symbol(s) if s == ":parallel" => {
+                        parallel = true;
+                        ki += 1;
+                    }
+                    Value::Symbol(s) if s == ":max-parallel" => {
+                        ki += 1;
+                        match args.get(ki) {
+                            Some(Value::Int(n)) if *n > 0 => {
+                                max_parallel = Some(*n as usize);
+                                parallel = true;
+                            }
+                            _ => {
+                                return Err(LispError::new(
+                                    "run-all: :max-parallel requires a positive integer",
+                                ))
+                            }
+                        }
+                        ki += 1;
+                    }
+                    other => {
+                        return Err(LispError::new(format!(
+                            "run-all: unexpected argument: {}",
+                            other
+                        )))
+                    }
+                }
+            }
 
             use super::eval::eval_apply;
             use crate::lisp::value::FutureKind;
@@ -310,7 +353,10 @@ pub fn register_runtime_builtins(
                 }
             }
 
-            // Kahn's topological sort.
+            // Tier-aware Kahn's topological sort.
+            // Each tier contains futures that are independent of each other and
+            // depend only on futures in earlier tiers — exactly the set that can
+            // be dispatched in parallel.
             let n = entries.len();
             let id_to_idx: std::collections::HashMap<u64, usize> =
                 entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
@@ -324,117 +370,231 @@ pub fn register_runtime_builtins(
                     }
                 }
             }
-            let mut queue: std::collections::VecDeque<usize> =
-                (0..n).filter(|&i| in_degree[i] == 0).collect();
-            let mut order: Vec<usize> = Vec::with_capacity(n);
-            while let Some(i) = queue.pop_front() {
-                order.push(i);
-                for &j in &dependents[i] {
-                    in_degree[j] -= 1;
-                    if in_degree[j] == 0 {
-                        queue.push_back(j);
+            let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+            let mut tiers: Vec<Vec<usize>> = Vec::new();
+            while !ready.is_empty() {
+                let tier = std::mem::take(&mut ready);
+                for &i in &tier {
+                    for &j in &dependents[i] {
+                        in_degree[j] -= 1;
+                        if in_degree[j] == 0 {
+                            ready.push(j);
+                        }
                     }
                 }
+                tiers.push(tier);
             }
-            if order.len() != n {
+            if tiers.iter().map(|t| t.len()).sum::<usize>() != n {
                 return Err(LispError::new("run-all: dependency cycle detected"));
             }
 
-            // Execute in topological order; track resolved values for inject/transform.
+            // Execute tiers; track resolved values for inject/transform.
             let mut resolved: std::collections::HashMap<u64, Value> =
                 std::collections::HashMap::new();
             let mut pairs: Vec<Value> = Vec::with_capacity(n);
 
-            for idx in order {
-                let e = &entries[idx];
-                let result = match &e.kind {
-                    FutureKind::Container { spec, inject } => {
-                        let mut spec = *spec.clone();
-                        // If :inject is present, call it with resolved :after values.
-                        if let Some(inject_fn) = inject {
-                            let dep_vals: Vec<Value> = e
-                                .after_ids
-                                .iter()
-                                .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
-                                .collect();
-                            let env_list = eval_apply(inject_fn, &dep_vals)?;
-                            for pair in env_list.to_vec()? {
-                                match pair {
-                                    Value::Pair(p) => {
-                                        let k = match &p.0 {
-                                            Value::Str(s) => s.clone(),
-                                            Value::Symbol(s) => s.clone(),
-                                            other => {
-                                                return Err(LispError::new(format!(
-                                                "run-all: inject env key must be string, got {}",
-                                                other.type_name()
-                                            )))
-                                            }
-                                        };
-                                        let v = match &p.1 {
-                                            Value::Str(s) => s.clone(),
-                                            other => format!("{}", other),
-                                        };
-                                        spec.env.insert(k, v);
-                                    }
-                                    other => {
-                                        return Err(LispError::new(format!(
-                                        "run-all: inject must return (key . value) pairs, got {}",
-                                        other.type_name()
-                                    )))
-                                    }
+            if !parallel {
+                // ── Serial path ──────────────────────────────────────────────
+                // Identical to the previous implementation; tiers flatten to the
+                // same deterministic topo order.
+                for tier in &tiers {
+                    for &idx in tier {
+                        let e = &entries[idx];
+                        let result = match &e.kind {
+                            FutureKind::Container { spec, inject } => {
+                                let mut spec = *spec.clone();
+                                if let Some(inject_fn) = inject {
+                                    let dep_vals: Vec<Value> = e
+                                        .after_ids
+                                        .iter()
+                                        .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
+                                        .collect();
+                                    let env_list = eval_apply(inject_fn, &dep_vals)?;
+                                    apply_inject_env(&mut spec, env_list, "run-all")?;
+                                }
+                                do_container_start(spec, &project, &compose_dir, &registry)?
+                            }
+                            FutureKind::Transform {
+                                upstream,
+                                transform,
+                            } => {
+                                let upstream_id = upstream.future_id().unwrap_or(0);
+                                let upstream_val =
+                                    resolved.get(&upstream_id).cloned().unwrap_or(Value::Nil);
+                                let result = eval_apply(transform, &[upstream_val])?;
+                                // Monadic flatten: if the lambda returns a Future (conditional
+                                // branch), resolve it dynamically so already-computed values
+                                // are shared and not re-executed.  This is the bridge between
+                                // static and dynamic execution.
+                                match result {
+                                    Value::Future { .. } => resolve_dynamic(
+                                        result,
+                                        &mut resolved,
+                                        &project,
+                                        &compose_dir,
+                                        &registry,
+                                    )?,
+                                    other => other,
+                                }
+                            }
+                            FutureKind::Join { transform } => {
+                                let upstream_vals: Vec<Value> = e
+                                    .after_ids
+                                    .iter()
+                                    .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
+                                    .collect();
+                                let result = eval_apply(transform, &upstream_vals)?;
+                                match result {
+                                    Value::Future { .. } => resolve_dynamic(
+                                        result,
+                                        &mut resolved,
+                                        &project,
+                                        &compose_dir,
+                                        &registry,
+                                    )?,
+                                    other => other,
+                                }
+                            }
+                        };
+                        resolved.insert(e.id, result.clone());
+                        pairs.push(Value::Pair(Rc::new((Value::Str(e.name.clone()), result))));
+                    }
+                }
+            } else {
+                // ── Parallel path ────────────────────────────────────────────
+                // For each tier:
+                //   Phase 1 (main thread): evaluate all lambdas (inject, transform,
+                //     join).  Lambdas capture Rc values so they must stay on the
+                //     main thread.  Container futures with inject produce a prepared
+                //     ServiceSpec; Transform/Join futures produce their result directly.
+                //   Phase 2 (worker threads): spawn prepared Container futures in
+                //     parallel, at most max_parallel at a time.  Each thread gets
+                //     owned data (ServiceSpec, String, PathBuf, Arc<Mutex<...>>).
+                //   Results are merged in declaration order for a deterministic alist.
+
+                let chunk_size = max_parallel.unwrap_or(0); // 0 = all at once
+
+                for tier in &tiers {
+                    let mut tier_results: Vec<(usize, Value)> = Vec::new();
+                    let mut container_jobs: Vec<(usize, ServiceSpec)> = Vec::new();
+
+                    // Phase 1: evaluate lambdas on main thread.
+                    for &idx in tier {
+                        let e = &entries[idx];
+                        match &e.kind {
+                            FutureKind::Container { spec, inject } => {
+                                let mut spec = *spec.clone();
+                                if let Some(inject_fn) = inject {
+                                    let dep_vals: Vec<Value> = e
+                                        .after_ids
+                                        .iter()
+                                        .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
+                                        .collect();
+                                    let env_list = eval_apply(inject_fn, &dep_vals)?;
+                                    apply_inject_env(&mut spec, env_list, "run-all")?;
+                                }
+                                container_jobs.push((idx, spec));
+                            }
+                            FutureKind::Transform {
+                                upstream,
+                                transform,
+                            } => {
+                                let upstream_id = upstream.future_id().unwrap_or(0);
+                                let upstream_val =
+                                    resolved.get(&upstream_id).cloned().unwrap_or(Value::Nil);
+                                let result = eval_apply(transform, &[upstream_val])?;
+                                let result = match result {
+                                    Value::Future { .. } => resolve_dynamic(
+                                        result,
+                                        &mut resolved,
+                                        &project,
+                                        &compose_dir,
+                                        &registry,
+                                    )?,
+                                    other => other,
+                                };
+                                tier_results.push((idx, result));
+                            }
+                            FutureKind::Join { transform } => {
+                                let upstream_vals: Vec<Value> = e
+                                    .after_ids
+                                    .iter()
+                                    .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
+                                    .collect();
+                                let result = eval_apply(transform, &upstream_vals)?;
+                                let result = match result {
+                                    Value::Future { .. } => resolve_dynamic(
+                                        result,
+                                        &mut resolved,
+                                        &project,
+                                        &compose_dir,
+                                        &registry,
+                                    )?,
+                                    other => other,
+                                };
+                                tier_results.push((idx, result));
+                            }
+                        }
+                    }
+
+                    // Phase 2: spawn container threads.
+                    // Use one big chunk (fully parallel) unless max_parallel is set.
+                    let effective_chunk = if chunk_size == 0 {
+                        container_jobs.len().max(1)
+                    } else {
+                        chunk_size
+                    };
+                    for chunk in container_jobs.chunks(effective_chunk) {
+                        let mut handles: Vec<(
+                            usize,
+                            std::thread::JoinHandle<Result<SpawnResult, LispError>>,
+                        )> = Vec::new();
+
+                        for (idx, spec) in chunk {
+                            let idx = *idx;
+                            let spec = spec.clone();
+                            let project_owned = (*project).clone();
+                            let compose_dir_owned = (*compose_dir).clone();
+                            let registry_arc = Arc::clone(&registry);
+                            let handle = std::thread::spawn(move || {
+                                do_container_start_inner(
+                                    spec,
+                                    &project_owned,
+                                    &compose_dir_owned,
+                                    &registry_arc,
+                                )
+                            });
+                            handles.push((idx, handle));
+                        }
+
+                        for (idx, handle) in handles {
+                            match handle.join() {
+                                Ok(Ok(r)) => {
+                                    let val = Value::ContainerHandle {
+                                        name: r.name,
+                                        pid: r.pid,
+                                        ip: r.ip,
+                                    };
+                                    tier_results.push((idx, val));
+                                }
+                                Ok(Err(e)) => return Err(e),
+                                Err(_) => {
+                                    return Err(LispError::new("run-all: a worker thread panicked"))
                                 }
                             }
                         }
-                        do_container_start(spec, &project, &compose_dir, &registry)?
                     }
-                    FutureKind::Transform {
-                        upstream,
-                        transform,
-                    } => {
-                        let upstream_id = upstream.future_id().unwrap_or(0);
-                        let upstream_val =
-                            resolved.get(&upstream_id).cloned().unwrap_or(Value::Nil);
-                        let result = eval_apply(transform, &[upstream_val])?;
-                        // Monadic flatten: if the lambda returns a Future (conditional
-                        // branch), resolve it dynamically using our resolved map so
-                        // already-computed values are shared and not re-executed.
-                        // This is the bridge between static and dynamic execution:
-                        // the static graph runs with full topo-sort; any conditional
-                        // tail resolves inline without dragging the whole graph into
-                        // dynamic mode.
-                        match result {
-                            Value::Future { .. } => resolve_dynamic(
-                                result,
-                                &mut resolved,
-                                &project,
-                                &compose_dir,
-                                &registry,
-                            )?,
-                            other => other,
-                        }
+
+                    // Merge tier results in declaration order (deterministic alist).
+                    tier_results.sort_by_key(|(idx, _)| *idx);
+                    for (idx, val) in tier_results {
+                        resolved.insert(entries[idx].id, val.clone());
+                        pairs.push(Value::Pair(Rc::new((
+                            Value::Str(entries[idx].name.clone()),
+                            val,
+                        ))));
                     }
-                    FutureKind::Join { transform } => {
-                        let upstream_vals: Vec<Value> = e
-                            .after_ids
-                            .iter()
-                            .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
-                            .collect();
-                        let result = eval_apply(transform, &upstream_vals)?;
-                        match result {
-                            Value::Future { .. } => resolve_dynamic(
-                                result,
-                                &mut resolved,
-                                &project,
-                                &compose_dir,
-                                &registry,
-                            )?,
-                            other => other,
-                        }
-                    }
-                };
-                resolved.insert(e.id, result.clone());
-                pairs.push(Value::Pair(Rc::new((Value::Str(e.name.clone()), result))));
+                }
             }
 
             Ok(Value::list(pairs.into_iter()))
@@ -456,7 +616,7 @@ pub fn register_runtime_builtins(
     // known; use resolve for linear pipelines or when the next step depends
     // on the runtime value of the previous one.
     {
-        let registry = Rc::clone(&registry);
+        let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "resolve", move |args| {
@@ -488,7 +648,7 @@ pub fn register_runtime_builtins(
     // optionally waiting for a TCP port.  Keywords: :port <int>, :timeout <num>.
     // Transform futures are not supported by await (use run-all or resolve).
     {
-        let registry = Rc::clone(&registry);
+        let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "await", move |args| {
@@ -589,7 +749,7 @@ pub fn register_runtime_builtins(
 
     // ── container-stop ─────────────────────────────────────────────────────
     {
-        let registry = Rc::clone(&registry);
+        let registry = Arc::clone(&registry);
         native(env, "container-stop", move |args| {
             if args.len() != 1 {
                 return Err(LispError::new(
@@ -601,7 +761,7 @@ pub fn register_runtime_builtins(
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGTERM,
             );
-            registry.borrow_mut().retain(|(n, _)| n != &name);
+            registry.lock().unwrap().retain(|(n, _)| n != &name);
             Ok(Value::Nil)
         });
     }
@@ -627,7 +787,7 @@ pub fn register_runtime_builtins(
 
     // ── container-run ──────────────────────────────────────────────────────
     {
-        let registry = Rc::clone(&registry);
+        let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "container-run", move |args| {
@@ -646,7 +806,7 @@ pub fn register_runtime_builtins(
                     _ => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
-            registry.borrow_mut().retain(|(n, _)| n != &name);
+            registry.lock().unwrap().retain(|(n, _)| n != &name);
             Ok(Value::Int(0))
         });
     }
@@ -764,7 +924,7 @@ fn resolve_dynamic(
     resolved: &mut std::collections::HashMap<u64, Value>,
     project: &str,
     compose_dir: &std::path::Path,
-    registry: &Rc<RefCell<Vec<(String, i32)>>>,
+    registry: &Arc<Mutex<Vec<(String, i32)>>>,
 ) -> Result<Value, LispError> {
     use super::eval::eval_apply;
     use crate::lisp::value::FutureKind;
@@ -790,33 +950,7 @@ fn resolve_dynamic(
                     let mut spec = *spec;
                     if let Some(inj) = inject {
                         let env_list = eval_apply(&inj, &after_vals)?;
-                        for pair in env_list.to_vec()? {
-                            match pair {
-                                Value::Pair(p) => {
-                                    let k = match &p.0 {
-                                        Value::Str(s) => s.clone(),
-                                        Value::Symbol(s) => s.clone(),
-                                        other => {
-                                            return Err(LispError::new(format!(
-                                                "resolve: inject env key must be string, got {}",
-                                                other.type_name()
-                                            )))
-                                        }
-                                    };
-                                    let v = match &p.1 {
-                                        Value::Str(s) => s.clone(),
-                                        other => format!("{}", other),
-                                    };
-                                    spec.env.insert(k, v);
-                                }
-                                other => {
-                                    return Err(LispError::new(format!(
-                                        "resolve: inject must return (key . value) pairs, got {}",
-                                        other.type_name()
-                                    )))
-                                }
-                            }
-                        }
+                        apply_inject_env(&mut spec, env_list, "resolve")?;
                     }
                     do_container_start(spec, project, compose_dir, registry)?
                 }
@@ -859,12 +993,42 @@ fn resolve_dynamic(
 // Core container-start logic
 // ---------------------------------------------------------------------------
 
+/// Thread-safe result of spawning a container.
+///
+/// Unlike [`Value::ContainerHandle`], this struct is `Send` (no `Rc` fields),
+/// so it can be returned from worker threads in the parallel executor.
+struct SpawnResult {
+    name: String,
+    pid: i32,
+    ip: Option<String>,
+}
+
+/// Spawn a container and return a [`Value::ContainerHandle`].
+///
+/// This is a thin wrapper around [`do_container_start_inner`] for callers on
+/// the main thread that need a `Value` directly.
 fn do_container_start(
     svc: ServiceSpec,
     project: &str,
     compose_dir: &std::path::Path,
-    registry: &Rc<RefCell<Vec<(String, i32)>>>,
+    registry: &Arc<Mutex<Vec<(String, i32)>>>,
 ) -> Result<Value, LispError> {
+    let r = do_container_start_inner(svc, project, compose_dir, registry)?;
+    Ok(Value::ContainerHandle {
+        name: r.name,
+        pid: r.pid,
+        ip: r.ip,
+    })
+}
+
+/// Core container spawn logic.  Returns a [`SpawnResult`] that is `Send`,
+/// enabling use from worker threads in the parallel executor.
+fn do_container_start_inner(
+    svc: ServiceSpec,
+    project: &str,
+    compose_dir: &std::path::Path,
+    registry: &Arc<Mutex<Vec<(String, i32)>>>,
+) -> Result<SpawnResult, LispError> {
     // Resolve image.
     let image_ref = &svc.image;
     let (_, manifest) = resolve_image(image_ref)?;
@@ -1095,7 +1259,7 @@ fn do_container_start(
     });
 
     // Register in interpreter's cleanup registry.
-    registry.borrow_mut().push((container_name.clone(), pid));
+    registry.lock().unwrap().push((container_name.clone(), pid));
 
     log::info!(
         "container-start: '{}' started (pid {}, ip {:?})",
@@ -1104,7 +1268,7 @@ fn do_container_start(
         ip
     );
 
-    Ok(Value::ContainerHandle {
+    Ok(SpawnResult {
         name: container_name,
         pid,
         ip,
@@ -1114,6 +1278,46 @@ fn do_container_start(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Apply an `(inject ...)` result — a list of `(key . value)` pairs — to a
+/// `ServiceSpec`'s env map.  Used in both the serial and parallel executor
+/// paths to avoid duplicating the pair-parsing logic.
+fn apply_inject_env(
+    spec: &mut ServiceSpec,
+    env_list: Value,
+    caller: &str,
+) -> Result<(), LispError> {
+    for pair in env_list.to_vec()? {
+        match pair {
+            Value::Pair(p) => {
+                let k = match &p.0 {
+                    Value::Str(s) => s.clone(),
+                    Value::Symbol(s) => s.clone(),
+                    other => {
+                        return Err(LispError::new(format!(
+                            "{}: inject env key must be string, got {}",
+                            caller,
+                            other.type_name()
+                        )))
+                    }
+                };
+                let v = match &p.1 {
+                    Value::Str(s) => s.clone(),
+                    other => format!("{}", other),
+                };
+                spec.env.insert(k, v);
+            }
+            other => {
+                return Err(LispError::new(format!(
+                    "{}: inject must return (key . value) pairs, got {}",
+                    caller,
+                    other.type_name()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Register a native function closure into `env`.
 fn native<F>(env: &Env, name: &str, f: F)

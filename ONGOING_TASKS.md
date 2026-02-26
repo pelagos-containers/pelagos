@@ -1,6 +1,40 @@
 # Ongoing Tasks
 
-## Current Task: Dual Executor Model Complete (Feb 25, 2026) ✅
+## Parallel Execution in `run-all` — COMPLETE (Feb 25, 2026) ✅
+
+### What shipped
+
+- **Registry type change**: `container_registry: Rc<RefCell<...>>` → `Arc<Mutex<...>>`
+  in `src/lisp/mod.rs` (field + Drop) and throughout `src/lisp/runtime.rs`.
+  Zero performance regression in single-threaded code.
+
+- **`SpawnResult` struct**: thread-safe (no `Rc`) result of container spawning.
+  `do_container_start_inner` returns `SpawnResult`; `do_container_start` wraps
+  it with `Value::ContainerHandle` for callers on the main thread.
+
+- **`apply_inject_env` helper**: extracted from inject logic shared between
+  serial and parallel paths.
+
+- **Tier-aware Kahn's sort**: flat `Vec<usize>` → `Vec<Vec<usize>>` tiers.
+  Serial path flattens tiers identically to the old order — fully backward-
+  compatible.
+
+- **Parallel path**: `:parallel` / `:max-parallel N` keywords on `run-all`.
+  Phase 1 evaluates all lambdas on main thread (Rc-safe).  Phase 2 spawns
+  `std::thread` for each container job in the tier; results collected,
+  sorted to declaration order, merged into resolved map and alist output.
+
+- **6 new unit tests**: keyword parsing, zero-max-parallel rejection, unknown
+  keyword rejection, Transform futures in parallel mode.
+
+- **`docs/REML_EXECUTOR_MODEL.md`**: executor table updated, `run-all` API
+  section expanded, parallel execution order diagram added, roadmap updated.
+
+**241 lib tests pass; clippy clean; fmt clean.**
+
+---
+
+## Previous: Dual Executor Model Complete (Feb 25, 2026) ✅
 
 ### Context
 
