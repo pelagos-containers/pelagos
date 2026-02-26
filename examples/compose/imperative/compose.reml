@@ -6,9 +6,9 @@
 ;;;
 ;;; Dependency graph:
 ;;;
-;;;   db ──→ db-url ──→ migrate
-;;;   db ──→ db-url ──→ app
-;;;   cache ──→ cache-url ──→ app
+;;;   db ──→ db-url ──→ migrate ──→ app
+;;;   db ──→ db-url ─────────────→ app  (DATABASE_URL env)
+;;;   cache ──→ cache-url ─────────→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
@@ -57,10 +57,10 @@
   :needs (list db-url)
   :env   (lambda (url) `(("DATABASE_URL" . ,url)))))
 
-;; Application: needs both URLs
+;; Application: waits for migration to complete, then starts with both URLs
 (define app (start svc-app
-  :needs (list db-url cache-url)
-  :env   (lambda (db-url cache-url)
+  :needs (list migrate db-url cache-url)
+  :env   (lambda (_ db-url cache-url)
            `(("DATABASE_URL" . ,db-url)
              ("CACHE_URL"    . ,cache-url)))))
 
@@ -80,8 +80,8 @@
 (logf "cache-url: ~a" cache-url)
 
 ;; Wait for app to finish.  container-wait cascades container-stop through
-;; app's transitive dependencies (cache, db) automatically — the same
-;; dependency graph that governed startup governs shutdown.
+;; app's transitive dependencies (migrate, cache, db) automatically — the
+;; same dependency graph that governed startup governs shutdown.
 ;; The cleanup lambda receives only the result signal: (ok exit-code) or
 ;; (err reason).  No manual stop calls needed.
 (with-cleanup (lambda (result)
