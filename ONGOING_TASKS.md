@@ -2,6 +2,10 @@
 
 ## Current: (nothing pending — session wrap-up Feb 27, 2026)
 
+See [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md) for the tracked delta between
+Remora and a full Docker Desktop / Finch equivalent.  Critical gaps (registry
+auth, image push) are the next natural targets.
+
 All work from this session has been committed and pushed.  See "Completed this
 session" below for the full list.
 

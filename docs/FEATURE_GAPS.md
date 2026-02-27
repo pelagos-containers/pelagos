@@ -1,0 +1,134 @@
+# Feature Gaps vs. Finch / Docker Desktop
+
+This document tracks the delta between Remora and a full Docker Desktop / Finch
+equivalent.  The goal is to whittle this list down over time.  Items are roughly
+ordered by impact.
+
+---
+
+## Context
+
+**Finch** is a Mac packaging layer that bundles Lima (VM) + nerdctl (CLI) +
+containerd (daemon) + runc (runtime) + BuildKit (image builder) into a single
+`brew install finch`.  It is integration and packaging work, not runtime work.
+
+**Remora** is the opposite end of the stack: it implements container isolation,
+networking, image management, and orchestration from scratch on Linux kernel
+interfaces, with no daemon and no CNI plugins underneath.
+
+The natural comparison is **Remora vs. runc** (same layer), but Remora extends
+upward into networking, image management, and programmable orchestration as
+first-class concerns — territory runc explicitly does not cover.
+
+---
+
+## What Remora already has
+
+| Capability | Notes |
+|------------|-------|
+| Container runtime | Namespaces (UTS/Mount/IPC/Net/PID/Cgroup), seccomp-BPF, capabilities, no-new-privileges, masked paths |
+| Security-by-default | All four hardening defaults applied unconditionally to every container |
+| OCI image pull | Anonymous pulls from any OCI registry; content-addressable layer store |
+| Image build | `remora build` — Remfile (Dockerfile-compatible), multi-stage, ARG, ADD (URLs + archives), build cache, `.remignore` |
+| Networking | Loopback, bridge, NAT, TCP port mapping, DNS service discovery, named networks, multi-network containers, pasta (rootless) |
+| Multi-service orchestration | `remora compose up/down/ps/logs` — Lisp DSL + futures graph executor |
+| Imperative scripting | `.reml` Lisp interpreter: `container-start`, `await-port`, `with-cleanup`, `guard`, parallel graph |
+| Interactive containers | PTY, SIGWINCH relay, terminal restore |
+| `remora exec` | Namespace join + PTY |
+| Volumes / bind mounts / tmpfs / overlay | Full filesystem flexibility |
+| Rootless mode | Pull, build, run, overlay (native or fuse), pasta networking |
+| OCI Runtime Spec | `create` / `start` / `state` / `kill` / `delete` lifecycle |
+| Library API | Embeddable Rust crate — no daemon or subprocess needed |
+
+---
+
+## Gaps
+
+### Critical (blocks real-world use)
+
+#### Registry authentication
+**What's missing:** Pulling from private registries — ECR, GCR, Docker Hub
+private repos, any registry requiring a token or credentials.  We only support
+anonymous pulls today.
+
+**What's needed:** Docker credential helper protocol, `~/.docker/config.json`
+parsing, OAuth2 token exchange for ECR/GCR, basic auth for self-hosted registries.
+
+---
+
+#### Image push
+**What's missing:** `remora image push` — distributing images you've built.
+Without push, the build pipeline is local-only; you can't feed CI/CD or share
+images between hosts.
+
+**What's needed:** OCI distribution spec push (chunked upload, manifest PUT),
+auth integration (same as pull).
+
+---
+
+### Significant (limits daily usefulness)
+
+#### `remora image save` / `remora image load`
+Exporting a built image as a tar archive and re-importing it.  Essential for
+air-gapped environments, CI artifact hand-off, and transferring images between
+hosts without a registry.
+
+---
+
+#### UDP port mapping
+We only handle TCP DNAT today.  UDP is required for DNS, QUIC/HTTP3, gaming
+servers, VoIP, and many other protocols.
+
+---
+
+#### Container healthchecks
+Dockerfile `HEALTHCHECK` instruction and runtime health monitoring.  Currently
+compose readiness is TCP-port-only; no support for exec-based health probes or
+HTTP checks.
+
+---
+
+#### Proper image tagging
+`remora tag <image> <newtag>` — creating aliases and multiple tags per manifest.
+Currently images are addressed by their pull reference only.
+
+---
+
+### Nice to have
+
+#### BuildKit feature parity
+BuildKit (used by Finch/Docker) is a separate high-performance build daemon with:
+- **Parallel stage execution** — independent FROM stages run concurrently
+- **Remote build cache** — push/pull layer cache to/from a registry
+- **SSH agent forwarding** in RUN steps (`--mount=type=ssh`)
+- **Secret mounts** (`--mount=type=secret`) — secrets available during build, not baked into layers
+- **`--platform` cross-compilation** — build amd64 images on arm64 and vice versa
+
+Our builder is solid and covers the common case, but is sequential and
+local-cache-only.
+
+---
+
+#### `docker save` / `docker load` tar format compatibility
+Our `image save`/`load` (once implemented) should ideally speak the Docker legacy
+tar format so images can be exchanged with Docker hosts without a registry.
+
+---
+
+#### Mac / Windows host support
+Finch's primary value proposition is the Lima VM wrapper that makes Linux
+containers work transparently on Mac.  Remora is Linux-only by nature — all the
+interesting code is Linux kernel interfaces.  A Lima-based wrapper (`remora-mac`
+or similar) could provide the same experience, but this is a separate packaging
+project, not a runtime gap.
+
+---
+
+## Dropped / out of scope
+
+| Item | Reason |
+|------|--------|
+| containerd / daemon | Explicitly out of scope — daemonless is a design principle |
+| CNI plugins | We implement networking natively; CNI adds complexity without benefit |
+| Kubernetes CRI | Possible future direction, not current scope |
+| Windows containers | Linux-only runtime; not planned |

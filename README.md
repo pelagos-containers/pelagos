@@ -290,6 +290,7 @@ requires syscalls it would otherwise block.
 | [`docs/INTEGRATION_TESTS.md`](docs/INTEGRATION_TESTS.md) | Every integration test documented |
 | [`docs/DESIGN_PRINCIPLES.md`](docs/DESIGN_PRINCIPLES.md) | Non-negotiable design principles |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
+| [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md) | Gap analysis vs. Docker Desktop / Finch |
 | [`docs/RUNTIME_COMPARISON.md`](docs/RUNTIME_COMPARISON.md) | Full feature matrix vs runc/Docker |
 | [`docs/SECCOMP_DEEP_DIVE.md`](docs/SECCOMP_DEEP_DIVE.md) | Seccomp-BPF implementation details |
 | [`docs/PTY_DEEP_DIVE.md`](docs/PTY_DEEP_DIVE.md) | PTY/interactive session design |
