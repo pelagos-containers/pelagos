@@ -6,25 +6,27 @@
 ;;; Key difference from compose.reml:
 ;;;
 ;;;   compose.reml       — static: full graph declared before execution;
-;;;                        run topo-sorts and cycle-detects upfront.
+;;;                        run topo-sorts and cycle-detects upfront;
+;;;                        ContainerHandle.deps populated → cascade teardown.
 ;;;
 ;;;   compose-chain.reml — dynamic: each (then ...) lambda returns the
 ;;;                        *next* node; the graph unfolds as execution
 ;;;                        proceeds.  No upfront graph declaration needed.
+;;;                        resolve does not populate deps → teardown is manual.
 ;;;
 ;;; When to use each:
 ;;;
 ;;;   run     — complex multi-service graphs, independent services that
 ;;;             can run in parallel (db ∥ cache), or when you want upfront
-;;;             cycle detection.
+;;;             cycle detection and automatic cascade teardown.
 ;;;
 ;;;   resolve — linear pipelines where each step depends on the *value*
 ;;;             produced by the previous step, and the next node cannot
 ;;;             be described until that value is known.
 ;;;
-;;; Dependency graph (same as compose.reml):
+;;; Dependency graph:
 ;;;
-;;;   db ──→ (then db-url) ──→ migrate ──→ (then) ──→ app
+;;;   db ──→ (then: compute db-url) ──→ migrate ──→ (then: start app) ──→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose-chain.reml -p chain-demo
@@ -41,14 +43,14 @@
 (define-service svc-migrate "migrate"
   :image   "alpine:latest"
   :network "app-net"
-  :command '("/bin/sh" "-c"
-             "echo \"migrating ${DATABASE_URL}\"; exit 0"))
+  :command "/bin/sh" "-c"
+           "echo \"migrating ${DATABASE_URL}\"; exit 0")
 
 (define-service svc-app "app"
   :image   "alpine:latest"
   :network "app-net"
-  :command '("/bin/sh" "-c"
-             "echo \"db=${DATABASE_URL}\"; sleep 5; echo done"))
+  :command "/bin/sh" "-c"
+           "echo \"db=${DATABASE_URL}\"; sleep 30; echo done")
 
 ;; ── Declare the chain — nothing executes yet ─────────────────────────────
 ;;
@@ -83,11 +85,19 @@
 
 ;; ── Execute: dynamic executor resolves the chain ──────────────────────────
 
-(define app (resolve pipeline))
+(define app-handle (resolve pipeline))
+(logf "app started: ~a" app-handle)
 
-;; ── Post-execution ────────────────────────────────────────────────────────
+;; ── Wait and clean up ─────────────────────────────────────────────────────
+;;
+;; resolve does not populate ContainerHandle.deps, so cascade teardown is
+;; not automatic — db must be stopped explicitly.  (contrast: compose.reml
+;; uses run, which populates deps and stops db automatically.)
 
-(logf "app started: ~a" app)
-(container-wait app)
-(container-stop app)
+(with-cleanup (lambda (result)
+                (container-stop db)
+                (if (ok? result)
+                  (logf "app exited cleanly (code ~a)" (ok-value result))
+                  (logf "app failed: ~a" (err-reason result))))
+  (container-wait app-handle))
 (log "Done")

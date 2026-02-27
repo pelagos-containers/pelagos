@@ -1,0 +1,85 @@
+;;; Parallel eager example — overlapping container startup latency
+;;;
+;;; db and cache are kicked off simultaneously with container-start-bg.
+;;; The script continues immediately; it only blocks at container-join
+;;; when a resolved value is actually needed.  Startup latency of db
+;;; and cache overlaps rather than stacking.
+;;;
+;;; When to use:
+;;;   Independent services whose startup can be overlapped, but you want
+;;;   immediate imperative control rather than the declarative graph model.
+;;;
+;;; Compare with:
+;;;   compose.reml                  — graph model: topo-sort, :parallel tiers,
+;;;                                   cascade teardown — preferred for complex graphs
+;;;   compose-eager-sequential.reml — same model, strictly serial
+;;;
+;;; Usage:
+;;;   sudo -E remora compose up -f compose-eager-parallel.reml -p eager-par
+
+;; ── Service declarations ──────────────────────────────────────────────────
+
+(define-service svc-db "db"
+  :image   "postgres:16"
+  :network "app-net"
+  :env     ("POSTGRES_PASSWORD" . "secret")
+           ("POSTGRES_DB"       . "appdb")
+           ("POSTGRES_USER"     . "app"))
+
+(define-service svc-cache "cache"
+  :image   "redis:7-alpine"
+  :network "app-net")
+
+(define-service svc-migrate "migrate"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command "/bin/sh" "-c"
+           "echo \"migrating ${DATABASE_URL}\"; exit 0")
+
+(define-service svc-app "app"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command "/bin/sh" "-c"
+           "echo \"db=${DATABASE_URL} cache=${CACHE_URL}\"; sleep 30; echo done")
+
+;; ── Parallel startup ──────────────────────────────────────────────────────
+
+;; Kick off db and cache simultaneously — both start in background threads.
+(define db-pending    (container-start-bg svc-db))
+(define cache-pending (container-start-bg svc-cache))
+
+;; Both are starting now.  Nothing blocks until container-join is called.
+
+(define db    (container-join db-pending))
+(define cache (container-join cache-pending))
+
+(define db-url    (format "postgres://app:secret@~a/appdb" (container-ip db)))
+(define cache-url (format "redis://~a:6379" (container-ip cache)))
+(logf "db at ~a, cache at ~a" (container-ip db) (container-ip cache))
+
+;; Run migrations against the now-ready db.
+(define migrate (container-start svc-migrate
+                  :env (list (cons "DATABASE_URL" db-url))))
+(define exit-code (container-wait migrate))
+(when (not (= exit-code 0))
+  (container-stop cache)
+  (container-stop db)
+  (errorf "migrations failed with exit code ~a" exit-code))
+(logf "migrations complete (exit ~a)" exit-code)
+
+;; Start app with both URLs injected.
+(define app (container-start svc-app
+              :env (list (cons "DATABASE_URL" db-url)
+                         (cons "CACHE_URL"    cache-url))))
+(logf "app started at ~a" (container-ip app))
+
+;; ── Wait and clean up ─────────────────────────────────────────────────────
+
+(with-cleanup (lambda (result)
+                (container-stop cache)
+                (container-stop db)
+                (if (ok? result)
+                  (logf "app exited cleanly (code ~a)" (ok-value result))
+                  (logf "app failed: ~a" (err-reason result))))
+  (container-wait app))
+(log "Done")

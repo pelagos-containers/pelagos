@@ -1,0 +1,69 @@
+;;; Sequential eager example — imperative container orchestration
+;;;
+;;; Starts containers one at a time; each result is available immediately
+;;; before the next container is configured and started.  The sequence is
+;;; strictly serial: db → (derive url) → migrate → app.
+;;;
+;;; When to use:
+;;;   Each step's configuration depends on the previous step's resolved value
+;;;   and there is no opportunity for parallelism.  Simpler than the graph
+;;;   model for purely linear chains with no branching.
+;;;
+;;; Compare with:
+;;;   compose.reml              — graph model: parallel tiers, cascade teardown
+;;;   compose-eager-parallel.reml — same model, but db and cache start in parallel
+;;;
+;;; Usage:
+;;;   sudo -E remora compose up -f compose-eager-sequential.reml -p eager-seq
+
+;; ── Service declarations ──────────────────────────────────────────────────
+
+(define-service svc-db "db"
+  :image   "postgres:16"
+  :network "app-net"
+  :env     ("POSTGRES_PASSWORD" . "secret")
+           ("POSTGRES_DB"       . "appdb")
+           ("POSTGRES_USER"     . "app"))
+
+(define-service svc-migrate "migrate"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command "/bin/sh" "-c"
+           "echo \"migrating ${DATABASE_URL}\"; exit 0")
+
+(define-service svc-app "app"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command "/bin/sh" "-c"
+           "echo \"db=${DATABASE_URL}\"; sleep 30; echo done")
+
+;; ── Sequential execution ──────────────────────────────────────────────────
+
+;; Start db and derive the connection URL immediately.
+(define db     (container-start svc-db))
+(define db-url (format "postgres://app:secret@~a/appdb" (container-ip db)))
+(logf "db started at ~a" (container-ip db))
+
+;; Run migrations; bail out if they fail.
+(define migrate (container-start svc-migrate
+                  :env (list (cons "DATABASE_URL" db-url))))
+(define exit-code (container-wait migrate))
+(when (not (= exit-code 0))
+  (container-stop db)
+  (errorf "migrations failed with exit code ~a" exit-code))
+(logf "migrations complete (exit ~a)" exit-code)
+
+;; Start app with the same DATABASE_URL.
+(define app (container-start svc-app
+              :env (list (cons "DATABASE_URL" db-url))))
+(logf "app started at ~a" (container-ip app))
+
+;; ── Wait and clean up ─────────────────────────────────────────────────────
+
+(with-cleanup (lambda (result)
+                (container-stop db)
+                (if (ok? result)
+                  (logf "app exited cleanly (code ~a)" (ok-value result))
+                  (logf "app failed: ~a" (err-reason result))))
+  (container-wait app))
+(log "Done")

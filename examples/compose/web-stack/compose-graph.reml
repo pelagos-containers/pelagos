@@ -1,0 +1,108 @@
+;;; Web-stack — graph model (compose-graph.reml)
+;;;
+;;; The same three-service Remora Blog stack as compose.reml, rewritten
+;;; using the declarative future graph instead of compose-up/supervisor.
+;;;
+;;; Architecture:
+;;;
+;;;   frontend (10.88.1.0/24):  proxy ←→ app
+;;;   backend  (10.88.2.0/24):           app ←→ redis
+;;;
+;;; Dependency graph:
+;;;
+;;;   redis ──→ redis-ready (await-port 6379) ──→ app
+;;;   app   ──→ app-ready   (await-port 5000) ──→ proxy
+;;;
+;;; Contrast with compose.reml (supervisor model):
+;;;
+;;;   compose.reml      — compose-up hands a ComposeFile to the CLI supervisor,
+;;;                       which manages restart policies and long-term lifecycle.
+;;;                       Uses depends-on for TCP readiness checks.
+;;;
+;;;   compose-graph.reml — run executes the graph directly; await-port replaces
+;;;                        depends-on; with-cleanup + container-wait replaces the
+;;;                        supervisor.  You own the lifecycle.
+;;;
+;;; Prerequisites:
+;;;   sudo -E remora build -t web-stack-redis  examples/web-stack/redis
+;;;   sudo -E remora build -t web-stack-app    examples/web-stack/app
+;;;   sudo -E remora build -t web-stack-proxy  examples/web-stack/proxy
+;;;
+;;; Usage:
+;;;   sudo -E remora compose up -f examples/compose/web-stack/compose-graph.reml \
+;;;                              -p web-graph
+
+;; ── Configuration ─────────────────────────────────────────────────────────
+
+(define host-port
+  (let ((p (env "BLOG_PORT")))
+    (if (null? p) 8080 (string->number p))))
+
+;; ── Service declarations ──────────────────────────────────────────────────
+
+(define-service svc-redis "redis"
+  :image   "web-stack-redis:latest"
+  :network "backend"
+  :memory  "64m")
+
+(define-service svc-app "app"
+  :image   "web-stack-app:latest"
+  :network "frontend"
+  :network "backend"
+  :env     ("REDIS_HOST" . "redis")
+           ("REDIS_PORT" . "6379")
+  :memory  "128m")
+
+(define-service svc-proxy "proxy"
+  :image   "web-stack-proxy:latest"
+  :network "frontend"
+  :port    (host-port . 80)
+  :memory  "32m")
+
+;; ── Declare the graph — nothing executes yet ─────────────────────────────
+;;
+;;   redis ──→ redis-ready ──→ app ──→ app-ready ──→ proxy
+
+(define redis (start svc-redis))
+
+;; Gate app startup on redis being ready to accept connections.
+(define-then redis-ready redis (h)
+  (await-port (container-ip h) 6379 30)
+  h)
+
+;; App needs redis-ready (ordering) but uses DNS name "redis" in env.
+(define app (start svc-app
+  :needs (list redis-ready)
+  :env   (lambda (_) '())))
+
+;; Gate proxy startup on app being ready to accept connections.
+(define-then app-ready app (h)
+  (await-port (container-ip h) 5000 30)
+  h)
+
+;; Proxy needs app-ready (ordering); no extra env needed.
+(define proxy (start svc-proxy
+  :needs (list app-ready)
+  :env   (lambda (_) '())))
+
+;; ── Execute and bind ──────────────────────────────────────────────────────
+;;
+;; Only proxy-handle is needed — redis and app are transitive deps and will
+;; be stopped automatically by the cascade when proxy exits.
+
+(define-run :parallel
+  (proxy-handle proxy))
+
+(logf "stack up — proxy listening on port ~a" host-port)
+
+;; ── Wait and clean up ─────────────────────────────────────────────────────
+;;
+;; container-wait cascades container-stop through proxy's transitive deps
+;; (app, redis) automatically in reverse startup order.
+
+(with-cleanup (lambda (result)
+                (if (ok? result)
+                  (logf "proxy exited cleanly (code ~a)" (ok-value result))
+                  (logf "proxy failed: ~a" (err-reason result))))
+  (container-wait proxy-handle))
+(log "Done")
