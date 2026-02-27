@@ -9191,13 +9191,13 @@ mod registry_auth {
         // hashes are no longer supported.
         let test_pass = "testpassword";
         // bcrypt of "testpassword", cost=5 (same as oci-client test fixtures)
-        let htpasswd_entry = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
+        let htpasswd_entry =
+            "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
 
         // ── 1. Build htpasswd file ────────────────────────────────────────────
         let htpasswd_dir = tempfile::tempdir().expect("tempdir for htpasswd");
         let htpasswd_path = htpasswd_dir.path().join("htpasswd");
-        std::fs::write(&htpasswd_path, format!("{}\n", htpasswd_entry))
-            .expect("write htpasswd");
+        std::fs::write(&htpasswd_path, format!("{}\n", htpasswd_entry)).expect("write htpasswd");
 
         // ── 2. Start authenticated registry:2 ─────────────────────────────────
         let _ = std::process::Command::new(bin)
