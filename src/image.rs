@@ -63,6 +63,44 @@ fn ensure_image_dirs() -> io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Health check configuration
+// ---------------------------------------------------------------------------
+
+fn default_health_interval() -> u64 {
+    30
+}
+fn default_health_timeout() -> u64 {
+    10
+}
+fn default_health_retries() -> u32 {
+    3
+}
+
+/// Health check configuration stored in image manifests and container state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    /// Command to run: e.g. `["/bin/sh", "-c", "curl -f http://localhost/"]`.
+    /// Empty vec means the healthcheck is explicitly disabled (`HEALTHCHECK NONE`).
+    pub cmd: Vec<String>,
+    /// Seconds between consecutive health checks.
+    #[serde(default = "default_health_interval")]
+    pub interval_secs: u64,
+    /// Seconds to wait for the check command to complete before declaring it failed.
+    #[serde(default = "default_health_timeout")]
+    pub timeout_secs: u64,
+    /// Seconds to ignore failed checks after container start (grace period).
+    #[serde(default)]
+    pub start_period_secs: u64,
+    /// Number of consecutive failures required to declare the container unhealthy.
+    #[serde(default = "default_health_retries")]
+    pub retries: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Image configuration
+// ---------------------------------------------------------------------------
+
 /// Image configuration extracted from the OCI config JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageConfig {
@@ -84,6 +122,9 @@ pub struct ImageConfig {
     /// Key-value labels (Docker `LABEL`).
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Health check configuration (from `HEALTHCHECK` instruction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<HealthConfig>,
 }
 
 /// Persisted metadata for a pulled image.
@@ -458,6 +499,7 @@ mod tests {
                 working_dir: String::new(),
                 user: String::new(),
                 labels: HashMap::new(),
+                healthcheck: None,
             },
         };
         let json = serde_json::to_string(&manifest).unwrap();
@@ -480,6 +522,7 @@ mod tests {
                 working_dir: String::new(),
                 user: String::new(),
                 labels: HashMap::new(),
+                healthcheck: None,
             },
         };
         let dirs = layer_dirs(&manifest);

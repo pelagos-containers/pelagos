@@ -4,11 +4,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use remora::image::HealthConfig;
+
+/// Health status of a container (tracks persistent health monitor state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    #[default]
+    None,
+    Starting,
+    Healthy,
+    Unhealthy,
+}
+
 pub mod auth;
 pub mod build;
 pub mod cleanup;
 pub mod compose;
 pub mod exec;
+pub mod health;
 pub mod image;
 pub mod logs;
 pub mod network;
@@ -110,6 +124,12 @@ pub struct ContainerState {
     /// Per-network IP addresses: network_name → IP string.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub network_ips: std::collections::HashMap<String, String>,
+    /// Current health status (set by the health monitor thread).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthStatus>,
+    /// Health check configuration (from image HEALTHCHECK instruction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_config: Option<HealthConfig>,
 }
 
 pub fn now_iso8601() -> String {
@@ -555,5 +575,55 @@ mod tests {
             result.is_err(),
             "rootfs_path should fail for nonexistent name"
         );
+    }
+
+    /// test_health_config_serde_roundtrip
+    ///
+    /// Verifies that HealthConfig serializes to JSON and deserializes back
+    /// correctly, preserving all fields. Failure indicates a serde regression.
+    #[test]
+    fn test_health_config_serde_roundtrip() {
+        let hc = HealthConfig {
+            cmd: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "curl -f http://localhost/".into(),
+            ],
+            interval_secs: 15,
+            timeout_secs: 5,
+            start_period_secs: 10,
+            retries: 2,
+        };
+        let json = serde_json::to_string(&hc).unwrap();
+        let decoded: HealthConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.cmd, hc.cmd);
+        assert_eq!(decoded.interval_secs, 15);
+        assert_eq!(decoded.timeout_secs, 5);
+        assert_eq!(decoded.start_period_secs, 10);
+        assert_eq!(decoded.retries, 2);
+    }
+
+    /// test_health_status_missing_field
+    ///
+    /// Verifies that a ContainerState JSON without a `health` field
+    /// deserializes successfully with `health == None` (backward compatibility).
+    /// Failure indicates the serde default is broken.
+    #[test]
+    fn test_health_status_missing_field() {
+        let json = r#"{
+            "name": "test",
+            "rootfs": "alpine",
+            "status": "running",
+            "pid": 1234,
+            "watcher_pid": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+            "exit_code": null,
+            "command": ["/bin/sh"],
+            "stdout_log": null,
+            "stderr_log": null
+        }"#;
+        let state: ContainerState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.health, None);
+        assert!(state.health_config.is_none());
     }
 }

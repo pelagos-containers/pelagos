@@ -174,6 +174,78 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Run `args` in the container identified by `pid`'s namespaces.
+///
+/// Returns:
+/// - `Some(true)` — command exited with status 0
+/// - `Some(false)` — command exited non-zero
+/// - `None` — the container is gone (pid dead, namespaces unreachable)
+///
+/// Discards all output (stdin/stdout/stderr → /dev/null).
+pub fn exec_in_container(pid: i32, args: &[String]) -> Option<bool> {
+    if args.is_empty() || pid <= 0 {
+        return None;
+    }
+
+    let ns_entries = discover_namespaces(pid).ok()?;
+    // If we can't discover any namespaces the container is probably gone.
+    // But allow proceeding (ns_entries may be empty if no namespaces differ).
+
+    let mut cmd = Command::new(&args[0]).args(&args[1..]);
+    cmd = cmd
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null);
+
+    let mut has_mount_ns = false;
+    for (path, ns) in &ns_entries {
+        if *ns == Namespace::MOUNT {
+            has_mount_ns = true;
+        } else {
+            cmd = cmd.with_namespace_join(path, *ns);
+        }
+    }
+
+    if has_mount_ns {
+        let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
+        let mnt_ns_file = std::fs::File::open(&mnt_ns_path).ok()?;
+        let mnt_ns_fd = mnt_ns_file.as_raw_fd();
+
+        let root_path = format!("/proc/{}/root", pid);
+        let root_file = std::fs::File::open(&root_path).ok()?;
+        let root_fd = root_file.as_raw_fd();
+
+        cmd = cmd.with_pre_exec(move || {
+            let _keep_mnt = &mnt_ns_file;
+            let _keep_root = &root_file;
+            unsafe {
+                if libc::setns(mnt_ns_fd, libc::CLONE_NEWNS) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fchdir(root_fd) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let dot = std::ffi::CString::new(".").unwrap();
+                if libc::chroot(dot.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let root_c = std::ffi::CString::new("/").unwrap();
+                if libc::chdir(root_c.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    } else {
+        cmd = cmd.with_chroot(format!("/proc/{}/root", pid));
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => child.wait().map(|s| s.success()).ok(),
+        Err(_) => None,
+    }
+}
+
 /// Compare `/proc/{pid}/ns/{type}` inodes against `/proc/1/ns/{type}` to discover
 /// which namespaces the container process is in (i.e., different from init).
 pub fn discover_namespaces(

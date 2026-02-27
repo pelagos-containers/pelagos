@@ -1889,3 +1889,70 @@ Failure at step 2 means `tag` failed to copy the manifest or OCI config.
 Failure at step 4 means the shared layer store is broken after tagging.
 Failure at step 5 means `tag` stored a reference to the source rather than
 creating its own manifest, so removing source broke the tag.
+
+---
+
+## Healthcheck Tests (`healthcheck_tests` module)
+
+### `healthcheck_tests::test_parse_healthcheck_instruction_roundtrip`
+**Type:** No-root, no-rootfs (parse-only)
+
+Parses three Remfile snippets containing `HEALTHCHECK` instructions and checks
+the resulting `Instruction::Healthcheck` fields:
+
+1. **Shell form** — `HEALTHCHECK --interval=5s --retries=2 CMD /bin/check.sh`
+   → `cmd == ["/bin/sh", "-c", "/bin/check.sh"]`, `interval_secs == 5`, `retries == 2`.
+2. **JSON form** — `HEALTHCHECK CMD ["pg_isready", "-U", "postgres"]`
+   → `cmd == ["pg_isready", "-U", "postgres"]`.
+3. **NONE form** — `HEALTHCHECK NONE`
+   → `cmd` is empty (healthcheck disabled).
+
+Failure indicates the `HEALTHCHECK` Remfile parser (`parse_healthcheck` /
+`parse_duration_str` in `src/build.rs`) is broken.
+
+### `healthcheck_tests::test_health_config_oci_json_roundtrip`
+**Type:** No-root, no-rootfs (serde-only)
+
+Creates a `HealthConfig` with non-default values, serializes it to JSON, and
+deserializes back, asserting all fields survive the round-trip. Also implicitly
+verifies that the default-function annotations for `interval_secs`, `timeout_secs`,
+and `retries` are correct (they are only invoked when the field is absent from JSON).
+
+Failure indicates a serde regression in `HealthConfig` — either a missing
+`#[serde(default = ...)]` annotation or a broken field name.
+
+### `healthcheck_tests::test_healthcheck_exec_true` (`#[ignore]`)
+**Requires:** root + rootfs
+
+Starts a detached container running `sleep 30` via the `remora` CLI, then:
+
+1. Runs `remora exec <name> /bin/true` and asserts exit status 0.
+2. Runs `remora exec <name> /bin/false` and asserts non-zero exit status.
+
+Failure at step 1 means `remora exec` can't join the container's namespaces or
+`/bin/true` is missing from the rootfs. Failure at step 2 means the exit code
+is not being propagated correctly from the exec'd process.
+
+### `healthcheck_tests::test_healthcheck_healthy` (`#[ignore]`)
+**Requires:** root + rootfs
+
+Starts a detached container, then patches `state.json` to inject a
+`health_config` with `cmd = ["/bin/true"]` and `health = "starting"`. Verifies
+that the patched JSON parses correctly (both fields present with expected types).
+Then writes `health = "healthy"` and re-reads to confirm the state file correctly
+stores and returns the `healthy` variant.
+
+This test primarily validates that the `health` and `health_config` fields in
+`state.json` are correctly serialized/deserialized. Failure indicates a serde
+regression in `ContainerState.health` or `ContainerState.health_config`.
+
+### `healthcheck_tests::test_healthcheck_unhealthy` (`#[ignore]`)
+**Requires:** root + rootfs
+
+Starts a detached container, writes `health = "unhealthy"` to `state.json`, and
+re-reads to confirm the `unhealthy` variant round-trips correctly through the
+state file.
+
+Failure indicates the `HealthStatus::Unhealthy` serde variant is broken
+(wrong serialized string or missing enum arm).
+

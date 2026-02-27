@@ -4,7 +4,7 @@
 //! and produces an `ImageManifest` stored in the local image store.
 
 use crate::container::{Command, Namespace, Stdio};
-use crate::image::{self, ImageConfig, ImageManifest};
+use crate::image::{self, HealthConfig, ImageConfig, ImageManifest};
 use crate::network::NetworkMode;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write as _};
@@ -74,6 +74,16 @@ pub enum Instruction {
     Add {
         src: String,
         dest: String,
+    },
+    /// `HEALTHCHECK [flags] CMD <args>` or `HEALTHCHECK NONE`.
+    ///
+    /// When `cmd` is empty this represents `HEALTHCHECK NONE` (disables inherited check).
+    Healthcheck {
+        cmd: Vec<String>,
+        interval_secs: u64,
+        timeout_secs: u64,
+        start_period_secs: u64,
+        retries: u32,
     },
 }
 
@@ -247,6 +257,13 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 };
                 instructions.push(Instruction::Arg { name, default });
             }
+            "HEALTHCHECK" => {
+                let instr = parse_healthcheck(rest).map_err(|msg| BuildError::Parse {
+                    line: line_num,
+                    message: msg,
+                })?;
+                instructions.push(instr);
+            }
             other => {
                 return Err(BuildError::Parse {
                     line: line_num,
@@ -289,6 +306,125 @@ fn parse_cmd_value(rest: &str) -> Result<Vec<String>, String> {
             trimmed.to_string(),
         ])
     }
+}
+
+/// Parse a HEALTHCHECK instruction.
+///
+/// Accepted forms:
+/// - `HEALTHCHECK NONE`
+/// - `HEALTHCHECK [--interval=Xs] [--timeout=Xs] [--start-period=Xs] [--retries=N] CMD <args>`
+///   where args can be a JSON array `["a","b"]` or shell form `curl -f http://localhost/`
+fn parse_healthcheck(rest: &str) -> Result<Instruction, String> {
+    let rest = rest.trim();
+    if rest.eq_ignore_ascii_case("NONE") {
+        return Ok(Instruction::Healthcheck {
+            cmd: vec![],
+            interval_secs: 30,
+            timeout_secs: 10,
+            start_period_secs: 0,
+            retries: 3,
+        });
+    }
+
+    let mut interval_secs: u64 = 30;
+    let mut timeout_secs: u64 = 10;
+    let mut start_period_secs: u64 = 0;
+    let mut retries: u32 = 3;
+
+    // Strip leading flags
+    let mut remaining = rest;
+    loop {
+        let trimmed = remaining.trim_start();
+        if !trimmed.starts_with("--") {
+            remaining = trimmed;
+            break;
+        }
+        // Find next token boundary (whitespace after value)
+        let flag_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let flag = &trimmed[..flag_end];
+        remaining = trimmed[flag_end..].trim_start();
+
+        if let Some(val) = flag.strip_prefix("--interval=") {
+            interval_secs = parse_duration_str(val)?;
+        } else if let Some(val) = flag.strip_prefix("--timeout=") {
+            timeout_secs = parse_duration_str(val)?;
+        } else if let Some(val) = flag.strip_prefix("--start-period=") {
+            start_period_secs = parse_duration_str(val)?;
+        } else if let Some(val) = flag.strip_prefix("--retries=") {
+            retries = val
+                .parse::<u32>()
+                .map_err(|_| format!("HEALTHCHECK: invalid --retries value '{}'", val))?;
+        } else {
+            return Err(format!("HEALTHCHECK: unknown flag '{}'", flag));
+        }
+    }
+
+    // Now remaining should start with CMD
+    let cmd_part = remaining
+        .strip_prefix("CMD")
+        .ok_or_else(|| format!("HEALTHCHECK: expected CMD after flags, got '{}'", remaining))?
+        .trim();
+
+    let cmd = if cmd_part.starts_with('[') {
+        // JSON array form: CMD ["pg_isready", "-U", "postgres"]
+        serde_json::from_str::<Vec<String>>(cmd_part)
+            .map_err(|e| format!("HEALTHCHECK CMD JSON parse error: {}", e))?
+    } else if cmd_part.is_empty() {
+        return Err("HEALTHCHECK CMD requires at least one argument".to_string());
+    } else {
+        // Shell form: wrap in sh -c
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            cmd_part.to_string(),
+        ]
+    };
+
+    if cmd.is_empty() {
+        return Err("HEALTHCHECK CMD cannot be empty".to_string());
+    }
+
+    Ok(Instruction::Healthcheck {
+        cmd,
+        interval_secs,
+        timeout_secs,
+        start_period_secs,
+        retries,
+    })
+}
+
+/// Parse a duration string like `30s`, `1m`, `1m30s`, or a bare integer (seconds).
+fn parse_duration_str(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+    // Bare integer → seconds
+    if let Ok(n) = s.parse::<u64>() {
+        return Ok(n);
+    }
+    let mut total: u64 = 0;
+    let mut buf = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            buf.push(ch);
+        } else {
+            let n: u64 = buf
+                .parse()
+                .map_err(|_| format!("invalid duration '{}'", s))?;
+            buf.clear();
+            match ch {
+                's' => total += n,
+                'm' => total += n * 60,
+                'h' => total += n * 3600,
+                other => return Err(format!("unknown duration unit '{}' in '{}'", other, s)),
+            }
+        }
+    }
+    if !buf.is_empty() {
+        return Err(format!("trailing digits without unit in duration '{}'", s));
+    }
+    Ok(total)
 }
 
 /// Parse LABEL: supports `KEY=VALUE` or `KEY="quoted value"`.
@@ -421,6 +557,19 @@ fn substitute_instruction(instr: &Instruction, vars: &HashMap<String, String>) -
         Instruction::Add { src, dest } => Instruction::Add {
             src: substitute_vars(src, vars),
             dest: substitute_vars(dest, vars),
+        },
+        Instruction::Healthcheck {
+            cmd,
+            interval_secs,
+            timeout_secs,
+            start_period_secs,
+            retries,
+        } => Instruction::Healthcheck {
+            cmd: cmd.iter().map(|a| substitute_vars(a, vars)).collect(),
+            interval_secs: *interval_secs,
+            timeout_secs: *timeout_secs,
+            start_period_secs: *start_period_secs,
+            retries: *retries,
         },
     }
 }
@@ -625,6 +774,27 @@ fn execute_stage(
                 let digest = execute_add(src, dest, context_dir, remignore, &config.working_dir)?;
                 layers.push(digest);
             }
+            Instruction::Healthcheck {
+                ref cmd,
+                interval_secs,
+                timeout_secs,
+                start_period_secs,
+                retries,
+            } => {
+                eprintln!("Step {}/{}: HEALTHCHECK {:?}", step, total, cmd);
+                if cmd.is_empty() {
+                    // HEALTHCHECK NONE — disable inherited healthcheck.
+                    config.healthcheck = None;
+                } else {
+                    config.healthcheck = Some(HealthConfig {
+                        cmd: cmd.clone(),
+                        interval_secs: *interval_secs,
+                        timeout_secs: *timeout_secs,
+                        start_period_secs: *start_period_secs,
+                        retries: *retries,
+                    });
+                }
+            }
         }
     }
 
@@ -823,7 +993,7 @@ fn generate_oci_config_json(config: &ImageConfig, layer_digests: &[String]) -> S
         .map(|d| image::load_blob_diffid(d).unwrap_or_else(|| d.clone()))
         .collect();
 
-    serde_json::json!({
+    let mut oci_config = serde_json::json!({
         "architecture": "amd64",
         "os": "linux",
         "config": {
@@ -839,8 +1009,25 @@ fn generate_oci_config_json(config: &ImageConfig, layer_digests: &[String]) -> S
             "diff_ids": diff_ids,
         },
         "history": []
-    })
-    .to_string()
+    });
+
+    // Embed healthcheck in OCI config format (nanosecond durations).
+    if let Some(ref hc) = config.healthcheck {
+        let test: Vec<serde_json::Value> = {
+            let mut v = vec![serde_json::Value::String("CMD".to_string())];
+            v.extend(hc.cmd.iter().map(|s| serde_json::Value::String(s.clone())));
+            v
+        };
+        oci_config["config"]["Healthcheck"] = serde_json::json!({
+            "Test": test,
+            "Interval": hc.interval_secs * 1_000_000_000u64,
+            "Timeout":  hc.timeout_secs  * 1_000_000_000u64,
+            "StartPeriod": hc.start_period_secs * 1_000_000_000u64,
+            "Retries": hc.retries,
+        });
+    }
+
+    oci_config.to_string()
 }
 
 /// Execute a RUN instruction: spawn a container, wait, capture upper layer.
@@ -2008,5 +2195,108 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         let stages = split_into_stages(&instructions);
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].instructions.len(), 3);
+    }
+
+    // ---------------------------------------------------------------------------
+    // HEALTHCHECK parsing tests
+    // ---------------------------------------------------------------------------
+
+    /// test_parse_healthcheck_cmd_shell_form
+    ///
+    /// Parses `HEALTHCHECK CMD curl -f http://localhost/` in shell form.
+    /// Shell form is wrapped in `["sh", "-c", <cmd>]`.
+    #[test]
+    fn test_parse_healthcheck_cmd_shell_form() {
+        let content = "FROM alpine\nHEALTHCHECK CMD curl -f http://localhost/";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(
+            instructions[1],
+            Instruction::Healthcheck {
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "curl -f http://localhost/".into()
+                ],
+                interval_secs: 30,
+                timeout_secs: 10,
+                start_period_secs: 0,
+                retries: 3,
+            }
+        );
+    }
+
+    /// test_parse_healthcheck_json_form
+    ///
+    /// Parses `HEALTHCHECK CMD ["pg_isready", "-U", "postgres"]` in JSON array form.
+    #[test]
+    fn test_parse_healthcheck_json_form() {
+        let content = r#"FROM alpine
+HEALTHCHECK CMD ["pg_isready", "-U", "postgres"]"#;
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Healthcheck {
+                cmd: vec!["pg_isready".into(), "-U".into(), "postgres".into()],
+                interval_secs: 30,
+                timeout_secs: 10,
+                start_period_secs: 0,
+                retries: 3,
+            }
+        );
+    }
+
+    /// test_parse_healthcheck_none
+    ///
+    /// Parses `HEALTHCHECK NONE` — cmd must be empty (disables inherited check).
+    #[test]
+    fn test_parse_healthcheck_none() {
+        let content = "FROM alpine\nHEALTHCHECK NONE";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Healthcheck {
+                cmd: vec![],
+                interval_secs: 30,
+                timeout_secs: 10,
+                start_period_secs: 0,
+                retries: 3,
+            }
+        );
+    }
+
+    /// test_parse_healthcheck_flags
+    ///
+    /// Parses `HEALTHCHECK --interval=10s --retries=5 CMD /bin/true` with
+    /// custom interval and retries flags.
+    #[test]
+    fn test_parse_healthcheck_flags() {
+        let content =
+            "FROM alpine\nHEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /bin/true";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Healthcheck {
+                cmd: vec!["/bin/sh".into(), "-c".into(), "/bin/true".into()],
+                interval_secs: 10,
+                timeout_secs: 5,
+                start_period_secs: 0,
+                retries: 5,
+            }
+        );
+    }
+
+    /// test_parse_duration_str
+    ///
+    /// Tests the duration parser for various formats.
+    #[test]
+    fn test_parse_duration_str() {
+        assert_eq!(parse_duration_str("30s").unwrap(), 30);
+        assert_eq!(parse_duration_str("1m").unwrap(), 60);
+        assert_eq!(parse_duration_str("1m30s").unwrap(), 90);
+        assert_eq!(parse_duration_str("2h").unwrap(), 7200);
+        assert_eq!(parse_duration_str("30").unwrap(), 30);
+        assert!(parse_duration_str("").is_err());
+        assert!(parse_duration_str("30x").is_err());
     }
 }

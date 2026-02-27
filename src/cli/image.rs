@@ -2,7 +2,7 @@
 
 use remora::image::{
     self, blob_exists, extract_layer, layer_dirs, layer_exists, list_images, load_image,
-    remove_image, save_image, ImageConfig, ImageManifest,
+    remove_image, save_image, HealthConfig, ImageConfig, ImageManifest,
 };
 use std::io::{Read as _, Write};
 
@@ -440,6 +440,79 @@ fn read_password_from_tty() -> Result<String, Box<dyn std::error::Error>> {
 // Config parsing (moved from pull; also used by push round-trip tests)
 // ---------------------------------------------------------------------------
 
+/// Parse an OCI `Healthcheck` config block into a [`HealthConfig`].
+///
+/// OCI nanosecond durations are converted to seconds (divide by 1_000_000_000).
+/// Returns `None` when the block is absent or disabled (`["NONE"]`).
+fn parse_oci_healthcheck(container_config: Option<&serde_json::Value>) -> Option<HealthConfig> {
+    let hc = container_config?.get("Healthcheck")?;
+    let test = hc.get("Test").and_then(|v| v.as_array())?;
+    if test.is_empty() {
+        return None;
+    }
+    let first = test[0].as_str().unwrap_or("");
+    if first == "NONE" {
+        return None;
+    }
+    let cmd: Vec<String> = match first {
+        "CMD" => test[1..]
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        "CMD-SHELL" => {
+            let shell_cmd = test.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                shell_cmd.to_string(),
+            ]
+        }
+        // Bare list (non-standard, treat as CMD)
+        _ => test
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+    };
+    if cmd.is_empty() {
+        return None;
+    }
+    let ns_to_secs = |field: &str| -> u64 {
+        hc.get(field)
+            .and_then(|v| v.as_u64())
+            .map(|ns| ns / 1_000_000_000)
+            .unwrap_or(0)
+    };
+    let interval_secs = {
+        let v = ns_to_secs("Interval");
+        if v == 0 {
+            30
+        } else {
+            v
+        }
+    };
+    let timeout_secs = {
+        let v = ns_to_secs("Timeout");
+        if v == 0 {
+            10
+        } else {
+            v
+        }
+    };
+    let start_period_secs = ns_to_secs("StartPeriod");
+    let retries = hc
+        .get("Retries")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(3);
+    Some(HealthConfig {
+        cmd,
+        interval_secs,
+        timeout_secs,
+        start_period_secs,
+        retries,
+    })
+}
+
 /// Parse the OCI image config JSON to extract Env, Cmd, Entrypoint, WorkingDir, User.
 pub(crate) fn parse_image_config(
     config_json: &str,
@@ -503,6 +576,12 @@ pub(crate) fn parse_image_config(
         })
         .unwrap_or_default();
 
+    // Parse OCI Healthcheck block.
+    // OCI format: { "Test": ["CMD", "arg", ...], "Interval": ns, "Timeout": ns,
+    //               "StartPeriod": ns, "Retries": n }
+    // "Test" variants: ["NONE"], ["CMD", ...], ["CMD-SHELL", "shell_cmd"]
+    let healthcheck = parse_oci_healthcheck(container_config);
+
     Ok(ImageConfig {
         env,
         cmd,
@@ -510,6 +589,7 @@ pub(crate) fn parse_image_config(
         working_dir,
         user,
         labels,
+        healthcheck,
     })
 }
 

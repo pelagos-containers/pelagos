@@ -1,5 +1,78 @@
 # Ongoing Tasks
 
+## Last completed: Container Healthchecks (2026-02-27)
+
+### What was done
+
+**`src/image.rs`**
+- Added `HealthConfig` struct with serde defaults for interval/timeout/retries
+- Added `healthcheck: Option<HealthConfig>` to `ImageConfig`
+
+**`src/cli/image.rs`**
+- Added `parse_oci_healthcheck()` — maps OCI `Healthcheck` JSON block
+  (nanosecond durations, `Test: ["CMD", ...]`) to `HealthConfig`
+- `parse_image_config` now populates `healthcheck`
+
+**`src/cli/mod.rs`**
+- Added `HealthStatus` enum (`None`, `Starting`, `Healthy`, `Unhealthy`)
+- Added `health: Option<HealthStatus>` and `health_config: Option<HealthConfig>` to `ContainerState`
+- Added `pub mod health;`
+- Added unit tests: `test_health_config_serde_roundtrip`, `test_health_status_missing_field`
+
+**`src/cli/health.rs`** (NEW)
+- `run_health_monitor(name, pid, config, stop)` — health monitor thread
+- `run_probe(pid, config)` — channel-based timeout enforcement
+- `update_health(name, status)` — read+write state.json
+- `sleep_interruptible(duration_secs, stop)` — 100ms ticks with stop check
+
+**`src/cli/exec.rs`**
+- Added `pub fn exec_in_container(pid, args) -> Option<bool>` (shared ns-join logic)
+
+**`src/cli/run.rs`**
+- `build_image_run` returns `ImageRunResult` (4-tuple with `Option<HealthConfig>`)
+- `run_detached` spawns health monitor thread with `AtomicBool` stop flag
+
+**`src/cli/compose.rs`**
+- `try_exec` now delegates to `exec_in_container`
+- `wait_for_dependency` handles `HealthCheck::Healthy` (polls `state.json`)
+- `eval_health_check` has `Healthy => false` arm
+
+**`src/compose.rs`**
+- Added `HealthCheck::Healthy` variant
+- Parses `:condition service_healthy` in `parse_dependency`
+
+**`src/cli/ps.rs`**
+- Added HEALTH column (10 chars)
+
+**`src/build.rs`**
+- Added `Instruction::Healthcheck { cmd, interval_secs, timeout_secs, start_period_secs, retries }`
+- `parse_healthcheck` + `parse_duration_str` (supports `30s`, `1m`, `1m30s`)
+- JSON-array and shell form for `CMD` argument
+- `generate_oci_config_json` emits OCI `Healthcheck` block with nanosecond durations
+- Unit tests: `test_parse_healthcheck_cmd_shell_form`, `_json_form`, `_none`, `_flags`,
+  `test_parse_duration_str`
+
+**`tests/integration_tests.rs`**
+- Added `healthcheck_tests` module with 4 tests
+
+**`docs/INTEGRATION_TESTS.md`**
+- Documented all 4 new healthcheck tests
+
+### Verification done
+- `cargo test --lib` — 267 tests pass
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt` — clean
+- `cargo test --test integration_tests healthcheck` — 2 non-ignored pass, 3 ignored
+- Please run: `sudo -E cargo test --test integration_tests healthcheck -- --ignored --nocapture`
+
+### Next suggested task
+
+Container healthcheck end-to-end test with a real OCI image that has a `HEALTHCHECK` in its
+manifest — verifies the full path from `image pull` → `run -d` → health monitor wakes up →
+`ps` shows `starting` → `healthy`.
+
+---
+
 ## Last completed: UDP port mapping (2026-02-27)
 
 ### What was done

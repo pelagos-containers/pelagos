@@ -3,7 +3,7 @@
 use super::{
     check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
     parse_memory, parse_ulimit, parse_user, parse_user_in_layers, rootfs_path, write_state,
-    ContainerState, ContainerStatus,
+    ContainerState, ContainerStatus, HealthConfig, HealthStatus,
 };
 use remora::container::{Capability, Command, Namespace, Stdio, Volume};
 use remora::network::NetworkMode;
@@ -184,46 +184,50 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Branch: --rootfs (local rootfs) vs positional args (OCI image, default).
-    let (rootfs_label, exe_and_args, cmd) = if let Some(ref rootfs_name) = args.rootfs {
-        let exe_and_args: Vec<String> = if args.args.is_empty() {
-            vec!["/bin/sh".to_string()]
+    let (rootfs_label, exe_and_args, cmd, health_config) =
+        if let Some(ref rootfs_name) = args.rootfs {
+            let exe_and_args: Vec<String> = if args.args.is_empty() {
+                vec!["/bin/sh".to_string()]
+            } else {
+                args.args.clone()
+            };
+            let rootfs_dir = rootfs_path(rootfs_name)?;
+            let cmd = build_command(
+                &args,
+                &rootfs_dir,
+                &exe_and_args,
+                &port_forwards,
+                network_mode,
+                &additional_networks,
+            )?;
+            (rootfs_name.clone(), exe_and_args, cmd, None)
         } else {
-            args.args.clone()
+            if args.args.is_empty() {
+                return Err("an image name is required".into());
+            }
+            let image_ref = &args.args[0];
+            let cmd_args: Vec<String> = args.args[1..].to_vec();
+            build_image_run(
+                &args,
+                image_ref,
+                &cmd_args,
+                &port_forwards,
+                network_mode,
+                &additional_networks,
+            )?
         };
-        let rootfs_dir = rootfs_path(rootfs_name)?;
-        let cmd = build_command(
-            &args,
-            &rootfs_dir,
-            &exe_and_args,
-            &port_forwards,
-            network_mode,
-            &additional_networks,
-        )?;
-        (rootfs_name.clone(), exe_and_args, cmd)
-    } else {
-        if args.args.is_empty() {
-            return Err("an image name is required".into());
-        }
-        let image_ref = &args.args[0];
-        let cmd_args: Vec<String> = args.args[1..].to_vec();
-        build_image_run(
-            &args,
-            image_ref,
-            &cmd_args,
-            &port_forwards,
-            network_mode,
-            &additional_networks,
-        )?
-    };
 
     if args.detach {
-        run_detached(name, rootfs_label, exe_and_args, cmd)
+        run_detached(name, rootfs_label, exe_and_args, cmd, health_config)
     } else if args.interactive {
         run_interactive(cmd)
     } else {
         run_foreground(name, rootfs_label, exe_and_args, cmd)
     }
 }
+
+/// (rootfs_label, exe_and_args, Command, health_config)
+type ImageRunResult = (String, Vec<String>, Command, Option<HealthConfig>);
 
 /// Build a Command from a pulled OCI image.
 fn build_image_run(
@@ -233,7 +237,7 @@ fn build_image_run(
     port_forwards: &[(u16, u16, remora::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
-) -> Result<(String, Vec<String>, Command), Box<dyn std::error::Error>> {
+) -> Result<ImageRunResult, Box<dyn std::error::Error>> {
     use remora::image;
 
     // Try loading the raw reference first (locally-built images), then normalised.
@@ -299,7 +303,8 @@ fn build_image_run(
     // Apply shared CLI options (network, volumes, security, etc.)
     cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks)?;
 
-    Ok((full_ref, exe_and_args, cmd))
+    let health_config = manifest.config.healthcheck.clone();
+    Ok((full_ref, exe_and_args, cmd, health_config))
 }
 
 /// Expand bare image names: "alpine" → "docker.io/library/alpine:latest".
@@ -633,6 +638,8 @@ fn run_foreground(
         stderr_log: None,
         bridge_ip: None,
         network_ips: std::collections::HashMap::new(),
+        health: None,
+        health_config: None,
     };
     write_state(&state)?;
 
@@ -694,6 +701,7 @@ fn run_detached(
     rootfs: String,
     command: Vec<String>,
     mut cmd: Command,
+    health_config: Option<HealthConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
@@ -716,6 +724,8 @@ fn run_detached(
         stderr_log: Some(stderr_log.to_string_lossy().into_owned()),
         bridge_ip: None,
         network_ips: std::collections::HashMap::new(),
+        health: None,
+        health_config: None,
     };
     write_state(&state)?;
 
@@ -757,10 +767,22 @@ fn run_detached(
                 .map(|(name, ip)| (name.to_string(), ip))
                 .collect();
             updated.network_ips = all_ips.iter().cloned().collect();
+            updated.health_config = health_config.clone();
+            if health_config.is_some() {
+                updated.health = Some(HealthStatus::Starting);
+            }
             let _ = write_state(&updated);
 
             // Register container with embedded DNS daemon.
             register_dns(&name, &all_ips);
+
+            // Spawn health monitor thread (if the image has a HEALTHCHECK).
+            let health_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let health_thread = health_config.map(|hc| {
+                let stop = std::sync::Arc::clone(&health_stop);
+                let name2 = name.clone();
+                std::thread::spawn(move || super::health::run_health_monitor(name2, pid, hc, stop))
+            });
 
             // Relay stdout and stderr to log files concurrently.
             let mut stdout_handle = child.take_stdout();
@@ -809,8 +831,13 @@ fn run_detached(
                     unsafe { libc::_exit(1) };
                 }
             };
+            // Signal the health monitor to stop and wait for it.
+            health_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = t_out.join();
             let _ = t_err.join();
+            if let Some(t) = health_thread {
+                let _ = t.join();
+            }
 
             // Deregister container from DNS.
             deregister_dns(&name, &all_ips);

@@ -51,18 +51,20 @@ pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(6)
         .max(6);
     let cmd_w = 12usize;
-    let _started_w = 14usize;
+    let health_w = 10usize;
 
     println!(
-        "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  STARTED",
+        "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  {:<health_w$}  STARTED",
         "NAME",
         "STATUS",
         "PID",
         "ROOTFS",
         "COMMAND",
+        "HEALTH",
         name_w = name_w,
         rootfs_w = rootfs_w,
         cmd_w = cmd_w,
+        health_w = health_w,
     );
 
     for s in &states {
@@ -78,18 +80,26 @@ pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
             cmd_str
         };
         let started = format_age(&s.started_at);
+        let health_str = match &s.health {
+            Some(super::HealthStatus::Starting) => "starting",
+            Some(super::HealthStatus::Healthy) => "healthy",
+            Some(super::HealthStatus::Unhealthy) => "unhealthy",
+            Some(super::HealthStatus::None) | None => "",
+        };
 
         println!(
-            "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  {}",
+            "{:<name_w$}  {:<8}  {:>7}  {:<rootfs_w$}  {:<cmd_w$}  {:<health_w$}  {}",
             s.name,
             s.status.to_string(),
             pid_str,
             s.rootfs,
             cmd_display,
+            health_str,
             started,
             name_w = name_w,
             rootfs_w = rootfs_w,
             cmd_w = cmd_w,
+            health_w = health_w,
         );
     }
 

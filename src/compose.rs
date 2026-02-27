@@ -84,6 +84,9 @@ pub enum HealthCheck {
     And(Vec<HealthCheck>),
     /// Any sub-check must pass.
     Or(Vec<HealthCheck>),
+    /// Wait until the dependency container's `state.json` reports `health == Healthy`.
+    /// Used with `:condition service_healthy` in the compose S-expression.
+    Healthy,
 }
 
 /// A dependency on another service with optional readiness check.
@@ -480,6 +483,27 @@ fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, Comp
                             ))
                         })?;
                         health_check = Some(check);
+                        i += 2;
+                        continue;
+                    }
+                    if kw == ":condition" && i + 1 < items.len() {
+                        let cond = items[i + 1].as_atom().ok_or_else(|| {
+                            ComposeError::InvalidValue(format!(
+                                "service '{}': :condition value must be an atom",
+                                service_name
+                            ))
+                        })?;
+                        match cond {
+                            "service_healthy" => {
+                                health_check = Some(HealthCheck::Healthy);
+                            }
+                            other => {
+                                return Err(ComposeError::InvalidValue(format!(
+                                    "service '{}': unknown :condition '{}' (supported: service_healthy)",
+                                    service_name, other
+                                )));
+                            }
+                        }
                         i += 2;
                         continue;
                     }
