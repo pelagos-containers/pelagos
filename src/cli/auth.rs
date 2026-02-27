@@ -3,11 +3,17 @@
 //! Resolution order:
 //! 1. CLI flags (`username` + `password`)
 //! 2. Environment variables (`REMORA_REGISTRY_USER` + `REMORA_REGISTRY_PASS`)
-//! 3. `~/.docker/config.json` `auths[registry].auth` (base64-decoded `user:pass`)
+//! 3. `~/.docker/config.json`:
+//!    a. `credHelpers[registry]` — per-registry credential helper
+//!    b. `credsStore` — global credential helper
+//!    c. `auths[registry].auth` — static base64-encoded `user:pass`
 //! 4. `RegistryAuth::Anonymous`
 //!
-//! Credential helpers (`credHelpers`, `credsStore`) are not supported.
-//! ECR users: `--password $(aws ecr get-login-password)`.
+//! Credential helpers follow the Docker credential helper protocol:
+//! - Binary: `docker-credential-<helper>` on PATH
+//! - `get`: registry hostname → stdin; JSON `{"Username":"…","Secret":"…"}` ← stdout
+//! - `store`: JSON `{"ServerURL":"…","Username":"…","Secret":"…"}` → stdin
+//! - `erase`: registry hostname → stdin
 
 use oci_client::secrets::RegistryAuth;
 
@@ -42,12 +48,22 @@ pub fn resolve_auth(
 }
 
 /// Parse `~/.docker/config.json` and return `(username, password)` for `registry`.
+///
+/// Checks `credHelpers`, then `credsStore`, then `auths` (static base64).
 pub fn parse_docker_config(registry: &str) -> Option<(String, String)> {
     let config_path = docker_config_path()?;
     let data = std::fs::read_to_string(config_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&data).ok()?;
-    let auths = value.get("auths")?.as_object()?;
 
+    // 1. Per-registry or global credential helper.
+    if let Some(helper) = find_credential_helper(&value, registry) {
+        if let Some(creds) = call_credential_helper(&helper, registry) {
+            return Some(creds);
+        }
+    }
+
+    // 2. Static base64 credentials.
+    let auths = value.get("auths")?.as_object()?;
     for key in registry_keys(registry) {
         if let Some(entry) = auths.get(&key) {
             if let Some(auth_b64) = entry.get("auth").and_then(|v| v.as_str()) {
@@ -60,8 +76,132 @@ pub fn parse_docker_config(registry: &str) -> Option<(String, String)> {
     None
 }
 
-/// Write (or update) a `~/.docker/config.json` `auths` entry for `registry`.
+/// Find the credential helper name for `registry` from a parsed config.json.
+///
+/// Checks `credHelpers[registry]` (per-registry) first, then `credsStore` (global).
+/// Returns the bare helper name (e.g. `"ecr-login"`), not the full binary name.
+pub(crate) fn find_credential_helper(config: &serde_json::Value, registry: &str) -> Option<String> {
+    // Per-registry helpers take priority.
+    for key in registry_keys(registry) {
+        if let Some(helper) = config
+            .get("credHelpers")
+            .and_then(|h| h.get(&key))
+            .and_then(|v| v.as_str())
+        {
+            return Some(helper.to_string());
+        }
+    }
+    // Global fallback.
+    config
+        .get("credsStore")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Invoke `docker-credential-<helper> get` and return `(username, secret)`.
+///
+/// Writes the registry hostname to the helper's stdin, reads JSON from stdout.
+/// Returns `None` if the helper binary is not found or returns an error.
+pub(crate) fn call_credential_helper(helper: &str, registry: &str) -> Option<(String, String)> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let binary = format!("docker-credential-{}", helper);
+    let mut child = Command::new(&binary)
+        .arg("get")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Write registry hostname (bare, without scheme) to stdin.
+    let bare = registry
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    child.stdin.take()?.write_all(bare.as_bytes()).ok()?;
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let username = json.get("Username").and_then(|v| v.as_str())?.to_string();
+    let secret = json.get("Secret").and_then(|v| v.as_str())?.to_string();
+    Some((username, secret))
+}
+
+/// Invoke `docker-credential-<helper> store` to persist credentials.
+fn store_via_helper(helper: &str, registry: &str, username: &str, password: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let binary = format!("docker-credential-{}", helper);
+    let payload = serde_json::json!({
+        "ServerURL": registry,
+        "Username": username,
+        "Secret": password,
+    });
+    let Ok(mut child) = Command::new(&binary)
+        .arg("store")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.to_string().as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Invoke `docker-credential-<helper> erase` to remove credentials.
+fn erase_via_helper(helper: &str, registry: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let binary = format!("docker-credential-{}", helper);
+    let bare = registry
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let Ok(mut child) = Command::new(&binary)
+        .arg("erase")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(bare.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Write (or update) credentials for `registry`.
+///
+/// If a credential helper is configured for the registry (`credHelpers` or
+/// `credsStore`), delegates to `docker-credential-<helper> store`.
+/// Otherwise writes a static base64 entry into `~/.docker/config.json`.
 pub fn write_docker_config(registry: &str, username: &str, password: &str) -> std::io::Result<()> {
+    // Check for a configured helper first.
+    if let Some(helper) = config_credential_helper(registry) {
+        if store_via_helper(&helper, registry, username, password) {
+            return Ok(());
+        }
+        // Helper available but failed — fall through to static storage.
+        log::warn!(
+            "credential helper '{}' store failed; falling back to config.json",
+            helper
+        );
+    }
+
     let config_path = docker_config_path().ok_or_else(|| {
         std::io::Error::other("cannot determine HOME directory for docker config")
     })?;
@@ -88,8 +228,22 @@ pub fn write_docker_config(registry: &str, username: &str, password: &str) -> st
     std::fs::write(&config_path, json)
 }
 
-/// Remove `registry` from `~/.docker/config.json` `auths`.
+/// Remove credentials for `registry`.
+///
+/// If a credential helper is configured, delegates to `docker-credential-<helper> erase`.
+/// Otherwise removes the `auths` entry from `~/.docker/config.json`.
 pub fn remove_docker_config(registry: &str) -> std::io::Result<()> {
+    // Check for a configured helper first.
+    if let Some(helper) = config_credential_helper(registry) {
+        if erase_via_helper(&helper, registry) {
+            return Ok(());
+        }
+        log::warn!(
+            "credential helper '{}' erase failed; falling back to config.json removal",
+            helper
+        );
+    }
+
     let config_path = docker_config_path().ok_or_else(|| {
         std::io::Error::other("cannot determine HOME directory for docker config")
     })?;
@@ -127,6 +281,14 @@ pub fn remove_docker_config(registry: &str) -> std::io::Result<()> {
     let json =
         serde_json::to_string_pretty(&value).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&config_path, json)
+}
+
+/// Return the credential helper name for `registry` from the live config, if any.
+fn config_credential_helper(registry: &str) -> Option<String> {
+    let config_path = docker_config_path()?;
+    let data = std::fs::read_to_string(config_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    find_credential_helper(&value, registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +506,126 @@ mod tests {
             matches!(auth, RegistryAuth::Anonymous),
             "expected Anonymous"
         );
+    }
+
+    /// Verify `find_credential_helper` returns the per-registry helper when present.
+    #[test]
+    fn test_find_credential_helper_per_registry() {
+        let config = serde_json::json!({
+            "credHelpers": {
+                "ghcr.io": "gh",
+                "123.dkr.ecr.us-east-1.amazonaws.com": "ecr-login"
+            },
+            "credsStore": "desktop"
+        });
+        assert_eq!(
+            find_credential_helper(&config, "ghcr.io"),
+            Some("gh".to_string())
+        );
+        assert_eq!(
+            find_credential_helper(&config, "123.dkr.ecr.us-east-1.amazonaws.com"),
+            Some("ecr-login".to_string())
+        );
+    }
+
+    /// Verify `find_credential_helper` falls back to `credsStore` when no per-registry entry.
+    #[test]
+    fn test_find_credential_helper_global_fallback() {
+        let config = serde_json::json!({ "credsStore": "desktop" });
+        assert_eq!(
+            find_credential_helper(&config, "ghcr.io"),
+            Some("desktop".to_string())
+        );
+    }
+
+    /// Verify `find_credential_helper` returns None when neither key is present.
+    #[test]
+    fn test_find_credential_helper_none() {
+        let config = serde_json::json!({ "auths": {} });
+        assert_eq!(find_credential_helper(&config, "ghcr.io"), None);
+    }
+
+    /// Verify `call_credential_helper` parses the JSON output of a fake helper.
+    ///
+    /// Writes a small shell script that emits the expected JSON on stdout,
+    /// adds the temp dir to PATH, then calls the helper.
+    #[test]
+    fn test_call_credential_helper_get() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let helper_path = tmp.path().join("docker-credential-fake-remora-test");
+        std::fs::write(
+            &helper_path,
+            "#!/bin/sh\necho '{\"Username\":\"testuser\",\"Secret\":\"testpass\"}'\n",
+        )
+        .unwrap();
+        // Make executable.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Prepend tmp dir to PATH so our fake binary is found.
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", tmp.path().display(), original_path);
+        std::env::set_var("PATH", &new_path);
+
+        let result = call_credential_helper("fake-remora-test", "ghcr.io");
+
+        std::env::set_var("PATH", original_path);
+
+        let (u, p) = result.expect("helper should return creds");
+        assert_eq!(u, "testuser");
+        assert_eq!(p, "testpass");
+    }
+
+    /// Verify that `parse_docker_config` uses a configured helper over static auths.
+    #[test]
+    fn test_parse_docker_config_uses_helper() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Write fake helper binary.
+        let helper_path = tmp.path().join("docker-credential-fake-remora-test2");
+        std::fs::write(
+            &helper_path,
+            "#!/bin/sh\necho '{\"Username\":\"helperuser\",\"Secret\":\"helperpass\"}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Write config.json that uses the helper for ghcr.io but also has a
+        // static auths entry — helper must win.
+        let docker_dir = tmp.path().join(".docker");
+        std::fs::create_dir_all(&docker_dir).unwrap();
+        let static_auth = base64_encode(b"staticuser:staticpass");
+        let config = serde_json::json!({
+            "credHelpers": { "ghcr.io": "fake-remora-test2" },
+            "auths": { "ghcr.io": { "auth": static_auth } }
+        });
+        std::fs::write(
+            docker_dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", tmp.path().display(), original_path),
+        );
+
+        let result = parse_docker_config("ghcr.io");
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        std::env::set_var("PATH", original_path);
+
+        let (u, p) = result.expect("should find creds via helper");
+        assert_eq!(u, "helperuser");
+        assert_eq!(p, "helperpass");
     }
 
     #[test]

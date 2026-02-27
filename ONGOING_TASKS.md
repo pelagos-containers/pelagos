@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Last completed: image tag (2026-02-27)
+## Last completed: credential helper support (2026-02-27)
 
 ### What to do
 
@@ -18,19 +18,65 @@ existing image without pulling.
 **Files:** `src/cli/image.rs`, `src/main.rs`, `tests/integration_tests.rs`,
 `docs/INTEGRATION_TESTS.md`, `ONGOING_TASKS.md`
 
+### What was done
+
+**`src/cli/auth.rs`**
+- `find_credential_helper(config, registry)` — checks `credHelpers[registry]`
+  then `credsStore` global fallback; returns bare helper name (e.g. `"ecr-login"`)
+- `call_credential_helper(helper, registry)` — spawns
+  `docker-credential-<helper> get`, writes bare registry hostname to stdin,
+  parses `{"Username":"...","Secret":"..."}` JSON from stdout
+- `store_via_helper` / `erase_via_helper` — delegate `image login` / `image logout`
+  to the configured helper's `store` / `erase` subcommands
+- `config_credential_helper(registry)` — reads live `config.json` to find helper
+- `parse_docker_config` — now checks helpers before static `auths` entries
+- `write_docker_config` / `remove_docker_config` — delegate to helper when configured,
+  fall back to static auths if helper not found or fails
+- 4 new unit tests: `test_find_credential_helper_per_registry`,
+  `test_find_credential_helper_global_fallback`, `test_find_credential_helper_none`,
+  `test_call_credential_helper_get`, `test_parse_docker_config_uses_helper`
+
 ### Verification done
 - `cargo build` — clean
 - `cargo clippy -- -D warnings` — clean
 - `cargo fmt` — clean
 - `cargo test --lib` — 254 tests pass
+- `cargo test --bin remora -- cli::auth` — 14 tests pass (all helper tests included)
 - `cargo test --test integration_tests --no-run` — compiles clean
-- Please run: `sudo -E cargo test --test integration_tests image_tag -- --ignored --nocapture`
 
-### Next task: credential helper support
+### Next suggested task
 
 `credHelpers` / `credsStore` in `~/.docker/config.json` — delegate auth to
 external helpers (`docker-credential-ecr-login`, OS keychain, etc.) so users
 don't need to call `image login` with short-lived tokens.
+
+**Protocol:**
+- Binary: `docker-credential-<helper>` must be on PATH
+- `get`: write registry hostname to stdin → read JSON `{"Username":"...","Secret":"..."}` from stdout
+- `store`: write JSON `{"ServerURL":"...","Username":"...","Secret":"..."}` to stdin
+- `erase`: write registry hostname to stdin
+
+**Resolution order in `parse_docker_config`:**
+1. `credHelpers[registry]` — per-registry helper (highest priority)
+2. `credsStore` — global fallback helper
+3. `auths[registry].auth` — static base64 (existing behaviour)
+
+**`write_docker_config` / `remove_docker_config`:**
+- If a helper is configured for the registry, delegate to `store`/`erase`
+- Otherwise keep existing `auths` logic
+
+**Files:** `src/cli/auth.rs` only (plus tests + ONGOING_TASKS.md)
+
+**New functions:**
+- `call_credential_helper(helper: &str, registry: &str) -> Option<(String, String)>`
+- `find_credential_helper(config: &serde_json::Value, registry: &str) -> Option<String>`
+
+**Unit tests (no root, no network):**
+- `test_call_credential_helper_get` — spawns a fake helper script, verifies
+  username/secret are parsed correctly
+- `test_find_credential_helper_per_registry` — credHelpers map lookup
+- `test_find_credential_helper_global` — credsStore fallback
+- `test_parse_docker_config_uses_helper` — full parse_docker_config with fake helper
 
 ---
 
