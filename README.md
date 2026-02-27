@@ -2,157 +2,214 @@
 
 [![CI](https://github.com/skeptomai/remora/actions/workflows/ci.yml/badge.svg)](https://github.com/skeptomai/remora/actions/workflows/ci.yml)
 
-A modern, lightweight Linux container runtime library written in Rust.
+**Remora** is a daemonless Linux container runtime written in Rust. It can run a
+single container or orchestrate a multi-service stack — and its primary interface
+is a Lisp scripting language, not YAML.
 
-Remora provides a safe, ergonomic API for creating containerized processes using
-Linux namespaces, seccomp filtering, cgroups v2, and native networking — without
-a daemon and without CNI plugins.
+The `.reml` scripting layer lets you express things that declarative config cannot:
+run a migration before the app starts, wait for a port to be ready, react to
+failure with cleanup logic, or build a dependency graph that executes in parallel.
+A runtime that is programmable from first principles.
 
-**[User Guide](docs/USER_GUIDE.md)** — full CLI reference, networking, storage, security, and more.
+Remora is also an embeddable Rust library, making it possible to add container
+isolation directly to your own programs without spawning a daemon or shelling out
+to Docker.
+
+**[User Guide](docs/USER_GUIDE.md)** — full CLI reference, networking, storage,
+security, scripting, and more.
+
+---
+
+## What makes it different
+
+| | Remora | Docker | runc |
+|--|--------|--------|------|
+| Daemon required | ❌ | ✅ | ❌ |
+| Library API | ✅ | ❌ | ❌ |
+| Config language | Lisp (`.reml`) | YAML | JSON |
+| Imperative scripting | ✅ full language | ❌ | ❌ |
+| Security-by-default | ✅ all containers | opt-in | opt-in |
+| Rootless networking | ✅ pasta | ✅ | limited |
+
+**Security-by-default** means every container gets seccomp-BPF filtering,
+all capabilities dropped, no-new-privileges, masked kernel paths, and PID/UTS/IPC
+namespace isolation — without any flags. Services that need specific capabilities
+opt back in with `:cap-add`.
+
+---
+
+## The `.reml` scripting interface
+
+Remora's compose files are Lisp programs, not config schemas. A minimal stack:
+
+```lisp
+(define-service svc-db "db"
+  :image "postgres:16"
+  :env   ("POSTGRES_PASSWORD" . "secret"))
+
+(define-service svc-app "app"
+  :image      "myapp:latest"
+  :depends-on ("db" :ready-port 5432))
+
+(compose-up
+  (compose svc-db svc-app))
+```
+
+But when you need more than ordering, the full language is available:
+
+```lisp
+; Start the database and wait for it
+(define db (container-start svc-db))
+(await-port "localhost" 5432 :timeout 60)
+
+; Run migrations — abort the whole deploy if they fail
+(define exit-code (container-run svc-migrate))
+(unless (zero? exit-code)
+  (error "migrations failed — aborting"))
+
+; Start the app, clean up on any exit
+(with-cleanup (lambda (result)
+                (container-stop db)
+                (logf "deploy result: ~a" result))
+  (container-wait (container-start svc-app)))
+```
+
+The same interpreter supports a **futures graph** for parallel execution:
+
+```lisp
+(define-nodes
+  (db    svc-db)
+  (cache svc-cache))
+
+(define-then db-url db (h)
+  (format "postgres://app:secret@~a/appdb" (container-ip h)))
+
+(define-run :parallel
+  (app-handle app)
+  (db-url     db-url))
+```
+
+See [`docs/REML_EXECUTOR_MODEL.md`](docs/REML_EXECUTOR_MODEL.md) for the full
+scripting reference.
+
+---
 
 ## Features
 
 ### Isolation
 - **Namespaces:** UTS, Mount, IPC, Network, User, PID, Cgroup
 - **Filesystem:** chroot, pivot_root, automatic /proc /sys /dev mounts
-- **Networking:** loopback-only or full bridge (veth + remora0, 172.19.0.x/24)
+- **Security defaults:** seccomp-BPF + all capabilities dropped + no-new-privileges
+  + masked paths applied to every container unconditionally
 
 ### Security
-- **Seccomp-BPF:** Docker's default profile or a minimal profile, via pure-Rust `seccompiler`
-- **No-new-privileges:** `PR_SET_NO_NEW_PRIVS` blocks setuid escalation
+- **Seccomp-BPF:** Docker's default profile via pure-Rust `seccompiler`
+- **Capability management:** all caps dropped by default; `:cap-add` restores specific ones
+- **No-new-privileges:** `PR_SET_NO_NEW_PRIVS` blocks setuid/setgid escalation
 - **Read-only rootfs:** `MS_RDONLY` remount makes the filesystem immutable
-- **Masked paths:** `/proc/kcore`, `/sys/firmware`, and others hidden with `/dev/null`
-- **Capability management:** drop all caps or keep a specific set
+- **Masked paths:** `/proc/kcore`, `/sys/firmware`, and others hidden
+
+### Networking
+- **Loopback:** isolated NET namespace, `lo` only
+- **Bridge:** veth pair + named bridge, IPAM, DNS service discovery
+- **NAT:** nftables MASQUERADE, reference-counted across containers
+- **Port mapping:** TCP DNAT via nftables + userspace proxy for localhost
+- **Named networks:** user-defined bridge networks with custom subnets
+- **Multi-network:** attach containers to multiple networks simultaneously
+- **DNS service discovery:** dual-backend (built-in daemon or dnsmasq), automatic
+  container name resolution on bridge networks
+- **Pasta:** full internet access without root via [pasta](https://passt.top/passt/about/)
 
 ### Resource Management
-- **rlimits:** memory address space, CPU time, file descriptors, process count
+- **rlimits:** memory, CPU time, file descriptors, process count
 - **Cgroups v2:** memory hard limit, CPU weight, CPU quota, PID limit
 - **Resource stats:** `child.resource_stats()` reads live cgroup counters
 
-### Filesystem Flexibility
+### Filesystem
 - **Bind mounts:** `with_bind_mount()` (RW) and `with_bind_mount_ro()` (RO)
-- **tmpfs:** `with_tmpfs()` — writable scratch space inside a read-only rootfs
-- **Named volumes:** `Volume::create/open/delete`, `with_volume()` — persisted in
-  the data directory (root: `/var/lib/remora/volumes/`, rootless: `~/.local/share/remora/volumes/`)
-- **Overlay filesystem:** `with_overlay(upper, work)` — copy-on-write view of a
-  shared lower rootfs; writes land in `upper_dir`, lower layer is never modified
+- **tmpfs:** writable scratch space inside a read-only rootfs
+- **Named volumes:** persisted storage, scoped per compose project
+- **Overlay filesystem:** copy-on-write layered rootfs via overlayfs
 
-### Networking
-- **Loopback:** `NetworkMode::Loopback` — isolated NET namespace, `lo` only
-- **Bridge:** `NetworkMode::Bridge` — veth pair + `remora0` bridge, IPAM via
-  `/run/remora/next_ip` (flock-protected)
-- **NAT:** `with_nat()` — nftables MASQUERADE, reference-counted across containers
-- **Port mapping:** `with_port_forward(host, container)` — TCP DNAT via nftables
-- **DNS:** `with_dns(&["1.1.1.1", "8.8.8.8"])` — bind-mounts a per-container resolv.conf; shared rootfs is never modified
-
-### OCI Runtime Compliance
-- **OCI bundles:** parse `config.json` — `ociVersion`, `root`, `process`, `linux.namespaces`, `mounts`
-- **Lifecycle:** `remora create <id> <bundle>` / `start` / `state` / `kill` / `delete`
-- **State machine:** creating → created → running → stopped
-- **Sync:** Unix socket at `/run/remora/<id>/exec.sock` suspends exec until `start`
-- **Phase 2 (complete):** `process.capabilities`, `linux.maskedPaths`, `linux.readonlyPaths`,
-  `linux.resources`, `process.rlimits`, `linux.sysctl`, `linux.devices`, hooks, `linux.seccomp`
-
-### Image Build
-- **`remora build`:** build custom images from Remfiles (simplified Dockerfiles)
-- **Instructions:** FROM, RUN, COPY, CMD, ENV, WORKDIR, EXPOSE
-- **Daemonless:** Buildah-style — each RUN step snapshots the overlay upper dir as a layer
-- **Path safety:** COPY rejects sources outside the build context
+### OCI Images
+- **Pull:** `remora image pull alpine` — anonymous pulls from any OCI registry
+- **Run:** `remora run alpine /bin/sh` — multi-layer overlay, image config applied
+- **Build:** `remora build -t myapp:latest` — Remfile (Dockerfile-compatible syntax)
+  with multi-stage builds, ARG, ADD (URLs + archives), `.remignore`, build cache
+- **Manage:** `remora image ls` / `remora image rm`
 
 ### Multi-Service Orchestration
-- **`remora compose up`:** parse a `.reml` file, create networks/volumes, start services in
-  dependency order with TCP readiness polling
-- **S-expression format:** `(compose (network ...) (service ...))` — Lisp, not YAML
-- **Imperative scripting:** the `.reml` Lisp interpreter is the primary programming interface;
-  use `container-start`, `await-port`, `guard`, and `with-cleanup` for custom deploy logic
-- **Futures graph:** `container-start-async` + `then` + `then-all` declare a dependency graph
-  before any execution begins; `run-all :parallel` executes independent futures concurrently
-  within each topological tier; `resolve` executes a monadic chain depth-first
+- **`remora compose up/down/ps/logs`:** dependency-ordered service lifecycle
+- **TCP readiness:** `:ready-port` polling before dependent services start
+- **Scoped resources:** networks, volumes, and container names prefixed per project
+- **Lifecycle hooks:** `on-ready` callbacks between startup tiers
 
-### Rootless Containers
-- **Auto-detection:** `getuid() != 0` triggers rootless mode automatically — no flag needed
-- **Image pull/run:** `remora image pull alpine && remora run alpine /bin/sh` works without root
-- **Rootless overlay:** kernel 5.11+ native overlay with `userxattr`, or automatic `fuse-overlayfs` fallback
-- **Rootless storage:** `~/.local/share/remora/` (images/layers) + `$XDG_RUNTIME_DIR/remora/` (runtime)
-- **User namespace:** auto-adds `Namespace::USER` and a default uid/gid map (`container 0 → host UID`)
-- **Pasta networking:** `NetworkMode::Pasta` — full internet access without root via [pasta](https://passt.top/passt/about/)
-- **Cgroups:** skipped gracefully in rootless (no `CAP_SYS_ADMIN` needed)
-- **Bridge rejected:** clear error if `NetworkMode::Bridge` is attempted without root
+### Other
+- **Interactive containers:** PTY, SIGWINCH relay, terminal restore
+- **`remora exec`:** run a command inside a running container (namespace join + PTY)
+- **OCI Runtime Spec:** `create` / `start` / `state` / `kill` / `delete` lifecycle
+- **Rootless:** pull, build, run, overlay, and pasta networking without root
 
-### Interactive Containers
-- **PTY:** `spawn_interactive()` allocates a PTY pair via `openpty()`
-- **SIGWINCH relay:** terminal resize forwarded to container via `TIOCSWINSZ`
-- **Terminal restore:** `TerminalGuard` RAII ensures raw mode is always cleaned up
+---
 
 ## Installation
 
+Download a pre-built static binary from the
+[Releases](https://github.com/skeptomai/remora/releases) page (x86_64 and
+aarch64 Linux, statically linked musl), or build from source:
+
 ```bash
-# Install to /usr/local/bin (recommended):
+# Install to /usr/local/bin:
 scripts/install.sh
 
-# Or install to ~/.cargo/bin:
+# Or via cargo:
 cargo install --path .
-
-# Or install to /usr/local/bin via cargo:
-sudo cargo install --path . --root /usr/local
 ```
 
-You can also download a pre-built binary from the
-[Releases](https://github.com/skeptomai/remora/releases) page.
-
-For a statically linked binary (e.g. for minimal containers or distroless hosts):
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-sudo apt-get install -y musl-tools   # or equivalent for your distro
-cargo build --release --target x86_64-unknown-linux-musl
-```
+---
 
 ## Quick Start
 
 ### Rootless (no sudo)
 
 ```bash
-# Pull an image and run a command — no root required
 remora image pull alpine
 remora run alpine /bin/echo hello
 
-# Interactive shell with internet (Ctrl-D to exit)
+# Interactive shell with internet
 remora run -i --network pasta alpine /bin/sh
 ```
 
 ### Root (full feature set)
 
 ```bash
-# Pull an image and run a command
-sudo remora image pull alpine
-sudo remora run alpine /bin/echo hello
-
-# Interactive shell (Ctrl-D to exit)
 sudo remora run -i alpine /bin/sh
 
 # Detached container with bridge networking
 sudo remora run -d --name mybox --network bridge --nat alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
-# Check on it
 remora ps
 remora logs -f mybox
-
-# Stop and clean up
-sudo remora stop mybox
-remora rm mybox
+sudo remora stop mybox && remora rm mybox
 ```
 
-See the **[User Guide](docs/USER_GUIDE.md)** for networking, storage, security,
-resource limits, rootless mode, exec, and the full flag reference.
+### Multi-service stack
+
+```bash
+# Declarative
+sudo -E remora compose up -f examples/compose/web-stack/compose.reml -p demo
+
+# Imperative
+sudo -E remora compose up -f examples/compose/imperative/compose.reml -p demo
+```
+
+---
 
 ## Rust Library API
 
-Remora is also a library. Use it to embed container isolation in your own programs.
-
 ```rust
-use remora::container::{Command, Namespace, Stdio};
+use remora::container::{Command, Namespace};
 
 let mut child = Command::new("/bin/sh")
     .args(&["-c", "echo hello from container"])
@@ -175,90 +232,72 @@ let session = Command::new("/bin/sh")
     .with_proc_mount()
     .spawn_interactive()?;
 
-session.run()?;  // blocks; relays stdin/stdout, forwards SIGWINCH, restores terminal
+session.run()?;  // relays stdin/stdout, forwards SIGWINCH, restores terminal
 ```
 
-See the [CLI-to-API translation table](docs/USER_GUIDE.md#cli-to-api-translation) in
-the user guide.
+See the [CLI-to-API translation table](docs/USER_GUIDE.md#cli-to-api-translation)
+in the user guide.
+
+---
 
 ## Testing
 
 ```bash
-# Unit tests + lint (no root required):
-cargo test --lib
-cargo clippy -- -D warnings
-cargo fmt -- --check
+# Unit tests (no root required):
+make test-unit
+# or: cargo test --lib
 
 # Integration tests (require root):
-sudo -E cargo test --test integration_tests
+sudo -E make test-integration
+# or: sudo -E cargo test --test integration_tests
 
-# E2E, build, and stress test suites (require root):
-sudo -E ./scripts/test-e2e.sh
-sudo -E ./scripts/test-build.sh
-sudo -E ./scripts/test-stress.sh
-
-# Web stack example (require root + release build):
-cargo build --release
-sudo PATH=$PWD/target/release:$PATH ./examples/web-stack/run.sh
+# E2E tests — exercises the full binary via BATS (require root + bats):
+sudo -E make test-e2e
+# or: sudo -E bats tests/e2e/hardening.bats tests/e2e/lifecycle.bats
 ```
 
-See the [User Guide testing section](docs/USER_GUIDE.md#testing) for details on each suite.
+The E2E suite verifies that `remora compose up` applies all four security
+hardening defaults to every container it starts, and exercises the full
+compose lifecycle (up / ps / down).
+
+See [`docs/INTEGRATION_TESTS.md`](docs/INTEGRATION_TESTS.md) for documentation
+of every integration test.
+
+---
 
 ## Architecture
 
-### Pre-exec hook order (critical)
+### Pre-exec hook order
 
 1. **Parent** — opens namespace files, compiles seccomp BPF, sets up bridge netns
 2. **Fork**
-3. **Child pre_exec** — unshare, UID/GID maps, setuid/setgid, chroot/pivot_root,
-   mounts, capability drop, rlimits, setns, seccomp (must be last)
+3. **Child pre_exec** — unshare → UID/GID maps → setuid/setgid → chroot/pivot_root
+   → mounts → **capability drop** → rlimits → setns → seccomp (must be last)
 4. **exec** — replace child with target program
 
-Seccomp is applied last because setup requires syscalls it would otherwise block.
-Bridge networking is set up entirely in the parent before fork — the child joins
-the pre-configured named netns via `setns()`, eliminating all races.
+Capability drop comes after all mount operations (masked paths, read-only rootfs)
+because those mounts require `CAP_SYS_ADMIN`. Seccomp is last because setup
+requires syscalls it would otherwise block.
 
-## Comparison
-
-| Feature | Remora | runc | Docker |
-|---------|--------|------|--------|
-| Namespaces | ✅ 6/7 | ✅ All | ✅ All |
-| Seccomp | ✅ Docker profile | ✅ | ✅ |
-| Read-only rootfs | ✅ | ✅ | ✅ |
-| Capabilities | ✅ | ✅ | ✅ |
-| Cgroups v2 | ✅ | ✅ | ✅ |
-| Bind / tmpfs / volumes | ✅ | ✅ | ✅ |
-| Overlay filesystem | ✅ | ✅ | ✅ |
-| Interactive PTY | ✅ | ✅ | ✅ |
-| Loopback + bridge | ✅ | ✅ | ✅ |
-| NAT (MASQUERADE) | ✅ | ✅ | ✅ |
-| Port mapping | ✅ TCP | — | ✅ |
-| DNS | ✅ resolv.conf | ✅ | ✅ |
-| Image build | ✅ Remfile | — | ✅ Dockerfile |
-| Multi-service compose | ✅ Lisp DSL + parallel graph executor | — | ✅ YAML |
-| OCI compliant | ✅ Phase 1 | ✅ | ✅ |
-| Rootless | ✅ (pull, build, run, overlay, pasta) | ✅ | ✅ |
-| Library API | ✅ | ❌ | ❌ |
-| Daemon required | ❌ | ❌ | ✅ |
-
-**Estimated runc parity: ~80%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
-and `docs/ROADMAP.md` for what's next.
+---
 
 ## Documentation
 
 | File | Contents |
 |------|----------|
-| `docs/DESIGN_PRINCIPLES.md` | Non-negotiable design principles |
-| `docs/USER_GUIDE.md` | CLI and API user guide |
-| `docs/REML_EXECUTOR_MODEL.md` | Futures graph model, `run-all`, `resolve`, parallel execution |
-| `docs/ROADMAP.md` | What's done and what's next |
-| `docs/RUNTIME_COMPARISON.md` | Full feature matrix vs runc/Docker |
-| `docs/INTEGRATION_TESTS.md` | Every integration test documented |
-| `docs/SECCOMP_DEEP_DIVE.md` | Seccomp-BPF implementation details |
-| `docs/PTY_DEEP_DIVE.md` | PTY/interactive session design |
-| `docs/CGROUPS.md` | Cgroups v1 vs v2 analysis |
-| `docs/BUILD_ROOTFS.md` | How to build the Alpine rootfs |
-| `CHANGELOG.md` | Version history and release notes |
+| [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | CLI and API reference |
+| [`docs/REML_EXECUTOR_MODEL.md`](docs/REML_EXECUTOR_MODEL.md) | Lisp scripting: futures graph, `run`, `then`, parallel execution |
+| [`docs/INTEGRATION_TESTS.md`](docs/INTEGRATION_TESTS.md) | Every integration test documented |
+| [`docs/DESIGN_PRINCIPLES.md`](docs/DESIGN_PRINCIPLES.md) | Non-negotiable design principles |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
+| [`docs/RUNTIME_COMPARISON.md`](docs/RUNTIME_COMPARISON.md) | Full feature matrix vs runc/Docker |
+| [`docs/SECCOMP_DEEP_DIVE.md`](docs/SECCOMP_DEEP_DIVE.md) | Seccomp-BPF implementation details |
+| [`docs/PTY_DEEP_DIVE.md`](docs/PTY_DEEP_DIVE.md) | PTY/interactive session design |
+| [`docs/CGROUPS.md`](docs/CGROUPS.md) | Cgroups v1 vs v2 analysis |
+| [`docs/BUILD_ROOTFS.md`](docs/BUILD_ROOTFS.md) | How to build the Alpine rootfs |
+| [`CHANGELOG.md`](CHANGELOG.md) | Version history and release notes |
+
+---
 
 ## Requirements
 
@@ -267,6 +306,9 @@ and `docs/ROADMAP.md` for what's next.
 - `pasta` ([passt](https://passt.top)) for rootless networking
 - `nft` (nftables) for NAT and port mapping (root only)
 - `ip` (iproute2) for bridge networking (root only)
+- `bats` for E2E tests (`sudo pacman -S bats` or `sudo apt install bats`)
+
+---
 
 ## License
 
