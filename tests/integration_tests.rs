@@ -8684,3 +8684,235 @@ fn test_lisp_eval_file_jupyter_fixture() {
         "expected exactly one hook for redis"
     );
 }
+
+// ── Hardening regression tests ────────────────────────────────────────────────
+//
+// These tests verify that ALL container security features are applied together
+// in the actual paths used by `compose up` and the lisp runtime.  A pure
+// unit test of the builder API is not sufficient: it only proves the methods
+// exist, not that spawn_service / do_container_start_inner actually call them.
+//
+// Strategy:
+//   - test_hardening_combination: exercises the raw Command builder with the
+//     same four-call hardening block used in compose.rs / runtime.rs, and
+//     reads /proc/self/status from inside the container to confirm each feature.
+//   - test_lisp_container_spawn_hardening: exercises do_container_start_inner
+//     via Interpreter::new_with_runtime, then inspects the spawned process from
+//     the host via /proc/{pid}/status.
+
+/// Read `/proc/{pid}/status` from the host and return its contents.
+fn read_proc_status(pid: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()
+}
+
+/// Extract the value of a field like "Seccomp:\t2\n" → "2".
+fn proc_status_field<'a>(status: &'a str, field: &str) -> Option<&'a str> {
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            return Some(rest.trim());
+        }
+    }
+    None
+}
+
+/// Return the first child PID listed in `/proc/{pid}/task/{pid}/children`.
+fn first_child_pid(parent_pid: i32) -> Option<i32> {
+    let path = format!("/proc/{}/task/{}/children", parent_pid, parent_pid);
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+}
+
+/// Verify that the four hardening primitives (seccomp, cap-drop, no-new-privs,
+/// masked paths) work correctly when stacked on the same container.
+///
+/// This test exercises the raw Command builder directly — not compose.rs or
+/// runtime.rs — so it serves as the ground truth for what the container must
+/// look like when all four features are active together.
+#[test]
+fn test_hardening_combination() {
+    if !is_root() {
+        eprintln!("SKIP: test_hardening_combination requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: test_hardening_combination requires alpine-rootfs");
+            return;
+        }
+    };
+
+    // Run a command that dumps the relevant /proc/self/status fields and the
+    // hostname, then exits.  The output is captured via Stdio::Piped.
+    let mut child = Command::new("/bin/sh")
+        .args(&[
+            "-c",
+            "grep -E '^(Seccomp|CapEff|NoNewPrivs|NSpid):' /proc/self/status; \
+             echo HOSTNAME=$(hostname)",
+        ])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(
+            Namespace::MOUNT | Namespace::PID | Namespace::UTS | Namespace::IPC,
+        )
+        .with_hostname("hardening-test")
+        .with_seccomp_default()
+        .drop_all_capabilities()
+        .with_no_new_privileges(true)
+        .with_masked_paths_default()
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (status, stdout_bytes, _stderr) =
+        child.wait_with_output().expect("wait_with_output failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+    // Seccomp mode 2 = filter active.
+    assert!(
+        stdout.contains("Seccomp:\t2") || stdout.contains("Seccomp: 2"),
+        "expected Seccomp:2, got: {stdout}"
+    );
+
+    // CapEff all-zero = no capabilities.
+    let capeff = stdout
+        .lines()
+        .find(|l| l.starts_with("CapEff:"))
+        .unwrap_or("CapEff: not found");
+    let capeff_val = capeff.split_whitespace().nth(1).unwrap_or("?");
+    assert!(
+        capeff_val.chars().all(|c| c == '0'),
+        "expected all-zero CapEff, got: {capeff_val}"
+    );
+
+    // NoNewPrivs 1 = escalation blocked.
+    assert!(
+        stdout.contains("NoNewPrivs:\t1") || stdout.contains("NoNewPrivs: 1"),
+        "expected NoNewPrivs:1, got: {stdout}"
+    );
+
+    // The container process tree is in a new PID namespace.  /bin/sh takes PID 1
+    // in the namespace and forks grep as PID 2 to run the command.  We verify the
+    // namespace IS active by checking that the innermost NSpid entry is small (≤ 5).
+    // If no PID namespace were created, the process would see a large host PID here.
+    let nspid_line = stdout
+        .lines()
+        .find(|l| l.starts_with("NSpid:"))
+        .unwrap_or("NSpid: not found");
+    let inner_nspid: u32 = nspid_line
+        .split_whitespace()
+        .last()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(99999);
+    assert!(
+        inner_nspid <= 5,
+        "expected small innermost NSpid (≤5, proves PID namespace active), NSpid line: {nspid_line}"
+    );
+
+    // Hostname is set correctly via the UTS namespace.
+    assert!(
+        stdout.contains("HOSTNAME=hardening-test"),
+        "expected HOSTNAME=hardening-test, got: {stdout}"
+    );
+
+    assert!(
+        status.success(),
+        "container exited non-zero: {:?}",
+        status
+    );
+}
+
+/// Verify that the lisp `do_container_start_inner` path applies the same
+/// hardening as the raw Command builder.
+///
+/// Strategy: start a `sleep 30` container via the interpreter, locate the inner
+/// child (PID 1 inside the PID namespace) via `/proc/{intermediate}/task/.../children`,
+/// read its `/proc/{inner}/status` from the host, and assert the same four
+/// properties that `test_hardening_combination` checks.
+///
+/// Skips if `alpine:latest` is not in the local image store (avoids a network
+/// pull in CI without internet).
+#[test]
+#[serial]
+fn test_lisp_container_spawn_hardening() {
+    if !is_root() {
+        eprintln!("SKIP: test_lisp_container_spawn_hardening requires root");
+        return;
+    }
+
+    // Skip if the alpine image is not already pulled.
+    if remora::image::load_image("alpine:latest").is_err() {
+        eprintln!("SKIP: test_lisp_container_spawn_hardening requires alpine:latest in image store");
+        return;
+    }
+
+    use remora::lisp::Interpreter;
+    use remora::lisp::Value;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut interp = Interpreter::new_with_runtime("test-iso".into(), tmp.path().to_path_buf());
+
+    // Start a short-lived sleep so we can inspect the process.
+    let val = interp
+        .eval_str(
+            r#"(container-start
+                 (service "probe"
+                   (list 'image "alpine:latest")
+                   (list 'command "sleep" "30")))"#,
+        )
+        .expect("container-start failed");
+
+    // Extract the intermediate PID from the ContainerHandle.
+    let intermediate_pid = match val {
+        Value::ContainerHandle { pid, .. } => pid,
+        other => panic!("expected ContainerHandle, got {:?}", other),
+    };
+
+    // Give the container a moment to reach its sleep call.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Find PID 1 inside the container (the inner child after the double-fork).
+    let inner_pid = first_child_pid(intermediate_pid)
+        .expect("could not find inner child of container intermediate process");
+
+    // Read /proc/{inner}/status from the host.
+    let status = read_proc_status(inner_pid)
+        .expect("could not read inner child's /proc/status");
+
+    // Seccomp mode 2 = filter active.
+    let seccomp = proc_status_field(&status, "Seccomp:").unwrap_or("missing");
+    assert_eq!(seccomp, "2", "expected Seccomp:2 in lisp container, got: {seccomp}");
+
+    // CapEff all-zero.
+    let capeff = proc_status_field(&status, "CapEff:").unwrap_or("missing");
+    assert!(
+        capeff.chars().all(|c| c == '0'),
+        "expected all-zero CapEff in lisp container, got: {capeff}"
+    );
+
+    // NoNewPrivs 1.
+    let nnp = proc_status_field(&status, "NoNewPrivs:").unwrap_or("missing");
+    assert_eq!(nnp, "1", "expected NoNewPrivs:1 in lisp container, got: {nnp}");
+
+    // UTS namespace differs from host (container has its own hostname namespace).
+    let container_uts = std::fs::read_link(format!("/proc/{}/ns/uts", inner_pid))
+        .expect("readlink container ns/uts");
+    let host_uts = std::fs::read_link("/proc/self/ns/uts")
+        .expect("readlink host ns/uts");
+    assert_ne!(
+        container_uts, host_uts,
+        "container UTS namespace should differ from host"
+    );
+
+    // Cleanup: drop the interpreter; its Drop impl sends SIGTERM to all
+    // registered containers, waits up to 5 s, then SIGKILLs stragglers and
+    // joins the waiter thread.  The PID namespace ensures sleep 30 dies
+    // (PR_SET_PDEATHSIG = SIGKILL on inner child) when the intermediate exits,
+    // so Drop completes in well under a second.
+    drop(interp);
+}

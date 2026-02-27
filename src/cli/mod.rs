@@ -508,6 +508,28 @@ fn iso8601_to_epoch(s: &str) -> Option<u64> {
     Some(epoch_days * 86400 + h * 3600 + mi * 60 + s)
 }
 
+/// Parse a list of capability name strings into a `Capability` bitflag mask.
+///
+/// Accepts bare names (`"net-raw"`, `"NET_RAW"`) or prefixed (`"CAP_NET_RAW"`),
+/// case-insensitive, with `-` or `_` as separators.  Unrecognised names are
+/// logged at warn level and skipped.
+pub fn parse_capability_mask(names: &[String]) -> remora::container::Capability {
+    use remora::container::Capability;
+    let mut mask = Capability::empty();
+    for name in names {
+        let normalised = name
+            .to_uppercase()
+            .replace('-', "_")
+            .trim_start_matches("CAP_")
+            .to_string();
+        match Capability::from_name(&normalised) {
+            Some(cap) => mask |= cap,
+            None => log::warn!("cap-add: unknown capability '{}' — skipping", name),
+        }
+    }
+    mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

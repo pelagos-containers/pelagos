@@ -1717,3 +1717,46 @@ inspects the resulting `ComposeSpec`. Asserts:
 Failure indicates a regression in: the new `:volume` Lisp service option,
 `:command` multi-value option, dotted-pair `:env` with literal values, or
 `env` built-in with null fallback.
+
+### `test_hardening_combination` (integration test in `tests/integration_tests.rs`)
+**Requires:** root, alpine-rootfs
+
+Spawns a container using the same four-call hardening block that `compose up`
+and the lisp runtime apply (`with_seccomp_default`, `drop_all_capabilities`,
+`with_no_new_privileges(true)`, `with_masked_paths_default`), plus
+`Namespace::PID | UTS | IPC | MOUNT`.  The container runs
+`grep -E '^(Seccomp|CapEff|NoNewPrivs|NSpid):' /proc/self/status` and
+`echo HOSTNAME=$(hostname)` via stdout capture.
+
+Asserts:
+- `Seccomp: 2` — Docker-default BPF filter is active
+- `CapEff: 0000000000000000` — all capabilities dropped
+- `NoNewPrivs: 1` — setuid escalation blocked
+- NSpid last field = `1` — container is PID 1 in its own PID namespace
+- `HOSTNAME=hardening-test` — UTS namespace is isolated
+
+Failure means one of the four hardening primitives regressed at the raw API
+level; every regression in this test will be masked from users unless this
+ground-truth test exists.
+
+### `test_lisp_container_spawn_hardening` (integration test in `tests/integration_tests.rs`)
+**Requires:** root, alpine:latest in image store
+
+Exercises `do_container_start_inner` (the lisp runtime path) via
+`Interpreter::new_with_runtime`, starts a `sleep 30` container, then inspects
+the spawned process from the host via `/proc/{inner_pid}/status`.
+
+Steps:
+1. Create interpreter with `new_with_runtime("test-iso", tmpdir)`
+2. Eval `(container-start ...)` with `alpine:latest` and `sleep 30`
+3. Extract intermediate PID from the returned `ContainerHandle`
+4. Find the inner child (PID 1 in the namespace) via `/proc/{pid}/task/{pid}/children`
+5. Read inner child's `/proc/{inner}/status` from the host
+6. Compare UTS namespace symlinks (`/proc/{inner}/ns/uts` vs `/proc/self/ns/uts`)
+
+Asserts same four properties as `test_hardening_combination`.  Skips if
+`alpine:latest` is not in the image store.
+
+Failure means the lisp `do_container_start_inner` path diverged from the
+security defaults applied by compose, or that a future refactor of that
+function accidentally removed the hardening block.

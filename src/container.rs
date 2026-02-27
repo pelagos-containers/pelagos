@@ -779,6 +779,11 @@ impl Command {
         self
     }
 
+    /// Return the current namespace flags.
+    pub fn namespaces(&self) -> Namespace {
+        self.namespaces
+    }
+
     /// Legacy API: accepts iterator of namespace references (for backwards compatibility)
     #[deprecated(since = "0.2.0", note = "Use with_namespaces() with bitflags instead")]
     pub fn unshare<'a, I>(mut self, namespaces: I) -> Self
@@ -2804,26 +2809,55 @@ impl Command {
 
                 // Step 4.75: Drop capabilities if specified
                 if let Some(keep_caps) = capabilities {
-                    // Drop all capabilities except the ones specified
-                    // We use prctl with PR_CAPBSET_DROP to drop from the bounding set
+                    // Two-step capability drop (mirrors Docker / runc):
+                    //
+                    // 1. PR_CAPBSET_DROP — remove unwanted caps from the
+                    //    bounding set so exec() cannot re-grant them.
+                    // 2. capset() — explicitly set the effective, permitted,
+                    //    and inheritable kernel sets to the desired mask.
+                    //    Without this step, CapEff/CapPrm remain at their
+                    //    current values (full root caps) regardless of what
+                    //    the bounding set says.
                     const PR_CAPBSET_DROP: i32 = 24;
-
-                    // All capability numbers (0-37 covers most common capabilities)
-                    for cap in 0..38 {
+                    for cap in 0..38u64 {
                         let cap_bit = 1u64 << cap;
-
-                        // If this capability is NOT in keep_caps, drop it
                         if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
                             let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
-                            // Ignore errors for capabilities that don't exist
                             if result != 0 {
                                 let err = io::Error::last_os_error();
-                                // EINVAL means capability doesn't exist, which is fine
                                 if err.raw_os_error() != Some(libc::EINVAL) {
                                     return Err(err);
                                 }
                             }
                         }
+                    }
+
+                    // capset() — zero (or restrict) the effective, permitted,
+                    // and inheritable sets to exactly keep_caps.
+                    // The v3 header (0x20080522) supports 64-bit cap sets via
+                    // two consecutive cap_user_data structs (lo/hi).
+                    let bits = keep_caps.bits();
+                    let lo = bits as u32;
+                    let hi = (bits >> 32) as u32;
+
+                    #[repr(C)]
+                    struct CapHeader { version: u32, pid: i32 }
+                    #[repr(C)]
+                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
+
+                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
+                    let data = [
+                        CapData { effective: lo, permitted: lo, inheritable: lo },
+                        CapData { effective: hi, permitted: hi, inheritable: hi },
+                    ];
+
+                    let ret = libc::syscall(
+                        libc::SYS_capset,
+                        &header as *const CapHeader,
+                        data.as_ptr(),
+                    );
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
 
@@ -4229,7 +4263,7 @@ impl Command {
 
                 if let Some(keep_caps) = capabilities {
                     const PR_CAPBSET_DROP: i32 = 24;
-                    for cap in 0..38 {
+                    for cap in 0..38u64 {
                         let cap_bit = 1u64 << cap;
                         if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
                             let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
@@ -4240,6 +4274,30 @@ impl Command {
                                 }
                             }
                         }
+                    }
+
+                    let bits = keep_caps.bits();
+                    let lo = bits as u32;
+                    let hi = (bits >> 32) as u32;
+
+                    #[repr(C)]
+                    struct CapHeader { version: u32, pid: i32 }
+                    #[repr(C)]
+                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
+
+                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
+                    let data = [
+                        CapData { effective: lo, permitted: lo, inheritable: lo },
+                        CapData { effective: hi, permitted: hi, inheritable: hi },
+                    ];
+
+                    let ret = libc::syscall(
+                        libc::SYS_capset,
+                        &header as *const CapHeader,
+                        data.as_ptr(),
+                    );
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
 

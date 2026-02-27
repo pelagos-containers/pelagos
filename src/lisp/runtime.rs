@@ -56,7 +56,7 @@ fn next_future_id() -> u64 {
 }
 
 use crate::compose::ServiceSpec;
-use crate::container::{Command, Stdio, Volume};
+use crate::container::{Command, Namespace, Stdio, Volume};
 use crate::image;
 use crate::network::NetworkMode;
 
@@ -73,6 +73,7 @@ use super::value::{LispError, Value};
 pub fn register_runtime_builtins(
     env: &Env,
     registry: Arc<Mutex<Vec<(String, i32)>>>,
+    thread_registry: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     project: String,
     compose_dir: PathBuf,
 ) {
@@ -84,6 +85,7 @@ pub fn register_runtime_builtins(
     // Optional :env applies a list of (KEY . value) pairs to the service env.
     {
         let registry = Arc::clone(&registry);
+        let thread_registry = Arc::clone(&thread_registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "container-start", move |args| {
@@ -113,7 +115,7 @@ pub fn register_runtime_builtins(
                     }
                 }
             }
-            do_container_start(svc, &project, &compose_dir, &registry)
+            do_container_start(svc, &project, &compose_dir, &registry, &thread_registry)
         });
     }
 
@@ -123,6 +125,7 @@ pub fn register_runtime_builtins(
     // Optional :env applies (KEY . value) pairs before spawning.
     {
         let registry = Arc::clone(&registry);
+        let thread_registry = Arc::clone(&thread_registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "container-start-bg", move |args| {
@@ -155,14 +158,20 @@ pub fn register_runtime_builtins(
                 }
             }
             let registry2 = Arc::clone(&registry);
+            let thread_registry2 = Arc::clone(&thread_registry);
             let project_str = (*project).clone();
             let compose_dir_path = compose_dir.to_path_buf();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let result =
-                    do_container_start_inner(svc, &project_str, &compose_dir_path, &registry2)
-                        .map(|r| (r.name, r.pid, r.ip))
-                        .map_err(|e| e.message);
+                let result = do_container_start_inner(
+                    svc,
+                    &project_str,
+                    &compose_dir_path,
+                    &registry2,
+                    &thread_registry2,
+                )
+                .map(|r| (r.name, r.pid, r.ip))
+                .map_err(|e| e.message);
                 let _ = tx.send(result);
             });
             use crate::lisp::value::{PendingRx, Value as V};
@@ -403,6 +412,7 @@ pub fn register_runtime_builtins(
     // Deps not in the list are treated as already satisfied (resolved externally).
     {
         let registry = Arc::clone(&registry);
+        let thread_registry = Arc::clone(&thread_registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "run", move |args| {
@@ -578,7 +588,13 @@ pub fn register_runtime_builtins(
                                     let env_list = eval_apply(inject_fn, &dep_vals)?;
                                     apply_inject_env(&mut spec, env_list, "run")?;
                                 }
-                                do_container_start(spec, &project, &compose_dir, &registry)?
+                                do_container_start(
+                                    spec,
+                                    &project,
+                                    &compose_dir,
+                                    &registry,
+                                    &thread_registry,
+                                )?
                             }
                             FutureKind::Transform {
                                 upstream,
@@ -599,6 +615,7 @@ pub fn register_runtime_builtins(
                                         &project,
                                         &compose_dir,
                                         &registry,
+                                        &thread_registry,
                                     )?,
                                     other => other,
                                 }
@@ -617,6 +634,7 @@ pub fn register_runtime_builtins(
                                         &project,
                                         &compose_dir,
                                         &registry,
+                                        &thread_registry,
                                     )?,
                                     other => other,
                                 }
@@ -675,6 +693,7 @@ pub fn register_runtime_builtins(
                                         &project,
                                         &compose_dir,
                                         &registry,
+                                        &thread_registry,
                                     )?,
                                     other => other,
                                 };
@@ -694,6 +713,7 @@ pub fn register_runtime_builtins(
                                         &project,
                                         &compose_dir,
                                         &registry,
+                                        &thread_registry,
                                     )?,
                                     other => other,
                                 };
@@ -721,12 +741,14 @@ pub fn register_runtime_builtins(
                             let project_owned = (*project).clone();
                             let compose_dir_owned = (*compose_dir).clone();
                             let registry_arc = Arc::clone(&registry);
+                            let thread_registry_arc = Arc::clone(&thread_registry);
                             let handle = std::thread::spawn(move || {
                                 do_container_start_inner(
                                     spec,
                                     &project_owned,
                                     &compose_dir_owned,
                                     &registry_arc,
+                                    &thread_registry_arc,
                                 )
                             });
                             handles.push((idx, handle));
@@ -858,6 +880,7 @@ pub fn register_runtime_builtins(
     // on the runtime value of the previous one.
     {
         let registry = Arc::clone(&registry);
+        let thread_registry = Arc::clone(&thread_registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "resolve", move |args| {
@@ -880,6 +903,7 @@ pub fn register_runtime_builtins(
                 &project,
                 &compose_dir,
                 &registry,
+                &thread_registry,
             )
         });
     }
@@ -890,6 +914,7 @@ pub fn register_runtime_builtins(
     // Transform futures are not supported by await (use run-all or resolve).
     {
         let registry = Arc::clone(&registry);
+        let thread_registry = Arc::clone(&thread_registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "await", move |args| {
@@ -951,7 +976,8 @@ pub fn register_runtime_builtins(
                 }
             }
 
-            let handle = do_container_start(svc, &project, &compose_dir, &registry)?;
+            let handle =
+                do_container_start(svc, &project, &compose_dir, &registry, &thread_registry)?;
 
             if let Some(p) = port {
                 let ip = match &handle {
@@ -1019,7 +1045,8 @@ pub fn register_runtime_builtins(
             loop {
                 match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
                     Err(nix::errno::Errno::ESRCH) => break,
-                    _ => std::thread::sleep(Duration::from_millis(100)),
+                    Err(_) => break,
+                    Ok(()) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
             // Deregister the waited container (it exited naturally) and cascade
@@ -1037,6 +1064,7 @@ pub fn register_runtime_builtins(
     // ── container-run ──────────────────────────────────────────────────────
     {
         let registry = Arc::clone(&registry);
+        let thread_registry = Arc::clone(&thread_registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
         native(env, "container-run", move |args| {
@@ -1046,7 +1074,8 @@ pub fn register_runtime_builtins(
                 ));
             }
             let svc = extract_service_spec("container-run", &args[0])?;
-            let handle = do_container_start(svc, &project, &compose_dir, &registry)?;
+            let handle =
+                do_container_start(svc, &project, &compose_dir, &registry, &thread_registry)?;
             let (name, pid) = extract_handle("container-run", &handle)?;
             // Wait for process to exit.
             loop {
@@ -1174,6 +1203,7 @@ fn resolve_dynamic(
     project: &str,
     compose_dir: &std::path::Path,
     registry: &Arc<Mutex<Vec<(String, i32)>>>,
+    thread_registry: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> Result<Value, LispError> {
     use super::eval::eval_apply;
     use crate::lisp::value::FutureKind;
@@ -1190,7 +1220,14 @@ fn resolve_dynamic(
             // Resolve :needs deps first (needed for :env).
             let mut after_vals: Vec<Value> = Vec::new();
             for dep_fut in after {
-                let val = resolve_dynamic(dep_fut, resolved, project, compose_dir, registry)?;
+                let val = resolve_dynamic(
+                    dep_fut,
+                    resolved,
+                    project,
+                    compose_dir,
+                    registry,
+                    thread_registry,
+                )?;
                 after_vals.push(val);
             }
 
@@ -1201,20 +1238,31 @@ fn resolve_dynamic(
                         let env_list = eval_apply(&inj, &after_vals)?;
                         apply_inject_env(&mut spec, env_list, "resolve")?;
                     }
-                    do_container_start(spec, project, compose_dir, registry)?
+                    do_container_start(spec, project, compose_dir, registry, thread_registry)?
                 }
                 FutureKind::Transform {
                     upstream,
                     transform,
                 } => {
-                    let upstream_val =
-                        resolve_dynamic(*upstream, resolved, project, compose_dir, registry)?;
+                    let upstream_val = resolve_dynamic(
+                        *upstream,
+                        resolved,
+                        project,
+                        compose_dir,
+                        registry,
+                        thread_registry,
+                    )?;
                     let result = eval_apply(&transform, &[upstream_val])?;
                     // Monadic flatten: lambda may return a Future — resolve it.
                     match result {
-                        Value::Future { .. } => {
-                            resolve_dynamic(result, resolved, project, compose_dir, registry)?
-                        }
+                        Value::Future { .. } => resolve_dynamic(
+                            result,
+                            resolved,
+                            project,
+                            compose_dir,
+                            registry,
+                            thread_registry,
+                        )?,
                         other => other,
                     }
                 }
@@ -1222,9 +1270,14 @@ fn resolve_dynamic(
                     // after_vals holds resolved values for all upstreams in order.
                     let result = eval_apply(&transform, &after_vals)?;
                     match result {
-                        Value::Future { .. } => {
-                            resolve_dynamic(result, resolved, project, compose_dir, registry)?
-                        }
+                        Value::Future { .. } => resolve_dynamic(
+                            result,
+                            resolved,
+                            project,
+                            compose_dir,
+                            registry,
+                            thread_registry,
+                        )?,
                         other => other,
                     }
                 }
@@ -1261,8 +1314,9 @@ fn do_container_start(
     project: &str,
     compose_dir: &std::path::Path,
     registry: &Arc<Mutex<Vec<(String, i32)>>>,
+    thread_registry: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> Result<Value, LispError> {
-    let r = do_container_start_inner(svc, project, compose_dir, registry)?;
+    let r = do_container_start_inner(svc, project, compose_dir, registry, thread_registry)?;
     Ok(Value::ContainerHandle {
         name: r.name,
         pid: r.pid,
@@ -1278,6 +1332,7 @@ fn do_container_start_inner(
     project: &str,
     compose_dir: &std::path::Path,
     registry: &Arc<Mutex<Vec<(String, i32)>>>,
+    thread_registry: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) -> Result<SpawnResult, LispError> {
     // Resolve image.
     let image_ref = &svc.image;
@@ -1305,6 +1360,7 @@ fn do_container_start_inner(
     };
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
+    let container_name = format!("{}-{}", project, svc.name);
 
     let mut cmd = Command::new(exe).args(rest).with_image_layers(layers);
 
@@ -1441,6 +1497,45 @@ fn do_container_start_inner(
         cmd = cmd.with_cwd(w);
     }
 
+    // ── Container hardening ──────────────────────────────────────────────────
+    //
+    // Applied last so we OR with any namespace flags already accumulated (e.g.
+    // MOUNT from with_image_layers, NET from Loopback mode).
+
+    // Namespaces: PID isolates the process tree so orphaned sub-processes
+    // (e.g. postgres workers) are killed by the kernel when PID 1 exits.
+    // UTS gives each container its own hostname; IPC isolates SysV/POSIX IPC.
+    let ns = cmd.namespaces();
+    cmd = cmd
+        .with_namespaces(ns | Namespace::PID | Namespace::UTS | Namespace::IPC)
+        .with_hostname(&container_name);
+
+    // Security: seccomp + dropped capabilities + no-new-privileges + masked paths.
+    // Mirrors Docker's secure-by-default posture.
+    cmd = cmd
+        .with_seccomp_default()
+        .drop_all_capabilities()
+        .with_no_new_privileges(true)
+        .with_masked_paths_default();
+
+    // Restore any capabilities explicitly requested via :cap-add in the service spec.
+    if !svc.cap_add.is_empty() {
+        use crate::container::Capability;
+        let mut restore = Capability::empty();
+        for name in &svc.cap_add {
+            let normalised = name
+                .to_uppercase()
+                .replace('-', "_")
+                .trim_start_matches("CAP_")
+                .to_string();
+            match Capability::from_name(&normalised) {
+                Some(cap) => restore |= cap,
+                None => log::warn!("container-start: unknown cap-add '{}' — skipping", name),
+            }
+        }
+        cmd = cmd.with_capabilities(restore);
+    }
+
     // Spawn with log capture.
     cmd = cmd
         .stdin(Stdio::Null)
@@ -1456,7 +1551,6 @@ fn do_container_start_inner(
 
     let pid = child.pid();
     let ip = child.container_ip();
-    let container_name = format!("{}-{}", project, svc.name);
 
     // Register DNS entries.
     let all_ips: Vec<(String, String)> = child
@@ -1495,14 +1589,14 @@ fn do_container_start_inner(
     let mut stderr_handle = child.take_stderr();
     let svc_name_log = svc.name.clone();
 
-    std::thread::spawn(move || {
+    let t_stdout = std::thread::spawn(move || {
         if let Some(mut src) = stdout_handle.take() {
             let mut buf = [0u8; 4096];
             while matches!(src.read(&mut buf), Ok(n) if n > 0) {}
         }
     });
 
-    std::thread::spawn(move || {
+    let t_stderr = std::thread::spawn(move || {
         if let Some(mut src) = stderr_handle.take() {
             let mut buf = [0u8; 4096];
             while matches!(src.read(&mut buf), Ok(n) if n > 0) {}
@@ -1511,12 +1605,26 @@ fn do_container_start_inner(
 
     // Spawn waiter that cleans up DNS when the container exits.
     let all_ips_wait = all_ips.clone();
-    std::thread::spawn(move || {
+    let t_waiter = std::thread::spawn(move || {
         let _ = child.wait();
         for (net_name, _) in &all_ips_wait {
             let _ = crate::dns::dns_remove_entry(net_name, &svc_name_log);
         }
     });
+
+    // Register the waiter thread so Drop can join it before calling exit().
+    // The waiter calls dns_remove_entry (which writes log messages), so we
+    // must ensure it finishes before exit() flushes stderr.
+    //
+    // The log-sink threads (t_stdout, t_stderr) are intentionally NOT joined:
+    // they block on read() until the container's write-end of the pipe closes,
+    // which may not happen if the container forked children that inherited the
+    // fd (e.g. postgres autovacuum workers that outlive the postmaster after
+    // SIGKILL).  Since the log sinks never write to stderr they cannot cause
+    // glibc's IO-lock deadlock; glibc's own _exit() will kill them at the end.
+    drop(t_stdout);
+    drop(t_stderr);
+    thread_registry.lock().unwrap().push(t_waiter);
 
     // Register in interpreter's cleanup registry.
     registry.lock().unwrap().push((container_name.clone(), pid));

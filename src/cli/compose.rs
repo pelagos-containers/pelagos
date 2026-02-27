@@ -8,7 +8,7 @@ use super::{
 use remora::compose::{
     parse_compose, topo_sort, ComposeFile, Dependency, HealthCheck, ServiceSpec,
 };
-use remora::container::{Command, Stdio, Volume};
+use remora::container::{Command, Namespace, Stdio, Volume};
 use remora::lisp::{HookMap, Interpreter};
 use remora::network::NetworkMode;
 use serde::{Deserialize, Serialize};
@@ -740,6 +740,33 @@ fn spawn_service(
     // Workdir.
     if let Some(ref w) = svc.workdir {
         cmd = cmd.with_cwd(w);
+    }
+
+    // ── Container hardening ──────────────────────────────────────────────────
+    //
+    // Applied last so we OR with any namespace flags already accumulated (e.g.
+    // MOUNT from with_image_layers, NET from Loopback mode).
+
+    // Namespaces: PID isolates the process tree so orphaned sub-processes
+    // (e.g. postgres workers) are killed by the kernel when PID 1 exits.
+    // UTS gives each container its own hostname; IPC isolates SysV/POSIX IPC.
+    let ns = cmd.namespaces();
+    cmd = cmd
+        .with_namespaces(ns | Namespace::PID | Namespace::UTS | Namespace::IPC)
+        .with_hostname(container_name);
+
+    // Security: seccomp + dropped capabilities + no-new-privileges + masked paths.
+    // Mirrors Docker's secure-by-default posture.
+    cmd = cmd
+        .with_seccomp_default()
+        .drop_all_capabilities()
+        .with_no_new_privileges(true)
+        .with_masked_paths_default();
+
+    // Restore any capabilities explicitly requested via :cap-add in the service spec.
+    if !svc.cap_add.is_empty() {
+        let restore = super::parse_capability_mask(&svc.cap_add);
+        cmd = cmd.with_capabilities(restore);
     }
 
     // Spawn detached with log capture.

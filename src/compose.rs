@@ -44,6 +44,9 @@ pub struct ServiceSpec {
     pub command: Option<Vec<String>>,
     pub workdir: Option<String>,
     pub user: Option<String>,
+    /// Capabilities to restore after `drop_all_capabilities()`.
+    /// Accepts bare names ("net-raw", "NET_RAW") or prefixed ("CAP_NET_RAW").
+    pub cap_add: Vec<String>,
 }
 
 /// A volume mount: `name:path` inside the container.
@@ -284,6 +287,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         command: None,
         workdir: None,
         user: None,
+        cap_add: Vec::new(),
     };
 
     for arg in &args[1..] {
@@ -393,6 +397,17 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
             "tmpfs" => {
                 let path = require_atom(list, 1, &format!("service '{}' tmpfs path", name))?;
                 spec.tmpfs_mounts.push(path);
+            }
+            "cap-add" => {
+                for item in &list[1..] {
+                    let cap = item.as_atom().ok_or_else(|| {
+                        ComposeError::InvalidValue(format!(
+                            "service '{}': cap-add values must be atoms",
+                            name
+                        ))
+                    })?;
+                    spec.cap_add.push(cap.to_string());
+                }
             }
             other => {
                 return Err(ComposeError::SyntaxError(format!(

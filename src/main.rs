@@ -377,8 +377,12 @@ fn main() {
         CliCommand::Delete { id } => remora::oci::cmd_delete(&id).map_err(|e| e.to_string().into()),
     };
 
-    if let Err(e) = result {
-        eprintln!("remora: error: {}", e);
-        std::process::exit(1);
-    }
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("remora: error: {}", e);
+            1
+        }
+    };
+    std::process::exit(code);
 }

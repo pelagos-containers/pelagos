@@ -40,7 +40,8 @@
 ;;   :env      ("KEY1" . "val1") ("KEY2" . var)  ; host env maps to container env
 ;;   :bind     ("./host/path" . "/container/path") ; read-only (safe default)
 ;;   :bind-rw  ("./host/path" . "/container/path") ; read-write (explicit opt-in)
-;;   :memory   mem-var)
+;;   :memory   mem-var
+;;   :cap-add  net-raw sys-admin)                ; restore specific caps (all dropped by default)
 ;;
 ;; The options are a flat keyword-value list.  Each :keyword introduces a new
 ;; option; its values run until the next :keyword or end of list.

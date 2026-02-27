@@ -34,8 +34,10 @@
 ;;;
 ;;;     1. Interpreter Drop (implicit): when the Interpreter goes out of
 ;;;        scope — whether the script completes normally or exits via error —
-;;;        it sends SIGTERM to every container still in the registry.  This
-;;;        is the safety net that makes the chain model safe to use.
+;;;        it sends SIGTERM to every container still in the registry, waits
+;;;        up to 5 s for graceful exit, then SIGKILLs any stragglers, and
+;;;        finally joins all background threads.  This is the safety net
+;;;        that makes the chain model safe to use.
 ;;;
 ;;;     2. with-cleanup (explicit, this file): fires on both normal exit
 ;;;        and error; handles logging and any teardown that *does* need

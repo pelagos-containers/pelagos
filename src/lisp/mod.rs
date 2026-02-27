@@ -36,9 +36,14 @@ pub struct Interpreter {
     pending: Rc<RefCell<PendingCompose>>,
     /// Registry of containers started via `container-start`.
     /// Entries are `(container_name, pid)`.
-    /// The `Drop` impl sends SIGTERM to any still-running containers.
+    /// The `Drop` impl sends SIGTERM/SIGKILL to any still-running containers,
+    /// then joins all background threads before returning.
     /// `Arc<Mutex<...>>` so that parallel worker threads can register entries.
     pub(crate) container_registry: Arc<Mutex<Vec<(String, i32)>>>,
+    /// Background threads (log sinks + waiters) for started containers.
+    /// Joined in `Drop` after containers are killed, ensuring no threads are
+    /// writing to stderr when the process calls `exit()`.
+    pub(crate) thread_registry: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl Interpreter {
@@ -48,6 +53,8 @@ impl Interpreter {
         let hooks: Rc<RefCell<HookMap>> = Rc::new(RefCell::new(HookMap::new()));
         let pending: Rc<RefCell<PendingCompose>> = Rc::new(RefCell::new(PendingCompose::default()));
         let container_registry: Arc<Mutex<Vec<(String, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let thread_registry: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
         register_builtins(&global_env);
         register_remora_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
@@ -57,6 +64,7 @@ impl Interpreter {
             hooks,
             pending,
             container_registry,
+            thread_registry,
         };
         interp
             .eval_str(include_str!("stdlib.lisp"))
@@ -73,7 +81,14 @@ impl Interpreter {
     pub fn new_with_runtime(project: String, compose_dir: std::path::PathBuf) -> Self {
         let interp = Self::new();
         let registry = Arc::clone(&interp.container_registry);
-        runtime::register_runtime_builtins(&interp.global_env, registry, project, compose_dir);
+        let thread_registry = Arc::clone(&interp.thread_registry);
+        runtime::register_runtime_builtins(
+            &interp.global_env,
+            registry,
+            thread_registry,
+            project,
+            compose_dir,
+        );
         interp
     }
 
@@ -133,12 +148,54 @@ impl Default for Interpreter {
 
 impl Drop for Interpreter {
     fn drop(&mut self) {
-        for (name, pid) in self.container_registry.lock().unwrap().iter() {
+        use std::time::{Duration, Instant};
+
+        // Snapshot the registry; don't hold the lock during sleeps.
+        let containers: Vec<(String, i32)> = self.container_registry.lock().unwrap().clone();
+        if containers.is_empty() {
+            return;
+        }
+
+        // 1. SIGTERM — graceful shutdown request.
+        for (name, pid) in &containers {
             log::info!("interpreter cleanup: stopping '{}' (pid {})", name, pid);
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(*pid),
                 nix::sys::signal::Signal::SIGTERM,
             );
+        }
+
+        // 2. Wait up to 5 s for all containers to exit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let all_dead = containers.iter().all(|(_, pid)| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), None).is_err()
+            });
+            if all_dead || Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        // 3. SIGKILL any stragglers that ignored SIGTERM.
+        for (name, pid) in &containers {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), None).is_ok() {
+                log::warn!(
+                    "interpreter cleanup: force-killing '{}' (pid {})",
+                    name,
+                    pid
+                );
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(*pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+
+        // 4. Join waiter threads so DNS cleanup completes before _exit().
+        let handles: Vec<_> = std::mem::take(&mut *self.thread_registry.lock().unwrap());
+        for handle in handles {
+            let _ = handle.join();
         }
     }
 }
