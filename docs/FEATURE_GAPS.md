@@ -52,10 +52,8 @@ first-class concerns — territory runc explicitly does not cover.
 `remora image login <registry>` writes credentials to `~/.docker/config.json`.
 `remora image pull --username <u> --password <p>` authenticates pulls.
 Auth resolution order: CLI flags → `REMORA_REGISTRY_USER`/`REMORA_REGISTRY_PASS`
-env vars → `~/.docker/config.json` → Anonymous.
-
-Credential helpers (`credHelpers`, `credsStore`) are not yet supported.
-ECR users: `--password $(aws ecr get-login-password)`.
+env vars → `~/.docker/config.json` (`credHelpers` / `credsStore` / `auths`) → Anonymous.
+Credential helpers fully supported: `docker-credential-ecr-login`, OS keychain, etc.
 
 ---
 
@@ -69,10 +67,14 @@ Auth uses the same resolution order as pull.
 
 ### Significant (limits daily usefulness)
 
-#### `remora image save` / `remora image load`
-Exporting a built image as a tar archive and re-importing it.  Essential for
-air-gapped environments, CI artifact hand-off, and transferring images between
-hosts without a registry.
+#### ~~`remora image save` / `remora image load`~~ ✅ COMPLETE
+OCI Image Layout tar format.  Interoperable with Docker, Podman, skopeo, crane.
+`remora image save <ref> [-o file.tar]` and `remora image load [-i file.tar] [--tag ref]`.
+
+---
+
+#### ~~Proper image tagging~~ ✅ COMPLETE
+`remora image tag <source> <target>` — assigns a new local reference, shares layers.
 
 ---
 
@@ -86,12 +88,6 @@ servers, VoIP, and many other protocols.
 Dockerfile `HEALTHCHECK` instruction and runtime health monitoring.  Currently
 compose readiness is TCP-port-only; no support for exec-based health probes or
 HTTP checks.
-
----
-
-#### Proper image tagging
-`remora tag <image> <newtag>` — creating aliases and multiple tags per manifest.
-Currently images are addressed by their pull reference only.
 
 ---
 
