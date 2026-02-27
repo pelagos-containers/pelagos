@@ -514,6 +514,36 @@ pub(crate) fn parse_image_config(
 }
 
 // ---------------------------------------------------------------------------
+// image tag
+// ---------------------------------------------------------------------------
+
+/// Assign a new local reference to an existing image without pulling.
+pub fn cmd_image_tag(source: &str, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let src_ref = resolve_local_reference(source);
+    let manifest =
+        load_image(&src_ref).map_err(|_| format!("image '{}' not found locally", src_ref))?;
+
+    let config_json = image::load_oci_config(&src_ref).map_err(|_| {
+        format!(
+            "OCI config not found for '{}' — re-pull or rebuild to populate the blob cache",
+            src_ref
+        )
+    })?;
+
+    let target_ref = add_default_tag(target);
+    let new_manifest = ImageManifest {
+        reference: target_ref.clone(),
+        digest: manifest.digest,
+        layers: manifest.layers,
+        config: manifest.config,
+    };
+    save_image(&new_manifest)?;
+    image::save_oci_config(&target_ref, &config_json)?;
+    println!("{} → {}", src_ref, target_ref);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // image save
 // ---------------------------------------------------------------------------
 

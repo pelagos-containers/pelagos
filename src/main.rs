@@ -320,6 +320,13 @@ pub(crate) enum ImageCmd {
         /// Registry hostname
         registry: String,
     },
+    /// Tag a locally stored image with a new reference
+    Tag {
+        /// Source image reference
+        source: String,
+        /// New reference to assign
+        target: String,
+    },
     /// Save a locally stored image to an OCI Image Layout tar archive
     Save {
         /// Image reference (e.g. alpine:latest)
@@ -447,6 +454,7 @@ fn main() {
                 password_stdin,
             } => cli::image::cmd_image_login(&registry, username.as_deref(), password_stdin),
             ImageCmd::Logout { registry } => cli::image::cmd_image_logout(&registry),
+            ImageCmd::Tag { source, target } => cli::image::cmd_image_tag(&source, &target),
             ImageCmd::Save { reference, output } => {
                 cli::image::cmd_image_save(&reference, output.as_deref())
             }

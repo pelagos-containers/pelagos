@@ -1852,3 +1852,19 @@ populate the blob cache, or a regression in blob store write paths).
 Failure at step 4 means `load` failed to extract layers or write the manifest.
 Failure at step 6 means the overlay mount for the loaded image is broken —
 layers are present in the store but the image config or layer order is wrong.
+
+### `image_tag::test_image_tag_roundtrip` (`#[ignore]`)
+**Requires:** root, network (Docker Hub for `alpine`), overlay support
+
+1. **Pull** `docker.io/library/alpine:latest`.
+2. **Tag** it to `my-alpine:tagged` via `remora image tag`.
+3. **Verify** both references appear in `remora image ls`.
+4. **Run** `/bin/true` in the tagged image — confirms layers and config are
+   shared correctly between source and target references.
+5. **Remove** the source reference, then **run** the tagged image again —
+   verifies that tag creates an independent manifest entry, not an alias.
+
+Failure at step 2 means `tag` failed to copy the manifest or OCI config.
+Failure at step 4 means the shared layer store is broken after tagging.
+Failure at step 5 means `tag` stored a reference to the source rather than
+creating its own manifest, so removing source broke the tag.

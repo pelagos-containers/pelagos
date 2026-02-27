@@ -1,5 +1,39 @@
 # Ongoing Tasks
 
+## Last completed: image tag (2026-02-27)
+
+### What to do
+
+`remora image tag <source> <target>` — assign a new local reference to an
+existing image without pulling.
+
+**Implementation:**
+1. Resolve source (local-first, same as rm/push)
+2. `load_image(src)` → manifest
+3. `load_oci_config(src)` → config JSON
+4. Build new `ImageManifest` with `reference = target`, same digest/layers/config
+5. `save_image(new_manifest)` — creates target image dir + manifest.json
+6. `save_oci_config(target, config_json)` — copies oci-config.json to target dir
+
+**Files:** `src/cli/image.rs`, `src/main.rs`, `tests/integration_tests.rs`,
+`docs/INTEGRATION_TESTS.md`, `ONGOING_TASKS.md`
+
+### Verification done
+- `cargo build` — clean
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt` — clean
+- `cargo test --lib` — 254 tests pass
+- `cargo test --test integration_tests --no-run` — compiles clean
+- Please run: `sudo -E cargo test --test integration_tests image_tag -- --ignored --nocapture`
+
+### Next task: credential helper support
+
+`credHelpers` / `credsStore` in `~/.docker/config.json` — delegate auth to
+external helpers (`docker-credential-ecr-login`, OS keychain, etc.) so users
+don't need to call `image login` with short-lived tokens.
+
+---
+
 ## Last completed: image save / load (2026-02-27)
 
 ### Context

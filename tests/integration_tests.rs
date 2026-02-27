@@ -9525,3 +9525,94 @@ mod image_save_load {
             .output();
     }
 }
+
+// ============================================================================
+// image tag
+// ============================================================================
+
+mod image_tag {
+    /// Pull alpine, tag it to a new reference, verify both appear in ls,
+    /// and confirm the tagged image is runnable.
+    ///
+    /// Requires root (image pull uses overlayfs extraction).
+    /// Marked `#[ignore]` — run with:
+    ///   sudo -E cargo test --test integration_tests image_tag -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_image_tag_roundtrip() {
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let source = "docker.io/library/alpine:latest";
+        let target = "my-alpine:tagged";
+
+        // ── 1. Pull source ────────────────────────────────────────────────────
+        let pull = std::process::Command::new(bin)
+            .args(["image", "pull", source])
+            .output()
+            .expect("remora image pull");
+        assert!(
+            pull.status.success(),
+            "pull failed:\n{}",
+            String::from_utf8_lossy(&pull.stderr)
+        );
+
+        // ── 2. Tag ────────────────────────────────────────────────────────────
+        let tag = std::process::Command::new(bin)
+            .args(["image", "tag", source, target])
+            .output()
+            .expect("remora image tag");
+        assert!(
+            tag.status.success(),
+            "tag failed:\n{}",
+            String::from_utf8_lossy(&tag.stderr)
+        );
+
+        // ── 3. Both references appear in ls ───────────────────────────────────
+        let ls = std::process::Command::new(bin)
+            .args(["image", "ls"])
+            .output()
+            .expect("remora image ls");
+        let ls_out = String::from_utf8_lossy(&ls.stdout);
+        assert!(ls_out.contains("alpine"), "source not in ls:\n{}", ls_out);
+        assert!(
+            ls_out.contains("my-alpine"),
+            "tagged image not in ls:\n{}",
+            ls_out
+        );
+
+        // ── 4. Tagged image is runnable ───────────────────────────────────────
+        let run = std::process::Command::new(bin)
+            .args(["run", target, "/bin/true"])
+            .output()
+            .expect("remora run");
+        assert!(
+            run.status.success(),
+            "run of tagged image failed:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        // ── 5. Remove source; tagged image still runs ─────────────────────────
+        let rm_src = std::process::Command::new(bin)
+            .args(["image", "rm", source])
+            .output()
+            .expect("remora image rm source");
+        assert!(rm_src.status.success(), "rm source failed");
+
+        let run2 = std::process::Command::new(bin)
+            .args(["run", target, "/bin/true"])
+            .output()
+            .expect("remora run tagged after rm source");
+        assert!(
+            run2.status.success(),
+            "run of tagged image after source rm failed:\n{}",
+            String::from_utf8_lossy(&run2.stderr)
+        );
+
+        // ── Cleanup ───────────────────────────────────────────────────────────
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", target])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", source])
+            .output();
+    }
+}
