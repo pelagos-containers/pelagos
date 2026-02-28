@@ -85,14 +85,23 @@ and UTS isolation.
 
 ## Thread Inventory Per Container
 
-The watcher process maintains a small, fixed set of threads:
+### Watcher process — static threads
+
+These threads are always present for every running container:
 
 | Thread | Purpose | Lifetime |
 |--------|----------|----------|
 | **Main thread** | `child.wait()` — blocks until container exits; then writes final `state.json`, cleans up DNS | Container lifetime |
 | **stdout relay** | Reads container stdout pipe → appends to `stdout.log` | Until container stdout pipe closes |
 | **stderr relay** | Reads container stderr pipe → appends to `stderr.log` | Until container stderr pipe closes |
-| **Health monitor** | Polls container health every `interval_secs`; writes `HealthStatus` to `state.json` | Container lifetime (if image has `HEALTHCHECK`) |
+
+### Watcher process — optional: health monitor
+
+If the image declares a `HEALTHCHECK`, one additional long-lived thread is added:
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **Health monitor** | Polls container health every `interval_secs`; writes `HealthStatus` to `state.json` | Container lifetime |
 
 Each health **probe** spawns one additional short-lived thread:
 
@@ -105,18 +114,110 @@ and waits on a channel with `recv_timeout`. If the probe hangs, the channel time
 and the probe thread is abandoned (it will eventually terminate when its child process
 dies or is killed by the OS).
 
-### Thread count per container
+### Watcher process — dynamic: port-forward proxy threads
 
-- **Minimum (no HEALTHCHECK):** 3 threads (main + stdout relay + stderr relay)
-- **With HEALTHCHECK:** 4 threads at rest; 5 during an active probe
+When the container has port mappings (`-p HOST:CONTAINER[/tcp|udp|both]`),
+`setup_bridge_network` calls `start_port_proxies` **before the container is forked**.
+All proxy threads therefore live in the **watcher process**, not the container.
+The nftables DNAT rules handle non-localhost traffic; the userspace proxy handles
+traffic from `localhost` (which nftables PREROUTING cannot intercept).
 
-### Scalability
+**Per TCP-mapped port — 1 persistent thread:**
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **TCP listener** (`start_tcp_proxy_listener`) | Accept loop on `0.0.0.0:{host_port}`; dispatches each connection to a relay pair | Until stop flag set at container teardown |
+
+**Per active TCP connection — 2 transient threads (spawned by `proxy_relay`):**
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **TCP relay → container** | Copies bytes: client socket → container socket | Until either half closes or stop flag set |
+| **TCP relay → client** | Copies bytes: container socket → client socket | Until either half closes or stop flag set |
+
+These threads are spawned inside `proxy_relay`, which itself is called from the TCP
+listener thread for each accepted connection. They terminate when either side closes
+the connection or when the stop flag is set.
+
+**Per UDP-mapped port — 1 persistent thread:**
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **UDP proxy** (`start_udp_proxy`) | Receives datagrams from clients; maintains per-client session table; forwards to container | Until stop flag set at container teardown |
+
+**Per active UDP client session — 1 transient thread (spawned on first datagram from that client):**
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **UDP reply forwarder** | Receives datagrams from container on the session's outbound socket; forwards to originating client | Until stop flag set; sessions idle >30 s are evicted |
+
+UDP session threads are spawned inside the UDP proxy loop the first time a datagram
+arrives from a new client address. They share the stop flag with the port's proxy thread
+and exit when it is set. The session table is evicted every receive loop iteration for
+entries idle longer than 30 seconds.
+
+### Thread count formula
+
+```
+total = 3 (static)
+      + 1 (health monitor, if HEALTHCHECK)
+      + N_tcp_ports          (TCP listener threads)
+      + 2 × active_tcp_conns (TCP relay pairs, transient)
+      + N_udp_ports          (UDP proxy threads)
+      + active_udp_sessions  (UDP reply threads, transient)
+```
+
+At rest with one TCP port and one UDP port and no HEALTHCHECK: **5 threads** (main +
+stdout + stderr + 1 TCP listener + 1 UDP proxy).
+
+### Scalability note
 
 The thread-per-fd relay approach is simple and correct for modest workloads. For N
 simultaneously running containers, the watcher processes consume O(N) threads across N
-separate processes (each watcher is its own process). This is not a concern in practice
-for ≤ hundreds of containers; for very large deployments an epoll-based relay would be
-more efficient. This is documented as future work.
+separate processes (each watcher is its own process). Under high TCP connection counts,
+the relay-pair-per-connection model grows linearly. A future refactor replacing the
+userspace proxy with a single tokio async task pool (tokio is already a dependency)
+would reduce this to O(1) threads per port. This is documented as future work in
+`src/network.rs`.
+
+---
+
+## Library-Level UID/GID Mapping Thread
+
+When a container is configured with `with_user_namespace()` and the `use_id_helpers`
+flag is set (i.e., `newuidmap`/`newgidmap` helper binaries are used to write UID/GID
+maps), `Command::spawn()` creates one short-lived thread in the **calling process**
+(the watcher, for `remora run -d`) before the `fork()`:
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **UID/GID mapper** | Reads child PID from pipe; runs `newuidmap`/`newgidmap`; signals done | Exits after maps are written (milliseconds) |
+
+This thread is only spawned when user namespaces with external helper binaries are in
+use; it exits immediately after writing the maps. It does not persist.
+
+---
+
+## Compose Supervisor Threads
+
+`remora compose up` runs a **supervisor process** (not a watcher) that directly manages
+all service containers. Threads in the supervisor are per-service:
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **stdout relay** | Container stdout pipe → log file | Until pipe closes |
+| **stderr relay** | Container stderr pipe → log file | Until pipe closes |
+| **Waiter** | `child.wait()` + DNS teardown on exit | Container lifetime |
+
+When services are started concurrently (parallel dependency scheduling), one additional
+thread is spawned per service during the startup phase:
+
+| Thread | Purpose | Lifetime |
+|--------|----------|----------|
+| **Service launcher** | Calls `do_container_start_inner`; reports result over channel | Until service is running (or fails) |
+
+These threads all belong to the supervisor process. There is no per-service watcher;
+the supervisor is the watcher for all services.
 
 ---
 
@@ -189,4 +290,6 @@ address it. This is documented as future work.
 | `remora exec` does not join container PID namespace | `ps` in exec'd shell shows host PIDs | Check `pid_for_children` in `discover_namespaces` |
 | Probe timeout does not SIGKILL the probe child | Hung probes consume a thread until OS reaps them | Explicit SIGKILL on timeout |
 | Thread-per-fd log relay | O(2) threads per container for I/O | epoll-based relay (future) |
+| TCP relay-pair-per-connection model | O(2 × connections) threads per TCP-mapped port under load | Replace with single tokio async proxy (tokio already a dep) |
+| UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Explicit join/kill on session eviction |
 | Watcher death does not propagate to PID 1 | Container orphaned if watcher dies | `PR_SET_CHILD_SUBREAPER` on watcher |
