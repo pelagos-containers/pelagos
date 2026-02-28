@@ -1,5 +1,55 @@
 # Ongoing Tasks
 
+## Last completed: PID namespace fixes + thread doc (2026-02-28, SHA b0fed4d)
+
+### What was done
+
+**`src/cli/run.rs`**
+- `build_image_run`: replaced `.with_namespaces(UTS|PID)` with `.add_namespaces(UTS|PID)`.
+  The old call replaced the flag set entirely, silently dropping `MOUNT` that
+  `with_image_layers()` had ORed in, causing every image-based container to fail with
+  "with_overlay requires Namespace::MOUNT".
+
+**`src/container.rs`**
+- Added `pub fn add_namespaces(self, ns: Namespace) -> Self` — ORs into existing flags
+  rather than replacing them.
+
+**`src/cli/exec.rs`**
+- Added `fn find_root_pid(pid: i32) -> i32`: reads `/proc/{pid}/task/{pid}/children`;
+  if exactly one child exists the caller is the PID-namespace intermediate process P
+  (which never called pivot_root), so returns the child's PID (C = PID 1 in the
+  container, which DID call pivot_root).
+- Updated all four root-fd open sites (`cmd_exec` + `exec_in_container`, both the
+  mount-ns and no-mount-ns paths) to use `find_root_pid(pid)` instead of `pid` directly.
+
+**`src/network.rs`**
+- Extended port-forward state-file format from `ip:hp:cp[:proto]` to
+  `ns_name:ip:hp:cp:proto` so `read_port_forwards_count` can filter by liveness
+  (`netns_exists(ns_name)`). Stale entries from crashed containers no longer prevent
+  nftables table deletion.
+- Added `PortForwardEntry` type alias to satisfy clippy `type_complexity`.
+- Fixed `enable_port_forwards` and `disable_port_forwards` callers.
+- Updated unit tests for new tuple field indices; added
+  `test_parse_port_forward_line_new_format`.
+
+**`docs/WATCHER_PROCESS_MODEL.md`**
+- Full thread inventory: static threads, optional health monitor + probe threads,
+  port-forward proxy threads (TCP listener, TCP relay pairs, UDP proxy, UDP reply
+  forwarder), UID/GID mapping thread, compose supervisor threads.
+- Thread-count formula section.
+- Two new known-limitation rows (TCP relay growth under load, UDP reply thread reaping).
+
+### Verification done
+- `cargo test --lib` — 268 tests pass
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt --check` — clean
+- All integration tests pass (user confirmed)
+- All e2e tests pass (user confirmed)
+
+### No pending tasks
+
+---
+
 ## Last completed: Container Healthchecks (2026-02-27, SHA 313d434)
 
 ### What was done
