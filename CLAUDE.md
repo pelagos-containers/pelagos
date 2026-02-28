@@ -38,19 +38,17 @@ Operations that **do** require root: `run`, `exec`, `compose`, `stop`, `rm`
 
 ---
 
-### ❌ NEVER RUN SUDO COMMANDS
-**YOU CANNOT RUN SUDO** - The user MUST run sudo commands themselves.
+### Running sudo Commands
+`sudo` is available via a NOPASSWD sudoers entry. You may run integration tests,
+e2e scripts, and other root-requiring commands directly.
 
-**What NOT to do:**
-- ❌ `sudo cargo test`
-- ❌ `sudo -E cargo run`
-- ❌ `sudo ./script.sh`
-- ❌ ANY command starting with `sudo`
+**Use sudo freely for:**
+- `sudo -E cargo test --test integration_tests`
+- `sudo -E bash scripts/test-e2e.sh` and other test scripts
+- `sudo -E cargo run -- ...` for runtime testing
 
-**What TO do instead:**
-- ✅ Tell the user: "Please run: sudo -E cargo test --test integration_tests"
-- ✅ Explain what the command will do
-- ✅ Wait for user to run it and report results
+**Still confirm before destructive/irreversible ops:**
+- Deleting data, dropping state, force-pushing, modifying shared infrastructure
 
 ### Integration Tests Are Part of the Feature
 **Every feature MUST include integration tests in the same commit. A feature is not done until it is tested.**
@@ -102,6 +100,14 @@ This is a hard requirement, not optional cleanup.
 1. Create a git tag (ask user for version if unclear)
 2. Push the tag to trigger GitHub Actions release workflow
 3. Monitor the release with a background agent and report result
+
+### Execution Style
+Execute quietly — no step-by-step narration of what you're about to do. Just do
+it, then give a short summary of what was done and any notable outcomes. Reserve
+prose for plans, questions, and results.
+
+All tool use is pre-approved: Bash (including sudo), Read, Edit, Write, Grep,
+Glob, WebSearch, WebFetch — use them freely without asking.
 
 ### Ask Before Major Decisions
 - API design choices

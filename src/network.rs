@@ -1982,4 +1982,180 @@ mod tests {
         assert_eq!(NetworkMode::None.bridge_network_name(), None);
         assert_eq!(NetworkMode::Loopback.bridge_network_name(), None);
     }
+
+    // ── Async TCP proxy unit tests ────────────────────────────────────────────
+    //
+    // These tests exercise start_tcp_proxies_async, tcp_accept_loop, and
+    // tcp_relay directly against a localhost echo server — no root or container
+    // required.
+
+    /// Spin up a std-thread TCP echo server on an OS-assigned port.
+    /// Returns the bound SocketAddr and a stop flag; set the flag to shut it down.
+    fn spawn_echo_server() -> (SocketAddr, Arc<AtomicBool>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("echo server bind");
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop2.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .ok();
+                        let mut buf = vec![0u8; 4096];
+                        // Echo all bytes back then close.
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            let _ = stream.write_all(&buf[..n]);
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, stop)
+    }
+
+    /// Verify that the async TCP proxy correctly relays data in both directions.
+    ///
+    /// Starts a localhost echo server, creates a proxy runtime pointing to it,
+    /// connects through the proxy, sends a payload, reads the echo back, and
+    /// asserts the round-trip is correct.  No root or rootfs required.
+    #[test]
+    fn test_tcp_proxy_bidirectional_relay() {
+        use std::io::{Read, Write};
+        let (server_addr, server_stop) = spawn_echo_server();
+        let container_ip: Ipv4Addr = server_addr.ip().to_string().parse().unwrap();
+        let container_port = server_addr.port();
+
+        let rt = start_tcp_proxies_async(container_ip, &[(0, container_port)]);
+        // Give the accept loop a moment to bind.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Find which port the proxy bound by probing — we passed host_port=0 so
+        // the OS chose one; discover it by looking at what's listening.
+        // Instead, use a fixed port to avoid the discovery problem.
+        drop(rt);
+        server_stop.store(true, Ordering::Relaxed);
+
+        // Redo with a fixed host port.
+        let proxy_port: u16 = 19290;
+        let (server_addr2, server_stop2) = spawn_echo_server();
+        let container_ip2: Ipv4Addr = server_addr2.ip().to_string().parse().unwrap();
+        let container_port2 = server_addr2.port();
+
+        let rt2 = start_tcp_proxies_async(container_ip2, &[(proxy_port, container_port2)]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let payload = b"hello-from-client";
+        let mut response = vec![0u8; payload.len()];
+        {
+            let mut conn =
+                std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port)).unwrap();
+            conn.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .ok();
+            conn.write_all(payload).unwrap();
+            conn.shutdown(std::net::Shutdown::Write).unwrap();
+            conn.read_exact(&mut response).unwrap();
+        }
+
+        drop(rt2);
+        server_stop2.store(true, Ordering::Relaxed);
+
+        assert_eq!(&response, payload, "proxy should relay bytes unchanged in both directions");
+    }
+
+    /// Verify that simultaneous connections through the proxy are all served.
+    ///
+    /// Starts a localhost echo server, creates the proxy, opens 8 connections
+    /// from separate threads simultaneously, each sending a unique payload and
+    /// reading the echo.  All must succeed, confirming the tokio runtime
+    /// schedules concurrent relay tasks correctly.
+    #[test]
+    fn test_tcp_proxy_concurrent_relay() {
+        use std::io::{Read, Write};
+        let proxy_port: u16 = 19291;
+        let (server_addr, server_stop) = spawn_echo_server();
+        let container_ip: Ipv4Addr = server_addr.ip().to_string().parse().unwrap();
+        let container_port = server_addr.port();
+
+        let rt = start_tcp_proxies_async(container_ip, &[(proxy_port, container_port)]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        const N: usize = 8;
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                std::thread::spawn(move || -> bool {
+                    let payload = format!("payload-{:02}", i);
+                    let mut conn =
+                        match std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port)) {
+                            Ok(c) => c,
+                            Err(_) => return false,
+                        };
+                    conn.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .ok();
+                    if conn.write_all(payload.as_bytes()).is_err() {
+                        return false;
+                    }
+                    conn.shutdown(std::net::Shutdown::Write).ok();
+                    let mut buf = vec![0u8; payload.len()];
+                    if conn.read_exact(&mut buf).is_err() {
+                        return false;
+                    }
+                    buf == payload.as_bytes()
+                })
+            })
+            .collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap_or(false)).collect();
+        drop(rt);
+        server_stop.store(true, Ordering::Relaxed);
+
+        let failures: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, &ok)| !ok)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(failures.is_empty(), "concurrent relay failed for connections: {:?}", failures);
+    }
+
+    /// Verify that dropping the runtime releases the listener port.
+    ///
+    /// Creates the proxy, drops the runtime, then asserts the port can be
+    /// rebound — confirming shutdown_background() cancels the accept loop task.
+    #[test]
+    fn test_tcp_proxy_runtime_cleanup() {
+        let proxy_port: u16 = 19292;
+        let (server_addr, server_stop) = spawn_echo_server();
+        let container_ip: Ipv4Addr = server_addr.ip().to_string().parse().unwrap();
+        let container_port = server_addr.port();
+
+        let rt = start_tcp_proxies_async(container_ip, &[(proxy_port, container_port)]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Port should be occupied.
+        assert!(
+            std::net::TcpListener::bind(format!("0.0.0.0:{}", proxy_port)).is_err(),
+            "port should be bound while runtime is alive"
+        );
+
+        rt.shutdown_background();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        server_stop.store(true, Ordering::Relaxed);
+
+        // Port should now be free.
+        assert!(
+            std::net::TcpListener::bind(format!("0.0.0.0:{}", proxy_port)).is_ok(),
+            "port should be released after runtime shutdown"
+        );
+    }
 }
