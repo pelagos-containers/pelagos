@@ -510,6 +510,19 @@ After 200 ms, queries nftables and asserts the prerouting chain contains BOTH
 Failure indicates the `Both` variant does not generate the two required rules,
 which would break dual-protocol services (e.g. DNS, QUIC/HTTP3).
 
+### `test_udp_proxy_threads_joined_on_teardown` — N4-UDP
+**Requires:** root, rootfs
+
+Starts a container with `with_port_forward_udp(19097, 5000)` and verifies:
+1. While running: `UdpSocket::bind(127.0.0.1:19097)` fails (proxy holds the port).
+2. After `SIGKILL` + `child.wait()`: the same bind succeeds (proxy thread was joined,
+   inbound socket is closed, port is released).
+
+This directly tests that `teardown_network` joins the per-port UDP proxy threads
+(via `proxy_udp_threads.drain(..)` + `handle.join()`). Without the join, the
+thread keeps the socket open and the port remains unavailable for a short window,
+causing the test to fail.
+
 ### `test_bridge_cleanup_after_sigkill` — N2+N3
 **Requires:** root, rootfs
 

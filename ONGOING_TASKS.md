@@ -110,8 +110,40 @@ GitHub issue: #3 (closed by this work).
 
 ---
 
-## Open GitHub issues (remaining work)
+## Completed: UDP proxy thread joining (2026-02-28)
 
-| # | Title |
-|---|-------|
-| #4 | UDP proxy: reply threads never explicitly joined |
+### Context
+
+UDP proxy threads (one per mapped port, plus one per active client session) were
+never explicitly joined. `teardown_network` set the stop flag but returned
+immediately; threads exited within 100ms on their own. This meant the inbound
+socket was still held briefly after teardown returned, and reply threads had no
+explicit synchronisation point.
+
+The fix stores per-port `JoinHandle`s in `NetworkSetup.proxy_udp_threads`.
+`teardown_network` now drains and joins them after setting the stop flag, ensuring
+the inbound socket is released before the function returns.  `start_udp_proxy`
+accumulates reply-thread handles and joins them all after its main loop exits (once
+the stop flag causes the loop to terminate), completing the cleanup chain.
+
+GitHub issue: #4 (closed by this work).
+
+### Files changed
+
+- `src/network.rs`:
+  - `NetworkSetup`: added `proxy_udp_threads: Vec<JoinHandle<()>>`
+  - `start_port_proxies`: changed return type to 3-tuple; collects per-port handles
+  - callsite: destructured 3-tuple, stored `proxy_udp_threads` in `NetworkSetup`
+  - `teardown_network`: joins per-port threads after setting stop flag
+  - `start_udp_proxy`: collects reply handles, prunes finished ones, joins remainder
+  - secondary `NetworkSetup` literal: added `proxy_udp_threads: Vec::new()`
+- `tests/integration_tests.rs`: new test
+  `networking::test_udp_proxy_threads_joined_on_teardown`
+- `docs/INTEGRATION_TESTS.md`: added entry
+- `docs/WATCHER_PROCESS_MODEL.md`: marked limitation as fixed
+
+---
+
+## All issues resolved
+
+All four open issues are now closed.
