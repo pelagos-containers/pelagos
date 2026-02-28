@@ -92,8 +92,7 @@ These threads are always present for every running container:
 | Thread | Purpose | Lifetime |
 |--------|----------|----------|
 | **Main thread** | `child.wait()` — blocks until container exits; then writes final `state.json`, cleans up DNS | Container lifetime |
-| **stdout relay** | Reads container stdout pipe → appends to `stdout.log` | Until container stdout pipe closes |
-| **stderr relay** | Reads container stderr pipe → appends to `stderr.log` | Until container stderr pipe closes |
+| **epoll relay** | Single `epoll_wait` loop multiplexes stdout and stderr pipes → `stdout.log` / `stderr.log` | Until both pipes reach EOF |
 
 ### Watcher process — optional: health monitor
 
@@ -169,7 +168,7 @@ entries idle longer than 30 seconds.
 Let W = `min(available_parallelism, 4)` (tokio TCP worker threads; 0 if no TCP ports).
 
 ```
-total = 3 (static)
+total = 2 (static: main + epoll relay)
       + 1  (health monitor, if HEALTHCHECK)
       + W  (TCP proxy worker threads, if any TCP ports; shared across all TCP ports)
       + N_udp_ports          (UDP proxy threads)
@@ -179,10 +178,10 @@ total = 3 (static)
 Active TCP connections do **not** add threads — they are async tasks on the W workers.
 
 At rest with one TCP port and one UDP port, no HEALTHCHECK, 4-core machine:
-**8 threads** (3 static + 4 TCP workers + 1 UDP proxy).
+**7 threads** (2 static + 4 TCP workers + 1 UDP proxy).
 
-At rest with one TCP port, no UDP, no HEALTHCHECK: **7 threads**.
-Under 1000 simultaneous TCP connections on the same port: still **7 threads**.
+At rest with one TCP port, no UDP, no HEALTHCHECK: **6 threads**.
+Under 1000 simultaneous TCP connections on the same port: still **6 threads**.
 
 ### Scalability note
 
@@ -304,6 +303,6 @@ two-hop chain.
 |-----------|--------|-------------|
 | ~~`remora exec` does not join container PID namespace~~ | ~~`ps` in exec'd shell shows host PIDs~~ | **Fixed** — `pid_for_children` + double-fork (issue #1) |
 | ~~Probe timeout does not SIGKILL the probe child~~ | ~~Hung probes consume a thread until OS reaps them~~ | **Fixed** — `exec_in_container_with_pid_sink` + SIGKILL on timeout (issue #2) |
-| Thread-per-fd log relay | O(2) threads per container for I/O | epoll-based relay (future) |
+| ~~Thread-per-fd log relay~~ | ~~O(2) threads per container for I/O~~ | **Fixed** — single epoll relay thread in `src/cli/relay.rs` (issue #3) |
 | UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Migrate UDP to async (tokio already used for TCP) |
 | ~~Watcher death does not propagate to PID 1~~ | ~~Container orphaned if watcher dies~~ | **Fixed** — `PR_SET_CHILD_SUBREAPER` on watcher (issue #5) |

@@ -85,9 +85,33 @@ GitHub issue: #2 (closed by this work).
 
 ---
 
+## Completed: epoll log relay (2026-02-28)
+
+### Context
+
+Each watcher previously spawned two dedicated relay threads (one for stdout, one
+for stderr). This cost 2 threads per container at steady state. The fix replaces
+both with a single `epoll`-based relay thread in `src/cli/relay.rs` that
+multiplexes both pipe fds via `epoll_wait`, reducing the static thread count per
+container from 3 to 2 (main + relay, down from main + stdout relay + stderr relay).
+
+GitHub issue: #3 (closed by this work).
+
+### Files changed
+
+- `src/cli/relay.rs`: new module — `start_log_relay`, `relay_loop` (epoll), 3 unit
+  tests
+- `src/cli/mod.rs`: added `pub mod relay;`
+- `src/cli/run.rs`: replaced two relay `thread::spawn` + two `join` calls with
+  `super::relay::start_log_relay`; removed unused `Read` import
+- `src/cli/compose.rs`: replaced two relay `thread::spawn` calls with
+  `super::relay::start_log_relay`; removed unused `Read` import
+- `docs/INTEGRATION_TESTS.md`: added entries for all three relay unit tests
+
+---
+
 ## Open GitHub issues (remaining work)
 
 | # | Title |
 |---|-------|
-| #3 | Log relay: thread-per-fd model wastes 2 threads per container |
 | #4 | UDP proxy: reply threads never explicitly joined |
