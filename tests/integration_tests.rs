@@ -3911,6 +3911,224 @@ mod oci_lifecycle {
         oci_run_to_completion(&id, bundle_dir.path(), 10);
         // reaching here means the container ran successfully with explicit cgroupsPath
     }
+
+    /// test_oci_create_container_hook_in_ns
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Creates an OCI bundle with a `createContainer` hook that writes the inode
+    /// of the hook process's mount namespace (`/proc/self/ns/mnt`) to a temp file.
+    /// After `remora create` completes, verifies that the recorded inode differs
+    /// from the host's mount namespace inode — confirming the hook ran inside the
+    /// container's mount namespace, not the host's.
+    ///
+    /// Failure indicates `createContainer` hooks are run in the host namespace
+    /// instead of the container namespace, violating the OCI Runtime Specification.
+    #[test]
+    fn test_oci_create_container_hook_in_ns() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_create_container_hook_in_ns: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_create_container_hook_in_ns: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        // Write the hook script that records ns inode.
+        let hook_out = bundle_dir.path().join("hook_ns.txt");
+        let hook_script = bundle_dir.path().join("record_ns.sh");
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/bin/sh\nstat -Lc %i /proc/self/ns/mnt > {}\n",
+                hook_out.display()
+            ),
+        )
+        .unwrap();
+        // Make it executable.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = format!(
+            r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/sleep", "5"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "hooks": {{
+    "createContainer": [
+      {{"path": "{}"}}
+    ]
+  }},
+  "linux": {{
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+            hook_script.display()
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
+
+        let id = format!("test-oci-cchook-{}", std::process::id());
+        let (_, stderr, ok) = run_remora(&[
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
+        ]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        // The hook should have written a file with the mount ns inode.
+        assert!(hook_out.exists(), "hook did not produce output file");
+        let hook_inode: u64 = std::fs::read_to_string(&hook_out)
+            .expect("read hook output")
+            .trim()
+            .parse()
+            .expect("hook output not a number");
+
+        // Get the host mount ns inode.
+        let host_mnt_meta = std::fs::metadata("/proc/1/ns/mnt").expect("stat /proc/1/ns/mnt");
+        use std::os::unix::fs::MetadataExt;
+        let host_inode = host_mnt_meta.ino();
+
+        assert_ne!(
+            hook_inode, host_inode,
+            "createContainer hook ran in host mount namespace (inode {}), expected container ns",
+            hook_inode
+        );
+
+        // Clean up.
+        run_remora(&["kill", &id, "SIGKILL"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_start_container_hook_in_ns
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Creates an OCI bundle with a `startContainer` hook that writes the inode
+    /// of the hook process's mount namespace to a temp file. After `remora start`
+    /// completes, verifies the recorded inode differs from the host's mount namespace
+    /// inode — confirming the hook ran inside the container's mount namespace.
+    ///
+    /// Failure indicates `startContainer` hooks are run in the host namespace
+    /// instead of the container namespace, violating the OCI Runtime Specification.
+    #[test]
+    fn test_oci_start_container_hook_in_ns() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_start_container_hook_in_ns: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_start_container_hook_in_ns: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        let hook_out = bundle_dir.path().join("start_hook_ns.txt");
+        let hook_script = bundle_dir.path().join("record_start_ns.sh");
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/bin/sh\nstat -Lc %i /proc/self/ns/mnt > {}\n",
+                hook_out.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = format!(
+            r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/echo", "ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "hooks": {{
+    "startContainer": [
+      {{"path": "{}"}}
+    ]
+  }},
+  "linux": {{
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+            hook_script.display()
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
+
+        let id = format!("test-oci-schook-{}", std::process::id());
+        let (_, stderr, ok) = run_remora(&[
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
+        ]);
+        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // The hook should have written a file with the mount ns inode.
+        assert!(
+            hook_out.exists(),
+            "startContainer hook did not produce output file"
+        );
+        let hook_inode: u64 = std::fs::read_to_string(&hook_out)
+            .expect("read hook output")
+            .trim()
+            .parse()
+            .expect("hook output not a number");
+
+        let host_mnt_meta = std::fs::metadata("/proc/1/ns/mnt").expect("stat /proc/1/ns/mnt");
+        use std::os::unix::fs::MetadataExt;
+        let host_inode = host_mnt_meta.ino();
+
+        assert_ne!(
+            hook_inode, host_inode,
+            "startContainer hook ran in host mount namespace (inode {}), expected container ns",
+            hook_inode
+        );
+
+        // Wait for container to stop and clean up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        run_remora(&["delete", &id]);
+    }
 }
 
 mod rootless {

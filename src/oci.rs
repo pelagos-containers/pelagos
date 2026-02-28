@@ -875,6 +875,144 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
     Ok(())
 }
 
+/// Run a list of OCI hooks in the container's namespaces (createContainer /
+/// startContainer hooks).
+///
+/// Opens the container's namespace fds from `/proc/<container_pid>/ns/{mnt,net,uts,ipc,pid}`,
+/// then forks a helper child that calls `setns(2)` for each namespace and runs every
+/// hook sequentially in that joined namespace. The parent waits for the child.
+///
+/// This satisfies the OCI spec requirement that `createContainer` and
+/// `startContainer` hooks execute inside the container's namespace context.
+fn run_hooks_in_ns(hooks: &[OciHook], state: &OciState, container_pid: i32) -> io::Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    // Collect the namespace fds we want to join.  We only try the namespaces
+    // that exist — a container without a network namespace won't have ns/net.
+    let ns_names = ["mnt", "net", "uts", "ipc", "pid"];
+    let mut ns_fds: Vec<i32> = Vec::new();
+    for ns in &ns_names {
+        let path = format!("/proc/{}/ns/{}", container_pid, ns);
+        let path_c = match std::ffi::CString::new(path.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            // Only add if it differs from the host namespace (same inode = already joined)
+            let host_path = format!("/proc/1/ns/{}", ns);
+            let host_c = match std::ffi::CString::new(host_path.as_bytes()) {
+                Ok(c) => c,
+                Err(_) => {
+                    ns_fds.push(fd);
+                    continue;
+                }
+            };
+            let mut cst = unsafe { std::mem::zeroed::<libc::stat>() };
+            let mut hst = unsafe { std::mem::zeroed::<libc::stat>() };
+            let cst_ok = unsafe { libc::fstat(fd, &mut cst) } == 0;
+            let hst_ok = unsafe { libc::stat(host_c.as_ptr(), &mut hst) } == 0;
+            if cst_ok && hst_ok && cst.st_ino == hst.st_ino {
+                // Same namespace as host — skip (setns would be a no-op / EPERM)
+                unsafe { libc::close(fd) };
+            } else {
+                ns_fds.push(fd);
+            }
+        }
+    }
+
+    let state_json = serde_json::to_vec(state).map_err(io::Error::other)?;
+
+    // Fork a helper process that joins the container namespaces, then runs hooks.
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            for fd in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            Err(io::Error::last_os_error())
+        }
+        0 => {
+            // CHILD: join each namespace.
+            for &fd in &ns_fds {
+                // Ignore errors: EPERM is expected for PID namespace (setns(CLONE_NEWPID)
+                // moves only pid_for_children, not the calling process — that's fine for hooks).
+                unsafe { libc::setns(fd, 0) };
+                unsafe { libc::close(fd) };
+            }
+
+            // Now run each hook.  We use std::process::Command here because
+            // we are already inside the right namespaces.
+            use std::io::Write;
+            for hook in hooks {
+                let mut cmd = std::process::Command::new(&hook.path);
+                if hook.args.len() > 1 {
+                    cmd.args(&hook.args[1..]);
+                }
+                for env_entry in &hook.env {
+                    if let Some(eq) = env_entry.find('=') {
+                        cmd.env(&env_entry[..eq], &env_entry[eq + 1..]);
+                    }
+                }
+                cmd.stdin(std::process::Stdio::piped());
+                let mut proc = match cmd.spawn() {
+                    Ok(p) => p,
+                    Err(_) => unsafe { libc::_exit(1) },
+                };
+                if let Some(mut stdin) = proc.stdin.take() {
+                    let _ = stdin.write_all(&state_json);
+                }
+
+                let timeout = hook.timeout.map(|t| Duration::from_secs(t as u64));
+                let ok = if let Some(dur) = timeout {
+                    let deadline = std::time::Instant::now() + dur;
+                    loop {
+                        match proc.try_wait() {
+                            Ok(Some(s)) => break s.success(),
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = proc.kill();
+                                    break false;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            Err(_) => break false,
+                        }
+                    }
+                } else {
+                    proc.wait().map(|s| s.success()).unwrap_or(false)
+                };
+
+                if !ok {
+                    unsafe { libc::_exit(1) };
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
+        child_pid => {
+            // PARENT: close our copies of the ns fds.
+            for fd in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            // Wait for the helper.
+            let mut status = 0i32;
+            let ret = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "createContainer/startContainer hook failed",
+                ))
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OCI subcommand implementations
 // ---------------------------------------------------------------------------
@@ -1100,16 +1238,18 @@ pub fn cmd_create(
                 fs::write(pf, format!("{}\n", container_pid))?;
             }
 
-            // Run prestart hooks (host namespace, after container is "created").
+            // Run lifecycle hooks after container is in "created" state.
             if let Some(ref hooks) = config.hooks {
+                // prestart + createRuntime: host namespace (per OCI spec)
                 if !hooks.prestart.is_empty() {
                     run_hooks(&hooks.prestart, &state)?;
                 }
                 if !hooks.create_runtime.is_empty() {
                     run_hooks(&hooks.create_runtime, &state)?;
                 }
+                // createContainer: container namespace (per OCI spec)
                 if !hooks.create_container.is_empty() {
-                    run_hooks(&hooks.create_container, &state)?;
+                    run_hooks_in_ns(&hooks.create_container, &state, container_pid)?;
                 }
             }
 
@@ -1130,6 +1270,16 @@ pub fn cmd_start(id: &str) -> io::Result<()> {
                 id, state.status
             ),
         ));
+    }
+
+    // Run startContainer hooks in the container's namespace BEFORE exec.
+    // These must run after "created" state but before the user process starts.
+    if let Ok(config) = config_from_bundle(std::path::Path::new(&state.bundle)) {
+        if let Some(ref hooks) = config.hooks {
+            if !hooks.start_container.is_empty() {
+                run_hooks_in_ns(&hooks.start_container, &state, state.pid)?;
+            }
+        }
     }
 
     // Connect to exec.sock and send the start byte.

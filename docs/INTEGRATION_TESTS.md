@@ -762,6 +762,29 @@ rely on predictable cgroup hierarchy placement (e.g. systemd-managed slices).
 
 ---
 
+### `test_oci_create_container_hook_in_ns`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with a `createContainer` hook script that writes the inode of
+`/proc/self/ns/mnt` to a temp file. After `remora create`, reads the recorded inode and compares
+it to the host's mount namespace inode (`/proc/1/ns/mnt`). Asserts they differ, confirming the
+hook executed inside the container's mount namespace. Failure means `createContainer` hooks run
+in the host namespace, violating the OCI spec and breaking runtimes that use these hooks to
+inject config (e.g. seccomp, apparmor profiles) into the container environment.
+
+---
+
+### `test_oci_start_container_hook_in_ns`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with a `startContainer` hook script that writes the inode of
+`/proc/self/ns/mnt` to a temp file. After `remora start`, reads the recorded inode and compares
+it to the host's mount namespace inode. Asserts they differ, confirming the hook executed inside
+the container's mount namespace before the user process was exec'd. Failure means `startContainer`
+hooks either do not run at all or run in the host namespace, violating the OCI spec.
+
+---
+
 ## Rootless Mode Tests
 
 The following tests only execute when the test binary is run **without root** (no `sudo`).
