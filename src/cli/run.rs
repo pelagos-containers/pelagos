@@ -7,7 +7,7 @@ use super::{
 };
 use remora::container::{Capability, Command, Namespace, Stdio, Volume};
 use remora::network::NetworkMode;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
@@ -797,44 +797,13 @@ fn run_detached(
                 std::thread::spawn(move || super::health::run_health_monitor(name2, pid, hc, stop))
             });
 
-            // Relay stdout and stderr to log files concurrently.
-            let mut stdout_handle = child.take_stdout();
-            let mut stderr_handle = child.take_stderr();
-
-            let stdout_path = stdout_log.clone();
-            let stderr_path = stderr_log.clone();
-
-            // Use two threads: one for each stream.
-            let t_out = std::thread::spawn(move || {
-                if let Some(mut src) = stdout_handle.take() {
-                    if let Ok(mut f) = std::fs::File::create(&stdout_path) {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match src.read(&mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    let _ = f.write_all(&buf[..n]);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-            let t_err = std::thread::spawn(move || {
-                if let Some(mut src) = stderr_handle.take() {
-                    if let Ok(mut f) = std::fs::File::create(&stderr_path) {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match src.read(&mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    let _ = f.write_all(&buf[..n]);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+            // Single epoll relay thread: multiplexes stdout and stderr into log files.
+            let t_relay = super::relay::start_log_relay(
+                child.take_stdout(),
+                child.take_stderr(),
+                stdout_log.clone(),
+                stderr_log.clone(),
+            );
 
             // Wait for the container to exit.
             let exit = match child.wait() {
@@ -844,10 +813,9 @@ fn run_detached(
                     unsafe { libc::_exit(1) };
                 }
             };
-            // Signal the health monitor to stop and wait for it.
+            // Signal the health monitor to stop; join relay and health threads.
             health_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = t_out.join();
-            let _ = t_err.join();
+            let _ = t_relay.join();
             if let Some(t) = health_thread {
                 let _ = t.join();
             }

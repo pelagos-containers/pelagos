@@ -13,7 +13,7 @@ use remora::lisp::{HookMap, Interpreter};
 use remora::network::NetworkMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -866,45 +866,15 @@ fn spawn_service(
         }
     }
 
-    // Spawn log relay threads.
-    let mut stdout_handle = child.take_stdout();
-    let mut stderr_handle = child.take_stderr();
-    let stdout_path = stdout_log.clone();
-    let stderr_path = stderr_log.clone();
+    // Single epoll relay thread: multiplexes stdout and stderr into log files.
     let svc_name = svc.name.clone();
     let cn = container_name.to_string();
-
-    std::thread::spawn(move || {
-        if let Some(mut src) = stdout_handle.take() {
-            if let Ok(mut f) = std::fs::File::create(&stdout_path) {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match src.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let _ = f.write_all(&buf[..n]);
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    std::thread::spawn(move || {
-        if let Some(mut src) = stderr_handle.take() {
-            if let Ok(mut f) = std::fs::File::create(&stderr_path) {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match src.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let _ = f.write_all(&buf[..n]);
-                        }
-                    }
-                }
-            }
-        }
-    });
+    super::relay::start_log_relay(
+        child.take_stdout(),
+        child.take_stderr(),
+        stdout_log.clone(),
+        stderr_log.clone(),
+    );
 
     // Spawn a waiter thread that updates state when the container exits.
     let cn_wait = cn.clone();

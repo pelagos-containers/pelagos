@@ -1009,6 +1009,42 @@ detecting that a timed-out probe child was successfully cleaned up.
 
 ---
 
+## Log Relay Tests (`cli::relay` unit tests)
+
+These tests live directly in `src/cli/relay.rs` and run via `cargo test --bin remora`
+(no root required).
+
+### `cli::relay::tests::test_relay_captures_stdout_and_stderr`
+**Requires:** none (no root, no rootfs)
+
+Spawns `sh -c "printf 'hello stdout'; printf 'hello stderr' >&2"` with piped
+stdio, passes the handles to `start_log_relay`, joins the relay thread after
+`child.wait()`, and asserts both log files contain the expected strings.
+
+Failure indicates the epoll relay loop is not writing pipe data to the log files
+(e.g. fd registration failed, write error was silently dropped, or the thread
+exited before draining the pipe).
+
+### `cli::relay::tests::test_relay_large_output`
+**Requires:** none (no root, no rootfs)
+
+Spawns `yes x | head -c 65536` (65 536 bytes — 8× the `BUF` read size) and
+relays its stdout to a log file. After the relay thread finishes, asserts the
+log file is exactly 65 536 bytes.
+
+Failure indicates that multi-cycle relay (where epoll fires multiple times because
+data exceeds one read buffer) is losing or truncating data.
+
+### `cli::relay::tests::test_relay_none_handles`
+**Requires:** none (no root, no rootfs)
+
+Calls `start_log_relay(None, None, ...)` and joins the thread. Verifies the relay
+exits immediately when no pipe fds are registered.
+
+Failure indicates the relay loop hangs or panics when given empty input.
+
+---
+
 ## Minimal /dev Tests (`dev` module)
 
 ### `test_dev_minimal_devices`
