@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Last completed: Container Healthchecks (2026-02-27)
+## Last completed: Container Healthchecks (2026-02-27, SHA 313d434)
 
 ### What was done
 
