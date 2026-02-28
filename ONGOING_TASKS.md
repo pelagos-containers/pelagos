@@ -1,504 +1,56 @@
 # Ongoing Tasks
 
-## Last completed: PID namespace fixes + thread doc (2026-02-28, SHA b0fed4d)
+## Last completed: PID namespace fixes + release v0.17.0 (2026-02-28, SHA c0ed571)
 
-### What was done
+### What was done this session
 
-**`src/cli/run.rs`**
-- `build_image_run`: replaced `.with_namespaces(UTS|PID)` with `.add_namespaces(UTS|PID)`.
-  The old call replaced the flag set entirely, silently dropping `MOUNT` that
-  `with_image_layers()` had ORed in, causing every image-based container to fail with
+**Bug fixes (all tests pass, shipped in v0.17.0):**
+
+- **`src/container.rs`**: Added `pub fn add_namespaces(self, ns: Namespace) -> Self` — ORs
+  into existing namespace flags rather than replacing them.
+
+- **`src/cli/run.rs`**: `build_image_run` now calls `.add_namespaces(UTS|PID)` instead of
+  `.with_namespaces(UTS|PID)`, which was silently dropping the `MOUNT` flag set by
+  `with_image_layers()` and causing every image-based container to fail with
   "with_overlay requires Namespace::MOUNT".
 
-**`src/container.rs`**
-- Added `pub fn add_namespaces(self, ns: Namespace) -> Self` — ORs into existing flags
-  rather than replacing them.
+- **`src/cli/exec.rs`**: Added `find_root_pid(pid)` — reads
+  `/proc/{pid}/task/{pid}/children`; if exactly one child exists the caller is the
+  PID-namespace intermediate process P (which never called `pivot_root`), so returns the
+  child's PID (C = PID 1 in the container, which DID call `pivot_root`). All four
+  root-fd open sites updated to use `find_root_pid`.
 
-**`src/cli/exec.rs`**
-- Added `fn find_root_pid(pid: i32) -> i32`: reads `/proc/{pid}/task/{pid}/children`;
-  if exactly one child exists the caller is the PID-namespace intermediate process P
-  (which never called pivot_root), so returns the child's PID (C = PID 1 in the
-  container, which DID call pivot_root).
-- Updated all four root-fd open sites (`cmd_exec` + `exec_in_container`, both the
-  mount-ns and no-mount-ns paths) to use `find_root_pid(pid)` instead of `pid` directly.
+- **`src/network.rs`**: Extended port-forward state-file format to include `ns_name` so
+  `read_port_forwards_count` can filter stale entries by liveness (`netns_exists`).
+  Stale entries from crashed containers no longer block nftables table teardown.
 
-**`src/network.rs`**
-- Extended port-forward state-file format from `ip:hp:cp[:proto]` to
-  `ns_name:ip:hp:cp:proto` so `read_port_forwards_count` can filter by liveness
-  (`netns_exists(ns_name)`). Stale entries from crashed containers no longer prevent
-  nftables table deletion.
-- Added `PortForwardEntry` type alias to satisfy clippy `type_complexity`.
-- Fixed `enable_port_forwards` and `disable_port_forwards` callers.
-- Updated unit tests for new tuple field indices; added
-  `test_parse_port_forward_line_new_format`.
+**Docs:**
 
-**`docs/WATCHER_PROCESS_MODEL.md`**
-- Full thread inventory: static threads, optional health monitor + probe threads,
-  port-forward proxy threads (TCP listener, TCP relay pairs, UDP proxy, UDP reply
-  forwarder), UID/GID mapping thread, compose supervisor threads.
-- Thread-count formula section.
-- Two new known-limitation rows (TCP relay growth under load, UDP reply thread reaping).
+- **`docs/WATCHER_PROCESS_MODEL.md`**: Full thread inventory including dynamic threads —
+  port-forward proxy threads (TCP listener, relay pairs, UDP proxy, UDP reply
+  forwarder), UID/GID mapping thread, compose supervisor threads, thread-count formula.
 
-### Verification done
-- `cargo test --lib` — 268 tests pass
-- `cargo clippy -- -D warnings` — clean
-- `cargo fmt --check` — clean
-- All integration tests pass (user confirmed)
-- All e2e tests pass (user confirmed)
+### Current state
+
+- All 268 unit tests pass
+- All integration tests pass
+- All e2e tests pass
+- `cargo clippy -- -D warnings` clean
+- `cargo fmt` clean
+- v0.17.0 released (x86_64 + aarch64 musl static binaries)
 
 ### No pending tasks
 
 ---
 
-## Last completed: Container Healthchecks (2026-02-27, SHA 313d434)
+## Next suggested areas
 
-### What was done
+- `remora exec` PID namespace join: `discover_namespaces` could check
+  `/proc/P/ns/pid_for_children` to let exec'd processes join the container's PID
+  namespace (currently they see host PIDs). Documented in `WATCHER_PROCESS_MODEL.md`.
 
-**`src/image.rs`**
-- Added `HealthConfig` struct with serde defaults for interval/timeout/retries
-- Added `healthcheck: Option<HealthConfig>` to `ImageConfig`
+- Probe timeout SIGKILL: health probe threads are abandoned on timeout rather than
+  explicitly killed. Low urgency.
 
-**`src/cli/image.rs`**
-- Added `parse_oci_healthcheck()` — maps OCI `Healthcheck` JSON block
-  (nanosecond durations, `Test: ["CMD", ...]`) to `HealthConfig`
-- `parse_image_config` now populates `healthcheck`
-
-**`src/cli/mod.rs`**
-- Added `HealthStatus` enum (`None`, `Starting`, `Healthy`, `Unhealthy`)
-- Added `health: Option<HealthStatus>` and `health_config: Option<HealthConfig>` to `ContainerState`
-- Added `pub mod health;`
-- Added unit tests: `test_health_config_serde_roundtrip`, `test_health_status_missing_field`
-
-**`src/cli/health.rs`** (NEW)
-- `run_health_monitor(name, pid, config, stop)` — health monitor thread
-- `run_probe(pid, config)` — channel-based timeout enforcement
-- `update_health(name, status)` — read+write state.json
-- `sleep_interruptible(duration_secs, stop)` — 100ms ticks with stop check
-
-**`src/cli/exec.rs`**
-- Added `pub fn exec_in_container(pid, args) -> Option<bool>` (shared ns-join logic)
-
-**`src/cli/run.rs`**
-- `build_image_run` returns `ImageRunResult` (4-tuple with `Option<HealthConfig>`)
-- `run_detached` spawns health monitor thread with `AtomicBool` stop flag
-
-**`src/cli/compose.rs`**
-- `try_exec` now delegates to `exec_in_container`
-- `wait_for_dependency` handles `HealthCheck::Healthy` (polls `state.json`)
-- `eval_health_check` has `Healthy => false` arm
-
-**`src/compose.rs`**
-- Added `HealthCheck::Healthy` variant
-- Parses `:condition service_healthy` in `parse_dependency`
-
-**`src/cli/ps.rs`**
-- Added HEALTH column (10 chars)
-
-**`src/build.rs`**
-- Added `Instruction::Healthcheck { cmd, interval_secs, timeout_secs, start_period_secs, retries }`
-- `parse_healthcheck` + `parse_duration_str` (supports `30s`, `1m`, `1m30s`)
-- JSON-array and shell form for `CMD` argument
-- `generate_oci_config_json` emits OCI `Healthcheck` block with nanosecond durations
-- Unit tests: `test_parse_healthcheck_cmd_shell_form`, `_json_form`, `_none`, `_flags`,
-  `test_parse_duration_str`
-
-**`tests/integration_tests.rs`**
-- Added `healthcheck_tests` module with 4 tests
-
-**`docs/INTEGRATION_TESTS.md`**
-- Documented all 4 new healthcheck tests
-
-### Verification done
-- `cargo test --lib` — 267 tests pass
-- `cargo clippy -- -D warnings` — clean
-- `cargo fmt` — clean
-- `cargo test --test integration_tests healthcheck` — 2 non-ignored pass, 3 ignored
-- Please run: `sudo -E cargo test --test integration_tests healthcheck -- --ignored --nocapture`
-
-### Next suggested task
-
-Container healthcheck end-to-end test with a real OCI image that has a `HEALTHCHECK` in its
-manifest — verifies the full path from `image pull` → `run -d` → health monitor wakes up →
-`ps` shows `starting` → `healthy`.
-
----
-
-## Last completed: UDP port mapping (2026-02-27)
-
-### What was done
-
-**`src/network.rs`**
-- Added `PortProto` enum (`Tcp`, `Udp`, `Both`) with `pub parse(s)` and `as_str()`
-- `port_forwards` type changed to `Vec<(u16, u16, PortProto)>` everywhere
-- State-file format extended to `IP:HOST:CONTAINER:PROTO`; old 3-field lines default to `tcp`
-- `build_prerouting_script`: emits `tcp` and/or `udp` DNAT rules per `PortProto`
-- `start_port_proxies`: dispatches `start_tcp_proxy_listener` (TCP/Both) and `start_udp_proxy` (UDP/Both)
-- `start_udp_proxy`: session-map proxy with per-client outbound socket, 30-second idle eviction,
-  per-session reply thread; FIXME comment + FEATURE_GAPS note about thread-per-port scaling
-- `setup_pasta_network`: emits `-t HOST:CONTAINER` for TCP/Both, `-u HOST:CONTAINER` for UDP/Both
-
-**`src/container.rs`**
-- `with_port_forward` (TCP default), `with_port_forward_udp`, `with_port_forward_both` builder methods
-
-**`src/cli/run.rs`**
-- `parse_port_forwards`: parses `HOST:CONTAINER[/tcp|/udp|/both]` (Docker-compatible syntax)
-
-**Tests**
-- 9 unit tests in `network.rs` (`test_port_proto_parse`, `test_port_proto_as_str`,
-  `test_parse_port_forward_line_with_proto`, `test_parse_port_forward_line_backwards_compat`,
-  `test_parse_port_forward_line_both_proto`, `test_build_prerouting_script_tcp_only`,
-  `test_build_prerouting_script_udp_only`, `test_build_prerouting_script_both`)
-- 6 unit tests in `cli/run.rs` (`test_parse_port_forwards_tcp_default`, `_explicit_tcp`, `_udp`,
-  `_both`, `_multiple`, `_invalid`)
-- 2 integration tests: `test_udp_port_forward_rule_added`, `test_both_port_forward_rule_added`
-
-### Verification done
-- `cargo build` — clean
-- `cargo clippy -- -D warnings` — clean
-- `cargo fmt` — clean
-- `cargo test --lib` — 262 tests pass
-- `cargo test --test integration_tests --no-run` — compiles clean
-- Please run: `sudo -E cargo test --test integration_tests udp_port_forward both_port_forward -- --nocapture`
-
-### Next suggested task
-
-Container healthchecks (`HEALTHCHECK` in Dockerfile / exec-based probes in compose readiness).
-Currently `compose` readiness is TCP-port-only; exec-based health probes
-(`HEALTHCHECK CMD ...`) and HTTP checks are missing.  See `docs/FEATURE_GAPS.md`.
-
----
-
-## Last completed: credential helper support (2026-02-27)
-
-### What to do
-
-`remora image tag <source> <target>` — assign a new local reference to an
-existing image without pulling.
-
-**Implementation:**
-1. Resolve source (local-first, same as rm/push)
-2. `load_image(src)` → manifest
-3. `load_oci_config(src)` → config JSON
-4. Build new `ImageManifest` with `reference = target`, same digest/layers/config
-5. `save_image(new_manifest)` — creates target image dir + manifest.json
-6. `save_oci_config(target, config_json)` — copies oci-config.json to target dir
-
-**Files:** `src/cli/image.rs`, `src/main.rs`, `tests/integration_tests.rs`,
-`docs/INTEGRATION_TESTS.md`, `ONGOING_TASKS.md`
-
-### What was done
-
-**`src/cli/auth.rs`**
-- `find_credential_helper(config, registry)` — checks `credHelpers[registry]`
-  then `credsStore` global fallback; returns bare helper name (e.g. `"ecr-login"`)
-- `call_credential_helper(helper, registry)` — spawns
-  `docker-credential-<helper> get`, writes bare registry hostname to stdin,
-  parses `{"Username":"...","Secret":"..."}` JSON from stdout
-- `store_via_helper` / `erase_via_helper` — delegate `image login` / `image logout`
-  to the configured helper's `store` / `erase` subcommands
-- `config_credential_helper(registry)` — reads live `config.json` to find helper
-- `parse_docker_config` — now checks helpers before static `auths` entries
-- `write_docker_config` / `remove_docker_config` — delegate to helper when configured,
-  fall back to static auths if helper not found or fails
-- 4 new unit tests: `test_find_credential_helper_per_registry`,
-  `test_find_credential_helper_global_fallback`, `test_find_credential_helper_none`,
-  `test_call_credential_helper_get`, `test_parse_docker_config_uses_helper`
-
-### Verification done
-- `cargo build` — clean
-- `cargo clippy -- -D warnings` — clean
-- `cargo fmt` — clean
-- `cargo test --lib` — 254 tests pass
-- `cargo test --bin remora -- cli::auth` — 14 tests pass (all helper tests included)
-- `cargo test --test integration_tests --no-run` — compiles clean
-
-### Next suggested task
-
-`credHelpers` / `credsStore` in `~/.docker/config.json` — delegate auth to
-external helpers (`docker-credential-ecr-login`, OS keychain, etc.) so users
-don't need to call `image login` with short-lived tokens.
-
-**Protocol:**
-- Binary: `docker-credential-<helper>` must be on PATH
-- `get`: write registry hostname to stdin → read JSON `{"Username":"...","Secret":"..."}` from stdout
-- `store`: write JSON `{"ServerURL":"...","Username":"...","Secret":"..."}` to stdin
-- `erase`: write registry hostname to stdin
-
-**Resolution order in `parse_docker_config`:**
-1. `credHelpers[registry]` — per-registry helper (highest priority)
-2. `credsStore` — global fallback helper
-3. `auths[registry].auth` — static base64 (existing behaviour)
-
-**`write_docker_config` / `remove_docker_config`:**
-- If a helper is configured for the registry, delegate to `store`/`erase`
-- Otherwise keep existing `auths` logic
-
-**Files:** `src/cli/auth.rs` only (plus tests + ONGOING_TASKS.md)
-
-**New functions:**
-- `call_credential_helper(helper: &str, registry: &str) -> Option<(String, String)>`
-- `find_credential_helper(config: &serde_json::Value, registry: &str) -> Option<String>`
-
-**Unit tests (no root, no network):**
-- `test_call_credential_helper_get` — spawns a fake helper script, verifies
-  username/secret are parsed correctly
-- `test_find_credential_helper_per_registry` — credHelpers map lookup
-- `test_find_credential_helper_global` — credsStore fallback
-- `test_parse_docker_config_uses_helper` — full parse_docker_config with fake helper
-
----
-
-## Last completed: image save / load (2026-02-27)
-
-### Context
-
-`remora image save` and `remora image load` export/import locally stored images
-as OCI Image Layout tar archives.  The blob store (populated by `image pull` and
-`remora build`) provides all the raw data; the commands just need to package/
-unpackage it into the standard layout.
-
-The format is OCI Image Layout (identical to `docker save` / `docker load`):
-
-```
-oci-layout                        # {"imageLayoutVersion":"1.0.0"}
-index.json                        # OCI image index pointing at the manifest blob
-blobs/sha256/<hex>                # manifest blob
-blobs/sha256/<hex>                # config blob
-blobs/sha256/<hex>                # layer blob (tar.gz) — one per layer
-```
-
-This makes archives interoperable with Docker, Podman, skopeo, crane, etc.
-
----
-
-### API design
-
-**`remora image save <reference> [-o <file.tar>]`**
-
-```
-1. load_image(reference)         → ImageManifest
-2. load_oci_config(reference)    → config JSON bytes
-3. compute sha256(config_json)   → config digest
-4. for each layer digest in manifest.layers:
-     load_blob(digest)           → layer bytes  (error if missing)
-5. build OCI manifest JSON:
-     { schemaVersion: 2,
-       mediaType: "application/vnd.oci.image.manifest.v1+json",
-       config: { mediaType: "...", digest: "sha256:<hex>", size: N },
-       layers: [ { mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
-                   digest: "sha256:<hex>", size: N }, ... ] }
-6. compute sha256(manifest_json) → manifest digest
-7. build index.json:
-     { schemaVersion: 2,
-       manifests: [ { mediaType: "...", digest: "sha256:<hex>", size: N,
-                      annotations: { "org.opencontainers.image.ref.name": reference } } ] }
-8. write tar to -o file (or stdout if omitted):
-     oci-layout
-     index.json
-     blobs/sha256/<config-hex>
-     blobs/sha256/<layer-hex>   (one entry per layer)
-     blobs/sha256/<manifest-hex>
-```
-
-**`remora image load [-i <file.tar>] [--tag <reference>]`**
-
-```
-1. open tar from -i file (or stdin)
-2. find and parse oci-layout  → verify imageLayoutVersion == "1.0.0"
-3. find and parse index.json  → get manifest descriptor
-4. read blobs/sha256/<manifest-hex> → parse OCI manifest
-5. read blobs/sha256/<config-hex>   → config JSON bytes
-6. for each layer descriptor in manifest.layers:
-     read blobs/sha256/<layer-hex>  → blob bytes
-     save_blob(digest, &bytes)      → blob store
-     extract_layer(digest, blob_path) → layer dir
-7. parse config JSON → ImageConfig
-8. reference = --tag if supplied, else annotation "org.opencontainers.image.ref.name",
-               else manifest digest (sha256:<hex>)
-9. save_oci_config(reference, config_json)
-10. save_image(ImageManifest { reference, digest: manifest_digest, layers, config })
-11. println!("Loaded {reference}")
-```
-
----
-
-### Files to modify
-
-| File | Change |
-|------|--------|
-| `src/cli/image.rs` | Add `cmd_image_save()`, `cmd_image_load()` |
-| `src/main.rs` | Add `ImageCmd::Save`, `ImageCmd::Load`; wire dispatch |
-| `docs/FEATURE_GAPS.md` | Mark image save/load as COMPLETE |
-| `docs/INTEGRATION_TESTS.md` | Add entries for new tests |
-| `tests/integration_tests.rs` | Add `test_image_save_load_roundtrip` |
-| `ONGOING_TASKS.md` | This file |
-
-No new dependencies needed: `tar` and `sha2`/inline sha256 are already present
-(we use sha256 inline in `auth.rs`; `flate2` and `tar` crates already in deps).
-
-Wait — check Cargo.toml: we have `flate2` and `tar` as deps, but no `sha2`.
-The inline sha256 in auth.rs is for base64 only.  We need sha256 for blob
-digests.  Options:
-- Add `sha2` crate (clean, idiomatic)
-- Use `std::process::Command` to call `sha256sum` (hacky)
-- Reuse the sha256 already computed by the blobs (digests are already stored!)
-
-**Decision:** for `save`, the layer digests are already known (stored in
-`manifest.layers`); for the config blob digest we compute sha256 over the
-config bytes.  We already depend on nothing for sha256 — but `build.rs` uses
-the `sha2` + `hex` crates or computes via `flate2` piping.  Check Cargo.toml.
-
-If `sha2` is already a dep (transitively used by `oci-client`), we can use it
-directly.  Otherwise add it explicitly.
-
----
-
-### Tests
-
-**Unit (no root, no network):**
-- `test_save_produces_oci_layout` — build a minimal fake ImageManifest + fake
-  blob bytes in a tempdir, call the save logic, extract the tar, verify:
-  - `oci-layout` present and valid JSON
-  - `index.json` contains one manifest entry with correct ref annotation
-  - `blobs/sha256/<hex>` present for config + each layer + manifest
-  - manifest JSON references correct config and layer digests
-
-**Integration (`#[ignore]`, requires root):**
-- `test_image_save_load_roundtrip`:
-  1. `remora image pull alpine:latest` (or use already-pulled image)
-  2. `remora image save alpine:latest -o /tmp/alpine-test.tar`
-  3. `remora image rm alpine:latest`
-  4. `remora image load -i /tmp/alpine-test.tar`
-  5. `remora run alpine:latest /bin/true` — must succeed
-  - Asserts: exit code 0, image re-appears in `image ls`
-
----
-
-### Verification
-
-1. `cargo test --lib` — all existing + new unit tests pass
-2. `cargo clippy -- -D warnings` + `cargo fmt --check`
-3. Please run: `sudo -E cargo test --test integration_tests image_save -- --ignored --nocapture`
-4. Manual: `remora image save alpine:latest | gzip -d | tar -tv` — inspect layout
-5. Manual: `docker load < alpine-remora.tar` — Docker should accept the archive
-
-### Verification done
-- `cargo build` — clean
-- `cargo clippy -- -D warnings` — clean
-- `cargo fmt` — clean
-- `cargo test --lib` — 254 tests pass
-- `cargo test --bin remora -- cli::image::tests::test_build_oci_tar` — passes
-- `cargo test --test integration_tests --no-run` — compiles clean
-- Please run: `sudo -E cargo test --test integration_tests image_save_load -- --ignored --nocapture`
-
-### Next suggested task
-
-**Credential helper support** (`credHelpers`, `credsStore`) — delegate auth to
-`docker-credential-ecr-login`, OS keychain, etc., so ECR/GCR users don't have
-to pass `--password` or call `image login` with a short-lived token.
-
-Or: **`remora image tag`** — assign a new local reference to an existing image
-without pulling.
-
----
-
-## Last completed: Registry Auth + Image Push (2026-02-27)
-
-### What was done
-
-Implemented full registry authentication and image push support:
-
-**`src/cli/auth.rs`** (new)
-- `resolve_auth(registry, username, password)` — resolution order: CLI flags →
-  `REMORA_REGISTRY_USER`/`REMORA_REGISTRY_PASS` env vars → `~/.docker/config.json` → Anonymous
-- `parse_docker_config(registry)` — reads and decodes `auths[registry].auth` (base64 `user:pass`)
-- `write_docker_config(registry, user, pass)` — `remora image login`
-- `remove_docker_config(registry)` — `remora image logout`
-- Inline pure-Rust base64 encoder/decoder (no new dep)
-- Unit tests: roundtrip, synthetic config.json, env var priority, CLI priority, anonymous fallback
-
-**`src/paths.rs`**
-- `blobs_dir()` — `<data>/blobs/`
-- `blob_path(digest)` — `<data>/blobs/<hex>.tar.gz`
-- `blob_diffid_path(digest)` — `<data>/blobs/<hex>.diffid`
-
-**`src/image.rs`**
-- `blob_exists()`, `save_blob()`, `load_blob()` — blob store CRUD
-- `save_blob_diffid()`, `load_blob_diffid()` — uncompressed-tar sha256 sidecar
-- `oci_config_path()`, `save_oci_config()`, `load_oci_config()` — raw OCI config JSON
-- `ensure_image_dirs()` now creates `blobs_dir()` too
-
-**`src/cli/image.rs`**
-- `cmd_image_pull` now accepts `--username`, `--password`, `--password-stdin`
-- `pull_image` persists raw blob bytes via `save_blob` + `save_oci_config`
-- `cmd_image_push` — loads blobs from store, builds `ImageLayer::oci_v1_gzip`, calls `client.push()`
-- `cmd_image_login` — prompts, writes `~/.docker/config.json`
-- `cmd_image_logout` — removes entry from `~/.docker/config.json`
-- `read_password_from_tty` — no-echo password input via `/dev/tty`
-
-**`src/build.rs`**
-- `create_layer_from_dir` now builds raw tar first → computes diff_id → compresses → saves blob + diffid sidecar
-- `execute_build` calls `generate_oci_config_json` after building, saves to `oci-config.json`
-- `generate_oci_config_json` — produces valid OCI config JSON with `diff_ids` from sidecars
-
-**`src/main.rs`**
-- `ImageCmd::Pull` — added `username`, `password`, `password_stdin` flags
-- `ImageCmd::Push` — new variant with `reference`, `dest`, `username`, `password`, `password_stdin`
-- `ImageCmd::Login` — new variant
-- `ImageCmd::Logout` — new variant
-
-**`src/cli/image.rs`** — `oci_client_config(registry, insecure)` helper
-- Auto-detects localhost / RFC-1918 / 172.16–31.x as insecure
-- Uses `ClientProtocol::HttpsExcept(vec![registry])` for plain-HTTP registries
-- `--insecure` flag added to `image pull` and `image push`
-
-**`docs/FEATURE_GAPS.md`** — marked registry auth + image push as COMPLETE
-
-**`docs/INTEGRATION_TESTS.md`** — documented new tests including the two
-registry auth integration tests
-
-**`tests/integration_tests.rs`** — `mod registry_auth` (two `#[ignore]` tests):
-- `test_local_registry_push_pull_roundtrip` — no-auth push/pull via `registry:2`
-- `test_local_registry_auth_roundtrip` — htpasswd auth enforcement: anon push
-  fails → login → push/pull succeed → logout → pull fails
-
-**`scripts/test-registry-auth-e2e.sh`** — shell E2E against a real registry
-(GHCR / Docker Hub / any); reads `REMORA_E2E_REGISTRY`, `REMORA_E2E_USER`,
-`REMORA_E2E_TOKEN`, `REMORA_E2E_IMAGE`; tests login → push → pull → env-var
-fallback → logout → post-logout-pull-fails
-
-**`src/cli/run.rs`** — fixed `-v host:container:ro` parsing bug
-- `split_once(':')` only splits on first colon, so `host:container:ro` produced
-  `tgt = "container:ro"` (wrong). Changed to `rsplit_once(':')` so `:ro`/`:rw`
-  suffix is correctly stripped; added `test_cli_volume_flag_ro` integration test.
-
-**`tests/integration_tests.rs`** — fixed `test_local_registry_auth_roundtrip`
-- Was using `openssl passwd -apr1` (APR1/MD5) which docker/distribution ≥2.8
-  no longer accepts. Changed to the same hard-coded bcrypt entry (`$2y$05$...`,
-  password `testpassword`) used by oci-client's own integration tests.
-
-### Verification done
-- `cargo build` — clean
-- `cargo clippy -- -D warnings` — clean
-- `cargo fmt` — clean
-- `cargo test --lib` — 254 tests pass
-- `cargo test --test integration_tests --no-run` — compiles clean
-- `sudo -E cargo test --test integration_tests registry_auth -- --ignored --nocapture` — both registry auth tests pass
-- `scripts/test-registry-auth-e2e.sh` against GHCR private + public, Docker Hub private + public — 44/44 pass
-
-**`src/cli/auth.rs`** — fixed Docker Hub registry key lookup
-- `registry_keys("index.docker.io")` now includes `"docker.io"` so creds stored
-  by `remora image login docker.io` are found when pushing `docker.io/...` refs
-
-**`scripts/test-registry-auth-e2e.sh`** — rewrote for multi-registry support
-- Profiles: ghcr, dockerhub, ecr (each skipped if not configured)
-- ECR: token auto-fetched via `aws ecr get-login-password`
-- Per-registry pass/fail totals + global summary
-- 8 tests per registry: anon-push-fails → login → push → pull-back → env-var
-  fallback → CLI-flag fallback → logout → post-logout-pull-fails
-
-**`scripts/e2e-creds.env.example`** — committed credential template (gitignored actual)
-
-**`.gitignore`** — added `scripts/e2e-creds.env`
-
----
+- Port-forward proxy: replace thread-per-connection TCP relay with a single tokio async
+  task pool (tokio is already a dep). Low urgency for typical workloads.
