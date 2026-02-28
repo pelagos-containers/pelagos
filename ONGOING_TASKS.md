@@ -168,3 +168,39 @@ Key findings:
 
 See the doc for the full runtime comparison matrix, CVE analysis, Wasm/WASI trends,
 embedded/IoT landscape, and the ranked opportunity list.
+
+---
+
+## Completed: OCI Runtime Spec compliance Phases 1–6 (2026-02-28)
+
+Epic issue: #11 (closed).
+
+### Summary
+
+Full OCI lifecycle compliance implemented across 6 phases, merged to main as PRs #18–22.
+
+| Phase | Content | PR |
+|-------|---------|-----|
+| 1 | `--bundle`, `--console-socket`, `--pid-file` CLI flags | #18 |
+| 2 | Kernel mount type dispatch (proc, sysfs, devpts, mqueue, cgroup2) | #19 |
+| 3+4 | Complete cap/signal tables, annotations, double-proc-mount fix, tmpfs flag fix | #20 |
+| 5 | `linux.rootfsPropagation` + `linux.cgroupsPath` | #22 (rebased) |
+| 6 | `createContainer`/`startContainer` hooks in container namespace | #22 |
+
+### Key bugs fixed
+
+- **`OciHooks` serde rename**: `OciHooks` was missing `#[serde(rename_all = "camelCase")]`,
+  causing `createContainer` / `startContainer` / `createRuntime` hook arrays to be silently
+  ignored on deserialization (JSON key `"createContainer"` never matched field `create_container`).
+  Fixed by adding the attribute — the root cause of hook test failures.
+
+- **Double proc mount**: `build_command` auto-added `with_proc_mount()` when a mount namespace
+  was requested, but OCI bundles that already list a `proc`-type mount caused a double-mount
+  failure. Fixed with an `has_explicit_proc` guard.
+
+- **tmpfs flag vs data**: OCI mount options like `nosuid`, `strictatime` were passed as the
+  `data` string argument to `mount(2)` instead of the flags argument, causing `EINVAL`.
+  Fixed by parsing known MS_* flag names out of options before calling `with_kernel_mount`.
+
+### 18 OCI lifecycle integration tests all pass.
+
