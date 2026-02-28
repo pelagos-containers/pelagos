@@ -201,6 +201,7 @@ pub struct OciSyscallArg {
 
 /// OCI lifecycle hooks. Run in the host namespace.
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct OciHooks {
     #[serde(default)]
     pub prestart: Vec<OciHook>,
@@ -447,12 +448,18 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
             cmd = cmd.with_namespaces(ns_flags);
         }
 
-        // Mount proc automatically when a mount namespace is requested
+        // Mount proc automatically when a mount namespace is requested,
+        // unless the OCI config already supplies an explicit "proc" type mount
+        // (adding both would cause a double-mount and a pre_exec failure).
         let has_mount_ns = linux
             .namespaces
             .iter()
             .any(|n| n.ns_type == "mount" && n.path.is_none());
-        if has_mount_ns {
+        let has_explicit_proc = config
+            .mounts
+            .iter()
+            .any(|m| m.mount_type.as_deref() == Some("proc"));
+        if has_mount_ns && !has_explicit_proc {
             cmd = cmd.with_proc_mount();
         }
 
@@ -655,10 +662,13 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
 
         match mount_type {
             "tmpfs" => {
-                // For tmpfs, pass the option string (size=, mode=, etc.) as data;
-                // the with_tmpfs builder adds MS_NOSUID|MS_NODEV itself.
-                let opts: Vec<&str> = mount.options.iter().map(|s| s.as_str()).collect();
-                cmd = cmd.with_tmpfs(dest, &opts.join(","));
+                // Use with_kernel_mount so the parsed MS_* flags (nosuid, strictatime, etc.)
+                // go into the mount(2) flags argument, while only non-flag options
+                // (mode=, size=, uid=, gid=) are passed as mount data.
+                // with_tmpfs hardcodes MS_NOSUID|MS_NODEV and passes all opts as data,
+                // which causes EINVAL when flag-like tokens appear in the data string.
+                let f = libc::MS_NOSUID | libc::MS_NODEV | flags;
+                cmd = cmd.with_kernel_mount("tmpfs", "tmpfs", dest, f, &extra_data);
             }
             "proc" => {
                 let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
@@ -878,20 +888,31 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
 /// Run a list of OCI hooks in the container's namespaces (createContainer /
 /// startContainer hooks).
 ///
-/// Opens the container's namespace fds from `/proc/<container_pid>/ns/{mnt,net,uts,ipc,pid}`,
+/// Opens the container's namespace fds from `/proc/<container_pid>/ns/{net,uts,ipc}`,
 /// then forks a helper child that calls `setns(2)` for each namespace and runs every
 /// hook sequentially in that joined namespace. The parent waits for the child.
 ///
+/// Mount namespace is intentionally excluded: by the time `createContainer` /
+/// `startContainer` hooks are called in remora's lifecycle the container process
+/// has already called `pivot_root`, so the mount namespace's filesystem view is
+/// the container rootfs — the hook binary (on the host) would not be found.
+/// OCI runtimes that run hooks before `pivot_root` (e.g. runc) can join the mount
+/// namespace; remora joins the remaining namespaces (net, uts, ipc).
+///
+/// PID namespace is excluded for the same reason: `setns(CLONE_NEWPID)` only
+/// affects `pid_for_children`; the calling process is not moved.
+///
 /// This satisfies the OCI spec requirement that `createContainer` and
-/// `startContainer` hooks execute inside the container's namespace context.
+/// `startContainer` hooks execute inside the container's network/uts/ipc
+/// namespace context.
 fn run_hooks_in_ns(hooks: &[OciHook], state: &OciState, container_pid: i32) -> io::Result<()> {
     if hooks.is_empty() {
         return Ok(());
     }
 
-    // Collect the namespace fds we want to join.  We only try the namespaces
-    // that exist — a container without a network namespace won't have ns/net.
-    let ns_names = ["mnt", "net", "uts", "ipc", "pid"];
+    // Only join non-filesystem namespaces so the hook binary on the host is
+    // still accessible after setns.
+    let ns_names = ["net", "uts", "ipc"];
     let mut ns_fds: Vec<i32> = Vec::new();
     for ns in &ns_names {
         let path = format!("/proc/{}/ns/{}", container_pid, ns);
@@ -935,58 +956,113 @@ fn run_hooks_in_ns(hooks: &[OciHook], state: &OciState, container_pid: i32) -> i
             Err(io::Error::last_os_error())
         }
         0 => {
-            // CHILD: join each namespace.
+            // CHILD: join each namespace then exec hooks.
+            //
+            // IMPORTANT: we must NOT call Rust's std::process::Command here —
+            // doing so after fork() in a potentially-multithreaded process risks
+            // deadlock (Rust's internal I/O and allocator mutexes may be held by
+            // threads that no longer exist in the forked child).  Use raw libc
+            // fork+exec for each hook instead.
             for &fd in &ns_fds {
-                // Ignore errors: EPERM is expected for PID namespace (setns(CLONE_NEWPID)
-                // moves only pid_for_children, not the calling process — that's fine for hooks).
                 unsafe { libc::setns(fd, 0) };
                 unsafe { libc::close(fd) };
             }
 
-            // Now run each hook.  We use std::process::Command here because
-            // we are already inside the right namespaces.
-            use std::io::Write;
+            // Create a pipe so we can write state JSON to each hook's stdin.
             for hook in hooks {
-                let mut cmd = std::process::Command::new(&hook.path);
-                if hook.args.len() > 1 {
-                    cmd.args(&hook.args[1..]);
+                let mut stdin_pipe = [0i32; 2];
+                if unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) } != 0 {
+                    unsafe { libc::_exit(1) };
                 }
-                for env_entry in &hook.env {
-                    if let Some(eq) = env_entry.find('=') {
-                        cmd.env(&env_entry[..eq], &env_entry[eq + 1..]);
-                    }
-                }
-                cmd.stdin(std::process::Stdio::piped());
-                let mut proc = match cmd.spawn() {
-                    Ok(p) => p,
+                let (pipe_r, pipe_w) = (stdin_pipe[0], stdin_pipe[1]);
+
+                // Build argv and envp as CString arrays.
+                let mut argv_cstr: Vec<std::ffi::CString> = Vec::new();
+                let path_c = match std::ffi::CString::new(hook.path.as_bytes()) {
+                    Ok(c) => c,
                     Err(_) => unsafe { libc::_exit(1) },
                 };
-                if let Some(mut stdin) = proc.stdin.take() {
-                    let _ = stdin.write_all(&state_json);
+                argv_cstr.push(path_c.clone());
+                for arg in hook.args.iter().skip(1) {
+                    match std::ffi::CString::new(arg.as_bytes()) {
+                        Ok(c) => argv_cstr.push(c),
+                        Err(_) => unsafe { libc::_exit(1) },
+                    }
                 }
+                let mut argv_ptrs: Vec<*const libc::c_char> =
+                    argv_cstr.iter().map(|c| c.as_ptr()).collect();
+                argv_ptrs.push(std::ptr::null());
 
-                let timeout = hook.timeout.map(|t| Duration::from_secs(t as u64));
-                let ok = if let Some(dur) = timeout {
-                    let deadline = std::time::Instant::now() + dur;
-                    loop {
-                        match proc.try_wait() {
-                            Ok(Some(s)) => break s.success(),
-                            Ok(None) => {
-                                if std::time::Instant::now() >= deadline {
-                                    let _ = proc.kill();
-                                    break false;
-                                }
-                                std::thread::sleep(Duration::from_millis(50));
+                let mut envp_cstr: Vec<std::ffi::CString> = Vec::new();
+                for entry in &hook.env {
+                    if let Ok(c) = std::ffi::CString::new(entry.as_bytes()) {
+                        envp_cstr.push(c);
+                    }
+                }
+                let mut envp_ptrs: Vec<*const libc::c_char> =
+                    envp_cstr.iter().map(|c| c.as_ptr()).collect();
+                envp_ptrs.push(std::ptr::null());
+
+                let hook_pid = unsafe { libc::fork() };
+                match hook_pid {
+                    -1 => unsafe { libc::_exit(1) },
+                    0 => {
+                        // Hook grandchild: redirect stdin from pipe, then exec.
+                        unsafe { libc::close(pipe_w) };
+                        unsafe { libc::dup2(pipe_r, 0) };
+                        unsafe { libc::close(pipe_r) };
+                        unsafe {
+                            libc::execve(path_c.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr())
+                        };
+                        unsafe { libc::_exit(127) };
+                    }
+                    _ => {
+                        // Helper child: write state JSON to hook's stdin, then wait.
+                        unsafe { libc::close(pipe_r) };
+                        let mut written = 0usize;
+                        while written < state_json.len() {
+                            let n = unsafe {
+                                libc::write(
+                                    pipe_w,
+                                    state_json[written..].as_ptr() as *const libc::c_void,
+                                    state_json.len() - written,
+                                )
+                            };
+                            if n <= 0 {
+                                break;
                             }
-                            Err(_) => break false,
+                            written += n as usize;
+                        }
+                        unsafe { libc::close(pipe_w) };
+
+                        // Wait for hook, respecting optional timeout.
+                        let deadline = hook
+                            .timeout
+                            .map(|t| std::time::Instant::now() + Duration::from_secs(t as u64));
+                        loop {
+                            let mut wstatus = 0i32;
+                            let ret =
+                                unsafe { libc::waitpid(hook_pid, &mut wstatus, libc::WNOHANG) };
+                            if ret == hook_pid {
+                                let ok =
+                                    libc::WIFEXITED(wstatus) && libc::WEXITSTATUS(wstatus) == 0;
+                                if !ok {
+                                    unsafe { libc::_exit(1) };
+                                }
+                                break;
+                            }
+                            if let Some(dl) = deadline {
+                                if std::time::Instant::now() >= dl {
+                                    unsafe { libc::kill(hook_pid, libc::SIGKILL) };
+                                    unsafe { libc::_exit(1) };
+                                }
+                            }
+                            // Brief sleep to avoid busy-poll.
+                            unsafe {
+                                libc::usleep(20_000);
+                            }
                         }
                     }
-                } else {
-                    proc.wait().map(|s| s.success()).unwrap_or(false)
-                };
-
-                if !ok {
-                    unsafe { libc::_exit(1) };
                 }
             }
             unsafe { libc::_exit(0) };

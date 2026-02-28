@@ -3917,9 +3917,9 @@ mod oci_lifecycle {
     /// Requires: root, rootfs.
     ///
     /// Creates an OCI bundle with a `createContainer` hook that writes the inode
-    /// of the hook process's mount namespace (`/proc/self/ns/mnt`) to a temp file.
+    /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file..
     /// After `remora create` completes, verifies that the recorded inode differs
-    /// from the host's mount namespace inode — confirming the hook ran inside the
+    /// from the host UTS namespace inode — confirming the hook ran inside the
     /// container's mount namespace, not the host's.
     ///
     /// Failure indicates `createContainer` hooks are run in the host namespace
@@ -3947,7 +3947,7 @@ mod oci_lifecycle {
         std::fs::write(
             &hook_script,
             format!(
-                "#!/bin/sh\nstat -Lc %i /proc/self/ns/mnt > {}\n",
+                "#!/bin/sh\nstat -Lc %i /proc/self/ns/uts > {}\n",
                 hook_out.display()
             ),
         )
@@ -3991,7 +3991,7 @@ mod oci_lifecycle {
         ]);
         assert!(ok, "remora create failed: {}", stderr);
 
-        // The hook should have written a file with the mount ns inode.
+        // The hook should have written a file with the uts ns inode.
         assert!(hook_out.exists(), "hook did not produce output file");
         let hook_inode: u64 = std::fs::read_to_string(&hook_out)
             .expect("read hook output")
@@ -3999,14 +3999,14 @@ mod oci_lifecycle {
             .parse()
             .expect("hook output not a number");
 
-        // Get the host mount ns inode.
-        let host_mnt_meta = std::fs::metadata("/proc/1/ns/mnt").expect("stat /proc/1/ns/mnt");
+        // Get the host uts ns inode.
+        let host_uts_meta = std::fs::metadata("/proc/1/ns/uts").expect("stat /proc/1/ns/uts");
         use std::os::unix::fs::MetadataExt;
-        let host_inode = host_mnt_meta.ino();
+        let host_inode = host_uts_meta.ino();
 
         assert_ne!(
             hook_inode, host_inode,
-            "createContainer hook ran in host mount namespace (inode {}), expected container ns",
+            "createContainer hook ran in host UTS namespace (inode {}), expected container ns",
             hook_inode
         );
 
@@ -4021,9 +4021,9 @@ mod oci_lifecycle {
     /// Requires: root, rootfs.
     ///
     /// Creates an OCI bundle with a `startContainer` hook that writes the inode
-    /// of the hook process's mount namespace to a temp file. After `remora start`
-    /// completes, verifies the recorded inode differs from the host's mount namespace
-    /// inode — confirming the hook ran inside the container's mount namespace.
+    /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file. After `remora start`
+    /// completes, verifies the recorded inode differs from the host's UTS namespace
+    /// inode — confirming the hook ran inside the container's UTS namespace.
     ///
     /// Failure indicates `startContainer` hooks are run in the host namespace
     /// instead of the container namespace, violating the OCI Runtime Specification.
@@ -4049,7 +4049,7 @@ mod oci_lifecycle {
         std::fs::write(
             &hook_script,
             format!(
-                "#!/bin/sh\nstat -Lc %i /proc/self/ns/mnt > {}\n",
+                "#!/bin/sh\nstat -Lc %i /proc/self/ns/uts > {}\n",
                 hook_out.display()
             ),
         )
@@ -4094,7 +4094,7 @@ mod oci_lifecycle {
         let (_, stderr, ok) = run_remora(&["start", &id]);
         assert!(ok, "remora start failed: {}", stderr);
 
-        // The hook should have written a file with the mount ns inode.
+        // The hook should have written a file with the uts ns inode.
         assert!(
             hook_out.exists(),
             "startContainer hook did not produce output file"
@@ -4105,13 +4105,13 @@ mod oci_lifecycle {
             .parse()
             .expect("hook output not a number");
 
-        let host_mnt_meta = std::fs::metadata("/proc/1/ns/mnt").expect("stat /proc/1/ns/mnt");
+        let host_uts_meta = std::fs::metadata("/proc/1/ns/uts").expect("stat /proc/1/ns/uts");
         use std::os::unix::fs::MetadataExt;
-        let host_inode = host_mnt_meta.ino();
+        let host_inode = host_uts_meta.ino();
 
         assert_ne!(
             hook_inode, host_inode,
-            "startContainer hook ran in host mount namespace (inode {}), expected container ns",
+            "startContainer hook ran in host UTS namespace (inode {}), expected container ns",
             hook_inode
         );
 
