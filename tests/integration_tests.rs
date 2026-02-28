@@ -2584,6 +2584,74 @@ mod networking {
         );
     }
 
+    /// N4-UDP teardown: UDP proxy threads are joined on container stop, releasing the port.
+    ///
+    /// Starts a container with `with_port_forward_udp(19097, 5000)`. Verifies the
+    /// proxy holds the port (a second `UdpSocket::bind` to that port must fail).
+    /// Then kills the container and calls `wait()`, which triggers `teardown_network`.
+    /// After `wait()` returns the per-port proxy thread has been joined, meaning the
+    /// inbound socket is closed and the port is available for re-use.
+    ///
+    /// Failure (bind succeeds while container is running) means the proxy did not
+    /// start.  Failure (bind fails after teardown) means the proxy thread was not
+    /// joined and the socket is still held — i.e. `proxy_udp_threads` join logic is
+    /// broken.
+    #[test]
+    #[serial(nat)]
+    fn test_udp_proxy_threads_joined_on_teardown() {
+        if !is_root() {
+            eprintln!("Skipping test_udp_proxy_threads_joined_on_teardown: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_udp_proxy_threads_joined_on_teardown: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let test_port: u16 = 19097;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward_udp(test_port, 5000)
+            .with_chroot(&rootfs)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container");
+
+        // Give the proxy a moment to bind.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Proxy should hold the port: binding to it must fail.
+        let bind_while_running =
+            std::net::UdpSocket::bind(std::net::SocketAddr::from(([127, 0, 0, 1], test_port)));
+        assert!(
+            bind_while_running.is_err(),
+            "UDP proxy should hold port {} while container is running",
+            test_port
+        );
+
+        // Kill container; wait() calls teardown_network which joins proxy threads.
+        unsafe { libc::kill(child.pid(), libc::SIGKILL) };
+        let _ = child.wait();
+
+        // Port must now be released (proxy thread joined → socket dropped).
+        let bind_after =
+            std::net::UdpSocket::bind(std::net::SocketAddr::from(([127, 0, 0, 1], test_port)));
+        assert!(
+            bind_after.is_ok(),
+            "UDP proxy port {} should be released after teardown (thread not joined?)",
+            test_port
+        );
+    }
+
     /// N2+N3: Bridge + NAT cleanup must work even after SIGKILL.
     ///
     /// Spawns a bridge+NAT container (`sleep 60`), records veth name, netns name,

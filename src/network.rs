@@ -412,6 +412,8 @@ pub struct NetworkSetup {
     proxy_tcp_runtime: Option<tokio::runtime::Runtime>,
     /// Stop flag for UDP proxy threads (std threads).
     proxy_udp_stop: Option<Arc<AtomicBool>>,
+    /// Join handles for per-port UDP proxy threads; joined explicitly in teardown.
+    proxy_udp_threads: Vec<std::thread::JoinHandle<()>>,
     /// Name of the network this setup belongs to (e.g. `"remora0"`, `"frontend"`).
     pub network_name: String,
 }
@@ -426,6 +428,7 @@ impl std::fmt::Debug for NetworkSetup {
             .field("port_forwards", &self.port_forwards)
             .field("proxy_tcp_active", &self.proxy_tcp_runtime.is_some())
             .field("proxy_udp_active", &self.proxy_udp_stop.is_some())
+            .field("proxy_udp_threads", &self.proxy_udp_threads.len())
             .field("network_name", &self.network_name)
             .finish()
     }
@@ -707,10 +710,10 @@ pub fn setup_bridge_network(
     // 9. Start userspace port proxies (handles localhost traffic that nftables
     //    DNAT in PREROUTING cannot intercept).  TCP uses an async tokio runtime;
     //    UDP uses std threads unchanged.
-    let (proxy_tcp_runtime, proxy_udp_stop) = if !port_forwards.is_empty() {
+    let (proxy_tcp_runtime, proxy_udp_stop, proxy_udp_threads) = if !port_forwards.is_empty() {
         start_port_proxies(container_ip, &port_forwards)
     } else {
-        (None, None)
+        (None, None, Vec::new())
     };
 
     Ok(NetworkSetup {
@@ -721,6 +724,7 @@ pub fn setup_bridge_network(
         port_forwards,
         proxy_tcp_runtime,
         proxy_udp_stop,
+        proxy_udp_threads,
         network_name: network_name.to_string(),
     })
 }
@@ -739,9 +743,15 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     if let Some(rt) = setup.proxy_tcp_runtime.take() {
         rt.shutdown_background();
     }
-    // Stop UDP proxy threads.
+    // Stop UDP proxy threads and join them.  Setting the flag first lets the
+    // threads notice the stop signal during their next 100ms recv_from timeout.
+    // Joining ensures the inbound socket is fully closed (port released) before
+    // we proceed to delete the veth/netns.
     if let Some(ref stop) = setup.proxy_udp_stop {
         stop.store(true, Ordering::Relaxed);
+    }
+    for handle in setup.proxy_udp_threads.drain(..) {
+        let _ = handle.join();
     }
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
         log::warn!("network teardown veth (non-fatal): {}", e);
@@ -837,6 +847,7 @@ pub fn attach_network_to_netns(
         port_forwards: Vec::new(),
         proxy_tcp_runtime: None,
         proxy_udp_stop: None,
+        proxy_udp_threads: Vec::new(),
         network_name: network_name.to_string(),
     })
 }
@@ -1380,13 +1391,17 @@ fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
 /// UDP still uses std threads: one thread per port plus one thread per active
 /// client session (30-second idle eviction).
 ///
-/// Returns `(tcp_runtime, udp_stop)`. The caller stores both in `NetworkSetup`;
-/// teardown calls `rt.shutdown_background()` for TCP and sets the stop flag
-/// for UDP.
+/// Returns `(tcp_runtime, udp_stop, udp_threads)`. The caller stores all three in
+/// `NetworkSetup`; teardown calls `rt.shutdown_background()` for TCP, sets the
+/// stop flag for UDP, and joins the per-port UDP threads.
 fn start_port_proxies(
     container_ip: Ipv4Addr,
     forwards: &[(u16, u16, PortProto)],
-) -> (Option<tokio::runtime::Runtime>, Option<Arc<AtomicBool>>) {
+) -> (
+    Option<tokio::runtime::Runtime>,
+    Option<Arc<AtomicBool>>,
+    Vec<std::thread::JoinHandle<()>>,
+) {
     let tcp_forwards: Vec<(u16, u16)> = forwards
         .iter()
         .filter(|(_, _, p)| matches!(p, PortProto::Tcp | PortProto::Both))
@@ -1405,20 +1420,21 @@ fn start_port_proxies(
         None
     };
 
-    let udp_stop = if !udp_forwards.is_empty() {
+    let (udp_stop, udp_threads) = if !udp_forwards.is_empty() {
         let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
         for (host_port, container_port) in udp_forwards {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                start_udp_proxy(host_port, container_ip, container_port, stop);
-            });
+            let stop_clone = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                start_udp_proxy(host_port, container_ip, container_port, stop_clone);
+            }));
         }
-        Some(stop)
+        (Some(stop), handles)
     } else {
-        None
+        (None, Vec::new())
     };
 
-    (tcp_runtime, udp_stop)
+    (tcp_runtime, udp_stop, udp_threads)
 }
 
 /// Build a tokio multi-threaded runtime and spawn one async accept-loop task
@@ -1548,20 +1564,23 @@ fn start_udp_proxy(
     let sessions: Arc<Mutex<SessionMap>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut buf = [0u8; 65535];
+    // Collect reply-thread handles so we can join them when the proxy stops.
+    let mut reply_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         match inbound.recv_from(&mut buf) {
             Ok((n, client_addr)) => {
                 let data = buf[..n].to_vec();
 
-                let outbound = {
+                // Return both the outbound socket and an optional new reply handle.
+                let (outbound, spawned) = {
                     let mut map = sessions.lock().unwrap();
                     // Evict sessions idle > 30 seconds.
                     map.retain(|_, (_, last)| last.elapsed() < Duration::from_secs(30));
 
                     if let Some((sock, last)) = map.get_mut(&client_addr) {
                         *last = Instant::now();
-                        Arc::clone(sock)
+                        (Arc::clone(sock), None)
                     } else {
                         // New client: create a dedicated outbound socket.
                         let sock = match UdpSocket::bind("0.0.0.0:0") {
@@ -1581,7 +1600,7 @@ fn start_udp_proxy(
                         let reply_sock = Arc::clone(&sock);
                         let inbound_ref = Arc::clone(&inbound);
                         let stop2 = Arc::clone(&stop);
-                        std::thread::spawn(move || {
+                        let handle = std::thread::spawn(move || {
                             let mut rbuf = [0u8; 65535];
                             reply_sock
                                 .set_read_timeout(Some(Duration::from_millis(100)))
@@ -1599,9 +1618,15 @@ fn start_udp_proxy(
                             }
                         });
 
-                        sock
+                        (sock, Some(handle))
                     }
                 };
+
+                if let Some(h) = spawned {
+                    reply_handles.push(h);
+                    // Prune already-finished handles to bound memory use.
+                    reply_handles.retain(|h| !h.is_finished());
+                }
 
                 if let Err(e) = outbound.send(&data) {
                     log::debug!("udp proxy: forward to {} failed: {}", target, e);
@@ -1617,6 +1642,12 @@ fn start_udp_proxy(
                 break;
             }
         }
+    }
+
+    // Join all remaining reply threads.  They observe the same stop flag and
+    // exit within one read timeout (100 ms) of it being set.
+    for handle in reply_handles {
+        let _ = handle.join();
     }
 }
 

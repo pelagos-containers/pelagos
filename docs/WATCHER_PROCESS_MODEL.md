@@ -304,5 +304,5 @@ two-hop chain.
 | ~~`remora exec` does not join container PID namespace~~ | ~~`ps` in exec'd shell shows host PIDs~~ | **Fixed** — `pid_for_children` + double-fork (issue #1) |
 | ~~Probe timeout does not SIGKILL the probe child~~ | ~~Hung probes consume a thread until OS reaps them~~ | **Fixed** — `exec_in_container_with_pid_sink` + SIGKILL on timeout (issue #2) |
 | ~~Thread-per-fd log relay~~ | ~~O(2) threads per container for I/O~~ | **Fixed** — single epoll relay thread in `src/cli/relay.rs` (issue #3) |
-| UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Migrate UDP to async (tokio already used for TCP) |
+| ~~UDP reply threads are never explicitly reaped~~ | ~~Thread joins on stop flag only; idle sessions may linger until stop~~ | **Fixed** — per-port threads joined in `teardown_network`; reply threads joined at end of `start_udp_proxy` (issue #4) |
 | ~~Watcher death does not propagate to PID 1~~ | ~~Container orphaned if watcher dies~~ | **Fixed** — `PR_SET_CHILD_SUBREAPER` on watcher (issue #5) |
