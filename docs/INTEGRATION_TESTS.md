@@ -276,6 +276,44 @@ Spawns with `with_cgroup_memory(64MB)`, records the child PID, calls `wait()`, t
 checks that `/sys/fs/cgroup/remora-{pid}` no longer exists. Verifies that
 `teardown_cgroup()` deletes the cgroup directory after the container exits.
 
+### `test_cgroup_memory_swap`
+**Requires:** root, rootfs
+
+Spawns with `with_cgroup_memory(64MB)` + `with_cgroup_memory_swap(128MB)`. Verifies the
+container starts and exits without error. Confirms that `memory.swap.max` is accepted by
+the cgroup controller (issue #31).
+
+### `test_cgroup_memory_reservation`
+**Requires:** root, rootfs
+
+Spawns with `with_cgroup_memory_reservation(32MB)`. Verifies the container starts and exits
+cleanly. Confirms `memory.low` (soft limit) is wired through correctly (issue #31).
+
+### `test_cgroup_cpuset`
+**Requires:** root, rootfs
+
+Spawns with `with_cgroup_cpuset_cpus("0")` + `with_cgroup_cpuset_mems("0")`. Verifies no
+startup error. Confirms cpuset.cpus/cpuset.mems are applied after cgroup creation (issue #32).
+
+### `test_cgroup_blkio_weight`
+**Requires:** root, rootfs
+
+Spawns with `with_cgroup_blkio_weight(100)`. Verifies no error. Confirms the blkio weight
+is accepted by the cgroup builder on cgroupv2 via `io.weight` (issue #33).
+
+### `test_cgroup_device_rule`
+**Requires:** root, rootfs
+
+Spawns with two device cgroup rules (allow-all + deny-console). On cgroupv2 these are
+gracefully skipped without error since the devices controller uses eBPF, not
+`devices.allow/deny`. Verifies no container startup failure (issue #34).
+
+### `test_cgroup_net_classid`
+**Requires:** root, rootfs
+
+Spawns with `with_cgroup_net_classid(0x10001)`. On cgroupv2 `net_cls` is unavailable;
+verifies it is silently skipped without error (issue #35).
+
 ---
 
 ## Phase 6: Native Networking Tests
@@ -665,6 +703,16 @@ Creates a `config.json` with `linux.resources` setting a 64 MiB memory limit and
 limit of 50. The container reads `/sys/fs/cgroup/memory.max` and `/sys/fs/cgroup/pids.max`.
 Failure indicates that `linux.resources` parsing from OCI config or the wiring into
 `with_cgroup_memory()` / `with_cgroup_pids_limit()` is broken.
+
+### `test_oci_resources_extended`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with the full extended `linux.resources` set: `memory.swap`,
+`memory.reservation`, `cpu.cpus/mems`, `blockIO.weight`, `linux.resources.devices`, and
+`linux.resources.network`. Runs `exit 0` inside the container. Failure indicates a parsing
+or `build_command()` wiring bug for any of the extended resource fields introduced in
+epic #29 (issues #31–#35). On cgroupv2-only systems, device and network cgroup rules are
+gracefully skipped; the test still verifies no startup error occurs.
 
 ### `test_oci_rlimits`
 **Requires:** root, rootfs

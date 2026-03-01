@@ -117,28 +117,147 @@ pub struct OciLinux {
 // linux.resources
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct OciResources {
     pub memory: Option<OciMemoryResources>,
     pub cpu: Option<OciCpuResources>,
     pub pids: Option<OciPidsResources>,
+    pub block_io: Option<OciBlockIOResources>,
+    pub network: Option<OciNetworkResources>,
+    #[serde(default)]
+    pub devices: Vec<OciDeviceCgroup>,
+    #[serde(default)]
+    pub hugepage_limits: Vec<OciHugepageLimit>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct OciMemoryResources {
+    /// Hard memory limit in bytes (`memory.max`).
     pub limit: Option<i64>,
+    /// Memory + swap limit in bytes (`memory.swap.max` on v2, `memory.memsw.limit_in_bytes` on v1).
+    /// -1 means unlimited swap.
+    pub swap: Option<i64>,
+    /// Soft memory limit / low-water mark (`memory.low` on v2, `memory.soft_limit_in_bytes` on v1).
+    pub reservation: Option<i64>,
+    /// Kernel memory limit in bytes (v1 only; ignored on v2).
+    pub kernel: Option<i64>,
+    /// Kernel TCP buffer memory limit in bytes (v1 only; ignored on v2).
+    pub kernel_tcp: Option<i64>,
+    /// Swappiness hint (0–100) for the memory controller (v1 only; ignored on v2).
+    pub swappiness: Option<u64>,
+    /// Disable OOM killer for the cgroup.
+    #[serde(default)]
+    pub disable_oom_killer: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct OciCpuResources {
+    /// CPU weight / shares (`cpu.weight` on v2, `cpu.shares` on v1).
     pub shares: Option<u64>,
+    /// CPU quota in microseconds per period (`cpu.max` on v2).
     pub quota: Option<i64>,
+    /// CPU period in microseconds.
     pub period: Option<u64>,
+    /// Realtime CPU runtime in microseconds (v1 only; ignored on v2).
+    pub realtime_runtime: Option<i64>,
+    /// Realtime CPU period in microseconds (v1 only; ignored on v2).
+    pub realtime_period: Option<u64>,
+    /// CPUs allowed for this cgroup (cpuset string, e.g. "0-3,6").
+    pub cpus: Option<String>,
+    /// Memory nodes allowed for this cgroup (cpuset string, e.g. "0-1").
+    pub mems: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OciPidsResources {
+    /// Maximum number of pids in the cgroup (`pids.max`).
+    pub limit: Option<i64>,
+}
+
+/// linux.resources.blockIO
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OciBlockIOResources {
+    /// Overall block I/O weight (10–1000).
+    pub weight: Option<u16>,
+    /// Leaf-node weight (v1 only).
+    pub leaf_weight: Option<u16>,
+    /// Per-device weight overrides.
+    #[serde(default)]
+    pub weight_device: Vec<OciWeightDevice>,
+    /// Per-device read BPS throttle.
+    #[serde(default)]
+    pub throttle_read_bps_device: Vec<OciThrottleDevice>,
+    /// Per-device write BPS throttle.
+    #[serde(default)]
+    pub throttle_write_bps_device: Vec<OciThrottleDevice>,
+    /// Per-device read IOPS throttle.
+    #[serde(default)]
+    pub throttle_read_iops_device: Vec<OciThrottleDevice>,
+    /// Per-device write IOPS throttle.
+    #[serde(default)]
+    pub throttle_write_iops_device: Vec<OciThrottleDevice>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OciPidsResources {
-    pub limit: Option<i64>,
+#[serde(rename_all = "camelCase")]
+pub struct OciWeightDevice {
+    pub major: u64,
+    pub minor: u64,
+    pub weight: Option<u16>,
+    pub leaf_weight: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciThrottleDevice {
+    pub major: u64,
+    pub minor: u64,
+    pub rate: u64,
+}
+
+/// linux.resources.network
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OciNetworkResources {
+    /// net_cls classid (v1 only; ignored on v2).
+    pub class_id: Option<u32>,
+    /// net_prio interface priorities (v1 only; ignored on v2).
+    #[serde(default)]
+    pub priorities: Vec<OciNetPriority>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciNetPriority {
+    pub name: String,
+    pub priority: u32,
+}
+
+/// A single entry in linux.resources.devices (device cgroup allow/deny rules).
+/// Note: distinct from linux.devices (actual device node creation).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciDeviceCgroup {
+    pub allow: bool,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    pub major: Option<i64>,
+    pub minor: Option<i64>,
+    #[serde(default)]
+    pub access: String,
+}
+
+/// linux.resources.hugepageLimits entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciHugepageLimit {
+    pub page_size: String,
+    pub limit: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -583,13 +702,26 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
 
         // linux.resources → cgroup builders
         if let Some(ref res) = linux.resources {
+            // Memory
             if let Some(ref mem) = res.memory {
                 if let Some(limit) = mem.limit {
                     if limit > 0 {
                         cmd = cmd.with_cgroup_memory(limit);
                     }
                 }
+                if let Some(swap) = mem.swap {
+                    cmd = cmd.with_cgroup_memory_swap(swap);
+                }
+                if let Some(res) = mem.reservation {
+                    if res > 0 {
+                        cmd = cmd.with_cgroup_memory_reservation(res);
+                    }
+                }
+                if let Some(swappiness) = mem.swappiness {
+                    cmd = cmd.with_cgroup_memory_swappiness(swappiness);
+                }
             }
+            // CPU + cpuset
             if let Some(ref cpu) = res.cpu {
                 if let Some(shares) = cpu.shares {
                     if shares > 0 {
@@ -601,12 +733,57 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                         cmd = cmd.with_cgroup_cpu_quota(quota, period);
                     }
                 }
+                if let Some(ref cpus) = cpu.cpus {
+                    if !cpus.is_empty() {
+                        cmd = cmd.with_cgroup_cpuset_cpus(cpus.clone());
+                    }
+                }
+                if let Some(ref mems) = cpu.mems {
+                    if !mems.is_empty() {
+                        cmd = cmd.with_cgroup_cpuset_mems(mems.clone());
+                    }
+                }
             }
+            // PIDs
             if let Some(ref pids) = res.pids {
                 if let Some(limit) = pids.limit {
                     if limit > 0 {
                         cmd = cmd.with_cgroup_pids_limit(limit as u64);
                     }
+                }
+            }
+            // Block I/O
+            if let Some(ref bio) = res.block_io {
+                if let Some(w) = bio.weight {
+                    cmd = cmd.with_cgroup_blkio_weight(w);
+                }
+                for d in &bio.throttle_read_bps_device {
+                    cmd = cmd.with_cgroup_blkio_throttle_read_bps(d.major, d.minor, d.rate);
+                }
+                for d in &bio.throttle_write_bps_device {
+                    cmd = cmd.with_cgroup_blkio_throttle_write_bps(d.major, d.minor, d.rate);
+                }
+                for d in &bio.throttle_read_iops_device {
+                    cmd = cmd.with_cgroup_blkio_throttle_read_iops(d.major, d.minor, d.rate);
+                }
+                for d in &bio.throttle_write_iops_device {
+                    cmd = cmd.with_cgroup_blkio_throttle_write_iops(d.major, d.minor, d.rate);
+                }
+            }
+            // Device cgroup allow/deny rules
+            for dev in &res.devices {
+                let kind = dev.kind.chars().next().unwrap_or('a');
+                let major = dev.major.unwrap_or(-1);
+                let minor = dev.minor.unwrap_or(-1);
+                cmd = cmd.with_cgroup_device_rule(dev.allow, kind, major, minor, dev.access.clone());
+            }
+            // Network (v1 only; silently skipped on v2)
+            if let Some(ref net) = res.network {
+                if let Some(class_id) = net.class_id {
+                    cmd = cmd.with_cgroup_net_classid(class_id as u64);
+                }
+                for p in &net.priorities {
+                    cmd = cmd.with_cgroup_net_priority(p.name.clone(), p.priority as u64);
                 }
             }
         }

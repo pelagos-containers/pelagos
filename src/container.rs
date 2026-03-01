@@ -1159,6 +1159,130 @@ impl Command {
         self
     }
 
+    /// Set the memory + swap combined limit in bytes (`memory.swap.max` on v2).
+    /// -1 means unlimited swap.
+    pub fn with_cgroup_memory_swap(mut self, bytes: i64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .memory_swap = Some(bytes);
+        self
+    }
+
+    /// Set the soft memory limit / low-water mark in bytes (`memory.low` on v2).
+    pub fn with_cgroup_memory_reservation(mut self, bytes: i64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .memory_reservation = Some(bytes);
+        self
+    }
+
+    /// Set the memory swappiness hint (0–100, v1 only; silently ignored on v2).
+    pub fn with_cgroup_memory_swappiness(mut self, swappiness: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .memory_swappiness = Some(swappiness);
+        self
+    }
+
+    /// Set the CPUs allowed for this cgroup (cpuset string, e.g. `"0-3,6"`).
+    pub fn with_cgroup_cpuset_cpus(mut self, cpus: impl Into<String>) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .cpuset_cpus = Some(cpus.into());
+        self
+    }
+
+    /// Set the memory nodes allowed for this cgroup (cpuset string, e.g. `"0-1"`).
+    pub fn with_cgroup_cpuset_mems(mut self, mems: impl Into<String>) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .cpuset_mems = Some(mems.into());
+        self
+    }
+
+    /// Set the block I/O weight (10–1000; maps to `io.weight` on v2, `blkio.weight` on v1).
+    pub fn with_cgroup_blkio_weight(mut self, weight: u16) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .blkio_weight = Some(weight);
+        self
+    }
+
+    /// Add a per-device read BPS throttle rule `(major, minor, bytes_per_sec)`.
+    pub fn with_cgroup_blkio_throttle_read_bps(mut self, major: u64, minor: u64, rate: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .blkio_throttle_read_bps
+            .push((major, minor, rate));
+        self
+    }
+
+    /// Add a per-device write BPS throttle rule `(major, minor, bytes_per_sec)`.
+    pub fn with_cgroup_blkio_throttle_write_bps(mut self, major: u64, minor: u64, rate: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .blkio_throttle_write_bps
+            .push((major, minor, rate));
+        self
+    }
+
+    /// Add a per-device read IOPS throttle rule `(major, minor, iops)`.
+    pub fn with_cgroup_blkio_throttle_read_iops(mut self, major: u64, minor: u64, rate: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .blkio_throttle_read_iops
+            .push((major, minor, rate));
+        self
+    }
+
+    /// Add a per-device write IOPS throttle rule `(major, minor, iops)`.
+    pub fn with_cgroup_blkio_throttle_write_iops(mut self, major: u64, minor: u64, rate: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .blkio_throttle_write_iops
+            .push((major, minor, rate));
+        self
+    }
+
+    /// Add a device cgroup allow/deny rule (v1 only; gracefully skipped on v2).
+    pub fn with_cgroup_device_rule(
+        mut self,
+        allow: bool,
+        kind: char,
+        major: i64,
+        minor: i64,
+        access: impl Into<String>,
+    ) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .device_rules
+            .push(crate::cgroup::CgroupDeviceRule {
+                allow,
+                kind,
+                major,
+                minor,
+                access: access.into(),
+            });
+        self
+    }
+
+    /// Set the net_cls classid (v1 only; silently ignored on v2).
+    pub fn with_cgroup_net_classid(mut self, classid: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .net_classid = Some(classid);
+        self
+    }
+
+    /// Add a net_prio interface priority entry (v1 only; silently ignored on v2).
+    pub fn with_cgroup_net_priority(mut self, ifname: impl Into<String>, priority: u64) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .net_priorities
+            .push((ifname.into(), priority));
+        self
+    }
+
     /// Configure container networking.
     ///
     /// - [`NetworkMode::None`](crate::network::NetworkMode::None) — share the host

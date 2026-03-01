@@ -99,27 +99,52 @@ pub fn setup_rootless_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<R
     let child_controllers = available_controllers(&cg_path).unwrap_or_default();
 
     // Apply limits only for controllers that are actually present.
-    if let Some(bytes) = cfg.memory_limit {
-        if child_controllers.contains("memory") {
+    if child_controllers.contains("memory") {
+        if let Some(bytes) = cfg.memory_limit {
             write_limit(&cg_path, "memory.max", &bytes.to_string())?;
-        } else {
-            log::warn!("memory controller not available in sub-cgroup, skipping memory limit");
         }
+        if let Some(swap) = cfg.memory_swap {
+            write_limit(&cg_path, "memory.swap.max", &swap.to_string())?;
+        }
+        if let Some(res) = cfg.memory_reservation {
+            write_limit(&cg_path, "memory.low", &res.to_string())?;
+        }
+    } else if cfg.memory_limit.is_some()
+        || cfg.memory_swap.is_some()
+        || cfg.memory_reservation.is_some()
+    {
+        log::warn!("memory controller not available in sub-cgroup, skipping memory limits");
     }
-    if let Some((quota_us, period_us)) = cfg.cpu_quota {
-        if child_controllers.contains("cpu") {
+
+    if child_controllers.contains("cpu") {
+        if let Some((quota_us, period_us)) = cfg.cpu_quota {
             write_limit(&cg_path, "cpu.max", &format!("{} {}", quota_us, period_us))?;
-        } else {
-            log::warn!("cpu controller not available in sub-cgroup, skipping cpu quota");
         }
-    }
-    if let Some(shares) = cfg.cpu_shares {
-        if child_controllers.contains("cpu") {
+        if let Some(shares) = cfg.cpu_shares {
             write_limit(&cg_path, "cpu.weight", &shares.to_string())?;
-        } else {
-            log::warn!("cpu controller not available in sub-cgroup, skipping cpu weight");
+        }
+    } else if cfg.cpu_quota.is_some() || cfg.cpu_shares.is_some() {
+        log::warn!("cpu controller not available in sub-cgroup, skipping cpu limits");
+    }
+
+    // cpuset: write directly to cpuset.cpus / cpuset.mems if the files exist.
+    if let Some(ref cpus) = cfg.cpuset_cpus {
+        let knob = cg_path.join("cpuset.cpus");
+        if knob.exists() {
+            if let Err(e) = fs::write(&knob, cpus) {
+                log::warn!("cpuset.cpus={} failed (non-fatal): {}", cpus, e);
+            }
         }
     }
+    if let Some(ref mems) = cfg.cpuset_mems {
+        let knob = cg_path.join("cpuset.mems");
+        if knob.exists() {
+            if let Err(e) = fs::write(&knob, mems) {
+                log::warn!("cpuset.mems={} failed (non-fatal): {}", mems, e);
+            }
+        }
+    }
+
     if let Some(max) = cfg.pids_limit {
         if child_controllers.contains("pids") {
             write_limit(&cg_path, "pids.max", &max.to_string())?;
