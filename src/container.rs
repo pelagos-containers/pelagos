@@ -2396,7 +2396,8 @@ impl Command {
                     // setns changes pid_for_children; the grandchild (born after the fork
                     // below) is the first process created under the new pid_for_children
                     // and therefore enters the target PID namespace.
-                    if libc::setns(pid_join_fd, 0) != 0 {
+                    let r = libc::setns(pid_join_fd, 0);
+                    if r != 0 {
                         return Err(io::Error::last_os_error());
                     }
                     let inner_pid = libc::fork();
@@ -3105,10 +3106,29 @@ impl Command {
                     }
                 }
 
+                // Step 4.855: Join path-specified namespaces.
+                //
+                // MUST come before capability drop (step 4.86) because setns(2)
+                // requires CAP_SYS_ADMIN, which we still have at this point.
+                // MUST come after all mount operations so that the filesystem
+                // has been configured before we switch namespaces.
+                // PID namespace joins are handled earlier (step 1.65 double-fork).
+                for (fd, ns) in &join_ns_fds {
+                    if *ns == Namespace::PID {
+                        // Handled at step 1.65 via double-fork.
+                        continue;
+                    }
+                    let result = libc::setns(*fd, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
                 // Step 4.86: Drop capabilities.
                 //
                 // MUST come after all mount operations (masked paths, readonly
-                // paths, readonly rootfs) because those require CAP_SYS_ADMIN.
+                // paths, readonly rootfs) AND namespace joins because those
+                // require CAP_SYS_ADMIN.
                 // Two-step drop (mirrors Docker / runc):
                 //
                 // 1. PR_CAPBSET_DROP — remove unwanted caps from the bounding
@@ -3190,21 +3210,6 @@ impl Command {
                 // which requires CAP_SYS_ADMIN.
                 if let Some(ref callback) = user_pre_exec {
                     callback()?;
-                }
-
-                // Step 6: Join existing namespaces AFTER chroot and filesystem setup
-                // This ensures paths are resolved correctly before namespace transitions.
-                // PID namespace entries are skipped here — they are handled at step 1.65
-                // via double-fork (see below).
-                for (fd, ns) in &join_ns_fds {
-                    if *ns == Namespace::PID {
-                        // Handled at step 1.65 via double-fork.
-                        continue;
-                    }
-                    let result = libc::setns(*fd, 0);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
                 }
 
                 // Step 6.1: Set UID/GID if specified.

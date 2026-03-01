@@ -1339,8 +1339,7 @@ pub fn cmd_create(
             }
             let mut child = match command.spawn() {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("remora: create: spawn failed: {}", e);
+                Err(_) => {
                     unsafe { libc::_exit(1) };
                 }
             };
@@ -1376,18 +1375,47 @@ pub fn cmd_create(
 
             // The pre_exec pipe carries `getpid()` from inside the container.
             // Without a PID namespace this is the host-visible PID (correct).
-            // With a PID namespace + double-fork, the container sees itself as
-            // PID 1 (namespace-local), which is useless on the host.
+            // With a PID namespace + double-fork (create OR join-by-path), the
+            // container's getpid() returns a namespace-local PID, which is
+            // useless on the host.
             //
-            // When the pipe PID looks namespace-local (<=1), walk the shim's
-            // process tree via /proc to find the real host-visible PID.
-            // Process tree: shim → intermediate (waitpid loop) → container.
+            // Two cases require a double-fork (both produce namespace-local PIDs):
+            //   A. linux.namespaces has {type:"pid"} without a path → creates new ns; container is PID 1
+            //   B. linux.namespaces has {type:"pid", path:"..."} → joins existing ns; container is PID 2+
+            //
+            // For Case A the sentinel is pipe_pid==1. For Case B pipe_pid>1 but
+            // is still namespace-local, so we must detect Case B via the config.
+            let has_pid_ns_join = config
+                .linux
+                .as_ref()
+                .map(|l| {
+                    l.namespaces
+                        .iter()
+                        .any(|ns| ns.ns_type == "pid" && ns.path.is_some())
+                })
+                .unwrap_or(false);
+
             let pipe_pid = i32::from_ne_bytes(pid_buf);
-            let container_pid = if pipe_pid <= 1 {
-                find_descendant_pid(shim_pid).unwrap_or(pipe_pid)
+            // Use process-tree walk whenever a double-fork occurred (Case A or B).
+            let container_pid = if pipe_pid <= 1 || has_pid_ns_join {
+                let found = find_descendant_pid(shim_pid);
+                log::debug!(
+                    "OCI create: id={} shim_pid={} pipe_pid={} found_descendant={:?}",
+                    id,
+                    shim_pid,
+                    pipe_pid,
+                    found
+                );
+                found.unwrap_or(pipe_pid)
             } else {
                 pipe_pid
             };
+            log::debug!(
+                "OCI create: id={} container_pid={} has_pid_ns_join={}",
+                id,
+                container_pid,
+                has_pid_ns_join
+            );
 
             // Write state.json with status=created.
             let state = OciState {
@@ -1403,7 +1431,7 @@ pub fn cmd_create(
 
             // Write PID to --pid-file if requested (used by containerd / CRI-O).
             if let Some(pf) = pid_file {
-                fs::write(pf, format!("{}\n", container_pid))?;
+                fs::write(pf, format!("{}", container_pid))?;
             }
 
             // Send PTY master fd to caller via console_socket (SCM_RIGHTS).
@@ -1498,6 +1526,12 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
     // Determine actual liveness via kill(pid, 0).
     if state.status == "created" || state.status == "running" {
         let alive = unsafe { libc::kill(state.pid, 0) } == 0;
+        log::debug!(
+            "OCI state: id={} state.pid={} alive={}",
+            id,
+            state.pid,
+            alive
+        );
         if !alive {
             state.status = "stopped".to_string();
         }
@@ -1555,6 +1589,12 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
         })?,
     };
 
+    log::debug!(
+        "OCI kill: id={} state.pid={} sig={}",
+        id,
+        state.pid,
+        sig
+    );
     let ret = unsafe { libc::kill(state.pid, sig) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
@@ -1568,6 +1608,33 @@ pub fn cmd_delete(id: &str) -> io::Result<()> {
 
     // Allow delete if process is gone (stopped) regardless of state.json status.
     let alive = unsafe { libc::kill(state.pid, 0) } == 0;
+    if alive {
+        // Log the command line of the still-alive process for diagnostics.
+        let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", state.pid))
+            .unwrap_or_default()
+            .replace('\0', " ");
+        let status_line = fs::read_to_string(format!("/proc/{}/status", state.pid))
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("State:"))
+            .unwrap_or("")
+            .to_string();
+        log::debug!(
+            "OCI delete: id={} state.pid={} alive={} cmdline={:?} status={:?}",
+            id,
+            state.pid,
+            alive,
+            cmdline.trim(),
+            status_line
+        );
+    } else {
+        log::debug!(
+            "OCI delete: id={} state.pid={} alive={}",
+            id,
+            state.pid,
+            alive
+        );
+    }
     if alive {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

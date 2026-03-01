@@ -204,3 +204,146 @@ Full OCI lifecycle compliance implemented across 6 phases, merged to main as PRs
 
 ### 18 OCI lifecycle integration tests all pass.
 
+
+---
+
+## Active: OCI Full Compliance — console-socket + runtime-tools conformance (2026-03-01)
+
+Epic issue: TBD (will be created)
+
+### Goal
+
+Reach full OCI Runtime Spec compliance:
+1. Implement `console-socket` PTY fd passthrough (`process.terminal = true`)
+2. Pass the `opencontainers/runtime-tools` conformance suite with zero failures
+
+---
+
+### Background
+
+Phases 1–6 (epic #11) closed the known structural gaps. Two items remain:
+
+**A. `console-socket` is a stub.**  
+When `process.terminal: true`, the OCI spec requires the runtime to allocate a PTY,
+wire the slave as the container's stdin/stdout/stderr, and send the PTY master fd to
+the Unix socket at `--console-socket` via `sendmsg(SCM_RIGHTS)`. Currently the
+`_console_socket` parameter is accepted but entirely ignored.
+
+**B. The `opencontainers/runtime-tools` conformance suite has never been run.**  
+Our 18 OCI tests exercise behaviours we wrote for; runtime-tools generates ~80 test
+bundles covering the full spec and exposes edge-cases we haven't thought of.
+
+---
+
+### Sub-issue 1: console-socket PTY fd passthrough
+
+**Files:** `src/container.rs`, `src/oci.rs`, `tests/integration_tests.rs`,
+`docs/INTEGRATION_TESTS.md`
+
+#### container.rs changes
+
+1. Add field `pty_slave: Option<i32>` to `Command` struct.
+2. Add builder method `with_pty_slave(fd: i32) -> Self`.
+3. Capture `pty_slave` in the `pre_exec` closure of **both** `spawn()` and
+   `spawn_interactive()`.
+4. In pre_exec, just before the OCI-sync block (write PID + accept), if
+   `pty_slave` is Some(slave_fd):
+   ```
+   libc::setsid();
+   libc::dup2(slave_fd, 0);   // stdin
+   libc::dup2(slave_fd, 1);   // stdout
+   libc::dup2(slave_fd, 2);   // stderr
+   libc::ioctl(slave_fd, TIOCSCTTY, 0);  // make controlling terminal
+   if slave_fd > 2 { libc::close(slave_fd); }
+   ```
+   slave_fd must NOT be CLOEXEC (so it survives fork chains to reach pre_exec).
+
+#### oci.rs changes
+
+1. Add helper `fn send_fd_to_console_socket(path: &Path, fd: i32) -> io::Result<()>`:
+   - `UnixStream::connect(path)` to connect to caller's socket
+   - Build `msghdr` with `SCM_RIGHTS` ancillary data containing the master fd
+   - `sendmsg()` the 1-byte dummy payload + ancillary data
+   
+2. In `cmd_create`, before building the command, detect terminal+socket:
+   ```rust
+   let pty = if config.process.as_ref().map_or(false, |p| p.terminal)
+               && console_socket.is_some() {
+       let p = nix::pty::openpty(None, None)?;
+       // ensure slave NOT CLOEXEC; master CLOEXEC
+       Some((p.master.into_raw_fd(), p.slave.into_raw_fd()))
+   } else {
+       None
+   };
+   ```
+
+3. Add `with_pty_slave(slave_raw)` to command if PTY allocated.
+
+4. In shim branch (`0 =>`): `close(master_raw)`.
+
+5. In parent branch: `close(slave_raw)` immediately after fork; after ready pipe,
+   call `send_fd_to_console_socket(sock, master_raw)` then `close(master_raw)`.
+
+#### Integration test
+
+`test_oci_console_socket`: Build an OCI bundle with `process.terminal: true`.
+Create a Unix socket listener. Run `remora create --console-socket <path>`.
+Assert that the listener receives exactly one fd via SCM_RIGHTS, and that the
+received fd is readable/writable as a PTY master (write to it, container echoes back).
+
+---
+
+### Sub-issue 2: runtime-tools conformance suite
+
+**Repo:** `https://github.com/opencontainers/runtime-tools`
+
+#### Setup
+```bash
+git clone https://github.com/opencontainers/runtime-tools /tmp/runtime-tools
+cd /tmp/runtime-tools
+make runtimetest
+```
+
+#### Run
+```bash
+sudo RUNTIME=$(which remora) make validate
+# or
+sudo go test -v ./validation/... -args -runtime=$(which remora) 2>&1 | tee /tmp/rt-results.txt
+```
+
+Each failing test produces a bundle + error message. Fix each failure in its own
+commit, re-run until `0 failures`.
+
+#### Expected failures to fix
+
+Beyond console-socket (covered in sub-issue 1), likely failures include:
+- Any OciProcess fields not yet parsed (`oomScoreAdj`, etc.)
+- Edge cases in mount option parsing
+- Any spec requirement in hook state JSON we've missed
+- Device node handling details
+- Anything in the namespace path-join flow
+
+All fixes go into the same PR as the runtime-tools run, with individual commits
+per fixed failure category.
+
+---
+
+### Execution Order
+
+```
+1. Create epic + sub-issues in GitHub
+2. Branch: fix/oci-console-socket
+   - container.rs: with_pty_slave() + pre_exec setup
+   - oci.rs: send_fd_to_console_socket() + cmd_create wiring
+   - tests + docs
+   - PR, merge
+3. Branch: fix/oci-runtimetools
+   - Clone + build runtime-tools
+   - Run conformance suite, collect failures
+   - Fix each failure, re-run, iterate until clean
+   - PR, merge
+4. Run full integration test suite (sudo -E cargo test --test integration_tests)
+5. Resolve epic + report
+```
+
+---
