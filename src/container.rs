@@ -710,6 +710,9 @@ pub struct Command {
     links: Vec<(String, String)>,
     // Additional bridge networks to attach (secondary interfaces: eth1, eth2, ...).
     additional_networks: Vec<String>,
+    // Propagation-only remounts applied after all other mounts:
+    // each entry is (target, MS_SHARED|MS_SLAVE|MS_PRIVATE|...).
+    propagation_mounts: Vec<(PathBuf, libc::c_ulong)>,
 }
 
 impl Command {
@@ -756,6 +759,7 @@ impl Command {
             links: Vec::new(),
             use_id_helpers: false,
             additional_networks: Vec::new(),
+            propagation_mounts: Vec::new(),
         }
     }
 
@@ -1711,6 +1715,20 @@ impl Command {
         self
     }
 
+    /// Apply a propagation-only remount to `target` inside the container.
+    ///
+    /// This performs `mount(NULL, target, NULL, flags, NULL)` after all other mounts,
+    /// which sets the mount propagation mode (MS_SHARED, MS_SLAVE, MS_PRIVATE, etc.).
+    /// Required by OCI: propagation flags must be a separate mount(2) call.
+    pub fn with_propagation_remount<P: Into<PathBuf>>(
+        mut self,
+        target: P,
+        flags: libc::c_ulong,
+    ) -> Self {
+        self.propagation_mounts.push((target.into(), flags));
+        self
+    }
+
     /// Mount a named volume at `target` inside the container.
     ///
     /// This is syntactic sugar for [`with_bind_mount`] using the volume's host path.
@@ -1875,9 +1893,17 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
+        let propagation_mounts = self.propagation_mounts.clone();
         let rootfs_propagation = self.rootfs_propagation;
         let hostname = self.hostname.clone();
         let use_id_helpers = self.use_id_helpers;
+        // When root creates a user namespace with explicit uid/gid maps, the child
+        // cannot write /proc/self/uid_map after unshare(CLONE_NEWUSER) because it
+        // loses CAP_SETUID in the parent user namespace.  The parent process must
+        // write the maps (same mechanism as use_id_helpers but writing directly).
+        let needs_parent_idmap = !is_rootless
+            && namespaces.contains(Namespace::USER)
+            && (!uid_maps.is_empty() || !gid_maps.is_empty());
         // Loopback/Pasta mode: bring up lo inside pre_exec (after unshare(NEWNET)).
         // Bridge mode uses setns instead — lo is configured by setup_bridge_network.
         let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
@@ -2172,18 +2198,19 @@ impl Command {
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         // (ready_w, done_r) go into the child closure; (ready_r, done_w) stay for the parent thread.
-        let (idmap_ready_w, idmap_done_r, idmap_ready_r, idmap_done_w) = if use_id_helpers {
-            let mut ready_fds = [0i32; 2];
-            let mut done_fds = [0i32; 2];
-            if unsafe { libc::pipe(ready_fds.as_mut_ptr()) } != 0
-                || unsafe { libc::pipe(done_fds.as_mut_ptr()) } != 0
-            {
-                return Err(Error::Io(io::Error::last_os_error()));
-            }
-            (ready_fds[1], done_fds[0], ready_fds[0], done_fds[1])
-        } else {
-            (-1, -1, -1, -1)
-        };
+        let (idmap_ready_w, idmap_done_r, idmap_ready_r, idmap_done_w) =
+            if use_id_helpers || needs_parent_idmap {
+                let mut ready_fds = [0i32; 2];
+                let mut done_fds = [0i32; 2];
+                if unsafe { libc::pipe(ready_fds.as_mut_ptr()) } != 0
+                    || unsafe { libc::pipe(done_fds.as_mut_ptr()) } != 0
+                {
+                    return Err(Error::Io(io::Error::last_os_error()));
+                }
+                (ready_fds[1], done_fds[0], ready_fds[0], done_fds[1])
+            } else {
+                (-1, -1, -1, -1)
+            };
 
         // Install our combined pre_exec hook
         unsafe {
@@ -2269,6 +2296,40 @@ impl Command {
                         // Privileged (root) mode: unshare all namespaces at once.
                         unshare(namespaces.to_clone_flags())
                             .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+
+                        // If the OCI config specifies uid/gid maps for a root-created user
+                        // namespace, the child cannot write /proc/self/uid_map after
+                        // unshare(CLONE_NEWUSER) (loses CAP_SETUID in parent ns).
+                        // Signal the parent to write maps and wait for confirmation.
+                        if needs_parent_idmap {
+                            let pid: u32 = libc::getpid() as u32;
+                            libc::write(
+                                idmap_ready_w,
+                                pid.to_ne_bytes().as_ptr() as *const libc::c_void,
+                                4,
+                            );
+                            libc::close(idmap_ready_w);
+                            let mut buf = [0u8; 1];
+                            libc::read(idmap_done_r, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                            libc::close(idmap_done_r);
+                            // After uid_map is written by the parent, the child process
+                            // (running as host UID 0) has no mapping in the new user
+                            // namespace (uid_map maps container 0 → host 1000, not host 0).
+                            // Without setuid(0) here, the child appears as overflow UID
+                            // (65534) and loses all capabilities, causing mounts to fail.
+                            // Switch to container UID/GID 0 immediately to gain full
+                            // capabilities in the new user namespace.
+                            if let Some(g) = gid {
+                                libc::setgid(g);
+                            } else {
+                                libc::setgid(0);
+                            }
+                            if let Some(u) = uid {
+                                libc::setuid(u);
+                            } else {
+                                libc::setuid(0);
+                            }
+                        }
                     }
 
                     // Step 1.5: If we created a mount namespace, make all mounts private
@@ -2454,62 +2515,12 @@ impl Command {
                     }
                 }
 
-                // Step 2: Set up UID/GID mapping if user namespace is active.
-                // Skip for rootless — maps were written early in Step 1 so that
-                // subsequent namespace unshares could use the resulting capabilities.
-                if namespaces.contains(Namespace::USER) && !is_rootless {
-                    use std::fs;
-                    use std::io::Write;
-
-                    // For unprivileged containers, must deny setgroups before writing gid_map
-                    if !gid_maps.is_empty() {
-                        let mut setgroups = fs::OpenOptions::new()
-                            .write(true)
-                            .open("/proc/self/setgroups")
-                            .map_err(|e| io::Error::other(format!("open setgroups: {}", e)))?;
-                        setgroups
-                            .write_all(b"deny\n")
-                            .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
-                    }
-
-                    // Write UID mappings — must be a single write() call (kernel requirement).
-                    if !uid_maps.is_empty() {
-                        use std::io::Write as _;
-                        let mut content = String::new();
-                        for map in &uid_maps {
-                            content.push_str(&format!(
-                                "{} {} {}\n",
-                                map.inside, map.outside, map.count
-                            ));
-                        }
-                        let mut uid_map_file = fs::OpenOptions::new()
-                            .write(true)
-                            .open("/proc/self/uid_map")
-                            .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
-                        uid_map_file
-                            .write_all(content.as_bytes())
-                            .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
-                    }
-
-                    // Write GID mappings — must be a single write() call (kernel requirement).
-                    if !gid_maps.is_empty() {
-                        use std::io::Write as _;
-                        let mut content = String::new();
-                        for map in &gid_maps {
-                            content.push_str(&format!(
-                                "{} {} {}\n",
-                                map.inside, map.outside, map.count
-                            ));
-                        }
-                        let mut gid_map_file = fs::OpenOptions::new()
-                            .write(true)
-                            .open("/proc/self/gid_map")
-                            .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
-                        gid_map_file
-                            .write_all(content.as_bytes())
-                            .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
-                    }
-                }
+                // Step 2: UID/GID mapping for root-created user namespaces.
+                // Maps are written by the parent process (via needs_parent_idmap pipe),
+                // not by the child — the child loses CAP_SETUID in the parent user
+                // namespace after unshare(CLONE_NEWUSER) and cannot write its own uid_map.
+                // (Rootless maps were written early in Step 1 by the child itself, which
+                // is allowed because the child's own UID is in the mapped range.)
 
                 // Step 3.5: Mount overlayfs (if configured).
                 // The merged dir becomes the effective root for chroot and bind mounts.
@@ -2989,6 +3000,27 @@ impl Command {
                     }
                 }
 
+                // Step 4.65: Propagation-only remounts (MS_SHARED, MS_SLAVE, etc.)
+                // These must come after the initial mount; passing propagation flags
+                // in the initial mount(2) call returns EINVAL on Linux.
+                for (target, flags) in &propagation_mounts {
+                    let tgt_c = CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                    let result = libc::mount(
+                        ptr::null(),
+                        tgt_c.as_ptr(),
+                        ptr::null(),
+                        *flags,
+                        ptr::null(),
+                    );
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "propagation remount at {}: {}",
+                            target.display(),
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
                 // Step 4.7: Apply sysctl settings (write to /proc/sys/)
                 for (key, value) in &sysctl {
                     // Convert "net.ipv4.ip_forward" -> "/proc/sys/net/ipv4/ip_forward"
@@ -3263,6 +3295,11 @@ impl Command {
                 // CRITICAL: This MUST be before the OCI sync! Once seccomp is applied, many syscalls
                 // are blocked. All setup must be complete before signalling "created".
                 if let Some(ref filter) = seccomp_filter {
+                    // Seccomp requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS=1.
+                    // Capabilities may have been dropped above. Set nnp unconditionally
+                    // here so seccomp application doesn't fail with EPERM.
+                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                    libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                     crate::seccomp::apply_filter(filter)?;
                 }
 
@@ -3291,13 +3328,17 @@ impl Command {
             });
         }
 
-        // If using ID helpers, spawn the helper thread now (before fork).
-        // It reads the child PID from the pipe, runs newuidmap/newgidmap, signals done.
-        if use_id_helpers {
+        // Spawn the idmap helper thread when uid/gid maps must be written by the parent.
+        // Two cases share the same pipe mechanism:
+        //   use_id_helpers: rootless containers — parent runs newuidmap/newgidmap.
+        //   needs_parent_idmap: root-created user namespace — parent writes maps directly
+        //     because the child loses CAP_SETUID in the parent namespace after unshare.
+        if use_id_helpers || needs_parent_idmap {
             let uid_maps_h = self.uid_maps.clone();
             let gid_maps_h = self.gid_maps.clone();
             let ready_r = idmap_ready_r;
             let done_w = idmap_done_w;
+            let via_helpers = use_id_helpers;
 
             std::thread::spawn(move || {
                 let mut pid_bytes = [0u8; 4];
@@ -3310,11 +3351,38 @@ impl Command {
                 }
                 let child_pid = u32::from_ne_bytes(pid_bytes);
 
-                if let Err(e) = crate::idmap::apply_uid_map(child_pid, &uid_maps_h) {
-                    log::warn!("newuidmap failed: {}", e);
-                }
-                if let Err(e) = crate::idmap::apply_gid_map(child_pid, &gid_maps_h) {
-                    log::warn!("newgidmap failed: {}", e);
+                if via_helpers {
+                    if let Err(e) = crate::idmap::apply_uid_map(child_pid, &uid_maps_h) {
+                        log::warn!("newuidmap failed: {}", e);
+                    }
+                    if let Err(e) = crate::idmap::apply_gid_map(child_pid, &gid_maps_h) {
+                        log::warn!("newgidmap failed: {}", e);
+                    }
+                } else {
+                    // Write uid_map/gid_map directly from the parent (root has CAP_SETUID).
+                    if !uid_maps_h.is_empty() {
+                        let path = format!("/proc/{}/uid_map", child_pid);
+                        let content: String = uid_maps_h
+                            .iter()
+                            .map(|m| format!("{} {} {}\n", m.inside, m.outside, m.count))
+                            .collect();
+                        if let Err(e) = std::fs::write(&path, content.as_bytes()) {
+                            log::warn!("write uid_map for pid {}: {}", child_pid, e);
+                        }
+                    }
+                    if !gid_maps_h.is_empty() {
+                        // Must deny setgroups before writing gid_map (kernel requirement).
+                        let sg_path = format!("/proc/{}/setgroups", child_pid);
+                        let _ = std::fs::write(&sg_path, b"deny\n");
+                        let path = format!("/proc/{}/gid_map", child_pid);
+                        let content: String = gid_maps_h
+                            .iter()
+                            .map(|m| format!("{} {} {}\n", m.inside, m.outside, m.count))
+                            .collect();
+                        if let Err(e) = std::fs::write(&path, content.as_bytes()) {
+                            log::warn!("write gid_map for pid {}: {}", child_pid, e);
+                        }
+                    }
                 }
 
                 unsafe { libc::write(done_w, [0u8].as_ptr() as *const libc::c_void, 1) };
@@ -3326,7 +3394,7 @@ impl Command {
         let child_inner = match self.inner.spawn() {
             Ok(c) => c,
             Err(e) => {
-                if use_id_helpers {
+                if use_id_helpers || needs_parent_idmap {
                     // Close child-side pipe ends to unblock the helper thread.
                     unsafe { libc::close(idmap_ready_w) };
                     unsafe { libc::close(idmap_done_r) };
@@ -3336,7 +3404,7 @@ impl Command {
         };
 
         // Close child-side pipe ends in the parent (child inherited them via fork).
-        if use_id_helpers {
+        if use_id_helpers || needs_parent_idmap {
             unsafe { libc::close(idmap_ready_w) };
             unsafe { libc::close(idmap_done_r) };
         }
@@ -3578,9 +3646,13 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
+        let propagation_mounts = self.propagation_mounts.clone();
         let rootfs_propagation = self.rootfs_propagation;
         let hostname = self.hostname.clone();
         let use_id_helpers = self.use_id_helpers;
+        let needs_parent_idmap = !is_rootless
+            && namespaces.contains(Namespace::USER)
+            && (!uid_maps.is_empty() || !gid_maps.is_empty());
         let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
@@ -3850,18 +3922,19 @@ impl Command {
             });
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
-        let (idmap_ready_w_i, idmap_done_r_i, idmap_ready_r_i, idmap_done_w_i) = if use_id_helpers {
-            let mut ready_fds = [0i32; 2];
-            let mut done_fds = [0i32; 2];
-            if unsafe { libc::pipe(ready_fds.as_mut_ptr()) } != 0
-                || unsafe { libc::pipe(done_fds.as_mut_ptr()) } != 0
-            {
-                return Err(Error::Io(io::Error::last_os_error()));
-            }
-            (ready_fds[1], done_fds[0], ready_fds[0], done_fds[1])
-        } else {
-            (-1, -1, -1, -1)
-        };
+        let (idmap_ready_w_i, idmap_done_r_i, idmap_ready_r_i, idmap_done_w_i) =
+            if use_id_helpers || needs_parent_idmap {
+                let mut ready_fds = [0i32; 2];
+                let mut done_fds = [0i32; 2];
+                if unsafe { libc::pipe(ready_fds.as_mut_ptr()) } != 0
+                    || unsafe { libc::pipe(done_fds.as_mut_ptr()) } != 0
+                {
+                    return Err(Error::Io(io::Error::last_os_error()));
+                }
+                (ready_fds[1], done_fds[0], ready_fds[0], done_fds[1])
+            } else {
+                (-1, -1, -1, -1)
+            };
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -3959,6 +4032,31 @@ impl Command {
                     } else {
                         unshare(namespaces.to_clone_flags())
                             .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+
+                        if needs_parent_idmap {
+                            let pid: u32 = libc::getpid() as u32;
+                            libc::write(
+                                idmap_ready_w_i,
+                                pid.to_ne_bytes().as_ptr() as *const libc::c_void,
+                                4,
+                            );
+                            libc::close(idmap_ready_w_i);
+                            let mut buf = [0u8; 1];
+                            libc::read(idmap_done_r_i, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                            libc::close(idmap_done_r_i);
+                            // After uid_map is written, switch to container UID/GID 0
+                            // to gain proper capabilities in the new user namespace.
+                            if let Some(g) = gid {
+                                libc::setgid(g);
+                            } else {
+                                libc::setgid(0);
+                            }
+                            if let Some(u) = uid {
+                                libc::setuid(u);
+                            } else {
+                                libc::setuid(0);
+                            }
+                        }
                     }
 
                     // linux.rootfsPropagation overrides the default MS_PRIVATE|MS_REC.
@@ -4092,54 +4190,9 @@ impl Command {
                     }
                 }
 
-                // Step 2: Set up UID/GID mapping if user namespace is active.
-                // Skip for rootless — maps were written early in Step 1.
-                if namespaces.contains(Namespace::USER) && !is_rootless {
-                    use std::io::Write;
-
-                    if !gid_maps.is_empty() {
-                        let mut setgroups = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open("/proc/self/setgroups")
-                            .map_err(|e| io::Error::other(format!("open setgroups: {}", e)))?;
-                        setgroups
-                            .write_all(b"deny\n")
-                            .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
-                    }
-                    // uid_map and gid_map MUST be written in a single write() call.
-                    if !uid_maps.is_empty() {
-                        let mut content = String::new();
-                        for map in &uid_maps {
-                            content.push_str(&format!(
-                                "{} {} {}\n",
-                                map.inside, map.outside, map.count
-                            ));
-                        }
-                        let mut uid_map_file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open("/proc/self/uid_map")
-                            .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
-                        uid_map_file
-                            .write_all(content.as_bytes())
-                            .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
-                    }
-                    if !gid_maps.is_empty() {
-                        let mut content = String::new();
-                        for map in &gid_maps {
-                            content.push_str(&format!(
-                                "{} {} {}\n",
-                                map.inside, map.outside, map.count
-                            ));
-                        }
-                        let mut gid_map_file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open("/proc/self/gid_map")
-                            .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
-                        gid_map_file
-                            .write_all(content.as_bytes())
-                            .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
-                    }
-                }
+                // Step 2: UID/GID mapping for root-created user namespaces.
+                // Maps are written by the parent (needs_parent_idmap pipe mechanism),
+                // not by the child — same as spawn().
 
                 // Step 3.5: Mount overlayfs (if configured).
                 let overlay_merged: Option<&std::ffi::CString> =
@@ -4566,6 +4619,25 @@ impl Command {
                     }
                 }
 
+                // Propagation-only remounts (MS_SHARED, MS_SLAVE, etc.)
+                for (target, flags) in &propagation_mounts {
+                    let tgt_c = CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                    let result = libc::mount(
+                        ptr::null(),
+                        tgt_c.as_ptr(),
+                        ptr::null(),
+                        *flags,
+                        ptr::null(),
+                    );
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "propagation remount at {}: {}",
+                            target.display(),
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
                 for (key, value) in &sysctl {
                     let proc_path = format!("/proc/sys/{}", key.replace('.', "/"));
                     let path_c = match std::ffi::CString::new(proc_path.as_bytes()) {
@@ -4788,6 +4860,8 @@ impl Command {
                 }
 
                 if let Some(ref filter) = seccomp_filter {
+                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                    libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                     crate::seccomp::apply_filter(filter)?;
                 }
 
@@ -4810,13 +4884,13 @@ impl Command {
             });
         }
 
-        // If using ID helpers, spawn the helper thread now (before fork).
-        // It reads the child PID from the pipe, runs newuidmap/newgidmap, signals done.
-        if use_id_helpers {
+        // Spawn the idmap helper thread (same logic as in spawn()).
+        if use_id_helpers || needs_parent_idmap {
             let uid_maps_h = self.uid_maps.clone();
             let gid_maps_h = self.gid_maps.clone();
             let ready_r = idmap_ready_r_i;
             let done_w = idmap_done_w_i;
+            let via_helpers = use_id_helpers;
 
             std::thread::spawn(move || {
                 let mut pid_bytes = [0u8; 4];
@@ -4829,11 +4903,36 @@ impl Command {
                 }
                 let child_pid = u32::from_ne_bytes(pid_bytes);
 
-                if let Err(e) = crate::idmap::apply_uid_map(child_pid, &uid_maps_h) {
-                    log::warn!("newuidmap failed: {}", e);
-                }
-                if let Err(e) = crate::idmap::apply_gid_map(child_pid, &gid_maps_h) {
-                    log::warn!("newgidmap failed: {}", e);
+                if via_helpers {
+                    if let Err(e) = crate::idmap::apply_uid_map(child_pid, &uid_maps_h) {
+                        log::warn!("newuidmap failed: {}", e);
+                    }
+                    if let Err(e) = crate::idmap::apply_gid_map(child_pid, &gid_maps_h) {
+                        log::warn!("newgidmap failed: {}", e);
+                    }
+                } else {
+                    if !uid_maps_h.is_empty() {
+                        let path = format!("/proc/{}/uid_map", child_pid);
+                        let content: String = uid_maps_h
+                            .iter()
+                            .map(|m| format!("{} {} {}\n", m.inside, m.outside, m.count))
+                            .collect();
+                        if let Err(e) = std::fs::write(&path, content.as_bytes()) {
+                            log::warn!("write uid_map for pid {}: {}", child_pid, e);
+                        }
+                    }
+                    if !gid_maps_h.is_empty() {
+                        let sg_path = format!("/proc/{}/setgroups", child_pid);
+                        let _ = std::fs::write(&sg_path, b"deny\n");
+                        let path = format!("/proc/{}/gid_map", child_pid);
+                        let content: String = gid_maps_h
+                            .iter()
+                            .map(|m| format!("{} {} {}\n", m.inside, m.outside, m.count))
+                            .collect();
+                        if let Err(e) = std::fs::write(&path, content.as_bytes()) {
+                            log::warn!("write gid_map for pid {}: {}", child_pid, e);
+                        }
+                    }
                 }
 
                 unsafe { libc::write(done_w, [0u8].as_ptr() as *const libc::c_void, 1) };
@@ -4845,7 +4944,7 @@ impl Command {
         let child_inner = match self.inner.spawn() {
             Ok(c) => c,
             Err(e) => {
-                if use_id_helpers {
+                if use_id_helpers || needs_parent_idmap {
                     // Close child-side pipe ends to unblock the helper thread.
                     unsafe { libc::close(idmap_ready_w_i) };
                     unsafe { libc::close(idmap_done_r_i) };
@@ -4855,7 +4954,7 @@ impl Command {
         };
 
         // Close child-side pipe ends in the parent (child inherited them via fork).
-        if use_id_helpers {
+        if use_id_helpers || needs_parent_idmap {
             unsafe { libc::close(idmap_ready_w_i) };
             unsafe { libc::close(idmap_done_r_i) };
         }

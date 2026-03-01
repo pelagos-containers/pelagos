@@ -19,7 +19,7 @@ use std::time::Duration;
 pub struct OciConfig {
     pub oci_version: String,
     pub root: OciRoot,
-    pub process: OciProcess,
+    pub process: Option<OciProcess>,
     pub hostname: Option<String>,
     pub linux: Option<OciLinux>,
     #[serde(default)]
@@ -235,9 +235,10 @@ pub struct OciNamespace {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OciIdMapping {
+    #[serde(rename = "hostID")]
     pub host_id: u32,
+    #[serde(rename = "containerID")]
     pub container_id: u32,
     pub size: u32,
 }
@@ -373,50 +374,105 @@ fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
 // Build a container::Command from OCI config
 // ---------------------------------------------------------------------------
 
+/// Validate that the ociVersion string is a recognized spec version (1.x.y).
+/// Rejects obviously invalid strings like "invalid" or "0.1".
+fn is_supported_oci_version(version: &str) -> bool {
+    // Accept any 1.x.y version — the OCI spec has been at major version 1 since 1.0.0.
+    // Reject anything that doesn't start with "1." to catch typos and test injections.
+    let parts: Vec<&str> = version.splitn(3, '.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    parts[0] == "1" && parts[1].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Validate that the symlink at `path` refers to a namespace of type `ns_type`.
+/// Returns an error if the path doesn't exist or the type doesn't match.
+fn validate_ns_path_type(path: &str, ns_type: &str) -> io::Result<()> {
+    let target = std::fs::read_link(path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("namespace path '{}': {}", path, e),
+        )
+    })?;
+    let target_str = target.to_string_lossy();
+    // Symlink targets look like "ipc:[4026531839]" or "mnt:[...]".
+    // The OCI type name "mount" maps to the kernel name "mnt"; "network" → "net".
+    let expected_prefix = match ns_type {
+        "mount" => "mnt",
+        "network" => "net",
+        other => other,
+    };
+    let prefix = format!("{}:[", expected_prefix);
+    if !target_str.starts_with(&prefix) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "namespace path '{}' has type '{}' (expected '{}')",
+                path, target_str, ns_type
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::container::Command> {
     use crate::container::{Command, Namespace};
 
+    // Validate ociVersion: must look like a supported spec version (1.x.y).
+    if !is_supported_oci_version(&config.oci_version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported ociVersion '{}' — expected 1.x.y",
+                config.oci_version
+            ),
+        ));
+    }
+
     let root_path = bundle.join(&config.root.path);
-    let exe = config
-        .process
-        .args
-        .first()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "process.args is empty"))?;
+
+    // process is optional in OCI spec; when absent use a no-op placeholder.
+    let process = config.process.as_ref();
+    let exe: &str = process
+        .and_then(|p| p.args.first().map(|s| s.as_str()))
+        .unwrap_or("/bin/true");
+    let cwd: &str = process.map(|p| p.cwd.as_str()).unwrap_or("/");
 
     let mut cmd = Command::new(exe)
         .env_clear()
         .with_chroot(&root_path)
-        .with_cwd(&config.process.cwd)
+        .with_cwd(cwd)
         .stdout(crate::container::Stdio::Inherit)
         .stderr(crate::container::Stdio::Inherit);
 
-    // Remaining args (exe is args[0])
-    if config.process.args.len() > 1 {
-        let rest: Vec<&str> = config.process.args[1..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        cmd = cmd.args(&rest);
-    }
+    if let Some(p) = process {
+        // Remaining args (exe is args[0])
+        if p.args.len() > 1 {
+            let rest: Vec<&str> = p.args[1..].iter().map(|s| s.as_str()).collect();
+            cmd = cmd.args(&rest);
+        }
 
-    // Environment
-    for entry in &config.process.env {
-        if let Some(eq) = entry.find('=') {
-            cmd = cmd.env(&entry[..eq], &entry[eq + 1..]);
-        } else {
-            cmd = cmd.env(entry, "");
+        // Environment
+        for entry in &p.env {
+            if let Some(eq) = entry.find('=') {
+                cmd = cmd.env(&entry[..eq], &entry[eq + 1..]);
+            } else {
+                cmd = cmd.env(entry, "");
+            }
+        }
+
+        // User (uid/gid)
+        if let Some(ref user) = p.user {
+            cmd = cmd.with_uid(user.uid).with_gid(user.gid);
+        }
+
+        // Security flags
+        if p.no_new_privileges {
+            cmd = cmd.with_no_new_privileges(true);
         }
     }
 
-    // User (uid/gid)
-    if let Some(ref user) = config.process.user {
-        cmd = cmd.with_uid(user.uid).with_gid(user.gid);
-    }
-
-    // Security flags
-    if config.process.no_new_privileges {
-        cmd = cmd.with_no_new_privileges(true);
-    }
     if config.root.readonly {
         cmd = cmd.with_readonly_rootfs(true);
     }
@@ -437,6 +493,8 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
             };
             if let Some(flag) = flag {
                 if let Some(ref path) = ns.path {
+                    // Validate that the path's namespace type matches the configured type.
+                    validate_ns_path_type(path, &ns.ns_type)?;
                     // Join an existing namespace by path
                     cmd = cmd.with_namespace_join(path, flag);
                 } else {
@@ -491,7 +549,7 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
     }
 
     // process.capabilities → with_capabilities()
-    if let Some(ref caps) = config.process.capabilities {
+    if let Some(caps) = process.and_then(|p| p.capabilities.as_ref()) {
         use crate::container::Capability;
         // The OCI bounding set defines which capabilities can be in the effective set.
         // We use it (falling back to effective) as the "keep" set for Remora's
@@ -605,7 +663,7 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
     }
 
     // process.rlimits
-    for rl in &config.process.rlimits {
+    for rl in process.map(|p| p.rlimits.as_slice()).unwrap_or(&[]) {
         let resource = match rl.type_.as_str() {
             "RLIMIT_CORE" => Some(libc::RLIMIT_CORE),
             "RLIMIT_CPU" => Some(libc::RLIMIT_CPU),
@@ -630,14 +688,25 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
         }
     }
 
+    // Track whether /dev is being freshly mounted as tmpfs (no device nodes yet).
+    let mut dev_is_fresh_tmpfs = false;
+
     // OCI mounts (processed in order)
     for mount in &config.mounts {
         let dest = &mount.destination;
         let mount_type = mount.mount_type.as_deref().unwrap_or("bind");
+
+        if dest == "/dev" && mount_type == "tmpfs" {
+            dev_is_fresh_tmpfs = true;
+        }
         let is_ro = mount.options.iter().any(|o| o == "ro" || o == "readonly");
 
         // Parse MS_* flags from option strings.
+        // Propagation flags (shared/slave/private/unbindable) must be applied as a
+        // SEPARATE mount(2) call after the initial mount — combining them in the
+        // initial call returns EINVAL on Linux.
         let mut flags: libc::c_ulong = 0;
+        let mut propagation_flags: libc::c_ulong = 0;
         let mut extra_data_parts: Vec<&str> = Vec::new();
         for opt in &mount.options {
             match opt.as_str() {
@@ -649,10 +718,15 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 "noatime" => flags |= libc::MS_NOATIME,
                 "nodiratime" => flags |= libc::MS_NODIRATIME,
                 "strictatime" => flags |= libc::MS_STRICTATIME,
-                "shared" => flags |= libc::MS_SHARED,
-                "slave" => flags |= libc::MS_SLAVE,
-                "private" => flags |= libc::MS_PRIVATE,
-                "unbindable" => flags |= libc::MS_UNBINDABLE,
+                // Propagation flags — collect separately, applied as a remount step.
+                "shared" => propagation_flags |= libc::MS_SHARED,
+                "rshared" => propagation_flags |= libc::MS_SHARED | libc::MS_REC,
+                "slave" => propagation_flags |= libc::MS_SLAVE,
+                "rslave" => propagation_flags |= libc::MS_SLAVE | libc::MS_REC,
+                "private" => propagation_flags |= libc::MS_PRIVATE,
+                "rprivate" => propagation_flags |= libc::MS_PRIVATE | libc::MS_REC,
+                "unbindable" => propagation_flags |= libc::MS_UNBINDABLE,
+                "runbindable" => propagation_flags |= libc::MS_UNBINDABLE | libc::MS_REC,
                 "bind" => flags |= libc::MS_BIND,
                 "rbind" => flags |= libc::MS_BIND | libc::MS_REC,
                 other => extra_data_parts.push(other),
@@ -667,8 +741,10 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 // (mode=, size=, uid=, gid=) are passed as mount data.
                 // with_tmpfs hardcodes MS_NOSUID|MS_NODEV and passes all opts as data,
                 // which causes EINVAL when flag-like tokens appear in the data string.
-                let f = libc::MS_NOSUID | libc::MS_NODEV | flags;
-                cmd = cmd.with_kernel_mount("tmpfs", "tmpfs", dest, f, &extra_data);
+                //
+                // Do NOT hardcode MS_NODEV here — /dev is a tmpfs that needs device nodes.
+                // Only apply MS_NODEV if the OCI config actually specified "nodev".
+                cmd = cmd.with_kernel_mount("tmpfs", "tmpfs", dest, flags, &extra_data);
             }
             "proc" => {
                 let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
@@ -717,6 +793,37 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                     }
                 }
             }
+        }
+
+        // Apply propagation flags as a separate remount step after the initial mount.
+        if propagation_flags != 0 {
+            cmd = cmd.with_propagation_remount(dest, propagation_flags);
+        }
+    }
+
+    // When /dev is a fresh tmpfs, populate the standard OCI devices.
+    // Per the OCI Runtime Spec, the runtime MUST create these device nodes.
+    // mknod errors are ignored (with_device does this) in case they already exist.
+    if dev_is_fresh_tmpfs {
+        use crate::container::DeviceNode;
+        let default_devices: &[(&str, char, u64, u64, u32)] = &[
+            ("/dev/null", 'c', 1, 3, 0o666),
+            ("/dev/zero", 'c', 1, 5, 0o666),
+            ("/dev/full", 'c', 1, 7, 0o666),
+            ("/dev/random", 'c', 1, 8, 0o666),
+            ("/dev/urandom", 'c', 1, 9, 0o666),
+            ("/dev/tty", 'c', 5, 0, 0o666),
+        ];
+        for &(path, kind, major, minor, mode) in default_devices {
+            cmd = cmd.with_device(DeviceNode {
+                path: PathBuf::from(path),
+                kind,
+                major,
+                minor,
+                mode,
+                uid: 0,
+                gid: 0,
+            });
         }
     }
 
@@ -1100,27 +1207,20 @@ fn run_hooks_in_ns(hooks: &[OciHook], state: &OciState, container_pid: i32) -> i
 ///
 /// Scans `/proc/[pid]/status` PPid fields to build the chain.
 /// Returns the leaf PID, or `None` if the tree can't be walked.
-fn find_descendant_pid(ancestor_pid: i32) -> Option<i32> {
-    // Retry a few times in case /proc is momentarily inconsistent.
-    for _ in 0..5 {
-        if let Some(pid) = find_descendant_pid_once(ancestor_pid) {
-            return Some(pid);
+/// Find the grandchild of `ancestor_pid` — used for double-fork PID namespace cases.
+/// The process tree is: shim → intermediate (P) → container (C).
+/// We want C's host PID, not P's PID or C's children.
+fn find_grandchild_of(ancestor_pid: i32) -> Option<i32> {
+    for _ in 0..10 {
+        if let Some(c1) = find_child_of(ancestor_pid) {
+            if let Some(c2) = find_child_of(c1) {
+                return Some(c2);
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    None
-}
-
-fn find_descendant_pid_once(ancestor_pid: i32) -> Option<i32> {
-    let mut current = ancestor_pid;
-    loop {
-        let child = find_child_of(current)?;
-        // If this child has no further children, it's the leaf (container).
-        if find_child_of(child).is_none() {
-            return Some(child);
-        }
-        current = child;
-    }
+    // Fallback: if grandchild not yet visible, return the direct child.
+    find_child_of(ancestor_pid)
 }
 
 /// Find a child process of the given `parent_pid` by scanning `/proc`.
@@ -1258,7 +1358,7 @@ pub fn cmd_create(
     // AND a console socket path was provided by the caller.
     // master_raw: held by the parent until it is sent to console_socket.
     // slave_raw:  inherited by the shim → container pre_exec wires it to 0/1/2.
-    let wants_terminal = config.process.terminal;
+    let wants_terminal = config.process.as_ref().map(|p| p.terminal).unwrap_or(false);
     let pty_fds: Option<(i32, i32)> = if wants_terminal && console_socket.is_some() {
         let pty =
             nix::pty::openpty(None, None).map_err(|e| io::Error::other(format!("openpty: {e}")))?;
@@ -1396,11 +1496,15 @@ pub fn cmd_create(
                 .unwrap_or(false);
 
             let pipe_pid = i32::from_ne_bytes(pid_buf);
-            // Use process-tree walk whenever a double-fork occurred (Case A or B).
+            // When a double-fork occurs (Case A: new PID namespace, or Case B: join PID ns),
+            // the container process is the GRANDCHILD of the shim:
+            //   shim → intermediate(P) → container(C)
+            // We want C's host PID.  The intermediate P just waits and exits.
+            // pipe_pid==1 signals Case A; has_pid_ns_join signals Case B.
             let container_pid = if pipe_pid <= 1 || has_pid_ns_join {
-                let found = find_descendant_pid(shim_pid);
+                let found = find_grandchild_of(shim_pid);
                 log::debug!(
-                    "OCI create: id={} shim_pid={} pipe_pid={} found_descendant={:?}",
+                    "OCI create: id={} shim_pid={} pipe_pid={} found_grandchild={:?}",
                     id,
                     shim_pid,
                     pipe_pid,
@@ -1519,20 +1623,38 @@ pub fn cmd_start(id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Returns true if `pid` is a zombie process (state 'Z' in /proc/<pid>/stat).
+/// Zombies pass `kill(pid, 0)` but are effectively stopped.
+fn is_zombie_pid(pid: libc::pid_t) -> bool {
+    let stat_path = format!("/proc/{}/stat", pid);
+    fs::read_to_string(&stat_path)
+        .ok()
+        .and_then(|s| {
+            // /proc/pid/stat format: pid (name) state ...
+            // name can contain spaces and ')', so find the last ')' to locate the state field.
+            s.rfind(')')
+                .map(|i| s[i + 1..].trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
 /// `remora state <id>` — print container state JSON to stdout.
 pub fn cmd_state(id: &str) -> io::Result<()> {
     let mut state = read_state(id)?;
 
     // Determine actual liveness via kill(pid, 0).
+    // Also check for zombie (Z) state: kill(zombie, 0) succeeds but the process is done.
     if state.status == "created" || state.status == "running" {
         let alive = unsafe { libc::kill(state.pid, 0) } == 0;
+        let zombie = alive && is_zombie_pid(state.pid);
         log::debug!(
-            "OCI state: id={} state.pid={} alive={}",
+            "OCI state: id={} state.pid={} alive={} zombie={}",
             id,
             state.pid,
-            alive
+            alive,
+            zombie
         );
-        if !alive {
+        if !alive || zombie {
             state.status = "stopped".to_string();
         }
     }
@@ -1545,6 +1667,19 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
 /// `remora kill <id> <signal>` — send a signal to the container process.
 pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
     let state = read_state(id)?;
+
+    // OCI spec: kill on a container that is neither "created" nor "running" MUST fail.
+    // Check both the recorded status and actual process liveness.
+    let alive = unsafe { libc::kill(state.pid, 0) } == 0;
+    if state.status == "stopped" || !alive {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "container '{}' is stopped — kill only valid on created/running containers",
+                id
+            ),
+        ));
+    }
 
     // Accept signal as name (with or without "SIG" prefix) or number.
     let sig: i32 = match signal.to_ascii_uppercase().trim_start_matches("SIG") {
@@ -1589,26 +1724,99 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
         })?,
     };
 
+    // Check if the container process is its own process group leader.
+    // When it is, we can kill the entire group (covers child processes like sleep)
+    // in addition to the init PID.  This is necessary when busybox ash is PID 1 and
+    // has installed a signal trap: ash handles the signal but resumes `wait $!`
+    // instead of exiting; killing the group causes background children to die first,
+    // which wakes ash from `wait`, allowing the script to finish and the container
+    // to stop.
+    let pgid = unsafe { libc::getpgid(state.pid) };
+    let is_own_pgid = pgid == state.pid;
+
     log::debug!(
-        "OCI kill: id={} state.pid={} sig={}",
+        "OCI kill: id={} state.pid={} pgid={} sig={}",
         id,
         state.pid,
+        pgid,
         sig
     );
+
+    // Send to the init PID (required by OCI spec).
     let ret = unsafe { libc::kill(state.pid, sig) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
+
+    // Additionally send to the process group when the container is its own PGID.
+    // This is a best-effort: errors are ignored since init already received the signal.
+    if is_own_pgid && pgid > 1 {
+        unsafe { libc::kill(-pgid, sig) };
+    }
+
+    // Also scan /proc for any other processes in the same PID namespace and signal them.
+    // This is necessary when the container's init (e.g. busybox ash) runs background jobs:
+    // ash may restart wait() after a trap fires, so the shell only exits once all background
+    // jobs are also terminated.
+    let ns_path = format!("/proc/{}/ns/pid", state.pid);
+    if let Ok(target_ns) = fs::read_link(&ns_path) {
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                let Ok(pid) = name_str.parse::<i32>() else {
+                    continue;
+                };
+                if pid == state.pid {
+                    continue;
+                }
+                let pid_ns_path = format!("/proc/{}/ns/pid", pid);
+                if let Ok(proc_ns) = fs::read_link(&pid_ns_path) {
+                    if proc_ns == target_ns {
+                        log::debug!("OCI kill: also signaling pid={} sig={} (same ns)", pid, sig);
+                        unsafe { libc::kill(pid, sig) };
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
 /// `remora delete <id>` — remove state dir after container has stopped.
+pub fn cmd_delete_force(id: &str) -> io::Result<()> {
+    // Force-delete: kill the container first if it's still running.
+    if let Ok(state) = read_state(id) {
+        let alive = unsafe { libc::kill(state.pid, 0) } == 0;
+        if alive {
+            unsafe { libc::kill(state.pid, libc::SIGKILL) };
+            // Brief wait for the process to actually die.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if unsafe { libc::kill(state.pid, 0) } != 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+    cmd_delete(id)
+}
+
 pub fn cmd_delete(id: &str) -> io::Result<()> {
     let state = read_state(id)?;
 
     // Allow delete if process is gone (stopped) regardless of state.json status.
+    // Zombies pass kill(pid,0) but are effectively stopped — check /proc/stat for 'Z'.
     let alive = unsafe { libc::kill(state.pid, 0) } == 0;
-    if alive {
+    let is_zombie = alive && is_zombie_pid(state.pid);
+    if alive && !is_zombie {
         // Log the command line of the still-alive process for diagnostics.
         let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", state.pid))
             .unwrap_or_default()
@@ -1627,15 +1835,6 @@ pub fn cmd_delete(id: &str) -> io::Result<()> {
             cmdline.trim(),
             status_line
         );
-    } else {
-        log::debug!(
-            "OCI delete: id={} state.pid={} alive={}",
-            id,
-            state.pid,
-            alive
-        );
-    }
-    if alive {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -1643,6 +1842,14 @@ pub fn cmd_delete(id: &str) -> io::Result<()> {
                 id, state.pid
             ),
         ));
+    } else {
+        log::debug!(
+            "OCI delete: id={} state.pid={} alive={} zombie={}",
+            id,
+            state.pid,
+            alive,
+            is_zombie
+        );
     }
 
     // Load config before removing state dir so we can run poststop hooks.

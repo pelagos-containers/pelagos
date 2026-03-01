@@ -182,7 +182,12 @@ pub(crate) enum CliCommand {
         signal: String,
     },
     /// OCI lifecycle: delete a stopped container's state directory
-    Delete { id: String },
+    Delete {
+        id: String,
+        /// Force-delete even if container is still running (kills it first)
+        #[clap(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -511,7 +516,13 @@ fn main() {
         CliCommand::Kill { id, signal } => {
             remora::oci::cmd_kill(&id, &signal).map_err(|e| e.to_string().into())
         }
-        CliCommand::Delete { id } => remora::oci::cmd_delete(&id).map_err(|e| e.to_string().into()),
+        CliCommand::Delete { id, force } => {
+            if force {
+                remora::oci::cmd_delete_force(&id).map_err(|e| e.to_string().into())
+            } else {
+                remora::oci::cmd_delete(&id).map_err(|e| e.to_string().into())
+            }
+        }
     };
 
     let code = match result {

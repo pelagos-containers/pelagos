@@ -662,6 +662,207 @@ pub fn syscall_number(name: &str) -> Result<i64, io::Error> {
         "statfs" => Ok(137),
         "fstatfs" => Ok(138),
 
+        // Signal-related
+        "rt_sigsuspend" => Ok(130),
+        "rt_sigpending" => Ok(127),
+        "rt_sigtimedwait" => Ok(128),
+        "rt_sigqueueinfo" => Ok(129),
+        "rt_tgsigqueueinfo" => Ok(297),
+        "signalfd" => Ok(282),
+        "signalfd4" => Ok(289),
+        "tkill" => Ok(200),
+        "pause" => Ok(34),
+
+        // Process/session management
+        "setpgid" => Ok(109),
+        "getpgid" => Ok(121),
+        "getpgrp" => Ok(111),
+        "getsid" => Ok(124),
+        "setsid" => Ok(112),
+        "setreuid" => Ok(113),
+        "setresuid" => Ok(117),
+        "setresgid" => Ok(119),
+        "setregid" => Ok(114),
+        "setgroups" => Ok(116),
+        "setfsgid" => Ok(123),
+        "setfsuid" => Ok(122),
+        "setpriority" => Ok(141),
+        "getpriority" => Ok(140),
+        "setitimer" => Ok(38),
+        "getitimer" => Ok(36),
+        "setrlimit" => Ok(160),
+        "getrusage" => Ok(98),
+        "times" => Ok(100),
+        "alarm" => Ok(37),
+        "syslog" => Ok(103),
+
+        // Capabilities
+        "capget" => Ok(125),
+        "capset" => Ok(126),
+
+        // File/filesystem operations
+        "creat" => Ok(85),
+        "flock" => Ok(73),
+        "fsync" => Ok(74),
+        "fdatasync" => Ok(75),
+        "mknod" => Ok(133),
+        "mknodat" => Ok(259),
+        "lchown" => Ok(94),
+        "utime" => Ok(132),
+        "utimes" => Ok(235),
+        "utimensat" => Ok(280),
+        "futimesat" => Ok(261),
+        "readahead" => Ok(187),
+        "fallocate" => Ok(285),
+        "copy_file_range" => Ok(326),
+        "fadvise64" => Ok(221),
+        "fanotify_mark" => Ok(301),
+        "sync" => Ok(162),
+        "syncfs" => Ok(306),
+        "sync_file_range" => Ok(277),
+        "statx" => Ok(332),
+
+        // Extended attributes
+        "getxattr" => Ok(191),
+        "lgetxattr" => Ok(192),
+        "fgetxattr" => Ok(193),
+        "listxattr" => Ok(194),
+        "llistxattr" => Ok(195),
+        "removexattr" => Ok(197),
+        "lremovexattr" => Ok(198),
+        "fremovexattr" => Ok(199),
+        "setxattr" => Ok(188),
+        "lsetxattr" => Ok(189),
+        "fsetxattr" => Ok(190),
+
+        // IPC - semaphores
+        "semget" => Ok(64),
+        "semop" => Ok(65),
+        "semctl" => Ok(66),
+        "semtimedop" => Ok(220),
+
+        // IPC - message queues
+        "msgget" => Ok(68),
+        "msgsnd" => Ok(69),
+        "msgrcv" => Ok(70),
+        "msgctl" => Ok(71),
+
+        // IPC - shared memory
+        "shmget" => Ok(29),
+        "shmat" => Ok(30),
+        "shmctl" => Ok(31),
+        "shmdt" => Ok(67),
+
+        // POSIX message queues
+        "mq_open" => Ok(240),
+        "mq_unlink" => Ok(241),
+        "mq_timedsend" => Ok(242),
+        "mq_timedreceive" => Ok(243),
+        "mq_notify" => Ok(244),
+        "mq_getsetattr" => Ok(245),
+
+        // Socket operations
+        "socketpair" => Ok(53),
+        "sendfile" => Ok(40),
+        "sendmmsg" => Ok(307),
+        "recvmmsg" => Ok(299),
+        "splice" => Ok(275),
+        "tee" => Ok(276),
+        "vmsplice" => Ok(278),
+
+        // Memory management
+        "mincore" => Ok(27),
+        "msync" => Ok(26),
+        "mlock" => Ok(149),
+        "mlock2" => Ok(325),
+        "mlockall" => Ok(151),
+        "munlock" => Ok(150),
+        "munlockall" => Ok(152),
+        "remap_file_pages" => Ok(216),
+        "memfd_create" => Ok(319),
+
+        // Async I/O
+        "io_setup" => Ok(206),
+        "io_destroy" => Ok(207),
+        "io_getevents" => Ok(208),
+        "io_submit" => Ok(209),
+        "io_cancel" => Ok(210),
+        "preadv" => Ok(295),
+        "pwritev" => Ok(296),
+
+        // I/O scheduling
+        "ioprio_set" => Ok(251),
+        "ioprio_get" => Ok(252),
+
+        // Epoll
+        "epoll_create" => Ok(213),
+        "epoll_create1" => Ok(291),
+        "epoll_ctl" => Ok(233),
+        "epoll_wait" => Ok(232),
+        "epoll_pwait" => Ok(281),
+
+        // Timers
+        "timer_create" => Ok(222),
+        "timer_settime" => Ok(223),
+        "timer_gettime" => Ok(224),
+        "timer_getoverrun" => Ok(225),
+        "timer_delete" => Ok(226),
+        "timerfd_create" => Ok(283),
+        "timerfd_settime" => Ok(286),
+        "timerfd_gettime" => Ok(287),
+
+        // Event/inotify
+        "eventfd" => Ok(284),
+        "eventfd2" => Ok(290),
+        "inotify_init" => Ok(253),
+        "inotify_init1" => Ok(294),
+        "inotify_add_watch" => Ok(254),
+        "inotify_rm_watch" => Ok(255),
+
+        // Scheduling
+        "sched_setparam" => Ok(142),
+        "sched_getparam" => Ok(143),
+        "sched_setscheduler" => Ok(144),
+        "sched_getscheduler" => Ok(145),
+        "sched_get_priority_max" => Ok(146),
+        "sched_get_priority_min" => Ok(147),
+        "sched_rr_get_interval" => Ok(148),
+        "sched_setaffinity" => Ok(203),
+        "sched_getaffinity" => Ok(204),
+        "sched_setattr" => Ok(314),
+        "sched_getattr" => Ok(315),
+        "sched_yield" => Ok(24),
+
+        // CPU/thread
+        "getcpu" => Ok(309),
+        "get_thread_area" => Ok(211),
+        "set_thread_area" => Ok(205),
+        "modify_ldt" => Ok(154),
+
+        // Seccomp
+        "seccomp" => Ok(317),
+
+        // Landlock
+        "landlock_create_ruleset" => Ok(444),
+        "landlock_add_rule" => Ok(445),
+        "landlock_restrict_self" => Ok(446),
+
+        // Miscellaneous
+        "restart_syscall" => Ok(219),
+
+        // 32-bit compat syscalls: not native on x86_64, silently ignored
+        "_llseek" | "_newselect" | "chown32" | "epoll_ctl_old" | "epoll_wait_old"
+        | "fadvise64_64" | "fchown32" | "fcntl64" | "fstat64" | "fstatat64" | "fstatfs64"
+        | "ftruncate64" | "getegid32" | "geteuid32" | "getgid32" | "getgroups32"
+        | "getresgid32" | "getresuid32" | "getuid32" | "ipc" | "lchown32" | "lstat64" | "mmap2"
+        | "recv" | "send" | "sendfile64" | "setfsgid32" | "setfsuid32" | "setgid32"
+        | "setgroups32" | "setregid32" | "setresgid32" | "setresuid32" | "setreuid32"
+        | "setuid32" | "sigreturn" | "socketcall" | "stat64" | "statfs64" | "truncate64"
+        | "ugetrlimit" | "waitpid" => Err(io::Error::other(format!(
+            "32-bit compat syscall not available on x86_64: {}",
+            name
+        ))),
+
         _ => Err(io::Error::other(format!("Unknown syscall: {}", name))),
     }
 
