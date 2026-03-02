@@ -108,6 +108,11 @@ scripting reference.
 - **No-new-privileges:** `PR_SET_NO_NEW_PRIVS` blocks setuid/setgid escalation
 - **Read-only rootfs:** `MS_RDONLY` remount makes the filesystem immutable
 - **Masked paths:** `/proc/kcore`, `/sys/firmware`, and others hidden
+- **Landlock LSM:** per-path filesystem rules via Linux 5.13+ kernel interface
+- **Structural TOCTOU immunity:** remora uses a single-threaded `pre_exec` hook and
+  never re-execs itself — the architecture that drives the November 2025 runc CVE
+  cluster (CVE-2025-31133, CVE-2025-52565, CVE-2025-52881) does not exist in remora.
+  See [docs/SECURITY.md](docs/SECURITY.md) for details.
 
 ### Networking
 - **Loopback:** isolated NET namespace, `lo` only

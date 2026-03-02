@@ -70,9 +70,7 @@ The seccomp filter is applied *last* in the pre_exec sequence, so all setup sysc
 complete before any restriction is in place — eliminating the partial-setup race window
 that runc's multi-process architecture creates.
 
-**Recommended action:** Document this immunity explicitly in `docs/DESIGN_PRINCIPLES.md`
-and the README. It is a meaningful security differentiator, especially for teams evaluating
-runtimes after the 2025 CVE cluster.
+**Documented in:** [docs/SECURITY.md](SECURITY.md) and README.md security section.
 
 ---
 
@@ -107,28 +105,26 @@ gap for production/compliance use cases.
 
 **Priority: High.** This is a hard blocker for any regulated environment.
 
-### 2. Landlock LSM (Linux ≥ 5.13)
+### 2. Landlock LSM (Linux ≥ 5.13) ✅ DONE
 
 Landlock is an unprivileged filesystem/network sandboxing mechanism. Unlike AppArmor/SELinux
 it requires no policy daemon, no root, and no pre-installed profiles. A process can
 self-restrict its own filesystem access via `landlock_create_ruleset()` / `landlock_add_rule()`
 / `landlock_restrict_self()`.
 
-**No major OCI runtime currently integrates Landlock.** runc has an open issue
-(#3500, open since 2022); youki has a tracking issue but no implementation.
+**Remora is the first production OCI-compatible runtime to ship Landlock integration.**
+runc has an open issue (#3500, open since 2022); youki has a tracking issue but no
+implementation.
 
-Remora can be the *first* production OCI-compatible runtime to offer Landlock integration.
-Proposed API:
+Shipped API (`src/landlock.rs`, commit 934f1f6):
 
 ```rust
 Command::new("/bin/server")
-    .with_landlock(LandlockPolicy::default()
-        .allow_read("/etc")
-        .allow_read_write("/var/lib/app")
-        .deny_all_network_bind())
+    .with_landlock_ro("/etc")          // read-only access beneath /etc
+    .with_landlock_rw("/var/lib/app")  // full access beneath /var/lib/app
 ```
 
-**Priority: Medium-High.** First-mover advantage; pure Rust; no external dependencies.
+ABI v1–v4 supported with automatic bitmask clamping for the running kernel.
 
 ### 3. `SECCOMP_RET_USER_NOTIF` (Linux ≥ 5.0)
 
