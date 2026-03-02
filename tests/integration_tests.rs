@@ -1479,6 +1479,156 @@ mod cgroups {
             cgroup_path
         );
     }
+
+    #[test]
+    fn test_cgroup_memory_swap() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_memory_swap: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_memory_swap: alpine-rootfs not found");
+            return;
+        };
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(64 * 1024 * 1024)
+            .with_cgroup_memory_swap(128 * 1024 * 1024)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup memory+swap");
+        let _status = child.wait().expect("wait failed");
+    }
+
+    #[test]
+    fn test_cgroup_memory_reservation() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_memory_reservation: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_memory_reservation: alpine-rootfs not found");
+            return;
+        };
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory_reservation(32 * 1024 * 1024)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup memory reservation");
+        let _status = child.wait().expect("wait failed");
+    }
+
+    #[test]
+    fn test_cgroup_cpuset() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_cpuset: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_cpuset: alpine-rootfs not found");
+            return;
+        };
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_cpuset_cpus("0")
+            .with_cgroup_cpuset_mems("0")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup cpuset");
+        let _status = child.wait().expect("wait failed");
+    }
+
+    #[test]
+    fn test_cgroup_blkio_weight() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_blkio_weight: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_blkio_weight: alpine-rootfs not found");
+            return;
+        };
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_blkio_weight(100)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup blkio weight");
+        let _status = child.wait().expect("wait failed");
+    }
+
+    #[test]
+    fn test_cgroup_device_rule() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_device_rule: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_device_rule: alpine-rootfs not found");
+            return;
+        };
+        // Device cgroup rules are v1-only; on cgroupv2 they are gracefully skipped
+        // without breaking container startup.
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_device_rule(true, 'a', -1, -1, "rwm")
+            .with_cgroup_device_rule(false, 'c', 5, 1, "rwm")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup device rules");
+        let _status = child.wait().expect("wait failed");
+    }
+
+    #[test]
+    fn test_cgroup_net_classid() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_net_classid: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_net_classid: alpine-rootfs not found");
+            return;
+        };
+        // net_cls classid is v1-only; on cgroupv2 it is gracefully skipped.
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_net_classid(0x10001)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup net classid");
+        let _status = child.wait().expect("wait failed");
+    }
 }
 
 mod networking {
@@ -3412,6 +3562,67 @@ mod oci_lifecycle {
     }"#;
         std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
         let id = format!("test-oci-res-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 5);
+    }
+
+    /// test_oci_resources_extended
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates an OCI bundle with extended linux.resources fields: memory.swap,
+    /// memory.reservation, cpu.cpus/mems, blockIO.weight, linux.resources.devices,
+    /// and linux.resources.network. Asserts the full lifecycle completes without error.
+    ///
+    /// Failure indicates a parsing or wiring bug for the extended OCI resource fields
+    /// introduced for epic #29 (issues #31–#35).
+    #[test]
+    fn test_oci_resources_extended() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_resources_extended: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_resources_extended: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
+        let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/sh", "-c", "exit 0"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}],
+    "resources": {
+      "memory": {
+        "limit": 67108864,
+        "swap": 134217728,
+        "reservation": 33554432
+      },
+      "cpu": {
+        "shares": 512,
+        "cpus": "0",
+        "mems": "0"
+      },
+      "pids": {"limit": 64},
+      "blockIO": {"weight": 100},
+      "devices": [
+        {"allow": true,  "type": "a", "access": "rwm"},
+        {"allow": false, "type": "c", "major": 5, "minor": 1, "access": "rwm"}
+      ],
+      "network": {"classID": 65537, "priorities": [{"name": "eth0", "priority": 10}]}
+    }
+  }
+}"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        let id = format!("test-oci-res-ext-{}", std::process::id());
         oci_run_to_completion(&id, bundle_dir.path(), 5);
     }
 
