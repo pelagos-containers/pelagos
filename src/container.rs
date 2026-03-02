@@ -500,6 +500,18 @@ impl From<Stdio> for process::Stdio {
     }
 }
 
+/// A single OCI-config mount entry, preserving the original order from config.json.
+///
+/// Used by the OCI bundle handler to apply all mounts in one unified pre-chroot
+/// loop so that `/proc/mountinfo` order matches OCI config order (required by
+/// runtimetest's `validatePosixMounts`).
+#[derive(Debug, Clone)]
+pub enum OciMountEntry {
+    Kernel(KernelMount),
+    Tmpfs(TmpfsMount),
+    Bind(BindMount),
+}
+
 /// A bind mount that maps a host directory into the container.
 #[derive(Debug, Clone)]
 pub struct BindMount {
@@ -671,6 +683,9 @@ pub struct Command {
     bind_mounts: Vec<BindMount>,
     tmpfs_mounts: Vec<TmpfsMount>,
     kernel_mounts: Vec<KernelMount>,
+    /// OCI-ordered mount list — when non-empty, replaces the per-type vectors for
+    /// pre-chroot mounting so that /proc/mountinfo order matches OCI config order.
+    oci_ordered_mounts: Vec<OciMountEntry>,
     // Resource limits
     rlimits: Vec<ResourceLimit>,
     // Cgroup-based resource management
@@ -713,6 +728,17 @@ pub struct Command {
     // Propagation-only remounts applied after all other mounts:
     // each entry is (target, MS_SHARED|MS_SLAVE|MS_PRIVATE|...).
     propagation_mounts: Vec<(PathBuf, libc::c_ulong)>,
+    // Symlinks to create inside /dev when it is a fresh tmpfs.
+    // Each entry is (link_path, target) — created via symlink(2) in pre_exec.
+    dev_symlinks: Vec<(PathBuf, PathBuf)>,
+    // Ambient capability numbers (0–40) to raise via PR_CAP_AMBIENT_RAISE in pre_exec.
+    ambient_cap_numbers: Vec<u8>,
+    // OOM score adjustment to write to /proc/self/oom_score_adj in pre_exec.
+    oom_score_adj: Option<i32>,
+    // Supplementary group IDs (process.user.additionalGids in OCI spec).
+    additional_gids: Vec<u32>,
+    // Process umask (process.user.umask in OCI spec).
+    umask: Option<u32>,
 }
 
 impl Command {
@@ -741,6 +767,7 @@ impl Command {
             bind_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
             kernel_mounts: Vec::new(),
+            oci_ordered_mounts: Vec::new(),
             rlimits: Vec::new(),
             cgroup_config: None,
             network_config: None,
@@ -760,6 +787,11 @@ impl Command {
             use_id_helpers: false,
             additional_networks: Vec::new(),
             propagation_mounts: Vec::new(),
+            dev_symlinks: Vec::new(),
+            ambient_cap_numbers: Vec::new(),
+            oom_score_adj: None,
+            additional_gids: Vec::new(),
+            umask: None,
         }
     }
 
@@ -1209,7 +1241,12 @@ impl Command {
     }
 
     /// Add a per-device read BPS throttle rule `(major, minor, bytes_per_sec)`.
-    pub fn with_cgroup_blkio_throttle_read_bps(mut self, major: u64, minor: u64, rate: u64) -> Self {
+    pub fn with_cgroup_blkio_throttle_read_bps(
+        mut self,
+        major: u64,
+        minor: u64,
+        rate: u64,
+    ) -> Self {
         self.cgroup_config
             .get_or_insert_with(Default::default)
             .blkio_throttle_read_bps
@@ -1218,7 +1255,12 @@ impl Command {
     }
 
     /// Add a per-device write BPS throttle rule `(major, minor, bytes_per_sec)`.
-    pub fn with_cgroup_blkio_throttle_write_bps(mut self, major: u64, minor: u64, rate: u64) -> Self {
+    pub fn with_cgroup_blkio_throttle_write_bps(
+        mut self,
+        major: u64,
+        minor: u64,
+        rate: u64,
+    ) -> Self {
         self.cgroup_config
             .get_or_insert_with(Default::default)
             .blkio_throttle_write_bps
@@ -1227,7 +1269,12 @@ impl Command {
     }
 
     /// Add a per-device read IOPS throttle rule `(major, minor, iops)`.
-    pub fn with_cgroup_blkio_throttle_read_iops(mut self, major: u64, minor: u64, rate: u64) -> Self {
+    pub fn with_cgroup_blkio_throttle_read_iops(
+        mut self,
+        major: u64,
+        minor: u64,
+        rate: u64,
+    ) -> Self {
         self.cgroup_config
             .get_or_insert_with(Default::default)
             .blkio_throttle_read_iops
@@ -1236,7 +1283,12 @@ impl Command {
     }
 
     /// Add a per-device write IOPS throttle rule `(major, minor, iops)`.
-    pub fn with_cgroup_blkio_throttle_write_iops(mut self, major: u64, minor: u64, rate: u64) -> Self {
+    pub fn with_cgroup_blkio_throttle_write_iops(
+        mut self,
+        major: u64,
+        minor: u64,
+        rate: u64,
+    ) -> Self {
         self.cgroup_config
             .get_or_insert_with(Default::default)
             .blkio_throttle_write_iops
@@ -1744,6 +1796,51 @@ impl Command {
         self
     }
 
+    /// Create a symlink inside /dev when it is freshly mounted as a tmpfs.
+    ///
+    /// Called from OCI `build_command()` to install the OCI-required default symlinks
+    /// (/dev/fd, /dev/stdin, /dev/stdout, /dev/stderr, /dev/ptmx).
+    /// The symlink is created via `symlink(target, link)` in pre_exec after the /dev
+    /// tmpfs is mounted and device nodes are created. Errors are silently ignored.
+    pub fn with_dev_symlink<P: Into<PathBuf>>(
+        mut self,
+        link: P,
+        target: impl Into<PathBuf>,
+    ) -> Self {
+        self.dev_symlinks.push((link.into(), target.into()));
+        self
+    }
+
+    /// Raise a capability in the ambient set (PR_CAP_AMBIENT_RAISE).
+    ///
+    /// `cap_num` is the kernel capability number (0 = CAP_CHOWN, 1 = CAP_DAC_OVERRIDE, …).
+    /// Called after `capset()` sets the inheritable/permitted sets, so the cap must already
+    /// be in both for this to succeed. Errors are silently ignored (unsupported kernel, etc.).
+    pub fn with_ambient_capability(mut self, cap_num: u8) -> Self {
+        self.ambient_cap_numbers.push(cap_num);
+        self
+    }
+
+    /// Set the OOM score adjustment for the container process.
+    ///
+    /// Written to `/proc/self/oom_score_adj` in pre_exec. Range is -1000 to 1000.
+    pub fn with_oom_score_adj(mut self, score: i32) -> Self {
+        self.oom_score_adj = Some(score);
+        self
+    }
+
+    /// Set supplementary group IDs (process.user.additionalGids in OCI spec).
+    pub fn with_additional_gids(mut self, gids: &[u32]) -> Self {
+        self.additional_gids = gids.to_vec();
+        self
+    }
+
+    /// Set the process umask (process.user.umask in OCI spec).
+    pub fn with_umask(mut self, umask: u32) -> Self {
+        self.umask = Some(umask);
+        self
+    }
+
     /// Apply a pre-compiled seccomp BPF program instead of a named profile.
     ///
     /// Takes priority over `with_seccomp_default()` / `with_seccomp_profile()`.
@@ -1836,6 +1933,16 @@ impl Command {
             flags,
             data: data.into(),
         });
+        self
+    }
+
+    /// Add a mount to the OCI-ordered mount list.
+    ///
+    /// Caller is responsible for also adding to the per-type vector so that
+    /// non-OCI code paths still work. In OCI bundle mode, the pre-chroot loop
+    /// uses `oci_ordered_mounts` exclusively and skips the per-type loops.
+    pub fn with_oci_mount(mut self, entry: OciMountEntry) -> Self {
+        self.oci_ordered_mounts.push(entry);
         self
     }
 
@@ -2014,6 +2121,11 @@ impl Command {
         let readonly_paths = self.readonly_paths.clone();
         let sysctl = self.sysctl.clone();
         let devices = self.devices.clone();
+        let dev_symlinks = self.dev_symlinks.clone();
+        let ambient_cap_numbers = self.ambient_cap_numbers.clone();
+        let oom_score_adj = self.oom_score_adj;
+        let additional_gids = self.additional_gids.clone();
+        let umask_val = self.umask;
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
@@ -2821,6 +2933,47 @@ impl Command {
                         }
                     }
 
+                    // Mount kernel filesystems (proc, sysfs, devpts, cgroup2, …) BEFORE
+                    // chroot so they appear in /proc/mountinfo before bind mounts —
+                    // runtimetest's validatePosixMounts checks OCI-config order.
+                    for km in &kernel_mounts {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let rel = km.target.strip_prefix("/").unwrap_or(&km.target);
+                        let host_target = effective_root.join(rel);
+                        std::fs::create_dir_all(&host_target).map_err(|e| {
+                            io::Error::other(format!(
+                                "kernel mount mkdir {}: {}",
+                                host_target.display(),
+                                e
+                            ))
+                        })?;
+                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        let src_c = CString::new(km.source.as_bytes()).unwrap();
+                        let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
+                        let dat_c = CString::new(km.data.as_bytes()).unwrap();
+                        let dat_ptr: *const libc::c_void = if km.data.is_empty() {
+                            ptr::null()
+                        } else {
+                            dat_c.as_ptr() as *const libc::c_void
+                        };
+                        let result = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            fst_c.as_ptr(),
+                            km.flags,
+                            dat_ptr,
+                        );
+                        if result != 0 {
+                            return Err(io::Error::other(format!(
+                                "mount {} ({}) at {}: {}",
+                                km.fs_type,
+                                km.source,
+                                host_target.display(),
+                                io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
                     // Perform bind mounts BEFORE chroot — source paths are host paths,
                     // unreachable once we chroot.
                     for bm in &bind_mounts {
@@ -2998,6 +3151,61 @@ impl Command {
                         }
                     }
 
+                    // Pre-chroot device bind-mounts for USER namespace containers.
+                    // mknod(2) for character/block devices requires CAP_MKNOD in the
+                    // initial user namespace — it always fails with EPERM inside a user
+                    // namespace even when the process appears as root.  Bind-mount the
+                    // corresponding host devices before chroot so they exist at step 4.72
+                    // without needing mknod.  (The mknod fallback in step 4.72 will then
+                    // see EEXIST and chmod the bind-mounted path instead.)
+                    if (is_rootless || namespaces.contains(Namespace::USER)) && !devices.is_empty()
+                    {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        for dev in &devices {
+                            if dev.kind != 'c' && dev.kind != 'b' {
+                                continue; // FIFOs don't need special handling
+                            }
+                            let dev_name = match dev.path.file_name() {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let host_src = std::path::PathBuf::from("/dev").join(dev_name);
+                            if !host_src.exists() {
+                                continue; // no matching host device — skip
+                            }
+                            let rel = dev.path.strip_prefix("/").unwrap_or(&dev.path);
+                            let target = effective_root.join(rel);
+                            if let Some(parent) = target.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            // file→file bind mount requires the target file to exist.
+                            let tgt_c = CString::new(target.as_os_str().as_bytes()).unwrap();
+                            let tfd = libc::open(
+                                tgt_c.as_ptr(),
+                                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                0o666u32,
+                            );
+                            if tfd >= 0 {
+                                libc::close(tfd);
+                            }
+                            let src_c = CString::new(host_src.as_os_str().as_bytes()).unwrap();
+                            let r = libc::mount(
+                                src_c.as_ptr(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND,
+                                ptr::null(),
+                            );
+                            if r != 0 {
+                                log::debug!(
+                                    "user-ns device bind-mount {} failed: {}",
+                                    dev.path.display(),
+                                    io::Error::last_os_error()
+                                );
+                            }
+                        }
+                    }
+
                     chroot(effective_root)
                         .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
@@ -3087,43 +3295,6 @@ impl Command {
                     }
                 }
 
-                // Mount kernel filesystems (proc, sysfs, devpts, mqueue, cgroup2, …)
-                // specified by OCI config.json `mounts` entries.
-                for km in &kernel_mounts {
-                    std::fs::create_dir_all(&km.target).map_err(|e| {
-                        io::Error::other(format!(
-                            "kernel mount mkdir {}: {}",
-                            km.target.display(),
-                            e
-                        ))
-                    })?;
-                    let tgt_c = CString::new(km.target.as_os_str().as_encoded_bytes()).unwrap();
-                    let src_c = CString::new(km.source.as_bytes()).unwrap();
-                    let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
-                    let dat_c = CString::new(km.data.as_bytes()).unwrap();
-                    let dat_ptr: *const libc::c_void = if km.data.is_empty() {
-                        ptr::null()
-                    } else {
-                        dat_c.as_ptr() as *const libc::c_void
-                    };
-                    let result = libc::mount(
-                        src_c.as_ptr(),
-                        tgt_c.as_ptr(),
-                        fst_c.as_ptr(),
-                        km.flags,
-                        dat_ptr,
-                    );
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "mount {} ({}) at {}: {}",
-                            km.fs_type,
-                            km.source,
-                            km.target.display(),
-                            io::Error::last_os_error()
-                        )));
-                    }
-                }
-
                 // Step 4.65: Propagation-only remounts (MS_SHARED, MS_SLAVE, etc.)
                 // These must come after the initial mount; passing propagation flags
                 // in the initial mount(2) call returns EINVAL on Linux.
@@ -3165,6 +3336,9 @@ impl Command {
 
                 // Step 4.72: Create device nodes
                 if !devices.is_empty() {
+                    // Clear umask so mknod creates devices with the exact mode
+                    // specified in the OCI config (not masked by the process umask).
+                    let old_umask = libc::umask(0);
                     for dev in &devices {
                         let path_c =
                             match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
@@ -3183,34 +3357,58 @@ impl Command {
                             type_bits | (dev.mode as libc::mode_t),
                             devnum,
                         );
-                        if r == 0 && (dev.uid != 0 || dev.gid != 0) {
-                            libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
+                        if r == 0 {
+                            if dev.uid != 0 || dev.gid != 0 {
+                                libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
+                            }
+                        } else {
+                            // Device may already exist — ensure correct permissions.
+                            libc::chmod(path_c.as_ptr(), dev.mode as libc::mode_t);
                         }
-                        // Ignore mknod errors — device may already exist
+                    }
+                    libc::umask(old_umask);
+                }
+
+                // Step 4.73: Create /dev symlinks (OCI default symlinks for fresh /dev tmpfs).
+                // symlink(target, linkpath) — ignore errors (may already exist).
+                for (link, target) in &dev_symlinks {
+                    if let (Ok(link_c), Ok(tgt_c)) = (
+                        CString::new(link.as_os_str().as_encoded_bytes()),
+                        CString::new(target.as_os_str().as_encoded_bytes()),
+                    ) {
+                        libc::symlink(tgt_c.as_ptr(), link_c.as_ptr());
                     }
                 }
 
                 // Step 4.8: Mask sensitive paths
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
+                    let tmpfs = CString::new("tmpfs").unwrap();
                     for path in &masked_paths {
                         let path_c = match CString::new(path.as_os_str().as_encoded_bytes()) {
                             Ok(p) => p,
                             Err(_) => continue, // Skip paths with null bytes
                         };
 
-                        // Bind mount /dev/null over the path to mask it
+                        // Try binding /dev/null over the path (works for files).
+                        // If ENOTDIR, the target is a directory — mount a read-only tmpfs
+                        // instead so its contents are hidden. If ENOENT, path doesn't
+                        // exist, skip silently.
                         let result = libc::mount(
-                            dev_null.as_ptr(), // source: /dev/null
-                            path_c.as_ptr(),   // target: path to mask
-                            ptr::null(),       // fstype: NULL
-                            libc::MS_BIND,     // bind mount
-                            ptr::null(),       // data: NULL
+                            dev_null.as_ptr(),
+                            path_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
                         );
-
-                        // Ignore errors - path might not exist, which is fine
-                        if result != 0 {
-                            // Don't fail, just skip this path
+                        if result != 0 && *libc::__errno_location() == libc::ENOTDIR {
+                            libc::mount(
+                                tmpfs.as_ptr(),
+                                path_c.as_ptr(),
+                                tmpfs.as_ptr(),
+                                libc::MS_RDONLY,
+                                ptr::null(),
+                            );
                         }
                     }
                 }
@@ -3277,6 +3475,39 @@ impl Command {
                     let result = libc::setns(*fd, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 4.9: Set resource limits BEFORE capability drops.
+                //
+                // MUST come before step 4.86 (capability drops) because raising a
+                // rlimit hard limit requires CAP_SYS_RESOURCE, which is dropped at
+                // step 4.86.  On many systems the inherited hard limit for RLIMIT_CORE
+                // is 0 (systemd default), so OCI configs requesting a higher hard limit
+                // would fail with EPERM if setrlimit ran after capset.
+                for limit in &rlimits {
+                    let rlimit = libc::rlimit {
+                        rlim_cur: limit.soft,
+                        rlim_max: limit.hard,
+                    };
+                    let result = libc::setrlimit(limit.resource, &rlimit);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 4.849: Apply seccomp early when no_new_privileges=false.
+                //
+                // When no_new_privileges=false we still hold CAP_SYS_ADMIN here
+                // (capabilities have not yet been dropped), so seccomp can be
+                // applied via apply_filter_no_nnp() — which does NOT set
+                // PR_SET_NO_NEW_PRIVS — preserving the NNP=0 state as required
+                // by the OCI spec when noNewPrivileges=false.
+                // When no_new_privileges=true, NNP is set at step 6.5 and seccomp
+                // is applied at step 7 after the capability drop.
+                if !no_new_privileges {
+                    if let Some(ref filter) = seccomp_filter {
+                        crate::seccomp::apply_filter_no_nnp(filter)?;
                     }
                 }
 
@@ -3348,16 +3579,37 @@ impl Command {
                     }
                 }
 
-                // Step 4.9: Set resource limits if specified
-                for limit in &rlimits {
-                    let rlimit = libc::rlimit {
-                        rlim_cur: limit.soft,
-                        rlim_max: limit.hard,
-                    };
+                // Step 4.87: Raise ambient capabilities.
+                // Must come after capset() — the cap must already be in inheritable+permitted.
+                if !ambient_cap_numbers.is_empty() {
+                    const PR_CAP_AMBIENT: i32 = 47;
+                    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
+                    for &cap_num in &ambient_cap_numbers {
+                        libc::prctl(
+                            PR_CAP_AMBIENT,
+                            PR_CAP_AMBIENT_RAISE,
+                            cap_num as libc::c_ulong,
+                            0,
+                            0,
+                        );
+                    }
+                }
 
-                    let result = libc::setrlimit(limit.resource, &rlimit);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
+                // Step 4.88: OOM score adjustment.
+                if let Some(score) = oom_score_adj {
+                    let score_str = format!("{}", score);
+                    let fd = libc::open(
+                        c"/proc/self/oom_score_adj".as_ptr(),
+                        libc::O_WRONLY | libc::O_CLOEXEC,
+                        0,
+                    );
+                    if fd >= 0 {
+                        libc::write(
+                            fd,
+                            score_str.as_ptr() as *const libc::c_void,
+                            score_str.len(),
+                        );
+                        libc::close(fd);
                     }
                 }
 
@@ -3366,29 +3618,6 @@ impl Command {
                 // which requires CAP_SYS_ADMIN.
                 if let Some(ref callback) = user_pre_exec {
                     callback()?;
-                }
-
-                // Step 6.1: Set UID/GID if specified.
-                // MUST come after all privileged operations (overlay mount, chroot,
-                // /proc, /dev, bind mounts, capabilities, user callback, ns joins)
-                // because those need root.
-                if let Some(gid_val) = gid {
-                    let result = libc::setgid(gid_val);
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgid: {}",
-                            io::Error::last_os_error()
-                        )));
-                    }
-                }
-                if let Some(uid_val) = uid {
-                    let result = libc::setuid(uid_val);
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setuid: {}",
-                            io::Error::last_os_error()
-                        )));
-                    }
                 }
 
                 // Step 6.5: Set no-new-privileges flag if requested
@@ -3415,16 +3644,15 @@ impl Command {
                     }
                 }
 
-                // Step 7: Apply seccomp filter if configured.
-                // CRITICAL: This MUST be before the OCI sync! Once seccomp is applied, many syscalls
-                // are blocked. All setup must be complete before signalling "created".
-                if let Some(ref filter) = seccomp_filter {
-                    // Seccomp requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS=1.
-                    // Capabilities may have been dropped above. Set nnp unconditionally
-                    // here so seccomp application doesn't fail with EPERM.
-                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
-                    libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                    crate::seccomp::apply_filter(filter)?;
+                // Step 7: Apply seccomp filter (no_new_privileges=true path only).
+                // When no_new_privileges=true, NNP was already set at step 6.5, which
+                // grants permission to apply seccomp without CAP_SYS_ADMIN.
+                // When no_new_privileges=false, seccomp was applied at step 4.849 using
+                // CAP_SYS_ADMIN (before capability drops), so no action needed here.
+                if no_new_privileges {
+                    if let Some(ref filter) = seccomp_filter {
+                        crate::seccomp::apply_filter(filter)?;
+                    }
                 }
 
                 // Step 8: OCI create/start synchronization.
@@ -3446,6 +3674,71 @@ impl Command {
                         libc::close(conn);
                     }
                     libc::close(listen_fd);
+                }
+
+                // Step 8.5: Set UID/GID after OCI sync.
+                // Placed AFTER the OCI sync so that "remora create" succeeds (container
+                // reaches "created" state) even when the target UID is not yet mapped in
+                // the user namespace at setup time.  All privileged operations (mounts,
+                // chroot, /proc, capabilities, ns joins) have already completed above.
+
+                // Set supplementary groups before setgid/setuid (requires root).
+                if !additional_gids.is_empty() {
+                    let result = libc::setgroups(additional_gids.len(), additional_gids.as_ptr());
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setgroups: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
+                // Apply umask if specified.
+                if let Some(mask) = umask_val {
+                    libc::umask(mask);
+                }
+
+                // When switching to a non-root UID, setuid(2) clears both the
+                // effective and ambient capability sets.  It also clears the
+                // permitted set UNLESS PR_SET_KEEPCAPS is set beforehand.
+                // Set it so that we can re-raise ambient caps afterwards.
+                // (PR_SET_KEEPCAPS is cleared automatically on exec(2).)
+                if uid.is_some_and(|u| u != 0) && !ambient_cap_numbers.is_empty() {
+                    const PR_SET_KEEPCAPS: i32 = 8;
+                    libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+                }
+
+                if let Some(gid_val) = gid {
+                    let result = libc::setgid(gid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setgid: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+                if let Some(uid_val) = uid {
+                    let result = libc::setuid(uid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setuid: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
+                // Re-raise ambient capabilities after setuid.
+                // setuid() to a non-root UID clears the ambient capability set.
+                // With PR_SET_KEEPCAPS set above, the permitted set is preserved,
+                // so raising ambient (requires cap in both permitted+inheritable) works.
+                for &cap_num in &ambient_cap_numbers {
+                    libc::prctl(
+                        libc::PR_CAP_AMBIENT,
+                        libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
+                        cap_num as libc::c_ulong,
+                        0,
+                        0,
+                    );
                 }
 
                 Ok(())
@@ -3767,6 +4060,11 @@ impl Command {
         let readonly_paths = self.readonly_paths.clone();
         let sysctl = self.sysctl.clone();
         let devices = self.devices.clone();
+        let dev_symlinks = self.dev_symlinks.clone();
+        let ambient_cap_numbers = self.ambient_cap_numbers.clone();
+        let oom_score_adj = self.oom_score_adj;
+        let additional_gids = self.additional_gids.clone();
+        let umask_val = self.umask;
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
@@ -4462,6 +4760,45 @@ impl Command {
                         }
                     }
 
+                    // Mount kernel filesystems BEFORE chroot (same ordering fix as spawn()).
+                    for km in &kernel_mounts {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let rel = km.target.strip_prefix("/").unwrap_or(&km.target);
+                        let host_target = effective_root.join(rel);
+                        std::fs::create_dir_all(&host_target).map_err(|e| {
+                            io::Error::other(format!(
+                                "kernel mount mkdir {}: {}",
+                                host_target.display(),
+                                e
+                            ))
+                        })?;
+                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        let src_c = CString::new(km.source.as_bytes()).unwrap();
+                        let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
+                        let dat_c = CString::new(km.data.as_bytes()).unwrap();
+                        let dat_ptr: *const libc::c_void = if km.data.is_empty() {
+                            ptr::null()
+                        } else {
+                            dat_c.as_ptr() as *const libc::c_void
+                        };
+                        let result = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            fst_c.as_ptr(),
+                            km.flags,
+                            dat_ptr,
+                        );
+                        if result != 0 {
+                            return Err(io::Error::other(format!(
+                                "mount {} ({}) at {}: {}",
+                                km.fs_type,
+                                km.source,
+                                host_target.display(),
+                                io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
                     // Perform bind mounts BEFORE chroot — source paths are host paths,
                     // unreachable once we chroot.
                     for bm in &bind_mounts {
@@ -4627,6 +4964,55 @@ impl Command {
                         }
                     }
 
+                    // Pre-chroot device bind-mounts for USER namespace containers.
+                    // See the same block in spawn() for rationale.
+                    if (is_rootless || namespaces.contains(Namespace::USER)) && !devices.is_empty()
+                    {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        for dev in &devices {
+                            if dev.kind != 'c' && dev.kind != 'b' {
+                                continue;
+                            }
+                            let dev_name = match dev.path.file_name() {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let host_src = std::path::PathBuf::from("/dev").join(dev_name);
+                            if !host_src.exists() {
+                                continue;
+                            }
+                            let rel = dev.path.strip_prefix("/").unwrap_or(&dev.path);
+                            let target = effective_root.join(rel);
+                            if let Some(parent) = target.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let tgt_c = CString::new(target.as_os_str().as_bytes()).unwrap();
+                            let tfd = libc::open(
+                                tgt_c.as_ptr(),
+                                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                0o666u32,
+                            );
+                            if tfd >= 0 {
+                                libc::close(tfd);
+                            }
+                            let src_c = CString::new(host_src.as_os_str().as_bytes()).unwrap();
+                            let r = libc::mount(
+                                src_c.as_ptr(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND,
+                                ptr::null(),
+                            );
+                            if r != 0 {
+                                log::debug!(
+                                    "user-ns device bind-mount {} failed: {}",
+                                    dev.path.display(),
+                                    io::Error::last_os_error()
+                                );
+                            }
+                        }
+                    }
+
                     chroot(effective_root)
                         .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
                     let cwd = container_cwd
@@ -4706,43 +5092,6 @@ impl Command {
                     }
                 }
 
-                // Mount kernel filesystems (proc, sysfs, devpts, mqueue, cgroup2, …)
-                // specified by OCI config.json `mounts` entries.
-                for km in &kernel_mounts {
-                    std::fs::create_dir_all(&km.target).map_err(|e| {
-                        io::Error::other(format!(
-                            "kernel mount mkdir {}: {}",
-                            km.target.display(),
-                            e
-                        ))
-                    })?;
-                    let tgt_c = CString::new(km.target.as_os_str().as_encoded_bytes()).unwrap();
-                    let src_c = CString::new(km.source.as_bytes()).unwrap();
-                    let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
-                    let dat_c = CString::new(km.data.as_bytes()).unwrap();
-                    let dat_ptr: *const libc::c_void = if km.data.is_empty() {
-                        ptr::null()
-                    } else {
-                        dat_c.as_ptr() as *const libc::c_void
-                    };
-                    let result = libc::mount(
-                        src_c.as_ptr(),
-                        tgt_c.as_ptr(),
-                        fst_c.as_ptr(),
-                        km.flags,
-                        dat_ptr,
-                    );
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "mount {} ({}) at {}: {}",
-                            km.fs_type,
-                            km.source,
-                            km.target.display(),
-                            io::Error::last_os_error()
-                        )));
-                    }
-                }
-
                 // Propagation-only remounts (MS_SHARED, MS_SLAVE, etc.)
                 for (target, flags) in &propagation_mounts {
                     let tgt_c = CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
@@ -4777,6 +5126,7 @@ impl Command {
                 }
 
                 if !devices.is_empty() {
+                    let old_umask = libc::umask(0);
                     for dev in &devices {
                         let path_c =
                             match std::ffi::CString::new(dev.path.as_os_str().as_encoded_bytes()) {
@@ -4795,26 +5145,51 @@ impl Command {
                             type_bits | (dev.mode as libc::mode_t),
                             devnum,
                         );
-                        if r == 0 && (dev.uid != 0 || dev.gid != 0) {
-                            libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
+                        if r == 0 {
+                            if dev.uid != 0 || dev.gid != 0 {
+                                libc::chown(path_c.as_ptr(), dev.uid, dev.gid);
+                            }
+                        } else {
+                            libc::chmod(path_c.as_ptr(), dev.mode as libc::mode_t);
                         }
+                    }
+                    libc::umask(old_umask);
+                }
+
+                // Create /dev symlinks (mirrors spawn() step 4.73).
+                for (link, target) in &dev_symlinks {
+                    if let (Ok(link_c), Ok(tgt_c)) = (
+                        CString::new(link.as_os_str().as_encoded_bytes()),
+                        CString::new(target.as_os_str().as_encoded_bytes()),
+                    ) {
+                        libc::symlink(tgt_c.as_ptr(), link_c.as_ptr());
                     }
                 }
 
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
+                    let tmpfs = CString::new("tmpfs").unwrap();
                     for path in &masked_paths {
                         let path_c = match CString::new(path.as_os_str().as_encoded_bytes()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        libc::mount(
+                        let result = libc::mount(
                             dev_null.as_ptr(),
                             path_c.as_ptr(),
                             ptr::null(),
                             libc::MS_BIND,
                             ptr::null(),
                         );
+                        if result != 0 && *libc::__errno_location() == libc::ENOTDIR {
+                            libc::mount(
+                                tmpfs.as_ptr(),
+                                path_c.as_ptr(),
+                                tmpfs.as_ptr(),
+                                libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                        }
                     }
                 }
 
@@ -4855,6 +5230,28 @@ impl Command {
                     );
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Set resource limits BEFORE capability drops (mirrors spawn() step 4.9).
+                // CAP_SYS_RESOURCE is required to raise rlimit hard limits; it is
+                // dropped by capset below. On many systems RLIMIT_CORE hard=0 by
+                // default, so raising it requires the capability still be held.
+                for limit in &rlimits {
+                    let rlimit = libc::rlimit {
+                        rlim_cur: limit.soft,
+                        rlim_max: limit.hard,
+                    };
+                    let result = libc::setrlimit(limit.resource, &rlimit);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Apply seccomp early without NNP (mirrors spawn() step 4.849).
+                if !no_new_privileges {
+                    if let Some(ref filter) = seccomp_filter {
+                        crate::seccomp::apply_filter_no_nnp(filter)?;
                     }
                 }
 
@@ -4915,14 +5312,36 @@ impl Command {
                     }
                 }
 
-                for limit in &rlimits {
-                    let rlimit = libc::rlimit {
-                        rlim_cur: limit.soft,
-                        rlim_max: limit.hard,
-                    };
-                    let result = libc::setrlimit(limit.resource, &rlimit);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
+                // Raise ambient capabilities (mirrors spawn() step 4.87).
+                if !ambient_cap_numbers.is_empty() {
+                    const PR_CAP_AMBIENT: i32 = 47;
+                    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
+                    for &cap_num in &ambient_cap_numbers {
+                        libc::prctl(
+                            PR_CAP_AMBIENT,
+                            PR_CAP_AMBIENT_RAISE,
+                            cap_num as libc::c_ulong,
+                            0,
+                            0,
+                        );
+                    }
+                }
+
+                // OOM score adjustment (mirrors spawn() step 4.88).
+                if let Some(score) = oom_score_adj {
+                    let score_str = format!("{}", score);
+                    let fd = libc::open(
+                        c"/proc/self/oom_score_adj".as_ptr(),
+                        libc::O_WRONLY | libc::O_CLOEXEC,
+                        0,
+                    );
+                    if fd >= 0 {
+                        libc::write(
+                            fd,
+                            score_str.as_ptr() as *const libc::c_void,
+                            score_str.len(),
+                        );
+                        libc::close(fd);
                     }
                 }
 
@@ -4940,26 +5359,6 @@ impl Command {
                     let result = libc::setns(*fd, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
-                    }
-                }
-
-                // Set UID/GID after all privileged operations (user callback, ns joins).
-                if let Some(gid_val) = gid {
-                    let result = libc::setgid(gid_val);
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgid: {}",
-                            io::Error::last_os_error()
-                        )));
-                    }
-                }
-                if let Some(uid_val) = uid {
-                    let result = libc::setuid(uid_val);
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setuid: {}",
-                            io::Error::last_os_error()
-                        )));
                     }
                 }
 
@@ -4983,10 +5382,11 @@ impl Command {
                     }
                 }
 
-                if let Some(ref filter) = seccomp_filter {
-                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
-                    libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                    crate::seccomp::apply_filter(filter)?;
+                // Apply seccomp (no_new_privileges=true path only, mirrors spawn() step 7).
+                if no_new_privileges {
+                    if let Some(ref filter) = seccomp_filter {
+                        crate::seccomp::apply_filter(filter)?;
+                    }
                 }
 
                 // Step 8: OCI sync (same as spawn()).
@@ -5002,6 +5402,57 @@ impl Command {
                         libc::close(conn);
                     }
                     libc::close(listen_fd);
+                }
+
+                // Step 8.5: Set UID/GID after OCI sync (mirrors spawn()).
+                if !additional_gids.is_empty() {
+                    let result = libc::setgroups(additional_gids.len(), additional_gids.as_ptr());
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setgroups: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
+                if let Some(mask) = umask_val {
+                    libc::umask(mask);
+                }
+
+                // PR_SET_KEEPCAPS: preserve permitted caps across setuid(non-root).
+                if uid.is_some_and(|u| u != 0) && !ambient_cap_numbers.is_empty() {
+                    const PR_SET_KEEPCAPS: i32 = 8;
+                    libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+                }
+
+                if let Some(gid_val) = gid {
+                    let result = libc::setgid(gid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setgid: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+                if let Some(uid_val) = uid {
+                    let result = libc::setuid(uid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setuid: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
+                // Re-raise ambient capabilities after setuid (mirrors spawn()).
+                for &cap_num in &ambient_cap_numbers {
+                    libc::prctl(
+                        libc::PR_CAP_AMBIENT,
+                        libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
+                        cap_num as libc::c_ulong,
+                        0,
+                        0,
+                    );
                 }
 
                 Ok(())
