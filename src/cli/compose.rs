@@ -5,12 +5,12 @@ use super::{
     check_liveness, container_dir, containers_dir, now_iso8601, write_state, ContainerState,
     ContainerStatus, HealthStatus,
 };
-use remora::compose::{
+use pelagos::compose::{
     parse_compose, topo_sort, ComposeFile, Dependency, HealthCheck, ServiceSpec,
 };
-use remora::container::{Command, Namespace, Stdio, Volume};
-use remora::lisp::{HookMap, Interpreter};
-use remora::network::NetworkMode;
+use pelagos::container::{Command, Namespace, Stdio, Volume};
+use pelagos::lisp::{HookMap, Interpreter};
+use pelagos::network::NetworkMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
@@ -157,7 +157,7 @@ fn cmd_compose_up(
     let order = topo_sort(&compose.services)?;
 
     // Check for existing project.
-    let state_file = remora::paths::compose_state_file(&project);
+    let state_file = pelagos::paths::compose_state_file(&project);
     if state_file.exists() {
         if let Ok(existing) = load_project_state(&project) {
             if existing.supervisor_pid > 0 && check_liveness(existing.supervisor_pid) {
@@ -174,7 +174,7 @@ fn cmd_compose_up(
     let mut created_networks = Vec::new();
     for net in &compose.networks {
         let scoped = scoped_network_name(&project, &net.name);
-        let config = remora::paths::network_config_dir(&scoped).join("config.json");
+        let config = pelagos::paths::network_config_dir(&scoped).join("config.json");
         if !config.exists() {
             let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
             super::network::cmd_network_create(&scoped, subnet)
@@ -194,7 +194,7 @@ fn cmd_compose_up(
     // Clean any stale DNS config files for this project's networks
     // (leftover from a previous run whose compose down didn't clean up properly).
     for net in &created_networks {
-        let dns_file = remora::paths::dns_network_file(net);
+        let dns_file = pelagos::paths::dns_network_file(net);
         if dns_file.exists() {
             log::info!("compose: removing stale DNS config for network '{}'", net);
             let _ = std::fs::remove_file(&dns_file);
@@ -292,7 +292,7 @@ fn cmd_compose_up_reml(
     let order = topo_sort(&spec.services)?;
 
     // Check for already-running project.
-    let state_file = remora::paths::compose_state_file(&project);
+    let state_file = pelagos::paths::compose_state_file(&project);
     if state_file.exists() {
         if let Ok(existing) = load_project_state(&project) {
             if existing.supervisor_pid > 0 && check_liveness(existing.supervisor_pid) {
@@ -308,7 +308,7 @@ fn cmd_compose_up_reml(
     let mut created_networks = Vec::new();
     for net in &spec.networks {
         let scoped = scoped_network_name(&project, &net.name);
-        let config = remora::paths::network_config_dir(&scoped).join("config.json");
+        let config = pelagos::paths::network_config_dir(&scoped).join("config.json");
         if !config.exists() {
             let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
             super::network::cmd_network_create(&scoped, subnet)
@@ -325,7 +325,7 @@ fn cmd_compose_up_reml(
     }
 
     for net in &created_networks {
-        let dns_file = remora::paths::dns_network_file(net);
+        let dns_file = pelagos::paths::dns_network_file(net);
         if dns_file.exists() {
             let _ = std::fs::remove_file(&dns_file);
         }
@@ -596,7 +596,7 @@ fn spawn_service(
     let image_ref = &svc.image;
     let (full_ref, manifest) = resolve_image(image_ref)?;
 
-    let layers = remora::image::layer_dirs(&manifest);
+    let layers = pelagos::image::layer_dirs(&manifest);
     if layers.is_empty() {
         return Err(format!("service '{}': image has no layers", svc.name).into());
     }
@@ -827,12 +827,12 @@ fn spawn_service(
             Ok(ip) => ip,
             Err(_) => continue,
         };
-        let net_def = match remora::network::load_network_def(net_name) {
+        let net_def = match pelagos::network::load_network_def(net_name) {
             Ok(d) => d,
             Err(_) => continue,
         };
         // Register with the bare service name (not project-prefixed).
-        if let Err(e) = remora::dns::dns_add_entry(
+        if let Err(e) = pelagos::dns::dns_add_entry(
             net_name,
             &svc.name,
             ip,
@@ -853,7 +853,7 @@ fn spawn_service(
     // and bind new sockets. Without this, dependent services may start
     // before DNS is ready.
     for (net_name, _) in &all_ips {
-        if let Ok(net_def) = remora::network::load_network_def(net_name) {
+        if let Ok(net_def) = pelagos::network::load_network_def(net_name) {
             let gw = net_def.gateway;
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
@@ -884,7 +884,7 @@ fn spawn_service(
         let exit = child.wait();
         // Deregister DNS.
         for (net_name, _) in &all_ips_wait {
-            let _ = remora::dns::dns_remove_entry(net_name, &svc_name_wait);
+            let _ = pelagos::dns::dns_remove_entry(net_name, &svc_name_wait);
         }
         // Update container state.
         if let Ok(mut st) = super::read_state(&cn_wait) {
@@ -899,8 +899,8 @@ fn spawn_service(
 
 fn resolve_image(
     image_ref: &str,
-) -> Result<(String, remora::image::ImageManifest), Box<dyn std::error::Error>> {
-    use remora::image;
+) -> Result<(String, pelagos::image::ImageManifest), Box<dyn std::error::Error>> {
+    use pelagos::image;
 
     if let Ok(m) = image::load_image(image_ref) {
         return Ok((image_ref.to_string(), m));
@@ -1004,7 +1004,7 @@ fn cmd_compose_down(
     // Clean up DNS entries for all services on all networks.
     for svc_name in project_state.services.keys() {
         for net in &project_state.networks {
-            let _ = remora::dns::dns_remove_entry(net, svc_name);
+            let _ = pelagos::dns::dns_remove_entry(net, svc_name);
         }
     }
 
@@ -1025,7 +1025,7 @@ fn cmd_compose_down(
     }
 
     // Remove project state.
-    let project_dir = remora::paths::compose_project_dir(&project);
+    let project_dir = pelagos::paths::compose_project_dir(&project);
     let _ = std::fs::remove_dir_all(&project_dir);
 
     println!("Project '{}' stopped and removed", project);
@@ -1408,15 +1408,15 @@ fn probe_dns(gateway: Ipv4Addr, name: &str) -> bool {
 }
 
 fn save_project_state(state: &ComposeProject) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = remora::paths::compose_project_dir(&state.name);
+    let dir = pelagos::paths::compose_project_dir(&state.name);
     std::fs::create_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(remora::paths::compose_state_file(&state.name), json)?;
+    std::fs::write(pelagos::paths::compose_state_file(&state.name), json)?;
     Ok(())
 }
 
 fn load_project_state(project: &str) -> Result<ComposeProject, Box<dyn std::error::Error>> {
-    let data = std::fs::read_to_string(remora::paths::compose_state_file(project))?;
+    let data = std::fs::read_to_string(pelagos::paths::compose_state_file(project))?;
     let state: ComposeProject = serde_json::from_str(&data)?;
     Ok(state)
 }

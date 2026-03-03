@@ -24,7 +24,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use remora::container::{Command, SeccompProfile};
+//! use pelagos::container::{Command, SeccompProfile};
 //!
 //! // Use Docker's default profile (recommended)
 //! let child = Command::new("/bin/sh")

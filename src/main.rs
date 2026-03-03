@@ -503,7 +503,7 @@ fn main() {
             pid_file,
         } => match bundle.or(bundle_positional) {
             None => Err("remora create: --bundle <path> is required".into()),
-            Some(bundle_path) => remora::oci::cmd_create(
+            Some(bundle_path) => pelagos::oci::cmd_create(
                 &id,
                 &bundle_path,
                 console_socket.as_deref(),
@@ -511,16 +511,16 @@ fn main() {
             )
             .map_err(|e| e.to_string().into()),
         },
-        CliCommand::Start { id } => remora::oci::cmd_start(&id).map_err(|e| e.to_string().into()),
-        CliCommand::State { id } => remora::oci::cmd_state(&id).map_err(|e| e.to_string().into()),
+        CliCommand::Start { id } => pelagos::oci::cmd_start(&id).map_err(|e| e.to_string().into()),
+        CliCommand::State { id } => pelagos::oci::cmd_state(&id).map_err(|e| e.to_string().into()),
         CliCommand::Kill { id, signal } => {
-            remora::oci::cmd_kill(&id, &signal).map_err(|e| e.to_string().into())
+            pelagos::oci::cmd_kill(&id, &signal).map_err(|e| e.to_string().into())
         }
         CliCommand::Delete { id, force } => {
             if force {
-                remora::oci::cmd_delete_force(&id).map_err(|e| e.to_string().into())
+                pelagos::oci::cmd_delete_force(&id).map_err(|e| e.to_string().into())
             } else {
-                remora::oci::cmd_delete(&id).map_err(|e| e.to_string().into())
+                pelagos::oci::cmd_delete(&id).map_err(|e| e.to_string().into())
             }
         }
     };

@@ -1,7 +1,7 @@
 //! `remora exec` — run a command inside a running container.
 
 use super::{check_liveness, parse_user, read_state, ContainerStatus};
-use remora::container::{Command, Namespace, Stdio};
+use pelagos::container::{Command, Namespace, Stdio};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
@@ -26,7 +26,7 @@ pub struct ExecArgs {
     #[clap(long = "workdir", short = 'w')]
     pub workdir: Option<String>,
 
-    /// UID[:GID] to run as (e.g. 1000 or 1000:1000)
+    /// `UID[:GID]` to run as (e.g. 1000 or 1000:1000)
     #[clap(long = "user", short = 'u')]
     pub user: Option<String>,
 

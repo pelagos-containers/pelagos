@@ -35,8 +35,8 @@ pub struct BuildArgs {
 }
 
 pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use remora::build;
-    use remora::network::NetworkMode;
+    use pelagos::build;
+    use pelagos::network::NetworkMode;
 
     // Set DNS backend env var before any DNS calls so active_backend() picks it up.
     if let Some(ref backend) = args.dns_backend {
@@ -76,7 +76,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         "pasta" => NetworkMode::Pasta,
         "none" => NetworkMode::Loopback,
         "auto" => {
-            if remora::paths::is_rootless() {
+            if pelagos::paths::is_rootless() {
                 NetworkMode::Pasta
             } else {
                 NetworkMode::Bridge
@@ -84,7 +84,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         name => {
             // Check if it's a named network.
-            let config = remora::paths::network_config_dir(name).join("config.json");
+            let config = pelagos::paths::network_config_dir(name).join("config.json");
             if config.exists() {
                 NetworkMode::BridgeNamed(name.to_string())
             } else {

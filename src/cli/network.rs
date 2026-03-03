@@ -1,6 +1,6 @@
 //! `remora network` — manage named networks.
 
-use remora::network::{Ipv4Net, NetworkDef};
+use pelagos::network::{Ipv4Net, NetworkDef};
 
 /// Validate a network name: alphanumeric + hyphen, no leading hyphen, ≤ 12 chars.
 fn validate_name(name: &str) -> Result<(), String> {
@@ -50,13 +50,13 @@ pub fn cmd_network_create(name: &str, subnet_cidr: &str) -> Result<(), Box<dyn s
     }
 
     // Check for existing network with same name.
-    let config_dir = remora::paths::network_config_dir(name);
+    let config_dir = pelagos::paths::network_config_dir(name);
     if config_dir.join("config.json").exists() {
         return Err(format!("network '{}' already exists", name).into());
     }
 
     // Check subnet overlap against all existing networks.
-    let networks_dir = remora::paths::networks_config_dir();
+    let networks_dir = pelagos::paths::networks_config_dir();
     if networks_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&networks_dir) {
             for entry in entries.flatten() {
@@ -93,9 +93,9 @@ pub fn cmd_network_create(name: &str, subnet_cidr: &str) -> Result<(), Box<dyn s
 
 pub fn cmd_network_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap default network so it always appears.
-    let _ = remora::network::bootstrap_default_network();
+    let _ = pelagos::network::bootstrap_default_network();
 
-    let networks_dir = remora::paths::networks_config_dir();
+    let networks_dir = pelagos::paths::networks_config_dir();
     let entries = match std::fs::read_dir(&networks_dir) {
         Ok(e) => e,
         Err(_) => {
@@ -150,7 +150,7 @@ pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err("cannot remove the default network 'remora0'".into());
     }
 
-    let config_dir = remora::paths::network_config_dir(name);
+    let config_dir = pelagos::paths::network_config_dir(name);
     if !config_dir.join("config.json").exists() {
         return Err(format!("network '{}' not found", name).into());
     }
@@ -182,7 +182,7 @@ pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_dir_all(&config_dir)?;
 
     // Remove runtime dir if it exists.
-    let runtime_dir = remora::paths::network_runtime_dir(name);
+    let runtime_dir = pelagos::paths::network_runtime_dir(name);
     let _ = std::fs::remove_dir_all(&runtime_dir);
 
     println!("Removed network '{}'", name);
@@ -191,7 +191,7 @@ pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn cmd_network_inspect(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let net = if name == "remora0" {
-        remora::network::bootstrap_default_network()?
+        pelagos::network::bootstrap_default_network()?
     } else {
         NetworkDef::load(name)?
     };

@@ -1,6 +1,6 @@
 //! `remora volume` — manage named volumes.
 
-use remora::container::Volume;
+use pelagos::container::Volume;
 
 pub fn cmd_volume_create(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Volume::create(name).map_err(|e| format!("create volume '{}': {}", name, e))?;
@@ -9,7 +9,7 @@ pub fn cmd_volume_create(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn cmd_volume_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let volumes_dir = remora::paths::volumes_dir();
+    let volumes_dir = pelagos::paths::volumes_dir();
     let entries = match std::fs::read_dir(&volumes_dir) {
         Ok(e) => e,
         Err(_) => {

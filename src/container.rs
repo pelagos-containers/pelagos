@@ -20,7 +20,7 @@
 //! ## Basic container with namespace isolation
 //!
 //! ```no_run
-//! use remora::container::{Command, Namespace, Stdio};
+//! use pelagos::container::{Command, Namespace, Stdio};
 //!
 //! let mut child = Command::new("/bin/sh")
 //!     .with_namespaces(Namespace::UTS | Namespace::PID | Namespace::MOUNT)
@@ -37,7 +37,7 @@
 //! ## With pre-exec callback for mounting filesystems
 //!
 //! ```no_run
-//! # use remora::container::{Command, Namespace};
+//! # use pelagos::container::{Command, Namespace};
 //! fn mount_proc() -> std::io::Result<()> {
 //!     // Mount proc filesystem inside container
 //!     // Implementation details...
@@ -462,7 +462,7 @@ impl Namespace {
 /// # Examples
 ///
 /// ```no_run
-/// use remora::container::{Command, Stdio};
+/// use pelagos::container::{Command, Stdio};
 ///
 /// let child = Command::new("/bin/cat")
 ///     .stdin(Stdio::Inherit)   // Read from parent's stdin
@@ -633,7 +633,7 @@ impl Volume {
 /// # Examples
 ///
 /// ```no_run
-/// use remora::container::{Command, Namespace, Stdio};
+/// use pelagos::container::{Command, Namespace, Stdio};
 ///
 /// // Create and configure a containerized process
 /// let child = Command::new("/bin/sh")
@@ -650,7 +650,7 @@ impl Volume {
 /// All builder methods consume `self` and return `Self`, enabling fluent chaining:
 ///
 /// ```no_run
-/// # use remora::container::{Command, Namespace};
+/// # use pelagos::container::{Command, Namespace};
 /// Command::new("/bin/ls")
 ///     .args(["-la"])
 ///     .with_namespaces(Namespace::MOUNT)
@@ -1359,7 +1359,7 @@ impl Command {
     /// # Examples
     ///
     /// ```ignore
-    /// use remora::network::NetworkMode;
+    /// use pelagos::network::NetworkMode;
     ///
     /// // Isolated loopback only
     /// Command::new("/bin/sh").with_network(NetworkMode::Loopback).spawn()?;
@@ -1395,8 +1395,8 @@ impl Command {
     /// # Example
     ///
     /// ```no_run
-    /// # use remora::container::Command;
-    /// # use remora::network::NetworkMode;
+    /// # use pelagos::container::Command;
+    /// # use pelagos::network::NetworkMode;
     /// let cmd = Command::new("/bin/sh")
     ///     .with_network(NetworkMode::BridgeNamed("frontend".into()))
     ///     .with_additional_network("backend");
@@ -1415,7 +1415,7 @@ impl Command {
     /// # Examples
     ///
     /// ```ignore
-    /// use remora::network::NetworkMode;
+    /// use pelagos::network::NetworkMode;
     /// Command::new("/bin/sh")
     ///     .with_network(NetworkMode::Bridge)
     ///     .with_nat()
@@ -1436,7 +1436,7 @@ impl Command {
     /// # Examples
     ///
     /// ```ignore
-    /// use remora::network::NetworkMode;
+    /// use pelagos::network::NetworkMode;
     /// Command::new("/bin/sh")
     ///     .with_network(NetworkMode::Bridge)
     ///     .with_nat()
@@ -1476,7 +1476,7 @@ impl Command {
     /// # Examples
     ///
     /// ```ignore
-    /// use remora::network::NetworkMode;
+    /// use pelagos::network::NetworkMode;
     /// Command::new("/bin/sh")
     ///     .with_network(NetworkMode::Bridge)
     ///     .with_nat()
@@ -1756,7 +1756,7 @@ impl Command {
     /// # Example
     ///
     /// ```ignore
-    /// use remora::notif::{SyscallHandler, SyscallNotif, SyscallResponse};
+    /// use pelagos::notif::{SyscallHandler, SyscallNotif, SyscallResponse};
     ///
     /// struct DenyConnect;
     /// impl SyscallHandler for DenyConnect {
@@ -5840,7 +5840,7 @@ impl Command {
 /// # Examples
 ///
 /// ```no_run
-/// use remora::container::{Command, Namespace};
+/// use pelagos::container::{Command, Namespace};
 ///
 /// let mut child = Command::new("/bin/sleep")
 ///     .args(["5"])

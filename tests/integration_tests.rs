@@ -13,11 +13,11 @@
 //! sudo -E cargo test --test integration_tests
 //! ```
 
-use remora::cgroup::ResourceStats;
-use remora::container::{
+use pelagos::cgroup::ResourceStats;
+use pelagos::container::{
     Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume,
 };
-use remora::network::NetworkMode;
+use pelagos::network::NetworkMode;
 use serial_test::serial;
 use std::path::PathBuf;
 
@@ -822,7 +822,7 @@ mod security {
     /// wrong results, or `landlock_add_rule`/`landlock_restrict_self` fail.
     #[test]
     fn test_landlock_read_only_allows_read() {
-        use remora::landlock::get_abi_version;
+        use pelagos::landlock::get_abi_version;
 
         if !is_root() {
             eprintln!("Skipping test_landlock_read_only_allows_read: requires root");
@@ -872,7 +872,7 @@ mod security {
     /// was not applied (e.g. `apply_landlock` silently returned Ok on EPERM).
     #[test]
     fn test_landlock_denies_write() {
-        use remora::landlock::get_abi_version;
+        use pelagos::landlock::get_abi_version;
 
         if !is_root() {
             eprintln!("Skipping test_landlock_denies_write: requires root");
@@ -926,7 +926,7 @@ mod security {
     /// rule is not being applied.
     #[test]
     fn test_landlock_rw_allows_write() {
-        use remora::landlock::get_abi_version;
+        use pelagos::landlock::get_abi_version;
 
         if !is_root() {
             eprintln!("Skipping test_landlock_rw_allows_write: requires root");
@@ -1021,7 +1021,7 @@ mod security {
     /// subtree, or `/tmp` is inadvertently receiving access.
     #[test]
     fn test_landlock_partial_path_allow() {
-        use remora::landlock::get_abi_version;
+        use pelagos::landlock::get_abi_version;
 
         if !is_root() {
             eprintln!("Skipping test_landlock_partial_path_allow: requires root");
@@ -1072,7 +1072,7 @@ mod security {
 
 mod user_notif {
     use super::*;
-    use remora::notif::{SyscallHandler, SyscallNotif, SyscallResponse};
+    use pelagos::notif::{SyscallHandler, SyscallNotif, SyscallResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -3566,7 +3566,7 @@ mod oci_lifecycle {
         assert!(ok, "remora delete failed: {}", stderr);
 
         // state dir should be gone
-        let state_dir = remora::oci::state_dir(&id);
+        let state_dir = pelagos::oci::state_dir(&id);
         assert!(
             !state_dir.exists(),
             "state dir still exists after delete: {}",
@@ -3682,7 +3682,7 @@ mod oci_lifecycle {
             }
         }
 
-        let state_dir = remora::oci::state_dir(&id);
+        let state_dir = pelagos::oci::state_dir(&id);
         assert!(state_dir.exists(), "state dir should exist before delete");
 
         let (_, stderr, ok) = run_remora(&["delete", &id]);
@@ -3740,7 +3740,7 @@ mod oci_lifecycle {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // State directory must still exist — the runtime owns it until delete.
-        let state_dir = remora::oci::state_dir(&id);
+        let state_dir = pelagos::oci::state_dir(&id);
         assert!(
             state_dir.exists(),
             "state dir must persist until remora delete, not be cleaned up on container exit"
@@ -3879,7 +3879,7 @@ mod oci_lifecycle {
     /// or that the PID reuse detection path in cmd_state is broken.
     #[test]
     fn test_oci_pid_start_time() {
-        use remora::oci::read_pid_start_time;
+        use pelagos::oci::read_pid_start_time;
 
         // Unit: read_pid_start_time on our own PID must return Some value.
         let our_pid = std::process::id() as libc::pid_t;
@@ -3971,7 +3971,7 @@ mod oci_lifecycle {
     /// poll result.
     #[test]
     fn test_oci_pidfd_mgmt_socket() {
-        use remora::oci::{is_pidfd_alive, mgmt_sock_path};
+        use pelagos::oci::{is_pidfd_alive, mgmt_sock_path};
 
         if !is_root() {
             eprintln!("Skipping test_oci_pidfd_mgmt_socket: requires root");
@@ -5219,7 +5219,7 @@ mod rootless {
 
     /// Check whether `pasta` is on PATH and responds to `--version`.
     fn is_pasta_available() -> bool {
-        remora::network::is_pasta_available()
+        pelagos::network::is_pasta_available()
     }
 
     #[test]
@@ -5976,7 +5976,7 @@ mod images {
             return;
         }
 
-        use remora::image;
+        use pelagos::image;
 
         // Create a synthetic tar.gz with two files.
         let tmp_dir = tempfile::tempdir().expect("create tempdir");
@@ -6248,7 +6248,7 @@ mod images {
             return;
         }
 
-        use remora::image;
+        use pelagos::image;
 
         let reference = "docker.io/library/alpine:latest";
 
@@ -7072,7 +7072,7 @@ mod rootless_cgroups {
     use super::*;
 
     fn skip_unless_delegation() -> bool {
-        if !remora::cgroup_rootless::is_delegation_available() {
+        if !pelagos::cgroup_rootless::is_delegation_available() {
             eprintln!("Skipping: cgroup v2 delegation not available");
             return false;
         }
@@ -7083,7 +7083,7 @@ mod rootless_cgroups {
     /// Returns None if the file doesn't exist (controller not delegated).
     fn read_cgroup_knob(pid: i32, knob: &str) -> Option<String> {
         let parent =
-            remora::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
+            pelagos::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
         let path = parent.join(format!("remora-{}", pid)).join(knob);
         match std::fs::read_to_string(&path) {
             Ok(s) => Some(s),
@@ -7242,7 +7242,7 @@ mod rootless_cgroups {
 
         // The kernel may take a moment to fully vacate the cgroup.
         let cg_parent =
-            remora::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
+            pelagos::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
         let cg_dir = cg_parent.join(format!("remora-{}", pid));
 
         // Retry removal briefly in case the kernel hasn't finished yet.
@@ -7449,7 +7449,7 @@ mod json_output {
 
         // Write a synthetic container state directly (avoids spawning a real
         // container and the associated process lifecycle / cleanup overhead).
-        let ctr_dir = remora::paths::containers_dir().join(name);
+        let ctr_dir = pelagos::paths::containers_dir().join(name);
         std::fs::create_dir_all(&ctr_dir).expect("create container dir");
         let state = serde_json::json!({
             "name": name,
@@ -7576,11 +7576,11 @@ mod rootless_idmap {
     /// Check whether multi-UID mapping via helpers is available.
     /// Requires: newuidmap + newgidmap on PATH, and non-empty subuid/subgid ranges.
     fn skip_unless_idmap_helpers() -> bool {
-        if !remora::idmap::has_newuidmap() || !remora::idmap::has_newgidmap() {
+        if !pelagos::idmap::has_newuidmap() || !pelagos::idmap::has_newgidmap() {
             eprintln!("Skipping: newuidmap/newgidmap not available");
             return false;
         }
-        let username = match remora::idmap::current_username() {
+        let username = match pelagos::idmap::current_username() {
             Ok(u) => u,
             Err(_) => {
                 eprintln!("Skipping: could not determine username");
@@ -7589,9 +7589,9 @@ mod rootless_idmap {
         };
         let uid = unsafe { libc::getuid() };
         let uid_ranges =
-            remora::idmap::parse_subid_file(std::path::Path::new("/etc/subuid"), &username, uid)
+            pelagos::idmap::parse_subid_file(std::path::Path::new("/etc/subuid"), &username, uid)
                 .unwrap_or_default();
-        let gid_ranges = remora::idmap::parse_subid_file(
+        let gid_ranges = pelagos::idmap::parse_subid_file(
             std::path::Path::new("/etc/subgid"),
             &username,
             unsafe { libc::getgid() },
@@ -7744,7 +7744,7 @@ mod rootless_idmap {
 // ── Build instruction tests (ENTRYPOINT, LABEL, USER, cache) ────────────────
 
 mod build_instructions {
-    use remora::build;
+    use pelagos::build;
     use std::collections::HashMap;
 
     /// test_parse_entrypoint_json
@@ -7856,7 +7856,7 @@ CMD ["8080"]"#;
     /// Failure indicates the `labels` field has broken serde attributes.
     #[test]
     fn test_image_config_labels_serde_roundtrip() {
-        use remora::image::ImageConfig;
+        use pelagos::image::ImageConfig;
 
         let mut labels = HashMap::new();
         labels.insert("maintainer".to_string(), "test@example.com".to_string());
@@ -7892,7 +7892,7 @@ CMD ["8080"]"#;
     /// Failure indicates the `user` field serde default is broken.
     #[test]
     fn test_image_config_user_field() {
-        use remora::image::ImageConfig;
+        use pelagos::image::ImageConfig;
 
         let config = ImageConfig {
             env: vec![],
@@ -8439,13 +8439,13 @@ mod port_proxy {
 
 mod multi_network {
     use super::*;
-    use remora::network::{Ipv4Net, NetworkDef};
+    use pelagos::network::{Ipv4Net, NetworkDef};
 
     /// Clean up a test network (best-effort).
     fn cleanup_test_network(name: &str) {
-        let config_dir = remora::paths::network_config_dir(name);
+        let config_dir = pelagos::paths::network_config_dir(name);
         let _ = std::fs::remove_dir_all(&config_dir);
-        let runtime_dir = remora::paths::network_runtime_dir(name);
+        let runtime_dir = pelagos::paths::network_runtime_dir(name);
         let _ = std::fs::remove_dir_all(&runtime_dir);
         // Delete bridge if it exists.
         let bridge = if name == "remora0" {
@@ -8483,7 +8483,7 @@ mod multi_network {
         net.save().expect("save network");
 
         // Verify config file exists.
-        let config = remora::paths::network_config_dir(name).join("config.json");
+        let config = pelagos::paths::network_config_dir(name).join("config.json");
         assert!(config.exists(), "config.json should exist after save");
 
         // Load and verify roundtrip.
@@ -8531,7 +8531,7 @@ mod multi_network {
         );
 
         // Walk existing networks to check for overlap (same logic as CLI).
-        let networks_dir = remora::paths::networks_config_dir();
+        let networks_dir = pelagos::paths::networks_config_dir();
         let mut found_overlap = false;
         if let Ok(entries) = std::fs::read_dir(&networks_dir) {
             for entry in entries.flatten() {
@@ -8689,8 +8689,8 @@ mod multi_network {
         }
         // The CLI refuses removal of "remora0" — but we test the concept:
         // the default network config should survive bootstrap.
-        let _ = remora::network::bootstrap_default_network().expect("bootstrap default");
-        let config = remora::paths::network_config_dir("remora0").join("config.json");
+        let _ = pelagos::network::bootstrap_default_network().expect("bootstrap default");
+        let config = pelagos::paths::network_config_dir("remora0").join("config.json");
         assert!(config.exists(), "default network config should exist");
     }
 
@@ -9059,7 +9059,7 @@ mod multi_network {
 
         // Save server state so link resolution can find it.
         let server_name = "mnlink-server";
-        let server_dir = remora::paths::containers_dir().join(server_name);
+        let server_dir = pelagos::paths::containers_dir().join(server_name);
         std::fs::create_dir_all(&server_dir).expect("create server dir");
         let mut network_ips = std::collections::HashMap::new();
         network_ips.insert(net1.to_string(), server_ip_net1.clone());
@@ -9120,12 +9120,12 @@ mod multi_network {
 
 mod dns {
     use super::*;
-    use remora::network::{Ipv4Net, NetworkDef};
+    use pelagos::network::{Ipv4Net, NetworkDef};
 
     fn cleanup_test_network(name: &str) {
-        let config_dir = remora::paths::network_config_dir(name);
+        let config_dir = pelagos::paths::network_config_dir(name);
         let _ = std::fs::remove_dir_all(&config_dir);
-        let runtime_dir = remora::paths::network_runtime_dir(name);
+        let runtime_dir = pelagos::paths::network_runtime_dir(name);
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let bridge = format!("rm-{}", name);
         let _ = std::process::Command::new("ip")
@@ -9148,7 +9148,7 @@ mod dns {
 
     /// Clean up DNS config files and kill daemon.
     fn cleanup_dns() {
-        let dns_dir = remora::paths::dns_config_dir();
+        let dns_dir = pelagos::paths::dns_config_dir();
         // Kill daemon if running.
         let pid_file = dns_dir.join("pid");
         if let Ok(content) = std::fs::read_to_string(&pid_file) {
@@ -9204,8 +9204,8 @@ mod dns {
         let server_ip = server.container_ip().expect("server should have IP");
 
         // Register server with DNS daemon.
-        let net_def = remora::network::load_network_def(net_name).expect("load net def");
-        remora::dns::dns_add_entry(
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
+        pelagos::dns::dns_add_entry(
             net_name,
             "server-a",
             server_ip.parse().unwrap(),
@@ -9249,7 +9249,7 @@ mod dns {
         );
 
         // Cleanup.
-        remora::dns::dns_remove_entry(net_name, "server-a").ok();
+        pelagos::dns::dns_remove_entry(net_name, "server-a").ok();
         unsafe { libc::kill(server.pid(), libc::SIGTERM) };
         let _ = server.wait();
         cleanup_dns();
@@ -9299,8 +9299,8 @@ mod dns {
             .expect("spawn holder");
 
         // Register a dummy entry to start the DNS daemon (bridge now exists).
-        let net_def = remora::network::load_network_def(net_name).expect("load net def");
-        remora::dns::dns_add_entry(
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
+        pelagos::dns::dns_add_entry(
             net_name,
             "dummy",
             "10.90.2.99".parse().unwrap(),
@@ -9345,7 +9345,7 @@ mod dns {
         );
 
         // Cleanup.
-        remora::dns::dns_remove_entry(net_name, "dummy").ok();
+        pelagos::dns::dns_remove_entry(net_name, "dummy").ok();
         unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
         let _ = holder.wait();
         cleanup_dns();
@@ -9408,8 +9408,8 @@ mod dns {
             .expect("spawn holder2");
 
         // Register "alpha" on net1 and "beta" on net2.
-        let net1_def = remora::network::load_network_def(net1).expect("load net1");
-        remora::dns::dns_add_entry(
+        let net1_def = pelagos::network::load_network_def(net1).expect("load net1");
+        pelagos::dns::dns_add_entry(
             net1,
             "alpha",
             "10.90.3.5".parse().unwrap(),
@@ -9418,8 +9418,8 @@ mod dns {
         )
         .expect("add alpha");
 
-        let net2_def = remora::network::load_network_def(net2).expect("load net2");
-        remora::dns::dns_add_entry(
+        let net2_def = pelagos::network::load_network_def(net2).expect("load net2");
+        pelagos::dns::dns_add_entry(
             net2,
             "beta",
             "10.90.4.5".parse().unwrap(),
@@ -9483,8 +9483,8 @@ mod dns {
         );
 
         // Cleanup.
-        remora::dns::dns_remove_entry(net1, "alpha").ok();
-        remora::dns::dns_remove_entry(net2, "beta").ok();
+        pelagos::dns::dns_remove_entry(net1, "alpha").ok();
+        pelagos::dns::dns_remove_entry(net2, "beta").ok();
         unsafe { libc::kill(holder1.pid(), libc::SIGTERM) };
         unsafe { libc::kill(holder2.pid(), libc::SIGTERM) };
         let _ = holder1.wait();
@@ -9541,9 +9541,9 @@ mod dns {
         assert!(ip_net2.starts_with("10.90.6."), "net2 IP: {}", ip_net2);
 
         // Register server "multi-a" on both networks.
-        let net1_def = remora::network::load_network_def(net1).expect("load net1");
-        let net2_def = remora::network::load_network_def(net2).expect("load net2");
-        remora::dns::dns_add_entry(
+        let net1_def = pelagos::network::load_network_def(net1).expect("load net1");
+        let net2_def = pelagos::network::load_network_def(net2).expect("load net2");
+        pelagos::dns::dns_add_entry(
             net1,
             "multi-a",
             ip_net1.parse().unwrap(),
@@ -9551,7 +9551,7 @@ mod dns {
             &["8.8.8.8".to_string()],
         )
         .expect("add to net1");
-        remora::dns::dns_add_entry(
+        pelagos::dns::dns_add_entry(
             net2,
             "multi-a",
             ip_net2.parse().unwrap(),
@@ -9591,8 +9591,8 @@ mod dns {
         );
 
         // Cleanup.
-        remora::dns::dns_remove_entry(net1, "multi-a").ok();
-        remora::dns::dns_remove_entry(net2, "multi-a").ok();
+        pelagos::dns::dns_remove_entry(net1, "multi-a").ok();
+        pelagos::dns::dns_remove_entry(net2, "multi-a").ok();
         unsafe { libc::kill(server.pid(), libc::SIGTERM) };
         let _ = server.wait();
         cleanup_dns();
@@ -9639,17 +9639,17 @@ mod dns {
             .spawn()
             .expect("spawn holder");
 
-        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
 
         // No daemon should be running initially.
-        let pid_file = remora::paths::dns_pid_file();
+        let pid_file = pelagos::paths::dns_pid_file();
         assert!(
             !pid_file.exists(),
             "PID file should not exist before any DNS entries"
         );
 
         // Add an entry — daemon should start.
-        remora::dns::dns_add_entry(
+        pelagos::dns::dns_add_entry(
             net_name,
             "lifecycle-test",
             "10.90.7.5".parse().unwrap(),
@@ -9677,7 +9677,7 @@ mod dns {
 
         // Remove the entry — daemon should eventually exit (SIGHUP triggers reload,
         // daemon sees no entries and exits).
-        remora::dns::dns_remove_entry(net_name, "lifecycle-test").expect("dns_remove_entry");
+        pelagos::dns::dns_remove_entry(net_name, "lifecycle-test").expect("dns_remove_entry");
 
         // Give daemon time to process SIGHUP and exit.
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -9754,8 +9754,8 @@ mod dns {
         let server_ip = server.container_ip().expect("server should have IP");
 
         // Register server with DNS daemon.
-        let net_def = remora::network::load_network_def(net_name).expect("load net def");
-        remora::dns::dns_add_entry(
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
+        pelagos::dns::dns_add_entry(
             net_name,
             "dnsmasq-server",
             server_ip.parse().unwrap(),
@@ -9768,7 +9768,7 @@ mod dns {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // Verify dnsmasq backend was used.
-        let backend_file = remora::paths::dns_backend_file();
+        let backend_file = pelagos::paths::dns_backend_file();
         if backend_file.exists() {
             let backend = std::fs::read_to_string(&backend_file).unwrap_or_default();
             assert_eq!(
@@ -9810,7 +9810,7 @@ mod dns {
         );
 
         // Cleanup.
-        remora::dns::dns_remove_entry(net_name, "dnsmasq-server").ok();
+        pelagos::dns::dns_remove_entry(net_name, "dnsmasq-server").ok();
         unsafe { libc::kill(server.pid(), libc::SIGTERM) };
         let _ = server.wait();
         cleanup_dns();
@@ -9864,10 +9864,10 @@ mod dns {
             .spawn()
             .expect("spawn holder");
 
-        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
 
         // Register a dummy entry to start the daemon.
-        remora::dns::dns_add_entry(
+        pelagos::dns::dns_add_entry(
             net_name,
             "dummy-fwd",
             "10.90.12.5".parse().unwrap(),
@@ -9911,7 +9911,7 @@ mod dns {
         );
 
         // Cleanup.
-        remora::dns::dns_remove_entry(net_name, "dummy-fwd").ok();
+        pelagos::dns::dns_remove_entry(net_name, "dummy-fwd").ok();
         unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
         let _ = holder.wait();
         cleanup_dns();
@@ -9965,8 +9965,8 @@ mod dns {
             .spawn()
             .expect("spawn holder");
 
-        let net_def = remora::network::load_network_def(net_name).expect("load net def");
-        let pid_file = remora::paths::dns_pid_file();
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
+        let pid_file = pelagos::paths::dns_pid_file();
 
         // No daemon initially.
         assert!(
@@ -9975,7 +9975,7 @@ mod dns {
         );
 
         // Add entry — daemon should start.
-        remora::dns::dns_add_entry(
+        pelagos::dns::dns_add_entry(
             net_name,
             "lifecycle-dnsmasq",
             "10.90.13.5".parse().unwrap(),
@@ -10000,14 +10000,14 @@ mod dns {
         );
 
         // Verify backend marker.
-        let backend_file = remora::paths::dns_backend_file();
+        let backend_file = pelagos::paths::dns_backend_file();
         assert!(backend_file.exists(), "backend marker should exist");
         let marker = std::fs::read_to_string(&backend_file).unwrap();
         assert_eq!(marker.trim(), "dnsmasq", "backend should be dnsmasq");
 
         // Remove entry — we need to stop the daemon manually since dnsmasq
         // doesn't auto-exit like the builtin daemon.
-        remora::dns::dns_remove_entry(net_name, "lifecycle-dnsmasq").expect("dns_remove_entry");
+        pelagos::dns::dns_remove_entry(net_name, "lifecycle-dnsmasq").expect("dns_remove_entry");
 
         // Cleanup: kill the daemon.
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -10126,7 +10126,7 @@ fn test_sexpr_parse_compose_file() {
     (port 80 3000)
     (command "/bin/sh" "-c" "nginx -g 'daemon off;'")))
 "#;
-    let expr = remora::sexpr::parse(input).expect("should parse compose file");
+    let expr = pelagos::sexpr::parse(input).expect("should parse compose file");
     let items = expr.as_list().expect("top-level should be a list");
     assert_eq!(items[0].as_atom().unwrap(), "compose");
     // compose + 2 networks + 1 volume + 3 services = 7
@@ -10154,7 +10154,7 @@ fn test_compose_parse_and_validate() {
     (depends-on (db :ready-port 5432))
     (port 8080 8080)))
 "#;
-    let compose = remora::compose::parse_compose(input).expect("should parse and validate");
+    let compose = pelagos::compose::parse_compose(input).expect("should parse and validate");
     assert_eq!(compose.networks.len(), 1);
     assert_eq!(compose.networks[0].name, "backend");
     assert_eq!(compose.networks[0].subnet.as_deref(), Some("10.88.1.0/24"));
@@ -10177,7 +10177,7 @@ fn test_compose_parse_and_validate() {
     assert_eq!(api.depends_on[0].service, "db");
     assert_eq!(
         api.depends_on[0].health_check,
-        Some(remora::compose::HealthCheck::Port(5432))
+        Some(pelagos::compose::HealthCheck::Port(5432))
     );
 }
 
@@ -10194,8 +10194,8 @@ fn test_compose_topo_sort() {
   (service db
     (image "db")))
 "#;
-    let compose = remora::compose::parse_compose(input).expect("should parse");
-    let order = remora::compose::topo_sort(&compose.services).expect("should topo-sort");
+    let compose = pelagos::compose::parse_compose(input).expect("should parse");
+    let order = pelagos::compose::topo_sort(&compose.services).expect("should topo-sort");
 
     let db_pos = order.iter().position(|n| n == "db").unwrap();
     let api_pos = order.iter().position(|n| n == "api").unwrap();
@@ -10226,7 +10226,7 @@ fn test_compose_cycle_detection() {
     (image "b")
     (depends-on a)))
 "#;
-    let err = remora::compose::parse_compose(input).unwrap_err();
+    let err = pelagos::compose::parse_compose(input).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("cycle"), "expected cycle error, got: {}", msg);
 }
@@ -10239,7 +10239,7 @@ fn test_compose_unknown_dependency() {
     (image "a")
     (depends-on nonexistent)))
 "#;
-    let err = remora::compose::parse_compose(input).unwrap_err();
+    let err = pelagos::compose::parse_compose(input).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("unknown service"),
@@ -10267,14 +10267,14 @@ fn test_compose_up_down_single_service() {
     let project_name = "test-compose";
 
     // Clean up any previous state.
-    let project_dir = remora::paths::compose_project_dir(project_name);
+    let project_dir = pelagos::paths::compose_project_dir(project_name);
     let _ = std::fs::remove_dir_all(&project_dir);
 
     // Verify state directory creation works.
-    std::fs::create_dir_all(remora::paths::compose_project_dir(project_name))
+    std::fs::create_dir_all(pelagos::paths::compose_project_dir(project_name))
         .expect("should create compose project dir");
     assert!(
-        remora::paths::compose_project_dir(project_name).exists(),
+        pelagos::paths::compose_project_dir(project_name).exists(),
         "compose project dir should exist"
     );
 
@@ -10318,7 +10318,7 @@ fn test_compose_bind_mount_parse_and_validate() {
     (bind-mount "./config/snmp.yml" "/etc/snmp_exporter/snmp.yml" :ro)))
 "#;
 
-    let compose = remora::compose::parse_compose(input).expect("should parse and validate");
+    let compose = pelagos::compose::parse_compose(input).expect("should parse and validate");
 
     assert_eq!(compose.networks.len(), 1);
     assert_eq!(compose.volumes, vec!["grafana-data"]);
@@ -10354,7 +10354,7 @@ fn test_compose_bind_mount_parse_and_validate() {
     assert_eq!(grafana.depends_on[0].service, "prometheus");
     assert_eq!(
         grafana.depends_on[0].health_check,
-        Some(remora::compose::HealthCheck::Port(9090))
+        Some(pelagos::compose::HealthCheck::Port(9090))
     );
 
     // SNMP exporter: single RO config mount, no volumes.
@@ -10371,7 +10371,7 @@ fn test_compose_bind_mount_parse_and_validate() {
     assert!(snmp.bind_mounts[0].read_only);
 
     // Topo sort: prometheus and snmp-exporter before grafana.
-    let order = remora::compose::topo_sort(&compose.services).unwrap();
+    let order = pelagos::compose::topo_sort(&compose.services).unwrap();
     let prom_pos = order.iter().position(|n| n == "prometheus").unwrap();
     let grafana_pos = order.iter().position(|n| n == "grafana").unwrap();
     assert!(
@@ -10401,7 +10401,7 @@ fn test_compose_tmpfs_parse_and_validate() {
     (tmpfs "/run")
     (depends-on redis)))
 "#;
-    let compose = remora::compose::parse_compose(input).expect("should parse and validate");
+    let compose = pelagos::compose::parse_compose(input).expect("should parse and validate");
 
     assert_eq!(compose.services.len(), 2);
 
@@ -10417,7 +10417,7 @@ fn test_compose_tmpfs_parse_and_validate() {
     assert_eq!(app.tmpfs_mounts[1], "/run");
     assert_eq!(app.depends_on[0].service, "redis");
 
-    let order = remora::compose::topo_sort(&compose.services).unwrap();
+    let order = pelagos::compose::topo_sort(&compose.services).unwrap();
     let redis_pos = order.iter().position(|n| n == "redis").unwrap();
     let app_pos = order.iter().position(|n| n == "app").unwrap();
     assert!(redis_pos < app_pos, "redis must start before app");
@@ -10427,7 +10427,7 @@ fn test_compose_tmpfs_parse_and_validate() {
 fn test_compose_health_check_parse() {
     // Verifies all health-check expression forms parse into the correct HealthCheck
     // variants without requiring root or image pulls.
-    use remora::compose::HealthCheck;
+    use pelagos::compose::HealthCheck;
 
     let input = r#"
 (compose
@@ -10474,7 +10474,7 @@ fn test_compose_health_check_parse() {
     (network net)))
 "#;
 
-    let compose = remora::compose::parse_compose(input).expect("should parse");
+    let compose = pelagos::compose::parse_compose(input).expect("should parse");
     assert_eq!(compose.services.len(), 7);
 
     let find = |name: &str| {
@@ -10540,7 +10540,7 @@ fn test_lisp_compose_basic() {
     // spec via compose-up, then assert the ComposeFile has the right structure.
     // Does not spawn containers; exercises the parser + evaluator + domain
     // builtins end-to-end.
-    use remora::lisp::Interpreter;
+    use pelagos::lisp::Interpreter;
 
     let mut interp = Interpreter::new();
     interp
@@ -10597,7 +10597,7 @@ fn test_lisp_compose_basic() {
 #[test]
 fn test_lisp_evaluator_tco_and_higher_order() {
     // Purely evaluator-level test: no domain builtins needed.
-    use remora::lisp::Interpreter;
+    use pelagos::lisp::Interpreter;
 
     let mut interp = Interpreter::new();
 
@@ -10610,7 +10610,7 @@ fn test_lisp_evaluator_tco_and_higher_order() {
              (sum-to 10000)",
         )
         .expect("eval failed");
-    assert_eq!(sum, remora::lisp::Value::Int(50005000));
+    assert_eq!(sum, pelagos::lisp::Value::Int(50005000));
 
     // map + lambda.
     let squares = interp
@@ -10618,7 +10618,7 @@ fn test_lisp_evaluator_tco_and_higher_order() {
         .expect("map failed");
     let items = squares.to_vec().expect("not a list");
     assert_eq!(items.len(), 5);
-    assert_eq!(items[4], remora::lisp::Value::Int(25));
+    assert_eq!(items[4], pelagos::lisp::Value::Int(25));
 }
 // ---------------------------------------------------------------------------
 // Lisp .reml fixture tests (no root required)
@@ -10629,7 +10629,7 @@ fn test_lisp_eval_file_web_stack_fixture() {
     // Read the actual compose.reml fixture from disk via eval_file().
     // Exercises the full path: file I/O → parse_all → eval → domain builtins.
     // Does not start containers.
-    use remora::lisp::Interpreter;
+    use pelagos::lisp::Interpreter;
 
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/compose/web-stack/compose.reml");
@@ -10682,7 +10682,7 @@ fn test_lisp_eval_file_web_stack_fixture() {
     assert!(
         matches!(
             app.depends_on[0].health_check,
-            Some(remora::compose::HealthCheck::Port(6379))
+            Some(pelagos::compose::HealthCheck::Port(6379))
         ),
         "app should depend on redis:6379 TCP check"
     );
@@ -10696,7 +10696,7 @@ fn test_lisp_eval_file_web_stack_fixture() {
     assert!(
         matches!(
             proxy.depends_on[0].health_check,
-            Some(remora::compose::HealthCheck::Port(5000))
+            Some(pelagos::compose::HealthCheck::Port(5000))
         ),
         "proxy should depend on app:5000 TCP check"
     );
@@ -10720,7 +10720,7 @@ fn test_lisp_eval_file_web_stack_fixture() {
 fn test_lisp_depends_on_with_port() {
     // Unit-level test for the (list 'depends-on "svc" N) → HealthCheck::Port(N)
     // extension to the service builtin.
-    use remora::lisp::Interpreter;
+    use pelagos::lisp::Interpreter;
 
     let mut interp = Interpreter::new();
     interp
@@ -10753,7 +10753,7 @@ fn test_lisp_depends_on_with_port() {
     assert!(
         matches!(
             dep_db.health_check,
-            Some(remora::compose::HealthCheck::Port(5432))
+            Some(pelagos::compose::HealthCheck::Port(5432))
         ),
         "db dependency should have Port(5432)"
     );
@@ -10773,7 +10773,7 @@ fn test_lisp_depends_on_with_port() {
 fn test_lisp_env_fallback_and_override() {
     // Verifies (env "VAR") returns Nil when unset, and that the fallback
     // pattern (if (null? p) default ...) produces the default value.
-    use remora::lisp::Interpreter;
+    use pelagos::lisp::Interpreter;
 
     // Ensure the test var is absent.
     std::env::remove_var("_REMORA_TEST_PORT");
@@ -10787,7 +10787,7 @@ fn test_lisp_env_fallback_and_override() {
                  (if (null? p) 9999 (string->number p)))"#,
         )
         .expect("eval failed");
-    assert_eq!(v, remora::lisp::Value::Int(9999));
+    assert_eq!(v, pelagos::lisp::Value::Int(9999));
 
     // With var set: should use the provided value.
     std::env::set_var("_REMORA_TEST_PORT", "1234");
@@ -10797,7 +10797,7 @@ fn test_lisp_env_fallback_and_override() {
                  (if (null? p) 9999 (string->number p)))"#,
         )
         .expect("eval failed");
-    assert_eq!(v2, remora::lisp::Value::Int(1234));
+    assert_eq!(v2, pelagos::lisp::Value::Int(1234));
 
     std::env::remove_var("_REMORA_TEST_PORT");
 }
@@ -10807,8 +10807,8 @@ fn test_lisp_eval_file_jupyter_fixture() {
     // Parse and evaluate the actual examples/compose/jupyter/compose.reml file.
     // Validates that the Jupyter stack's compose.reml produces the expected
     // ComposeFile structure without requiring root or running any containers.
-    use remora::compose::{HealthCheck, ServiceSpec};
-    use remora::lisp::Interpreter;
+    use pelagos::compose::{HealthCheck, ServiceSpec};
+    use pelagos::lisp::Interpreter;
 
     let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples/compose/jupyter/compose.reml");
@@ -11042,15 +11042,15 @@ fn test_lisp_container_spawn_hardening() {
     }
 
     // Skip if the alpine image is not already pulled.
-    if remora::image::load_image("alpine:latest").is_err() {
+    if pelagos::image::load_image("alpine:latest").is_err() {
         eprintln!(
             "SKIP: test_lisp_container_spawn_hardening requires alpine:latest in image store"
         );
         return;
     }
 
-    use remora::lisp::Interpreter;
-    use remora::lisp::Value;
+    use pelagos::lisp::Interpreter;
+    use pelagos::lisp::Value;
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut interp = Interpreter::new_with_runtime("test-iso".into(), tmp.path().to_path_buf());
@@ -11757,8 +11757,8 @@ mod image_tag {
 
 mod healthcheck_tests {
     use super::*;
-    use remora::build::parse_remfile;
-    use remora::image::HealthConfig;
+    use pelagos::build::parse_remfile;
+    use pelagos::image::HealthConfig;
 
     /// test_healthcheck_exec_true
     ///
@@ -12081,7 +12081,7 @@ mod healthcheck_tests {
         let content = "FROM alpine\nHEALTHCHECK --interval=5s --retries=2 CMD /bin/check.sh";
         let instrs = parse_remfile(content).unwrap();
         match &instrs[1] {
-            remora::build::Instruction::Healthcheck {
+            pelagos::build::Instruction::Healthcheck {
                 cmd,
                 interval_secs,
                 retries,
@@ -12099,7 +12099,7 @@ mod healthcheck_tests {
             r#"FROM alpine\nHEALTHCHECK CMD ["pg_isready", "-U", "postgres"]"#.replace("\\n", "\n");
         let instrs2 = parse_remfile(&content2).unwrap();
         match &instrs2[1] {
-            remora::build::Instruction::Healthcheck { cmd, .. } => {
+            pelagos::build::Instruction::Healthcheck { cmd, .. } => {
                 assert_eq!(cmd, &["pg_isready", "-U", "postgres"]);
             }
             other => panic!("expected Healthcheck, got {:?}", other),
@@ -12109,7 +12109,7 @@ mod healthcheck_tests {
         let content3 = "FROM alpine\nHEALTHCHECK NONE";
         let instrs3 = parse_remfile(content3).unwrap();
         match &instrs3[1] {
-            remora::build::Instruction::Healthcheck { cmd, .. } => {
+            pelagos::build::Instruction::Healthcheck { cmd, .. } => {
                 assert!(cmd.is_empty(), "NONE should produce empty cmd");
             }
             other => panic!("expected Healthcheck, got {:?}", other),
@@ -12156,7 +12156,7 @@ mod healthcheck_tests {
     /// This test drives the library-level mechanism:
     /// 1. Start a container running `sleep 60` with a PID namespace.
     /// 2. Spawn a "probe" (`sleep 300`) inside the container's chroot using
-    ///    `remora::container::Command`; record its PID.
+    ///    `pelagos::container::Command`; record its PID.
     /// 3. Verify the probe child is alive.
     /// 4. Send `SIGKILL` to the probe child (as `run_probe` does on timeout).
     /// 5. Verify the probe child is dead.

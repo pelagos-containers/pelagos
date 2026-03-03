@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use remora::image::HealthConfig;
+pub use pelagos::image::HealthConfig;
 
 /// Health status of a container (tracks persistent health monitor state).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -39,7 +39,7 @@ pub mod volume;
 // ---------------------------------------------------------------------------
 
 pub fn containers_dir() -> PathBuf {
-    remora::paths::containers_dir()
+    pelagos::paths::containers_dir()
 }
 
 pub fn container_dir(name: &str) -> PathBuf {
@@ -51,7 +51,7 @@ pub fn state_path(name: &str) -> PathBuf {
 }
 
 pub fn rootfs_store() -> PathBuf {
-    remora::paths::rootfs_store_dir()
+    pelagos::paths::rootfs_store_dir()
 }
 
 /// Resolve a named rootfs to its absolute path.
@@ -212,7 +212,7 @@ pub fn check_liveness(pid: i32) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn generate_name() -> std::io::Result<String> {
-    let counter = remora::paths::counter_file();
+    let counter = pelagos::paths::counter_file();
     if let Some(parent) = counter.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -260,7 +260,7 @@ pub fn parse_cpus(s: &str) -> Result<(i64, u64), String> {
     Ok((quota_us, period_us))
 }
 
-/// Parse --user "1000" or "1000:1000" → (uid, Option<gid>).
+/// Parse --user "1000" or "1000:1000" → `(uid, Option<gid>)`.
 /// Resolves symbolic names against the host /etc/passwd only.
 /// Use `parse_user_in_layers` when an image rootfs is available.
 pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
@@ -424,7 +424,7 @@ pub fn parse_ulimit(
     s: &str,
 ) -> Result<
     (
-        remora::container::RlimitResource,
+        pelagos::container::RlimitResource,
         libc::rlim_t,
         libc::rlim_t,
     ),
@@ -463,8 +463,8 @@ pub fn parse_ulimit(
 }
 
 /// Parse a capability name like "CAP_NET_RAW" or "NET_RAW" to Capability bitflag.
-pub fn parse_capability(s: &str) -> Result<remora::container::Capability, String> {
-    use remora::container::Capability;
+pub fn parse_capability(s: &str) -> Result<pelagos::container::Capability, String> {
+    use pelagos::container::Capability;
     let name = s.trim().to_ascii_uppercase();
     let name = name.strip_prefix("CAP_").unwrap_or(&name);
     match name {
@@ -535,8 +535,8 @@ fn iso8601_to_epoch(s: &str) -> Option<u64> {
 /// Accepts bare names (`"net-raw"`, `"NET_RAW"`) or prefixed (`"CAP_NET_RAW"`),
 /// case-insensitive, with `-` or `_` as separators.  Unrecognised names are
 /// logged at warn level and skipped.
-pub fn parse_capability_mask(names: &[String]) -> remora::container::Capability {
-    use remora::container::Capability;
+pub fn parse_capability_mask(names: &[String]) -> pelagos::container::Capability {
+    use pelagos::container::Capability;
     let mut mask = Capability::empty();
     for name in names {
         let normalised = name

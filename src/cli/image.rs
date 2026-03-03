@@ -1,6 +1,6 @@
 //! `remora image` — pull, list, remove, push, login, logout for OCI images.
 
-use remora::image::{
+use pelagos::image::{
     self, blob_exists, extract_layer, layer_dirs, layer_exists, list_images, load_image,
     remove_image, save_image, HealthConfig, ImageConfig, ImageManifest,
 };

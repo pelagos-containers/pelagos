@@ -5,8 +5,8 @@ use super::{
     parse_memory, parse_ulimit, parse_user, parse_user_in_layers, rootfs_path, write_state,
     ContainerState, ContainerStatus, HealthConfig, HealthStatus,
 };
-use remora::container::{Capability, Command, Namespace, Stdio, Volume};
-use remora::network::NetworkMode;
+use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
+use pelagos::network::NetworkMode;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -58,7 +58,7 @@ pub struct RunArgs {
     #[clap(long = "bind-ro")]
     pub bind_ro: Vec<String>,
 
-    /// tmpfs mount /path[:options] (repeatable)
+    /// tmpfs mount `/path[:options]` (repeatable)
     #[clap(long = "tmpfs")]
     pub tmpfs: Vec<String>,
 
@@ -78,7 +78,7 @@ pub struct RunArgs {
     #[clap(long = "workdir", short = 'w')]
     pub workdir: Option<String>,
 
-    /// UID[:GID] to run as (e.g. 1000 or 1000:1000)
+    /// `UID[:GID]` to run as (e.g. 1000 or 1000:1000)
     #[clap(long = "user", short = 'u')]
     pub user: Option<String>,
 
@@ -178,7 +178,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
     // Validate additional networks exist.
     for net_name in &additional_networks {
-        let config = remora::paths::network_config_dir(net_name).join("config.json");
+        let config = pelagos::paths::network_config_dir(net_name).join("config.json");
         if !config.exists() {
             return Err(format!(
                 "additional network '{}' not found — create it first: remora network create {} --subnet CIDR",
@@ -238,11 +238,11 @@ fn build_image_run(
     args: &RunArgs,
     image_ref: &str,
     cmd_args: &[String],
-    port_forwards: &[(u16, u16, remora::network::PortProto)],
+    port_forwards: &[(u16, u16, pelagos::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
 ) -> Result<ImageRunResult, Box<dyn std::error::Error>> {
-    use remora::image;
+    use pelagos::image;
 
     // Try loading the raw reference first (locally-built images), then normalised.
     let (full_ref, manifest) = if let Ok(m) = image::load_image(image_ref) {
@@ -336,7 +336,7 @@ fn build_command(
     args: &RunArgs,
     rootfs_dir: &std::path::Path,
     exe_and_args: &[String],
-    port_forwards: &[(u16, u16, remora::network::PortProto)],
+    port_forwards: &[(u16, u16, pelagos::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
 ) -> Result<Command, Box<dyn std::error::Error>> {
@@ -359,7 +359,7 @@ fn build_command(
 fn apply_cli_options(
     mut cmd: Command,
     args: &RunArgs,
-    port_forwards: &[(u16, u16, remora::network::PortProto)],
+    port_forwards: &[(u16, u16, pelagos::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
 ) -> Result<Command, Box<dyn std::error::Error>> {
@@ -371,7 +371,7 @@ fn apply_cli_options(
         cmd = cmd.with_additional_network(net_name);
     }
     for &(host, container, proto) in port_forwards {
-        use remora::network::PortProto;
+        use pelagos::network::PortProto;
         cmd = match proto {
             PortProto::Tcp => cmd.with_port_forward(host, container),
             PortProto::Udp => cmd.with_port_forward_udp(host, container),
@@ -566,7 +566,7 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>
         "pasta" => Ok(NetworkMode::Pasta),
         name => {
             // Check if it's a named network.
-            let config = remora::paths::network_config_dir(name).join("config.json");
+            let config = pelagos::paths::network_config_dir(name).join("config.json");
             if config.exists() {
                 Ok(NetworkMode::BridgeNamed(name.to_string()))
             } else {
@@ -584,8 +584,8 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>
 #[allow(clippy::type_complexity)]
 fn parse_port_forwards(
     specs: &[String],
-) -> Result<Vec<(u16, u16, remora::network::PortProto)>, Box<dyn std::error::Error>> {
-    use remora::network::PortProto;
+) -> Result<Vec<(u16, u16, pelagos::network::PortProto)>, Box<dyn std::error::Error>> {
+    use pelagos::network::PortProto;
     let mut out = Vec::new();
     for s in specs {
         // Accept HOST:CONTAINER[/tcp|/udp|/both]
@@ -860,11 +860,11 @@ fn register_dns(container_name: &str, network_ips: &[(String, String)]) {
             Ok(ip) => ip,
             Err(_) => continue,
         };
-        let net_def = match remora::network::load_network_def(net_name) {
+        let net_def = match pelagos::network::load_network_def(net_name) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        if let Err(e) = remora::dns::dns_add_entry(
+        if let Err(e) = pelagos::dns::dns_add_entry(
             net_name,
             container_name,
             ip,
@@ -884,7 +884,7 @@ fn register_dns(container_name: &str, network_ips: &[(String, String)]) {
 /// Deregister a container from the embedded DNS daemon for each bridge network.
 fn deregister_dns(container_name: &str, network_ips: &[(String, String)]) {
     for (net_name, _ip_str) in network_ips {
-        if let Err(e) = remora::dns::dns_remove_entry(net_name, container_name) {
+        if let Err(e) = pelagos::dns::dns_remove_entry(net_name, container_name) {
             log::warn!(
                 "dns: failed to deregister '{}' from {}: {}",
                 container_name,
@@ -904,28 +904,28 @@ mod tests {
         let specs = vec!["8080:80".to_string()];
         let fwds = parse_port_forwards(&specs).unwrap();
         assert_eq!(fwds.len(), 1);
-        assert_eq!(fwds[0], (8080, 80, remora::network::PortProto::Tcp));
+        assert_eq!(fwds[0], (8080, 80, pelagos::network::PortProto::Tcp));
     }
 
     #[test]
     fn test_parse_port_forwards_explicit_tcp() {
         let specs = vec!["8080:80/tcp".to_string()];
         let fwds = parse_port_forwards(&specs).unwrap();
-        assert_eq!(fwds[0], (8080, 80, remora::network::PortProto::Tcp));
+        assert_eq!(fwds[0], (8080, 80, pelagos::network::PortProto::Tcp));
     }
 
     #[test]
     fn test_parse_port_forwards_udp() {
         let specs = vec!["5353:53/udp".to_string()];
         let fwds = parse_port_forwards(&specs).unwrap();
-        assert_eq!(fwds[0], (5353, 53, remora::network::PortProto::Udp));
+        assert_eq!(fwds[0], (5353, 53, pelagos::network::PortProto::Udp));
     }
 
     #[test]
     fn test_parse_port_forwards_both() {
         let specs = vec!["53:53/both".to_string()];
         let fwds = parse_port_forwards(&specs).unwrap();
-        assert_eq!(fwds[0], (53, 53, remora::network::PortProto::Both));
+        assert_eq!(fwds[0], (53, 53, pelagos::network::PortProto::Both));
     }
 
     #[test]
@@ -933,8 +933,8 @@ mod tests {
         let specs = vec!["80:80/tcp".to_string(), "5353:53/udp".to_string()];
         let fwds = parse_port_forwards(&specs).unwrap();
         assert_eq!(fwds.len(), 2);
-        assert_eq!(fwds[0].2, remora::network::PortProto::Tcp);
-        assert_eq!(fwds[1].2, remora::network::PortProto::Udp);
+        assert_eq!(fwds[0].2, pelagos::network::PortProto::Tcp);
+        assert_eq!(fwds[1].2, pelagos::network::PortProto::Udp);
     }
 
     #[test]
