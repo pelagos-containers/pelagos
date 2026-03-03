@@ -10,7 +10,6 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 | #52 | epic: AppArmor / SELinux profile support | epic |
-| #53 | chore: publish remora as a crate on crates.io | chore/quick |
 | #56 | epic: Wasm/WASI shim mode (WasmMode) | epic |
 | #57 | feat(wasm): detect Wasm binary and select runtime (wasmtime/WasmEdge) | feat |
 | #58 | feat(wasm): OCI Wasm artifact support | feat |
@@ -21,10 +20,12 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #63 | feat(mac): AppArmor profile template (sub of #51) | feat |
 | #64 | feat(mac): SELinux process label support (sub of #51) | feat |
 
-## Conformance Baseline (as of 2026-03-02, v0.19.0)
+## Conformance Baseline (as of 2026-03-03, SHA 6eb7283)
 
 - Integration tests: **190/190 pass**
+- E2E tests: **81 pass, 1 skipped**
 - OCI conformance (runtime-tools): **33 PASS / 4 FAIL** (4 are unfixable upstream bugs — #47, #48, #49)
+- **Published to crates.io as `pelagos v0.1.0`** (crate name; CLI binary remains `remora`)
 
 ## Session Notes
 
