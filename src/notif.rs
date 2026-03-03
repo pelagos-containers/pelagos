@@ -333,7 +333,7 @@ pub fn run_supervisor_loop(notif_fd: i32, handler: Arc<dyn SyscallHandler>) {
         let ret = unsafe {
             libc::ioctl(
                 notif_fd,
-                SECCOMP_IOCTL_NOTIF_RECV,
+                SECCOMP_IOCTL_NOTIF_RECV as _,
                 &mut notif as *mut SeccompNotifRaw,
             )
         };
@@ -387,7 +387,7 @@ pub fn run_supervisor_loop(notif_fd: i32, handler: Arc<dyn SyscallHandler>) {
         let ret = unsafe {
             libc::ioctl(
                 notif_fd,
-                SECCOMP_IOCTL_NOTIF_SEND,
+                SECCOMP_IOCTL_NOTIF_SEND as _,
                 &resp as *const SeccompNotifResp,
             )
         };
