@@ -1389,7 +1389,7 @@ impl Command {
     /// Attach an additional bridge network to this container.
     ///
     /// The container must already have a primary bridge network set via
-    /// [`with_network`]. Each additional network gets a secondary interface
+    /// [`Self::with_network`]. Each additional network gets a secondary interface
     /// (`eth1`, `eth2`, ...) with a subnet route only (no default route).
     ///
     /// # Example
@@ -1428,7 +1428,7 @@ impl Command {
 
     /// Forward a host port into the container (TCP only).
     ///
-    /// Requires [`NetworkMode::Bridge`] and [`with_nat`](Self::with_nat) (for the
+    /// Requires [`crate::network::NetworkMode::Bridge`] and [`with_nat`](Self::with_nat) (for the
     /// nftables table to already exist). Installs a DNAT rule via nftables so that
     /// connections to `host_port` on any host interface are redirected to
     /// `container_port` on the container's IP.
@@ -1959,7 +1959,7 @@ impl Command {
 
     /// Add a read-only bind mount from a host directory into the container.
     ///
-    /// Identical to [`with_bind_mount`] but the mount is read-only inside the container.
+    /// Identical to [`Self::with_bind_mount`] but the mount is read-only inside the container.
     pub fn with_bind_mount_ro<P1, P2>(mut self, source: P1, target: P2) -> Self
     where
         P1: Into<PathBuf>,
@@ -2041,7 +2041,7 @@ impl Command {
 
     /// Mount a named volume at `target` inside the container.
     ///
-    /// This is syntactic sugar for [`with_bind_mount`] using the volume's host path.
+    /// This is syntactic sugar for [`Self::with_bind_mount`] using the volume's host path.
     pub fn with_volume<P: Into<PathBuf>>(self, vol: &Volume, target: P) -> Self {
         self.with_bind_mount(vol.path.clone(), target)
     }

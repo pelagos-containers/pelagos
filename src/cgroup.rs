@@ -4,7 +4,7 @@
 //! creating, configuring, and tearing down cgroups for containerized processes.
 //!
 //! The cgroup lifecycle is managed entirely from the **parent process**:
-//! 1. [`CgroupConfig`] is built via [`Command`] builder methods.
+//! 1. [`CgroupConfig`] is built via [`crate::container::Command`] builder methods.
 //! 2. After fork+exec, the parent creates the cgroup and adds the child PID.
 //! 3. After the child exits, the parent deletes the cgroup.
 //!

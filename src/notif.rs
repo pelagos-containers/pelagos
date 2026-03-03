@@ -66,7 +66,7 @@ pub struct SyscallNotif {
     pub arch: u32,
     /// Instruction pointer at the time of the syscall.
     pub instruction_pointer: u64,
-    /// Syscall arguments (args[0]..args[5]).
+    /// Syscall arguments (`args[0]`..`args[5]`).
     pub args: [u64; 6],
 }
 

@@ -395,7 +395,7 @@ pub struct OciState {
     /// Bridge IP address, populated when using bridge networking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_ip: Option<String>,
-    /// Process start time in jiffies from /proc/<pid>/stat field 22.
+    /// Process start time in jiffies from `/proc/<pid>/stat` field 22.
     ///
     /// Stored at create time and compared at state/kill time to detect PID reuse.
     /// If the current starttime differs from this value, the original container
@@ -1871,7 +1871,7 @@ fn is_zombie_pid(pid: libc::pid_t) -> bool {
         .unwrap_or(false)
 }
 
-/// Read the process start time (field 22) from /proc/<pid>/stat.
+/// Read the process start time (field 22) from `/proc/<pid>/stat`.
 ///
 /// The starttime field is the number of clock ticks since boot at which the
 /// process started. It is monotonic, never reused for a different process
@@ -1880,7 +1880,7 @@ fn is_zombie_pid(pid: libc::pid_t) -> bool {
 /// Used to detect PID reuse: if `state.pid_start_time` differs from the value
 /// read here, a new unrelated process has claimed the original container's PID.
 ///
-/// Returns None if /proc/<pid>/stat is unreadable or unparseable.
+/// Returns None if `/proc/<pid>/stat` is unreadable or unparseable.
 pub fn read_pid_start_time(pid: libc::pid_t) -> Option<u64> {
     let stat_path = format!("/proc/{}/stat", pid);
     let contents = fs::read_to_string(&stat_path).ok()?;

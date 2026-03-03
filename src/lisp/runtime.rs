@@ -1,7 +1,7 @@
 //! Imperative runtime builtins for the Lisp interpreter.
 //!
 //! Registered only when the interpreter is created via
-//! [`Interpreter::new_with_runtime`].  Not available in plain `Interpreter::new()`.
+//! [`super::Interpreter::new_with_runtime`].  Not available in plain `Interpreter::new()`.
 //!
 //! # Available functions
 //!

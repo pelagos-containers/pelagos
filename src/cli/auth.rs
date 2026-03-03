@@ -373,7 +373,7 @@ fn base64_decode(b64: &str) -> Option<Vec<u8>> {
         }
     }
     let clean: Vec<u8> = b64.bytes().filter(|&b| !b" \t\r\n".contains(&b)).collect();
-    if !clean.len().is_multiple_of(4) {
+    if clean.len() % 4 != 0 {
         return None;
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);

@@ -2,7 +2,7 @@
 name = "remora"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.76"
 description = "Fast Linux container runtime — OCI-compatible, namespaces, cgroups v2, seccomp, networking, image management"
 license = "Apache-2.0"
 repository = "https://github.com/skeptomai/remora"
@@ -10,6 +10,14 @@ homepage = "https://github.com/skeptomai/remora"
 readme = "README.md"
 keywords = ["container", "runtime", "linux", "namespaces", "oci"]
 categories = ["os::linux-apis", "command-line-utilities", "virtualization"]
+exclude = [
+    "scripts/",
+    "docs/",
+    "alpine-rootfs/",
+    ".github/",
+    "ONGOING_TASKS.md",
+    "CLAUDE.md",
+]
 
 [dependencies]
 log = "0.4"
