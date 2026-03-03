@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# bench-coldstart.sh — measure remora container cold-start latency
+#
+# Usage:
+#   sudo ./scripts/bench-coldstart.sh [--runs N] [--warmup N] [--compare]
+#
+# Requires: root (remora run needs namespaces), hyperfine, alpine image pulled.
+#
+# Outputs:
+#   - Median / mean / stddev cold-start time for remora
+#   - With --compare: also benchmarks crun and runc if available
+#   - Results written to scripts/bench-results.md (appended with timestamp)
+#
+# The measured command is the minimal useful workload:
+#   remora run --rm alpine /bin/true
+# This exercises: image layer mount, namespace creation, cgroup setup,
+# seccomp compile+load, exec, and teardown.
+
+set -euo pipefail
+
+REMORA="${REMORA:-$(dirname "$0")/../target/release/remora}"
+RUNS="${RUNS:-20}"
+WARMUP="${WARMUP:-3}"
+COMPARE=0
+OUTPUT="$(dirname "$0")/bench-results.md"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --runs)    RUNS="$2";    shift 2 ;;
+        --warmup)  WARMUP="$2";  shift 2 ;;
+        --compare) COMPARE=1;    shift   ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+    echo "error: must run as root (container creation requires CAP_SYS_ADMIN)"
+    exit 1
+fi
+
+if ! command -v hyperfine &>/dev/null; then
+    echo "error: hyperfine not found — install with: cargo install hyperfine"
+    exit 1
+fi
+
+if [[ ! -x "$REMORA" ]]; then
+    echo "error: remora binary not found at $REMORA"
+    echo "       build with: cargo build --release"
+    exit 1
+fi
+
+REMORA_VERSION="$("$REMORA" --version 2>/dev/null || echo unknown)"
+KERNEL="$(uname -r)"
+DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+echo "=== remora cold-start benchmark ==="
+echo "Binary:  $REMORA ($REMORA_VERSION)"
+echo "Kernel:  $KERNEL"
+echo "Runs:    $RUNS (warmup: $WARMUP)"
+echo ""
+
+CMDS=("$REMORA run --rm alpine /bin/true")
+LABELS=("remora")
+
+if [[ $COMPARE -eq 1 ]]; then
+    for rt in crun runc; do
+        if command -v "$rt" &>/dev/null; then
+            echo "Found $rt — will include in comparison"
+            # These need a pre-created OCI bundle; skip if no bundle present.
+            # For now just note availability.
+            echo "  (note: crun/runc require an OCI bundle — comparison not implemented yet)"
+        fi
+    done
+fi
+
+# Run hyperfine
+hyperfine \
+    --runs "$RUNS" \
+    --warmup "$WARMUP" \
+    --shell none \
+    --export-markdown /tmp/bench-hyperfine.md \
+    --export-json /tmp/bench-hyperfine.json \
+    "${CMDS[@]}"
+
+echo ""
+
+# Extract median from JSON
+if command -v python3 &>/dev/null; then
+    MEDIAN_MS=$(python3 -c "
+import json, sys
+data = json.load(open('/tmp/bench-hyperfine.json'))
+r = data['results'][0]
+print(f\"{r['median']*1000:.1f} ms  (mean {r['mean']*1000:.1f} ms, stddev {r['stddev']*1000:.1f} ms, min {r['min']*1000:.1f} ms, max {r['max']*1000:.1f} ms)\")
+")
+    echo "Result: $MEDIAN_MS"
+else
+    MEDIAN_MS="(python3 not available for JSON parsing)"
+fi
+
+# Append to results file
+{
+    echo ""
+    echo "## $DATE"
+    echo ""
+    echo "- **Kernel:** $KERNEL"
+    echo "- **Binary:** $REMORA_VERSION"
+    echo "- **Runs:** $RUNS (warmup: $WARMUP)"
+    echo "- **Command:** \`remora run --rm alpine /bin/true\`"
+    echo "- **Result:** $MEDIAN_MS"
+    echo ""
+    cat /tmp/bench-hyperfine.md
+} >> "$OUTPUT"
+
+echo ""
+echo "Results appended to $OUTPUT"

@@ -12,7 +12,6 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #52 | epic: AppArmor / SELinux profile support | epic |
 | #53 | chore: publish remora as a crate on crates.io | chore/quick |
 | #54 | feat: SECCOMP_RET_USER_NOTIF supervisor mode | feat/significant |
-| #55 | chore: submit remora to OCI runtime benchmark suite | chore/quick |
 | #56 | epic: Wasm/WASI shim mode (WasmMode) | epic |
 | #57 | feat(wasm): detect Wasm binary and select runtime (wasmtime/WasmEdge) | feat |
 | #58 | feat(wasm): OCI Wasm artifact support | feat |

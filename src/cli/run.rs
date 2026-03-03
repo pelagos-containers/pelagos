@@ -21,6 +21,10 @@ pub struct RunArgs {
     #[clap(long, short = 'd')]
     pub detach: bool,
 
+    /// Automatically remove the container when it exits
+    #[clap(long)]
+    pub rm: bool,
+
     /// Allocate a PTY for interactive use (incompatible with --detach)
     #[clap(long, short = 'i')]
     pub interactive: bool,
@@ -222,7 +226,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else if args.interactive {
         run_interactive(cmd)
     } else {
-        run_foreground(name, rootfs_label, exe_and_args, cmd)
+        run_foreground(name, rootfs_label, exe_and_args, cmd, args.rm)
     }
 }
 
@@ -623,6 +627,7 @@ fn run_foreground(
     rootfs: String,
     command: Vec<String>,
     mut cmd: Command,
+    auto_remove: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cmd = cmd
         .stdin(Stdio::Inherit)
@@ -673,10 +678,16 @@ fn run_foreground(
     // Deregister container from DNS.
     deregister_dns(&name, &all_ips);
 
-    // Update final state
-    state2.status = ContainerStatus::Exited;
-    state2.exit_code = Some(code);
-    write_state(&state2)?;
+    if auto_remove {
+        // Remove state directory immediately; ignore errors (best-effort).
+        let dir = super::container_dir(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        // Update final state
+        state2.status = ContainerStatus::Exited;
+        state2.exit_code = Some(code);
+        write_state(&state2)?;
+    }
 
     std::process::exit(code);
 }
