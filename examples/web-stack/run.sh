@@ -11,7 +11,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REMORA="${REMORA:-remora}"
+PELAGOS="${PELAGOS:-pelagos}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,7 +48,7 @@ die() { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
 log "Checking prerequisites..."
 
-command -v "$REMORA" >/dev/null 2>&1 || die "remora not found in PATH. Run: cargo build --release && export PATH=\$PWD/target/release:\$PATH"
+command -v "$PELAGOS" >/dev/null 2>&1 || die "pelagos not found in PATH. Run: cargo build --release && export PATH=\$PWD/target/release:\$PATH"
 
 # Ensure alpine:latest is pulled
 if ! $REMORA image ls 2>/dev/null | grep -q "alpine:latest"; then
@@ -57,7 +57,7 @@ if ! $REMORA image ls 2>/dev/null | grep -q "alpine:latest"; then
 fi
 
 # ── Build Phase ────────────────────────────────────────────────────────
-# remora build now enables NAT + DNS automatically for bridge RUN steps.
+# pelagos build now enables NAT + DNS automatically for bridge RUN steps.
 
 log "Building ${BOLD}web-stack-redis${NC}..."
 $REMORA build -t web-stack-redis --network bridge "$SCRIPT_DIR/redis"
@@ -99,8 +99,8 @@ start_container() {
     # Verify container is still running.
     if ! $REMORA ps 2>/dev/null | grep -q "$name"; then
         echo -e "  ${RED}Container '${name}' exited immediately!${NC}"
-        echo "  stdout: $(cat /run/remora/containers/${name}/stdout.log 2>/dev/null || echo '<empty>')"
-        echo "  stderr: $(cat /run/remora/containers/${name}/stderr.log 2>/dev/null || echo '<empty>')"
+        echo "  stdout: $(cat /run/pelagos/containers/${name}/stdout.log 2>/dev/null || echo '<empty>')"
+        echo "  stderr: $(cat /run/pelagos/containers/${name}/stderr.log 2>/dev/null || echo '<empty>')"
         exit 1
     fi
 }
@@ -125,7 +125,7 @@ echo
 # Port forwarding (localhost:8080) requires hairpin NAT which is not yet
 # implemented; for now we test via the bridge IP directly.
 PROXY_IP=$($REMORA ps 2>/dev/null | awk '/^proxy / {print $3}')
-PROXY_STATE="/run/remora/containers/proxy/state.json"
+PROXY_STATE="/run/pelagos/containers/proxy/state.json"
 if [ -f "$PROXY_STATE" ]; then
     PROXY_IP=$(python3 -c "import json; print(json.load(open('$PROXY_STATE')).get('bridge_ip',''))" 2>/dev/null || true)
 fi
@@ -172,7 +172,7 @@ fi
 
 # Test 4: Post a note
 BODY=$($CURL -X POST -H 'Content-Type: application/json' \
-    -d '{"text":"hello from remora"}' \
+    -d '{"text":"hello from pelagos"}' \
     "$BASE/api/notes" 2>/dev/null || true)
 if echo "$BODY" | grep -q '"ok"'; then
     ok "POST /api/notes — note created"
@@ -182,14 +182,14 @@ fi
 
 # Test 5: Verify note persisted
 BODY=$($CURL "$BASE/api/notes" 2>/dev/null || true)
-if echo "$BODY" | grep -q "hello from remora"; then
+if echo "$BODY" | grep -q "hello from pelagos"; then
     ok "GET /api/notes — note persisted"
 else
     fail "GET /api/notes — expected note in list, got: $BODY"
 fi
 
 # Test 6: Network isolation — proxy (frontend only) cannot reach redis (backend only)
-REDIS_STATE="/run/remora/containers/redis/state.json"
+REDIS_STATE="/run/pelagos/containers/redis/state.json"
 REDIS_IP=""
 if [ -f "$REDIS_STATE" ]; then
     REDIS_IP=$(python3 -c "import json; print(json.load(open('$REDIS_STATE')).get('bridge_ip',''))" 2>/dev/null || true)

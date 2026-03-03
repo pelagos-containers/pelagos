@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'remora'",
+            "name": "Debug executable 'pelagos'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=remora",
-                    "--package=remora"
+                    "--bin=pelagos",
+                    "--package=pelagos"
                 ],
                 "filter": {
-                    "name": "remora",
+                    "name": "pelagos",
                     "kind": "bin"
                 }
             },
@@ -26,16 +26,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'remora'",
+            "name": "Debug unit tests in executable 'pelagos'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=remora",
-                    "--package=remora"
+                    "--bin=pelagos",
+                    "--package=pelagos"
                 ],
                 "filter": {
-                    "name": "remora",
+                    "name": "pelagos",
                     "kind": "bin"
                 }
             },

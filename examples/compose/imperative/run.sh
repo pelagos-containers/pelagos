@@ -14,7 +14,7 @@
 #   parallel    compose-eager-parallel.reml    — eager parallel: container-start-bg/join
 #
 # Options:
-#   REMORA=path   Override remora binary (default: auto-detect from cargo build)
+#   PELAGOS=path   Override pelagos binary (default: auto-detect from cargo build)
 
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -25,18 +25,18 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 EXAMPLE="${1:-graph}"
-REMORA="${REMORA:-}"
+PELAGOS="${REMORA:-}"
 
-# Auto-detect remora binary.
-if [ -z "$REMORA" ]; then
-    if [ -f "./target/debug/remora" ]; then
-        REMORA="./target/debug/remora"
-    elif [ -f "./target/release/remora" ]; then
-        REMORA="./target/release/remora"
+# Auto-detect pelagos binary.
+if [ -z "$PELAGOS" ]; then
+    if [ -f "./target/debug/pelagos" ]; then
+        PELAGOS="./target/debug/pelagos"
+    elif [ -f "./target/release/pelagos" ]; then
+        PELAGOS="./target/release/pelagos"
     else
-        echo "==> Building remora..."
-        cargo build --bin remora
-        REMORA="./target/debug/remora"
+        echo "==> Building pelagos..."
+        cargo build --bin pelagos
+        PELAGOS="./target/debug/pelagos"
     fi
 fi
 
@@ -79,11 +79,11 @@ log "Example: $EXAMPLE  →  $COMPOSE_FILE"
 
 log "Checking images..."
 for image in "${IMAGES[@]}"; do
-    if "$REMORA" image ls 2>/dev/null | grep -qF "$image"; then
+    if "$PELAGOS" image ls 2>/dev/null | grep -qF "$image"; then
         echo "  $image already present"
     else
         echo "  pulling $image..."
-        "$REMORA" image pull "$image"
+        "$PELAGOS" image pull "$image"
     fi
 done
 
@@ -91,4 +91,4 @@ done
 
 log "Running $COMPOSE_FILE (project: $PROJECT)"
 echo
-RUST_LOG=info "$REMORA" compose up -f "$COMPOSE_FILE" -p "$PROJECT"
+RUST_LOG=info "$PELAGOS" compose up -f "$COMPOSE_FILE" -p "$PROJECT"

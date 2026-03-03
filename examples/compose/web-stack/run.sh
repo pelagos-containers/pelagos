@@ -3,7 +3,7 @@
 # Remora Compose Web Stack Demo
 # ==============================
 # The same 3-container blog stack as examples/web-stack, but
-# orchestrated with `remora compose` instead of imperative shell.
+# orchestrated with `pelagos compose` instead of imperative shell.
 #
 # Usage:  sudo ./examples/compose/web-stack/run.sh
 #
@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEB_STACK_DIR="$(cd "$SCRIPT_DIR/../../web-stack" && pwd)"
-REMORA="${REMORA:-remora}"
+PELAGOS="${PELAGOS:-pelagos}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,8 +28,8 @@ ok()   { echo -e "  ${GREEN}PASS${NC} $*"; pass=$((pass + 1)); }
 fail() { echo -e "  ${RED}FAIL${NC} $*"; fail=$((fail + 1)); }
 die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
-command -v "$REMORA" >/dev/null 2>&1 || \
-    die "remora not found in PATH.  Run: cargo build --release && export PATH=\$PWD/target/release:\$PATH"
+command -v "$PELAGOS" >/dev/null 2>&1 || \
+    die "pelagos not found in PATH.  Run: cargo build --release && export PATH=\$PWD/target/release:\$PATH"
 
 # ── Build Phase ───────────────────────────────────────────────────
 # Images are built once from the existing web-stack Remfiles.
@@ -114,7 +114,7 @@ fi
 
 # Test 4: Post a note
 BODY=$($CURL -X POST -H 'Content-Type: application/json' \
-    -d '{"text":"hello from remora compose"}' \
+    -d '{"text":"hello from pelagos compose"}' \
     "$BASE/api/notes" 2>/dev/null || true)
 if echo "$BODY" | grep -q '"ok"'; then
     ok "POST /api/notes — note created"
@@ -124,7 +124,7 @@ fi
 
 # Test 5: Verify note persisted
 BODY=$($CURL "$BASE/api/notes" 2>/dev/null || true)
-if echo "$BODY" | grep -q "hello from remora compose"; then
+if echo "$BODY" | grep -q "hello from pelagos compose"; then
     ok "GET /api/notes — note persisted through redis"
 else
     fail "GET /api/notes — expected note in list, got: $BODY"

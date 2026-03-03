@@ -11,7 +11,7 @@
 pub mod builtins;
 pub mod env;
 pub mod eval;
-pub mod remora;
+pub mod pelagos;
 pub mod runtime;
 pub mod value;
 
@@ -21,13 +21,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::sexpr;
-pub use remora::{HookFn, HookMap, PendingCompose};
+pub use pelagos::{HookFn, HookMap, PendingCompose};
 pub use value::{LispError, Value};
 
 use builtins::register_builtins;
 use env::{Env, EnvFrame};
 use eval::eval;
-use remora::register_remora_builtins;
+use pelagos::register_pelagos_builtins;
 
 /// A self-contained Lisp interpreter instance.
 pub struct Interpreter {
@@ -57,7 +57,7 @@ impl Interpreter {
             Arc::new(Mutex::new(Vec::new()));
 
         register_builtins(&global_env);
-        register_remora_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
+        register_pelagos_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
 
         let mut interp = Interpreter {
             global_env,

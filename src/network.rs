@@ -14,7 +14,7 @@
 //! ### Why named netns (not /proc/{pid}/ns/net)?
 //!
 //! The primary reason is **debuggability**: named netns are visible via
-//! `ip netns list` and inspectable with `ip netns exec remora-foo ip addr`
+//! `ip netns list` and inspectable with `ip netns exec pelagos-foo ip addr`
 //! from the host. Anonymous namespaces via `/proc/{pid}/ns/net` offer none
 //! of that visibility.
 //!
@@ -180,40 +180,40 @@ impl NetworkDef {
         std::fs::write(dir.join("config.json"), json)
     }
 
-    /// nftables table name for this network (e.g. `"remora-frontend"`).
+    /// nftables table name for this network (e.g. `"pelagos-frontend"`).
     pub fn nft_table_name(&self) -> String {
-        format!("remora-{}", self.name)
+        format!("pelagos-{}", self.name)
     }
 }
 
-/// Bootstrap or load the default `remora0` network definition.
+/// Bootstrap or load the default `pelagos0` network definition.
 ///
 /// If a config file exists on disk, loads it. Otherwise creates the default
-/// definition (`172.19.0.0/24`, bridge `remora0`) and persists it.
+/// definition (`172.19.0.0/24`, bridge `pelagos0`) and persists it.
 /// Also migrates old global state files to per-network directories if they exist.
 pub fn bootstrap_default_network() -> io::Result<NetworkDef> {
-    let config_path = crate::paths::network_config_dir("remora0").join("config.json");
+    let config_path = crate::paths::network_config_dir("pelagos0").join("config.json");
     if config_path.exists() {
-        return NetworkDef::load("remora0");
+        return NetworkDef::load("pelagos0");
     }
 
     let net = NetworkDef {
-        name: "remora0".to_string(),
+        name: "pelagos0".to_string(),
         subnet: Ipv4Net {
             addr: Ipv4Addr::new(172, 19, 0, 0),
             prefix_len: 24,
         },
         gateway: Ipv4Addr::new(172, 19, 0, 1),
-        bridge_name: "remora0".to_string(),
+        bridge_name: "pelagos0".to_string(),
     };
     net.save()?;
 
     // Migrate old global IPAM file to per-network dir if it exists.
     // Only next_ip is migrated — nat_refcount and port_forwards tracked
-    // state for the old `ip remora` nft table which no longer exists
-    // (now `ip remora-remora0`), so stale values would poison refcounts.
+    // state for the old `ip pelagos` nft table which no longer exists
+    // (now `ip pelagos-pelagos0`), so stale values would poison refcounts.
     let rt = crate::paths::runtime_dir();
-    let net_rt = crate::paths::network_runtime_dir("remora0");
+    let net_rt = crate::paths::network_runtime_dir("pelagos0");
     let old_ipam = rt.join("next_ip");
     let new_ipam = net_rt.join("next_ip");
     if old_ipam.exists() && !new_ipam.exists() {
@@ -236,10 +236,10 @@ pub fn bootstrap_default_network() -> io::Result<NetworkDef> {
 
 /// Load a network definition by name.
 ///
-/// For `"remora0"`, calls [`bootstrap_default_network`] to ensure it exists.
+/// For `"pelagos0"`, calls [`bootstrap_default_network`] to ensure it exists.
 /// For other names, loads from config dir.
 pub fn load_network_def(name: &str) -> io::Result<NetworkDef> {
-    if name == "remora0" {
+    if name == "pelagos0" {
         bootstrap_default_network()
     } else {
         NetworkDef::load(name)
@@ -284,8 +284,8 @@ pub fn ensure_network(name: &str) -> io::Result<()> {
         if used.iter().any(|u| u.overlaps(&subnet)) {
             continue;
         }
-        let bridge_name = if name == "remora0" {
-            "remora0".to_string()
+        let bridge_name = if name == "pelagos0" {
+            "pelagos0".to_string()
         } else {
             format!("rm-{}", name)
         };
@@ -308,7 +308,7 @@ pub fn ensure_network(name: &str) -> io::Result<()> {
 
 // Legacy constants — kept for reference but internal code now uses NetworkDef.
 /// Bridge name for the default network.
-pub const BRIDGE_NAME: &str = "remora0";
+pub const BRIDGE_NAME: &str = "pelagos0";
 /// Gateway IP for the default network.
 pub const BRIDGE_GW: &str = "172.19.0.1";
 
@@ -356,9 +356,9 @@ pub enum NetworkMode {
     None,
     /// Isolated network namespace with loopback only.
     Loopback,
-    /// Full connectivity via the default `remora0` bridge (172.19.0.x/24).
+    /// Full connectivity via the default `pelagos0` bridge (172.19.0.x/24).
     ///
-    /// Normalized to `BridgeNamed("remora0")` internally by `with_network()`.
+    /// Normalized to `BridgeNamed("pelagos0")` internally by `with_network()`.
     Bridge,
     /// Full connectivity via a named bridge network.
     ///
@@ -382,7 +382,7 @@ impl NetworkMode {
     /// Extract the network name for bridge modes. Returns `None` for non-bridge modes.
     pub fn bridge_network_name(&self) -> Option<&str> {
         match self {
-            NetworkMode::Bridge => Some("remora0"),
+            NetworkMode::Bridge => Some("pelagos0"),
             NetworkMode::BridgeNamed(name) => Some(name),
             _ => None,
         }
@@ -414,7 +414,7 @@ pub struct NetworkSetup {
     proxy_udp_stop: Option<Arc<AtomicBool>>,
     /// Join handles for per-port UDP proxy threads; joined explicitly in teardown.
     proxy_udp_threads: Vec<std::thread::JoinHandle<()>>,
-    /// Name of the network this setup belongs to (e.g. `"remora0"`, `"frontend"`).
+    /// Name of the network this setup belongs to (e.g. `"pelagos0"`, `"frontend"`).
     pub network_name: String,
 }
 
@@ -983,9 +983,9 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
 
         // Migration: if this is the default network, remove the old global
-        // `ip remora` table that previous versions created.
-        if net.name == "remora0" {
-            let _ = run_nft_quiet("delete table ip remora\n");
+        // `ip pelagos` table that previous versions created.
+        if net.name == "pelagos0" {
+            let _ = run_nft_quiet("delete table ip pelagos\n");
         }
 
         // Install the nftables MASQUERADE rule set.
@@ -1456,7 +1456,7 @@ fn start_tcp_proxies_async(
         .worker_threads(workers)
         .enable_io()
         .enable_time()
-        .thread_name("remora-tcp-proxy")
+        .thread_name("pelagos-tcp-proxy")
         .build()
         .expect("tokio tcp proxy runtime");
 
@@ -1868,7 +1868,7 @@ mod tests {
             gateway: Ipv4Addr::new(10, 88, 1, 1),
             bridge_name: "rm-frontend".to_string(),
         };
-        assert_eq!(net.nft_table_name(), "remora-frontend");
+        assert_eq!(net.nft_table_name(), "pelagos-frontend");
     }
 
     // ── NetworkMode tests ────────────────────────────────────────────────
@@ -1962,7 +1962,7 @@ mod tests {
             name: "test".to_string(),
             subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
             gateway: Ipv4Addr::new(172, 19, 0, 1),
-            bridge_name: "remora0".to_string(),
+            bridge_name: "pelagos0".to_string(),
         };
         let ip = Ipv4Addr::new(172, 19, 0, 2);
         let entries = vec![(ip, 8080u16, 80u16, PortProto::Tcp)];
@@ -1978,7 +1978,7 @@ mod tests {
             name: "test".to_string(),
             subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
             gateway: Ipv4Addr::new(172, 19, 0, 1),
-            bridge_name: "remora0".to_string(),
+            bridge_name: "pelagos0".to_string(),
         };
         let ip = Ipv4Addr::new(172, 19, 0, 2);
         let entries = vec![(ip, 5353u16, 53u16, PortProto::Udp)];
@@ -1994,7 +1994,7 @@ mod tests {
             name: "test".to_string(),
             subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
             gateway: Ipv4Addr::new(172, 19, 0, 1),
-            bridge_name: "remora0".to_string(),
+            bridge_name: "pelagos0".to_string(),
         };
         let ip = Ipv4Addr::new(172, 19, 0, 2);
         let entries = vec![(ip, 53u16, 53u16, PortProto::Both)];
@@ -2005,7 +2005,7 @@ mod tests {
 
     #[test]
     fn test_network_mode_bridge_network_name() {
-        assert_eq!(NetworkMode::Bridge.bridge_network_name(), Some("remora0"));
+        assert_eq!(NetworkMode::Bridge.bridge_network_name(), Some("pelagos0"));
         assert_eq!(
             NetworkMode::BridgeNamed("test".into()).bridge_network_name(),
             Some("test")

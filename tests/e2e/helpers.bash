@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/e2e/helpers.bash — shared helpers for all remora BATS suites
+# tests/e2e/helpers.bash — shared helpers for all pelagos BATS suites
 
 # ---------------------------------------------------------------------------
 # Root guard
@@ -15,19 +15,19 @@ require_root() {
 # Binary resolution
 # ---------------------------------------------------------------------------
 
-# Locate the remora binary.  Prefer the debug build so we don't need
+# Locate the pelagos binary.  Prefer the debug build so we don't need
 # a release build; fall back to whatever is on PATH.
-remora_bin() {
+pelagos_bin() {
     local debug_bin
-    debug_bin="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)/target/debug/remora"
+    debug_bin="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)/target/debug/pelagos"
     if [[ -x "$debug_bin" ]]; then
         echo "$debug_bin"
     else
-        echo "remora"
+        echo "pelagos"
     fi
 }
 
-REMORA="$(remora_bin)"
+PELAGOS="$(pelagos_bin)"
 
 # ---------------------------------------------------------------------------
 # Compose helpers
@@ -38,15 +38,15 @@ REMORA="$(remora_bin)"
 # its state file (i.e. all services are started).
 compose_up() {
     local file="$1" project="$2"
-    "$REMORA" compose up -f "$file" -p "$project" &
+    "$PELAGOS" compose up -f "$file" -p "$project" &
     COMPOSE_PID=$!
 
     # Wait up to 30 s for the project state file to appear
     local deadline=$(( $(date +%s) + 30 ))
-    until [[ -f "/run/remora/compose/${project}/state.json" ]] || (( $(date +%s) > deadline )); do
+    until [[ -f "/run/pelagos/compose/${project}/state.json" ]] || (( $(date +%s) > deadline )); do
         sleep 0.25
     done
-    if [[ ! -f "/run/remora/compose/${project}/state.json" ]]; then
+    if [[ ! -f "/run/pelagos/compose/${project}/state.json" ]]; then
         return 1
     fi
 }
@@ -54,7 +54,7 @@ compose_up() {
 # compose_down FILE PROJECT
 compose_down() {
     local file="$1" project="$2"
-    "$REMORA" compose down -f "$file" -p "$project"
+    "$PELAGOS" compose down -f "$file" -p "$project"
 }
 
 # service_pid PROJECT SERVICE
@@ -63,7 +63,7 @@ service_pid() {
     local project="$1" service="$2"
     python3 -c "
 import json, sys
-with open('/run/remora/compose/${project}/state.json') as f:
+with open('/run/pelagos/compose/${project}/state.json') as f:
     d = json.load(f)
 print(d['services']['${service}']['pid'])
 " 2>/dev/null

@@ -1759,7 +1759,7 @@ fn resolve_image(image_ref: &str) -> Result<(String, image::ImageManifest), Lisp
     let normalised = normalise_image_reference(image_ref);
     let m = image::load_image(&normalised).map_err(|e| {
         LispError::new(format!(
-            "image '{}' not found locally (run 'remora image pull {}'): {}",
+            "image '{}' not found locally (run 'pelagos image pull {}'): {}",
             image_ref, image_ref, e
         ))
     })?;

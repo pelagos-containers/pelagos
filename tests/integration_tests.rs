@@ -1,4 +1,4 @@
-//! Integration tests for remora container features.
+//! Integration tests for pelagos container features.
 //!
 //! These tests verify the core containerization features including:
 //! - UID/GID mapping
@@ -1314,7 +1314,7 @@ mod filesystem {
     /// Requires: root, rootfs.
     ///
     /// Verifies that the CLI `-v host:container:ro` suffix is parsed correctly
-    /// by `remora run` and results in a read-only bind mount inside the
+    /// by `pelagos run` and results in a read-only bind mount inside the
     /// container.  This exercises the `run.rs` volume-flag parsing path
     /// (distinct from the `with_bind_mount_ro` API path tested by
     /// `test_bind_mount_ro`).  Failure means a regression in the
@@ -1334,7 +1334,7 @@ mod filesystem {
         let vol_spec = format!("{}:/mnt/ro:ro", host_dir.path().display());
 
         // Run via the CLI binary so the -v flag goes through the run.rs parser.
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args([
                 "run",
                 "--rootfs",
@@ -1346,7 +1346,7 @@ mod filesystem {
                 "touch /mnt/ro/x 2>/dev/null; echo exit=$?",
             ])
             .output()
-            .expect("remora run");
+            .expect("pelagos run");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             stdout.contains("exit=1"),
@@ -1356,7 +1356,7 @@ mod filesystem {
 
         // Also confirm :rw (explicit) allows writes.
         let rw_spec = format!("{}:/mnt/rw:rw", host_dir.path().display());
-        let out2 = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+        let out2 = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args([
                 "run",
                 "--rootfs",
@@ -1368,7 +1368,7 @@ mod filesystem {
                 "touch /mnt/rw/x 2>/dev/null; echo exit=$?",
             ])
             .output()
-            .expect("remora run rw");
+            .expect("pelagos run rw");
         let stdout2 = String::from_utf8_lossy(&out2.stdout);
         assert!(
             stdout2.contains("exit=0"),
@@ -1661,7 +1661,7 @@ mod filesystem {
         );
     }
 
-    /// After wait(), the auto-created /run/remora/overlay-{pid}-{n}/merged directory
+    /// After wait(), the auto-created /run/pelagos/overlay-{pid}-{n}/merged directory
     /// and its parent are removed — no stale dirs left on the host.
     #[test]
     fn test_overlay_merged_cleanup() {
@@ -1891,7 +1891,7 @@ mod cgroups {
         child.wait().expect("Failed to wait for child");
 
         // After wait(), teardown_cgroup should have deleted the cgroup directory
-        let cgroup_path = format!("/sys/fs/cgroup/remora-{}", pid);
+        let cgroup_path = format!("/sys/fs/cgroup/pelagos-{}", pid);
         assert!(
             !std::path::Path::new(&cgroup_path).exists(),
             "Cgroup {} should be deleted after container exits",
@@ -2310,7 +2310,7 @@ mod networking {
         assert!(status.success(), "Container exited with failure");
     }
 
-    /// N2: The bridge gateway (172.19.0.1 on remora0) should be reachable via ICMP.
+    /// N2: The bridge gateway (172.19.0.1 on pelagos0) should be reachable via ICMP.
     ///
     /// Verifies actual layer-3 connectivity through the veth pair: the container
     /// sends a ping, the packet traverses eth0→veth→bridge, and the host replies.
@@ -2466,22 +2466,22 @@ mod networking {
 
         // While the container sleeps, the nftables table should exist.
         let status = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .status()
             .expect("Failed to run nft list table");
         assert!(
             status.success(),
-            "nft table ip remora-remora0 should exist while a NAT container is running"
+            "nft table ip pelagos-pelagos0 should exist while a NAT container is running"
         );
 
         child.wait().expect("Failed to wait for NAT container");
     }
 
-    /// N3: After the last NAT container exits, `nft list table ip remora-remora0` must fail.
+    /// N3: After the last NAT container exits, `nft list table ip pelagos-pelagos0` must fail.
     ///
     /// Spawns a bridge+NAT container with `ash -c "exit 0"`. After `wait()`,
-    /// asserts that `nft list table ip remora-remora0` exits non-zero, confirming that
+    /// asserts that `nft list table ip pelagos-pelagos0` exits non-zero, confirming that
     /// `disable_nat()` removed the nftables table.
     #[test]
     #[serial(nat)]
@@ -2513,14 +2513,14 @@ mod networking {
 
         // After the container exits, the nftables table should be gone.
         let status = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .expect("Failed to run nft list table");
         assert!(
             !status.success(),
-            "nft table ip remora-remora0 should be removed after all NAT containers exit"
+            "nft table ip pelagos-pelagos0 should be removed after all NAT containers exit"
         );
     }
 
@@ -2572,7 +2572,7 @@ mod networking {
         child_a.wait().expect("Failed to wait for container A");
 
         let status = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .status()
             .expect("Failed to run nft list table after A exits");
@@ -2585,7 +2585,7 @@ mod networking {
         child_b.wait().expect("Failed to wait for container B");
 
         let status = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -2675,7 +2675,7 @@ mod networking {
     /// container is running.
     ///
     /// Spawns a bridge+NAT container with `with_port_forward(18080, 80)` running
-    /// `sleep 2`. While it sleeps, checks that `nft list chain ip remora-remora0 prerouting`
+    /// `sleep 2`. While it sleeps, checks that `nft list chain ip pelagos-pelagos0 prerouting`
     /// succeeds and contains "dport 18080". Waits for the container.
     #[test]
     #[serial(nat)]
@@ -2706,7 +2706,7 @@ mod networking {
 
         // While the container is sleeping, the prerouting chain must contain the DNAT rule.
         let output = std::process::Command::new("nft")
-            .args(["list", "chain", "ip", "remora-remora0", "prerouting"])
+            .args(["list", "chain", "ip", "pelagos-pelagos0", "prerouting"])
             .output()
             .expect("Failed to run nft list chain");
         assert!(
@@ -2763,14 +2763,14 @@ mod networking {
 
         // After the container exits, the table must be gone entirely.
         let status = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .expect("Failed to run nft list table");
         assert!(
             !status.success(),
-            "nft table ip remora-remora0 should be removed after port-forward container exits"
+            "nft table ip pelagos-pelagos0 should be removed after port-forward container exits"
         );
     }
 
@@ -2824,7 +2824,7 @@ mod networking {
         child_a.wait().expect("Failed to wait for container A");
 
         let output = std::process::Command::new("nft")
-            .args(["list", "chain", "ip", "remora-remora0", "prerouting"])
+            .args(["list", "chain", "ip", "pelagos-pelagos0", "prerouting"])
             .output()
             .expect("Failed to run nft list chain after A exits");
         assert!(
@@ -2846,7 +2846,7 @@ mod networking {
         child_b.wait().expect("Failed to wait for container B");
 
         let status = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -3073,7 +3073,7 @@ mod networking {
 
         // Check nftables: the prerouting chain must contain a UDP DNAT rule.
         let nft_out = std::process::Command::new("nft")
-            .args(["list", "chain", "ip", "remora-remora0", "prerouting"])
+            .args(["list", "chain", "ip", "pelagos-pelagos0", "prerouting"])
             .output();
 
         unsafe {
@@ -3131,7 +3131,7 @@ mod networking {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let nft_out = std::process::Command::new("nft")
-            .args(["list", "chain", "ip", "remora-remora0", "prerouting"])
+            .args(["list", "chain", "ip", "pelagos-pelagos0", "prerouting"])
             .output();
 
         unsafe {
@@ -3314,7 +3314,7 @@ mod networking {
         );
 
         let nft_after = std::process::Command::new("nft")
-            .args(["list", "table", "ip", "remora-remora0"])
+            .args(["list", "table", "ip", "pelagos-pelagos0"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -3436,8 +3436,8 @@ mod oci_lifecycle {
         dir.to_path_buf()
     }
 
-    /// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
-    fn run_remora(args: &[&str]) -> (String, String, bool) {
+    /// Run a pelagos subcommand with the given args. Returns (stdout, stderr, success).
+    fn run_pelagos(args: &[&str]) -> (String, String, bool) {
         // `create` forks a long-lived shim that inherits the caller's pipe fds.
         // Using output() would block until the shim (and its container children)
         // exit, because output() waits for EOF on stdout/stderr pipes and the shim
@@ -3447,20 +3447,20 @@ mod oci_lifecycle {
         if args.first() == Some(&"create") {
             let tmp = tempfile::NamedTempFile::new().expect("tempfile for stderr");
             let stderr_file = tmp.reopen().expect("reopen stderr tempfile");
-            let status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            let status = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
                 .args(args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::from(stderr_file))
                 .status()
-                .expect("failed to run remora create");
+                .expect("failed to run pelagos create");
             let stderr = std::fs::read_to_string(tmp.path()).unwrap_or_default();
             return (String::new(), stderr, status.success());
         }
 
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args(args)
             .output()
-            .expect("failed to run remora binary");
+            .expect("failed to run pelagos binary");
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -3469,24 +3469,24 @@ mod oci_lifecycle {
     }
 
     fn oci_run_to_completion(id: &str, bundle: &std::path::Path, timeout_secs: u64) {
-        let (_, stderr, ok) = run_remora(&["create", id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
-        let (_, stderr, ok) = run_remora(&["start", id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", id]);
+            let (stdout, _, _) = run_pelagos(&["state", id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", id]);
+                run_pelagos(&["delete", id]);
                 panic!("container did not stop within {} seconds", timeout_secs);
             }
         }
-        let (_, stderr, ok) = run_remora(&["delete", id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_create_start_state
@@ -3494,10 +3494,10 @@ mod oci_lifecycle {
     /// Requires: root, alpine-rootfs.
     ///
     /// Creates a minimal OCI bundle running `sleep 2`. Verifies that:
-    /// - `remora create` leaves the container in "created" state
-    /// - `remora start` transitions it to "running"
-    /// - After the process exits, `remora state` reports "stopped"
-    /// - `remora delete` removes the state directory
+    /// - `pelagos create` leaves the container in "created" state
+    /// - `pelagos start` transitions it to "running"
+    /// - After the process exits, `pelagos state` reports "stopped"
+    /// - `pelagos delete` removes the state directory
     ///
     /// Failure indicates the create/start split synchronization is broken,
     /// state.json transitions are wrong, or liveness detection is incorrect.
@@ -3521,12 +3521,12 @@ mod oci_lifecycle {
 
         // Cleanup guard: always delete on test exit
         // create
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
         // state should be "created"
-        let (stdout, stderr, ok) = run_remora(&["state", &id]);
-        assert!(ok, "remora state (created) failed: {}", stderr);
+        let (stdout, stderr, ok) = run_pelagos(&["state", &id]);
+        assert!(ok, "pelagos state (created) failed: {}", stderr);
         assert!(
             stdout.contains("\"created\""),
             "expected status 'created', got: {}",
@@ -3534,11 +3534,11 @@ mod oci_lifecycle {
         );
 
         // start
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // state should be "running"
-        let (stdout, _, _) = run_remora(&["state", &id]);
+        let (stdout, _, _) = run_pelagos(&["state", &id]);
         assert!(
             stdout.contains("\"running\""),
             "expected status 'running' after start, got: {}",
@@ -3549,7 +3549,7 @@ mod oci_lifecycle {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
@@ -3562,8 +3562,8 @@ mod oci_lifecycle {
         }
 
         // delete
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
 
         // state dir should be gone
         let state_dir = pelagos::oci::state_dir(&id);
@@ -3579,7 +3579,7 @@ mod oci_lifecycle {
     /// Requires: root, alpine-rootfs.
     ///
     /// Spawns a long-running container (`sleep 60`) and sends SIGKILL via
-    /// `remora kill`. Asserts that the process exits promptly and `remora state`
+    /// `pelagos kill`. Asserts that the process exits promptly and `pelagos state`
     /// reports "stopped".
     ///
     /// Uses SIGKILL because the container runs in a PID namespace where `sleep`
@@ -3607,23 +3607,23 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "60"]);
         let id = format!("test-oci-kill-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Small delay to ensure the process is running
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
-        assert!(ok, "remora kill failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["kill", &id, "SIGKILL"]);
+        assert!(ok, "pelagos kill failed: {}", stderr);
 
         // Wait up to 4 seconds for the process to stop
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
@@ -3632,8 +3632,8 @@ mod oci_lifecycle {
             }
         }
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_delete_cleanup
@@ -3641,7 +3641,7 @@ mod oci_lifecycle {
     /// Requires: root, alpine-rootfs.
     ///
     /// Runs a short-lived container (`true`) through the full OCI lifecycle and
-    /// asserts that `remora delete` removes `/run/remora/<id>/` completely.
+    /// asserts that `pelagos delete` removes `/run/pelagos/<id>/` completely.
     ///
     /// Failure indicates that the state directory is not cleaned up on delete,
     /// which would cause resource leaks and "already exists" errors on re-use.
@@ -3663,17 +3663,17 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
         let id = format!("test-oci-del-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Wait for the container to stop (true exits immediately)
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
@@ -3685,8 +3685,8 @@ mod oci_lifecycle {
         let state_dir = pelagos::oci::state_dir(&id);
         assert!(state_dir.exists(), "state dir should exist before delete");
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
 
         assert!(
             !state_dir.exists(),
@@ -3700,13 +3700,13 @@ mod oci_lifecycle {
     /// Requires: root, alpine-rootfs.
     ///
     /// Starts a short-lived container (`true`), waits for it to exit, then asserts
-    /// that the state directory and `remora state` output remain accessible — the
+    /// that the state directory and `pelagos state` output remain accessible — the
     /// runtime must not clean up state automatically on container exit.
     ///
     /// This verifies the OCI spec requirement that `stopped` is a stable, inspectable
-    /// state that persists until `remora delete` is explicitly called. An orchestrator
-    /// (containerd, CRI-O) queries `remora state` after observing the process exit to
-    /// collect status, before calling `remora delete`.
+    /// state that persists until `pelagos delete` is explicitly called. An orchestrator
+    /// (containerd, CRI-O) queries `pelagos state` after observing the process exit to
+    /// collect status, before calling `pelagos delete`.
     ///
     /// Failure indicates the runtime is removing state on container exit rather than
     /// waiting for an explicit delete command.
@@ -3730,11 +3730,11 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
         let id = format!("test-oci-stable-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Wait for `true` to exit.
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3743,20 +3743,20 @@ mod oci_lifecycle {
         let state_dir = pelagos::oci::state_dir(&id);
         assert!(
             state_dir.exists(),
-            "state dir must persist until remora delete, not be cleaned up on container exit"
+            "state dir must persist until pelagos delete, not be cleaned up on container exit"
         );
 
-        // `remora state` must succeed and report stopped.
-        let (stdout, stderr, ok) = run_remora(&["state", &id]);
-        assert!(ok, "remora state on stopped container failed: {}", stderr);
+        // `pelagos state` must succeed and report stopped.
+        let (stdout, stderr, ok) = run_pelagos(&["state", &id]);
+        assert!(ok, "pelagos state on stopped container failed: {}", stderr);
         assert!(
             stdout.contains("\"stopped\""),
             "expected state=stopped, got: {}",
             stdout
         );
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
         assert!(!state_dir.exists(), "state dir should be gone after delete");
     }
 
@@ -3764,8 +3764,8 @@ mod oci_lifecycle {
     ///
     /// Requires: root, alpine-rootfs.
     ///
-    /// Starts a short-lived container (`true`) and immediately calls `remora kill`
-    /// without first calling `remora state`. Asserts kill returns success.
+    /// Starts a short-lived container (`true`) and immediately calls `pelagos kill`
+    /// without first calling `pelagos state`. Asserts kill returns success.
     ///
     /// This is the pidfile.t scenario: the container exits quickly but kill must still
     /// succeed because state.json says "running" (cmd_state not yet called). With
@@ -3791,32 +3791,32 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
         let id = format!("test-oci-kill-sl-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
-        // Brief pause for `true` to exit. Do NOT call `remora state` first.
+        // Brief pause for `true` to exit. Do NOT call `pelagos state` first.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
+        let (_, stderr, ok) = run_pelagos(&["kill", &id, "SIGKILL"]);
         assert!(
             ok,
-            "remora kill on short-lived container failed: {}",
+            "pelagos kill on short-lived container failed: {}",
             stderr
         );
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_kill_stopped_fails
     ///
     /// Requires: root, alpine-rootfs.
     ///
-    /// Starts a short-lived container (`true`), calls `remora state` to persist
-    /// "stopped" to state.json, then asserts that `remora kill` returns an error.
+    /// Starts a short-lived container (`true`), calls `pelagos state` to persist
+    /// "stopped" to state.json, then asserts that `pelagos kill` returns an error.
     ///
     /// This is the kill.t test 4 scenario: once cmd_state writes "stopped" to disk,
     /// subsequent kill attempts must fail per the OCI spec.
@@ -3841,16 +3841,16 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
         let id = format!("test-oci-kill-sf-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Call state — detects zombie, writes "stopped" to state.json.
-        let (stdout, _, _) = run_remora(&["state", &id]);
+        let (stdout, _, _) = run_pelagos(&["state", &id]);
         assert!(
             stdout.contains("\"stopped\""),
             "expected state=stopped, got: {}",
@@ -3858,11 +3858,11 @@ mod oci_lifecycle {
         );
 
         // Kill must fail — state.json now says "stopped".
-        let (_, _, ok) = run_remora(&["kill", &id, "SIGKILL"]);
-        assert!(!ok, "remora kill on stopped container should fail");
+        let (_, _, ok) = run_pelagos(&["kill", &id, "SIGKILL"]);
+        assert!(!ok, "pelagos kill on stopped container should fail");
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_pid_start_time
@@ -3923,14 +3923,14 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "30"]);
         let id = format!("test-oci-pst-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Read state.json directly and check pid_start_time is present.
-        let state_path = format!("/run/remora/{}/state.json", id);
+        let state_path = format!("/run/pelagos/{}/state.json", id);
         let raw = std::fs::read_to_string(&state_path).expect("state.json not found");
         let state_json: serde_json::Value =
             serde_json::from_str(&raw).expect("state.json is not valid JSON");
@@ -3951,16 +3951,16 @@ mod oci_lifecycle {
         );
 
         // Clean up.
-        let _ = run_remora(&["kill", &id, "SIGKILL"]);
+        let _ = run_pelagos(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = run_remora(&["delete", &id]);
+        let _ = run_pelagos(&["delete", &id]);
     }
 
     /// test_oci_pidfd_mgmt_socket
     ///
     /// Requires: root, alpine-rootfs, Linux ≥ 5.3 (pidfd_open).
     ///
-    /// Verifies that after `remora create` + `remora start`, the shim has
+    /// Verifies that after `pelagos create` + `pelagos start`, the shim has
     /// created `mgmt.sock` inside the state directory and that connecting to
     /// it returns a valid pidfd that `is_pidfd_alive` reports as alive.
     /// After the container exits, the same pidfd (re-polled) must report
@@ -3989,10 +3989,10 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "30"]);
         let id = format!("test-oci-pidfd-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Give the shim a moment to bind mgmt.sock (it's created after spawn()).
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -4056,7 +4056,7 @@ mod oci_lifecycle {
         );
 
         // Kill the container and wait for it to exit.
-        let _ = run_remora(&["kill", &id, "SIGKILL"]);
+        let _ = run_pelagos(&["kill", &id, "SIGKILL"]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4065,7 +4065,7 @@ mod oci_lifecycle {
             }
             if std::time::Instant::now() > deadline {
                 unsafe { libc::close(pidfd) };
-                let _ = run_remora(&["delete", &id]);
+                let _ = run_pelagos(&["delete", &id]);
                 panic!("pidfd still reports alive 5s after SIGKILL");
             }
         }
@@ -4077,14 +4077,14 @@ mod oci_lifecycle {
         );
         unsafe { libc::close(pidfd) };
 
-        let _ = run_remora(&["delete", &id]);
+        let _ = run_pelagos(&["delete", &id]);
     }
 
     /// test_oci_pidfd_state_liveness
     ///
     /// Requires: root, alpine-rootfs, Linux ≥ 5.3.
     ///
-    /// Runs a short-lived container (`true`) and repeatedly calls `remora state`
+    /// Runs a short-lived container (`true`) and repeatedly calls `pelagos state`
     /// until it reports "stopped".  Verifies that `cmd_state` correctly
     /// transitions to "stopped" — which on Linux ≥ 5.3 is driven by
     /// `is_pidfd_alive` via the shim's management socket.
@@ -4111,21 +4111,21 @@ mod oci_lifecycle {
         let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
         let id = format!("test-oci-pidfd-sl-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Poll state until stopped or timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                let _ = run_remora(&["delete", &id]);
+                let _ = run_pelagos(&["delete", &id]);
                 panic!(
                     "container did not reach 'stopped' within 5s; last state: {}",
                     stdout
@@ -4133,8 +4133,8 @@ mod oci_lifecycle {
             }
         }
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_bundle_mounts
@@ -4195,17 +4195,17 @@ mod oci_lifecycle {
         let bundle = bundle_dir.path();
         let id = format!("test-oci-mnt-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Wait for container to stop
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
@@ -4214,8 +4214,8 @@ mod oci_lifecycle {
             }
         }
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
         assert!(
             stderr.is_empty() || !stderr.contains("error"),
             "unexpected error: {}",
@@ -4230,7 +4230,7 @@ mod oci_lifecycle {
     /// Creates a bundle whose config.json specifies `process.capabilities` with
     /// only CAP_CHOWN in the bounding set. The container runs `id` (which should
     /// succeed even with a reduced capability set). Asserts:
-    /// - `remora create` / `start` / `delete` all succeed
+    /// - `pelagos create` / `start` / `delete` all succeed
     /// - The container exits successfully (reduced caps don't prevent basic exec)
     ///
     /// Failure indicates that capability set parsing from OCI config or the
@@ -4280,28 +4280,28 @@ mod oci_lifecycle {
 
         let id = format!("test-oci-cap-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Wait for container to stop
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]);
+                run_pelagos(&["delete", &id]);
                 panic!("container did not stop within 5 seconds");
             }
         }
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_masked_readonly_paths
@@ -4316,7 +4316,7 @@ mod oci_lifecycle {
     /// - Attempting to read /proc/kcore returns no useful data (bind-mounted /dev/null)
     /// - /sys/kernel exists but writes to it are denied
     ///
-    /// We verify at the OCI level: asserts that `remora create` / `start` / `delete`
+    /// We verify at the OCI level: asserts that `pelagos create` / `start` / `delete`
     /// all succeed. The correct application of maskedPaths and readonlyPaths is
     /// validated by the container command itself (exits 0 only if both checks pass).
     ///
@@ -4366,28 +4366,28 @@ mod oci_lifecycle {
 
         let id = format!("test-oci-mrp-{}", std::process::id());
 
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // Wait for container to stop
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]);
+                run_pelagos(&["delete", &id]);
                 panic!("container did not stop within 5 seconds");
             }
         }
 
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
     }
 
     /// test_oci_resources
@@ -4592,8 +4592,8 @@ mod oci_lifecycle {
     ///
     /// Creates a bundle with a `prestart` hook (touches a sentinel file) and a
     /// `poststop` hook (touches a different sentinel file). Asserts:
-    /// - The prestart sentinel exists right after `remora create`
-    /// - The poststop sentinel exists right after `remora delete`
+    /// - The prestart sentinel exists right after `pelagos create`
+    /// - The poststop sentinel exists right after `pelagos delete`
     ///
     /// Failure indicates that OCI `hooks` parsing, or the `run_hooks()` placement
     /// in `cmd_create()` / `cmd_delete()`, is broken.
@@ -4637,25 +4637,25 @@ mod oci_lifecycle {
         );
         std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
         let id = format!("test-oci-hk-{}", std::process::id());
-        let (_, stderr, ok) = run_remora(&["create", &id, bundle_dir.path().to_str().unwrap()]);
-        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["create", &id, bundle_dir.path().to_str().unwrap()]);
+        assert!(ok, "pelagos create failed: {}", stderr);
         assert!(prestart_marker.exists(), "prestart hook did not run");
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]);
+                run_pelagos(&["delete", &id]);
                 panic!("container did not stop within 5 seconds");
             }
         }
-        let (_, stderr, ok) = run_remora(&["delete", &id]);
-        assert!(ok, "remora delete failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete failed: {}", stderr);
         assert!(poststop_marker.exists(), "poststop hook did not run");
     }
 
@@ -4760,35 +4760,35 @@ mod oci_lifecycle {
     }"#;
         std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
         let id = format!("test-oci-kmnt-{}", std::process::id());
-        let (_, stderr, ok) = run_remora(&[
+        let (_, stderr, ok) = run_pelagos(&[
             "create",
             "--bundle",
             bundle_dir.path().to_str().unwrap(),
             &id,
         ]);
-        assert!(ok, "remora create (kernel mounts) failed: {}", stderr);
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        assert!(ok, "pelagos create (kernel mounts) failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                run_remora(&["delete", &id]);
+                run_pelagos(&["delete", &id]);
                 panic!("container with kernel mounts did not stop within 5s");
             }
         }
-        run_remora(&["delete", &id]);
+        run_pelagos(&["delete", &id]);
     }
 
     /// test_oci_create_bundle_flag
     ///
     /// Requires: root, alpine-rootfs.
     ///
-    /// Verifies that `remora create --bundle <path> <id>` works — i.e. the OCI-standard
+    /// Verifies that `pelagos create --bundle <path> <id>` works — i.e. the OCI-standard
     /// named flag interface is accepted in addition to the legacy positional arg.
     /// Failure indicates the CLI flag refactor broke the create subcommand invocation
     /// expected by containerd, CRI-O, and the opencontainers/runtime-tools harness.
@@ -4810,31 +4810,31 @@ mod oci_lifecycle {
         let id = format!("test-oci-bflag-{}", std::process::id());
 
         // Use the --bundle flag (OCI standard) rather than positional arg.
-        let (_, stderr, ok) = run_remora(&[
+        let (_, stderr, ok) = run_pelagos(&[
             "create",
             "--bundle",
             bundle_dir.path().to_str().unwrap(),
             &id,
         ]);
-        assert!(ok, "remora create --bundle failed: {}", stderr);
+        assert!(ok, "pelagos create --bundle failed: {}", stderr);
 
-        let (stdout, _, _) = run_remora(&["state", &id]);
+        let (stdout, _, _) = run_pelagos(&["state", &id]);
         assert!(
             stdout.contains("\"created\""),
             "expected created state, got: {}",
             stdout
         );
 
-        run_remora(&["kill", &id, "SIGKILL"]);
+        run_pelagos(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
-        run_remora(&["delete", &id]);
+        run_pelagos(&["delete", &id]);
     }
 
     /// test_oci_create_pid_file
     ///
     /// Requires: root, alpine-rootfs.
     ///
-    /// Verifies that `remora create --pid-file <path>` writes the container's host PID
+    /// Verifies that `pelagos create --pid-file <path>` writes the container's host PID
     /// to the specified file. containerd and CRI-O rely on this to track container PIDs
     /// without having to parse state.json.
     /// Failure indicates the --pid-file implementation is missing or writes the wrong PID.
@@ -4856,7 +4856,7 @@ mod oci_lifecycle {
         let id = format!("test-oci-pidf-{}", std::process::id());
         let pid_file = bundle_dir.path().join("container.pid");
 
-        let (_, stderr, ok) = run_remora(&[
+        let (_, stderr, ok) = run_pelagos(&[
             "create",
             "--bundle",
             bundle_dir.path().to_str().unwrap(),
@@ -4864,7 +4864,7 @@ mod oci_lifecycle {
             pid_file.to_str().unwrap(),
             &id,
         ]);
-        assert!(ok, "remora create --pid-file failed: {}", stderr);
+        assert!(ok, "pelagos create --pid-file failed: {}", stderr);
 
         // Verify pid file exists and contains a positive integer.
         let pid_str = std::fs::read_to_string(&pid_file).expect("pid file not written");
@@ -4875,7 +4875,7 @@ mod oci_lifecycle {
         assert!(pid > 1, "pid file contains invalid PID {}", pid);
 
         // Verify PID matches state.json.
-        let (state_out, _, _) = run_remora(&["state", &id]);
+        let (state_out, _, _) = run_pelagos(&["state", &id]);
         assert!(
             state_out.contains(&pid.to_string()),
             "pid file PID {} not found in state: {}",
@@ -4883,9 +4883,9 @@ mod oci_lifecycle {
             state_out
         );
 
-        run_remora(&["kill", &id, "SIGKILL"]);
+        run_pelagos(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
-        run_remora(&["delete", &id]);
+        run_pelagos(&["delete", &id]);
     }
 
     /// test_oci_rootfs_propagation
@@ -4944,7 +4944,7 @@ mod oci_lifecycle {
     ///
     /// Requires: root, alpine-rootfs, cgroups v2.
     ///
-    /// Creates an OCI bundle with `linux.cgroupsPath: "remora-oci-test"` and runs
+    /// Creates an OCI bundle with `linux.cgroupsPath: "pelagos-oci-test"` and runs
     /// `echo ok` inside it. Verifies that the container starts and finishes
     /// successfully — confirming that the path is parsed and passed to the cgroup
     /// builder without error.
@@ -4967,7 +4967,7 @@ mod oci_lifecycle {
         let rootfs_link = bundle_dir.path().join("rootfs");
         std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
 
-        let unique_cg = format!("remora-oci-test-{}", std::process::id());
+        let unique_cg = format!("pelagos-oci-test-{}", std::process::id());
         let config = format!(
             r#"{{
   "ociVersion": "1.0.2",
@@ -5001,7 +5001,7 @@ mod oci_lifecycle {
     ///
     /// Creates an OCI bundle with a `createContainer` hook that writes the inode
     /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file..
-    /// After `remora create` completes, verifies that the recorded inode differs
+    /// After `pelagos create` completes, verifies that the recorded inode differs
     /// from the host UTS namespace inode — confirming the hook ran inside the
     /// container's mount namespace, not the host's.
     ///
@@ -5066,13 +5066,13 @@ mod oci_lifecycle {
         std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
 
         let id = format!("test-oci-cchook-{}", std::process::id());
-        let (_, stderr, ok) = run_remora(&[
+        let (_, stderr, ok) = run_pelagos(&[
             "create",
             "--bundle",
             bundle_dir.path().to_str().unwrap(),
             &id,
         ]);
-        assert!(ok, "remora create failed: {}", stderr);
+        assert!(ok, "pelagos create failed: {}", stderr);
 
         // The hook should have written a file with the uts ns inode.
         assert!(hook_out.exists(), "hook did not produce output file");
@@ -5094,9 +5094,9 @@ mod oci_lifecycle {
         );
 
         // Clean up.
-        run_remora(&["kill", &id, "SIGKILL"]);
+        run_pelagos(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
-        run_remora(&["delete", &id]);
+        run_pelagos(&["delete", &id]);
     }
 
     /// test_oci_start_container_hook_in_ns
@@ -5104,7 +5104,7 @@ mod oci_lifecycle {
     /// Requires: root, rootfs.
     ///
     /// Creates an OCI bundle with a `startContainer` hook that writes the inode
-    /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file. After `remora start`
+    /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file. After `pelagos start`
     /// completes, verifies the recorded inode differs from the host's UTS namespace
     /// inode — confirming the hook ran inside the container's UTS namespace.
     ///
@@ -5167,15 +5167,15 @@ mod oci_lifecycle {
         std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
 
         let id = format!("test-oci-schook-{}", std::process::id());
-        let (_, stderr, ok) = run_remora(&[
+        let (_, stderr, ok) = run_pelagos(&[
             "create",
             "--bundle",
             bundle_dir.path().to_str().unwrap(),
             &id,
         ]);
-        assert!(ok, "remora create failed: {}", stderr);
-        let (_, stderr, ok) = run_remora(&["start", &id]);
-        assert!(ok, "remora start failed: {}", stderr);
+        assert!(ok, "pelagos create failed: {}", stderr);
+        let (_, stderr, ok) = run_pelagos(&["start", &id]);
+        assert!(ok, "pelagos start failed: {}", stderr);
 
         // The hook should have written a file with the uts ns inode.
         assert!(
@@ -5202,7 +5202,7 @@ mod oci_lifecycle {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let (stdout, _, _) = run_remora(&["state", &id]);
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
             if stdout.contains("\"stopped\"") {
                 break;
             }
@@ -5210,7 +5210,7 @@ mod oci_lifecycle {
                 break;
             }
         }
-        run_remora(&["delete", &id]);
+        run_pelagos(&["delete", &id]);
     }
 }
 
@@ -5590,7 +5590,7 @@ mod linking {
             .expect("container A should have bridge IP");
 
         // Write A's state so B can resolve it.
-        let state_dir = std::path::Path::new("/run/remora/containers/link-test-a");
+        let state_dir = std::path::Path::new("/run/pelagos/containers/link-test-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-test-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
@@ -5670,7 +5670,7 @@ mod linking {
             .container_ip()
             .expect("container A should have bridge IP");
 
-        let state_dir = std::path::Path::new("/run/remora/containers/link-alias-a");
+        let state_dir = std::path::Path::new("/run/pelagos/containers/link-alias-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-alias-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
@@ -5755,7 +5755,7 @@ mod linking {
             .container_ip()
             .expect("container A should have bridge IP");
 
-        let state_dir = std::path::Path::new("/run/remora/containers/link-ping-a");
+        let state_dir = std::path::Path::new("/run/pelagos/containers/link-ping-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-ping-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["sleep","60"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
@@ -5843,7 +5843,7 @@ mod linking {
             .expect("container A should have bridge IP");
 
         // Register A's state so B can resolve the link name.
-        let state_dir = std::path::Path::new("/run/remora/containers/link-tcp-a");
+        let state_dir = std::path::Path::new("/run/pelagos/containers/link-tcp-a");
         std::fs::create_dir_all(state_dir).unwrap();
         let state_json = format!(
             r#"{{"name":"link-tcp-a","rootfs":"test","status":"running","pid":{},"watcher_pid":0,"started_at":"2026-01-01T00:00:00Z","exit_code":null,"command":["/bin/sh"],"stdout_log":null,"stderr_log":null,"bridge_ip":"{}"}}"#,
@@ -6252,12 +6252,12 @@ mod images {
 
         let reference = "docker.io/library/alpine:latest";
 
-        // Pull the image using the remora binary (true E2E).
-        let pull_status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+        // Pull the image using the pelagos binary (true E2E).
+        let pull_status = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args(["image", "pull", "alpine"])
             .status()
-            .expect("failed to run remora image pull");
-        assert!(pull_status.success(), "remora image pull should succeed");
+            .expect("failed to run pelagos image pull");
+        assert!(pull_status.success(), "pelagos image pull should succeed");
 
         // Load manifest and resolve layers.
         let manifest =
@@ -6402,11 +6402,11 @@ mod exec {
     }
 
     /// Start a container, then exec a command inside it via mount-ns setns +
-    /// fchdir + chroot(".") in pre_exec — the same mechanism `remora exec` uses.
+    /// fchdir + chroot(".") in pre_exec — the same mechanism `pelagos exec` uses.
     ///
     /// NOTE: We use UTS+MOUNT (no PID namespace) because Namespace::PID triggers
     /// a double-fork where container.pid() returns the intermediate process, not
-    /// the actual container.  The real `remora exec` CLI uses the grandchild PID
+    /// the actual container.  The real `pelagos exec` CLI uses the grandchild PID
     /// from state.json, so it works correctly with PID namespaces.
     #[test]
     #[serial]
@@ -6606,7 +6606,7 @@ mod exec {
     }
 
     /// Trying to exec into a non-running container: verify that the liveness
-    /// check correctly detects a dead PID, which is what `remora exec` uses
+    /// check correctly detects a dead PID, which is what `pelagos exec` uses
     /// to reject exec into stopped containers.
     #[test]
     #[serial]
@@ -6625,11 +6625,11 @@ mod exec {
         assert!(!root_path.exists(), "/proc/999999/root should not exist");
     }
 
-    /// `remora exec` joins the container's PID namespace via `pid_for_children`.
+    /// `pelagos exec` joins the container's PID namespace via `pid_for_children`.
     ///
     /// Requires: root, alpine-rootfs.
     ///
-    /// Starts a detached container with a PID namespace (`remora run -d --rootfs`
+    /// Starts a detached container with a PID namespace (`pelagos run -d --rootfs`
     /// always enables Namespace::PID). The container's PID namespace is reachable
     /// via `/proc/<intermediate_pid>/ns/pid_for_children` — NOT via `ns/pid`, which
     /// still points at the host PID namespace for the intermediate process.
@@ -6637,7 +6637,7 @@ mod exec {
     /// After the fix, `discover_namespaces` checks `pid_for_children` as a fallback
     /// when the regular `pid` check finds no difference. We verify the fix by:
     ///  1. Reading the container's expected PID namespace via `pid_for_children` on the host.
-    ///  2. Running `remora exec <name> readlink /proc/self/ns/pid` inside the container.
+    ///  2. Running `pelagos exec` <name> readlink /proc/self/ns/pid` inside the container.
     ///  3. Asserting the two strings are equal.
     ///
     /// Failure indicates `discover_namespaces` is not joining the PID namespace, so
@@ -6657,8 +6657,8 @@ mod exec {
             }
         };
 
-        let bin = env!("CARGO_BIN_EXE_remora");
-        let name = "remora-exec-pid-ns-test";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-exec-pid-ns-test";
 
         let _ = std::process::Command::new(bin)
             .args(["rm", "-f", name])
@@ -6679,11 +6679,11 @@ mod exec {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run -d");
-        assert!(run_status.success(), "remora run -d failed");
+            .expect("pelagos run -d");
+        assert!(run_status.success(), "pelagos run -d failed");
 
         // Poll until the watcher writes the real PID.
-        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut started = false;
         while std::time::Instant::now() < deadline {
@@ -6714,7 +6714,7 @@ mod exec {
         let exec_out = std::process::Command::new(bin)
             .args(["exec", name, "readlink", "/proc/self/ns/pid"])
             .output()
-            .expect("remora exec readlink /proc/self/ns/pid");
+            .expect("pelagos exec readlink /proc/self/ns/pid");
 
         let _ = std::process::Command::new(bin)
             .args(["stop", name])
@@ -6725,7 +6725,7 @@ mod exec {
 
         assert!(
             exec_out.status.success(),
-            "remora exec readlink failed: {}",
+            "pelagos exec readlink failed: {}",
             String::from_utf8_lossy(&exec_out.stderr)
         );
 
@@ -6770,8 +6770,8 @@ mod watcher {
             }
         };
 
-        let bin = env!("CARGO_BIN_EXE_remora");
-        let name = "remora-watcher-subreaper-test";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-watcher-subreaper-test";
 
         let _ = std::process::Command::new(bin)
             .args(["rm", "-f", name])
@@ -6792,11 +6792,11 @@ mod watcher {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run -d");
-        assert!(run_status.success(), "remora run -d failed");
+            .expect("pelagos run -d");
+        assert!(run_status.success(), "pelagos run -d failed");
 
         // Poll until the watcher writes state.json with a valid PID.
-        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut container_pid: i32 = 0;
         while std::time::Instant::now() < deadline {
@@ -7084,7 +7084,7 @@ mod rootless_cgroups {
     fn read_cgroup_knob(pid: i32, knob: &str) -> Option<String> {
         let parent =
             pelagos::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
-        let path = parent.join(format!("remora-{}", pid)).join(knob);
+        let path = parent.join(format!("pelagos-{}", pid)).join(knob);
         match std::fs::read_to_string(&path) {
             Ok(s) => Some(s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -7243,7 +7243,7 @@ mod rootless_cgroups {
         // The kernel may take a moment to fully vacate the cgroup.
         let cg_parent =
             pelagos::cgroup_rootless::self_cgroup_path().expect("self_cgroup_path should work");
-        let cg_dir = cg_parent.join(format!("remora-{}", pid));
+        let cg_dir = cg_parent.join(format!("pelagos-{}", pid));
 
         // Retry removal briefly in case the kernel hasn't finished yet.
         for _ in 0..10 {
@@ -7266,12 +7266,12 @@ mod rootless_cgroups {
 mod json_output {
     use super::*;
 
-    /// Helper: run the remora binary, return (stdout, stderr, success).
-    fn remora(args: &[&str]) -> (String, String, bool) {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+    /// Helper: run the pelagos binary, return (stdout, stderr, success).
+    fn pelagos(args: &[&str]) -> (String, String, bool) {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args(args)
             .output()
-            .expect("failed to run remora binary");
+            .expect("failed to run pelagos binary");
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -7281,7 +7281,7 @@ mod json_output {
 
     /// test_volume_ls_json
     ///
-    /// Requires: root (volumes are stored under /var/lib/remora/volumes/).
+    /// Requires: root (volumes are stored under /var/lib/pelagos/volumes/).
     ///
     /// Creates a volume, verifies `volume ls --format json` contains an entry
     /// with the volume's name and path. Removes the volume and verifies the
@@ -7300,14 +7300,14 @@ mod json_output {
         let vol_name = "test-json-vol";
 
         // Clean up any leftover from a previous run.
-        let _ = remora(&["volume", "rm", vol_name]);
+        let _ = pelagos(&["volume", "rm", vol_name]);
 
         // Create a volume.
-        let (_, stderr, ok) = remora(&["volume", "create", vol_name]);
+        let (_, stderr, ok) = pelagos(&["volume", "create", vol_name]);
         assert!(ok, "volume create failed: {}", stderr);
 
         // List with --format json.
-        let (stdout, stderr, ok) = remora(&["volume", "ls", "--format", "json"]);
+        let (stdout, stderr, ok) = pelagos(&["volume", "ls", "--format", "json"]);
         assert!(ok, "volume ls --format json failed: {}", stderr);
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("volume ls JSON should parse");
@@ -7332,11 +7332,11 @@ mod json_output {
         );
 
         // Remove the volume.
-        let (_, stderr, ok) = remora(&["volume", "rm", vol_name]);
+        let (_, stderr, ok) = pelagos(&["volume", "rm", vol_name]);
         assert!(ok, "volume rm failed: {}", stderr);
 
         // List again — volume should be gone.
-        let (stdout, _, ok) = remora(&["volume", "ls", "--format", "json"]);
+        let (stdout, _, ok) = pelagos(&["volume", "ls", "--format", "json"]);
         assert!(ok, "volume ls --format json failed after rm");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("volume ls JSON should parse after rm");
@@ -7353,7 +7353,7 @@ mod json_output {
 
     /// test_rootfs_ls_json
     ///
-    /// Requires: root (rootfs store is under /var/lib/remora/rootfs/).
+    /// Requires: root (rootfs store is under /var/lib/pelagos/rootfs/).
     ///
     /// Imports a rootfs entry (symlink to /tmp), verifies `rootfs ls --format json`
     /// contains an entry with the correct name and path. Removes the entry and
@@ -7372,14 +7372,14 @@ mod json_output {
         let name = "test-json-rootfs";
 
         // Clean up leftover.
-        let _ = remora(&["rootfs", "rm", name]);
+        let _ = pelagos(&["rootfs", "rm", name]);
 
         // Import /tmp as a dummy rootfs.
-        let (_, stderr, ok) = remora(&["rootfs", "import", name, "/tmp"]);
+        let (_, stderr, ok) = pelagos(&["rootfs", "import", name, "/tmp"]);
         assert!(ok, "rootfs import failed: {}", stderr);
 
         // List with --format json.
-        let (stdout, stderr, ok) = remora(&["rootfs", "ls", "--format", "json"]);
+        let (stdout, stderr, ok) = pelagos(&["rootfs", "ls", "--format", "json"]);
         assert!(ok, "rootfs ls --format json failed: {}", stderr);
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("rootfs ls JSON should parse");
@@ -7403,11 +7403,11 @@ mod json_output {
         );
 
         // Remove.
-        let (_, stderr, ok) = remora(&["rootfs", "rm", name]);
+        let (_, stderr, ok) = pelagos(&["rootfs", "rm", name]);
         assert!(ok, "rootfs rm failed: {}", stderr);
 
         // Verify gone.
-        let (stdout, _, ok) = remora(&["rootfs", "ls", "--format", "json"]);
+        let (stdout, _, ok) = pelagos(&["rootfs", "ls", "--format", "json"]);
         assert!(ok, "rootfs ls --format json failed after rm");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("rootfs ls JSON should parse after rm");
@@ -7424,7 +7424,7 @@ mod json_output {
 
     /// test_ps_json_and_inspect
     ///
-    /// Requires: root (container state is stored under /run/remora/containers/).
+    /// Requires: root (container state is stored under /run/pelagos/containers/).
     ///
     /// Writes a synthetic container state.json, verifies `ps -a --format json`
     /// includes the container with the correct name. Then runs
@@ -7445,7 +7445,7 @@ mod json_output {
         let name = "test-json-ctr";
 
         // Clean up leftover.
-        let _ = remora(&["rm", name]);
+        let _ = pelagos(&["rm", name]);
 
         // Write a synthetic container state directly (avoids spawning a real
         // container and the associated process lifecycle / cleanup overhead).
@@ -7470,7 +7470,7 @@ mod json_output {
         .expect("write state.json");
 
         // ps -a --format json should include the container.
-        let (stdout, stderr, ok) = remora(&["ps", "-a", "--format", "json"]);
+        let (stdout, stderr, ok) = pelagos(&["ps", "-a", "--format", "json"]);
         assert!(ok, "ps --format json failed: {}", stderr);
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("ps JSON should parse");
@@ -7485,7 +7485,7 @@ mod json_output {
         );
 
         // container inspect should return a JSON object.
-        let (stdout, stderr, ok) = remora(&["container", "inspect", name]);
+        let (stdout, stderr, ok) = pelagos(&["container", "inspect", name]);
         assert!(ok, "container inspect failed: {}", stderr);
         let obj: serde_json::Value =
             serde_json::from_str(&stdout).expect("inspect JSON should parse");
@@ -7505,11 +7505,11 @@ mod json_output {
         );
 
         // Remove the container.
-        let (_, stderr, ok) = remora(&["rm", name]);
+        let (_, stderr, ok) = pelagos(&["rm", name]);
         assert!(ok, "rm failed: {}", stderr);
 
         // ps -a --format json should no longer include the container.
-        let (stdout, _, ok) = remora(&["ps", "-a", "--format", "json"]);
+        let (stdout, _, ok) = pelagos(&["ps", "-a", "--format", "json"]);
         assert!(ok, "ps --format json failed after rm");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("ps JSON should parse after rm");
@@ -7526,7 +7526,7 @@ mod json_output {
 
     /// test_image_ls_json
     ///
-    /// Requires: root (images are stored under /var/lib/remora/images/).
+    /// Requires: root (images are stored under /var/lib/pelagos/images/).
     ///
     /// Verifies `image ls --format json` returns a valid JSON array. Does NOT
     /// pull an image (to keep the test fast and offline). If images already
@@ -7543,7 +7543,7 @@ mod json_output {
             return;
         }
 
-        let (stdout, stderr, ok) = remora(&["image", "ls", "--format", "json"]);
+        let (stdout, stderr, ok) = pelagos(&["image", "ls", "--format", "json"]);
         assert!(ok, "image ls --format json failed: {}", stderr);
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("image ls JSON should parse");
@@ -8448,8 +8448,8 @@ mod multi_network {
         let runtime_dir = pelagos::paths::network_runtime_dir(name);
         let _ = std::fs::remove_dir_all(&runtime_dir);
         // Delete bridge if it exists.
-        let bridge = if name == "remora0" {
-            "remora0".to_string()
+        let bridge = if name == "pelagos0" {
+            "pelagos0".to_string()
         } else {
             format!("rm-{}", name)
         };
@@ -8461,7 +8461,7 @@ mod multi_network {
 
     /// Test network create, ls, and rm lifecycle.
     ///
-    /// Requires root: creates config dirs under /var/lib/remora/networks/.
+    /// Requires root: creates config dirs under /var/lib/pelagos/networks/.
     #[test]
     #[serial]
     fn test_network_create_ls_rm() {
@@ -8500,7 +8500,7 @@ mod multi_network {
 
     /// Two networks with overlapping subnets — verify detection.
     ///
-    /// Requires root: writes to /var/lib/remora/networks/.
+    /// Requires root: writes to /var/lib/pelagos/networks/.
     #[test]
     #[serial]
     fn test_network_create_overlap_rejected() {
@@ -8687,10 +8687,10 @@ mod multi_network {
             eprintln!("Skipping test_network_rm_refuses_default (requires root)");
             return;
         }
-        // The CLI refuses removal of "remora0" — but we test the concept:
+        // The CLI refuses removal of "pelagos0" — but we test the concept:
         // the default network config should survive bootstrap.
         let _ = pelagos::network::bootstrap_default_network().expect("bootstrap default");
-        let config = pelagos::paths::network_config_dir("remora0").join("config.json");
+        let config = pelagos::paths::network_config_dir("pelagos0").join("config.json");
         assert!(config.exists(), "default network config should exist");
     }
 
@@ -10263,7 +10263,7 @@ fn test_compose_up_down_single_service() {
         }
     };
 
-    // Test the compose state file handling (root required for /run/remora paths).
+    // Test the compose state file handling (root required for /run/pelagos paths).
     let project_name = "test-compose";
 
     // Clean up any previous state.
@@ -11148,7 +11148,7 @@ mod registry_auth {
 
     /// Stop and remove a container, ignoring errors (best-effort cleanup).
     fn cleanup_container(name: &str) {
-        let bin = env!("CARGO_BIN_EXE_remora");
+        let bin = env!("CARGO_BIN_EXE_pelagos");
         let _ = std::process::Command::new(bin)
             .args(["stop", name])
             .output();
@@ -11182,7 +11182,7 @@ mod registry_auth {
             return;
         }
 
-        let bin = env!("CARGO_BIN_EXE_remora");
+        let bin = env!("CARGO_BIN_EXE_pelagos");
         let port = find_free_port();
         let registry_addr = format!("127.0.0.1:{}", port);
         let registry_name = format!("test-registry-{}", port);
@@ -11191,13 +11191,13 @@ mod registry_auth {
         let pull = std::process::Command::new(bin)
             .args(["image", "pull", "registry:2"])
             .status()
-            .expect("remora image pull registry:2");
+            .expect("pelagos image pull registry:2");
         assert!(pull.success(), "failed to pull registry:2");
 
         // Start registry:2 in detached mode, mapping the ephemeral port.
         //
         // NOTE: must use Stdio::null() + status() — NOT .output() — because
-        // remora --detach uses libc::fork() internally.  The watcher child
+        // pelagos --detach uses libc::fork() internally.  The watcher child
         // inherits the stdout/stderr pipe write-ends that .output() creates,
         // so .output() would block waiting for EOF until the container exits.
         let port_map = format!("{}:5000", port);
@@ -11216,7 +11216,7 @@ mod registry_auth {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run registry:2");
+            .expect("pelagos run registry:2");
         assert!(run_status.success(), "failed to start registry");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -11237,7 +11237,7 @@ mod registry_auth {
         let push_out = std::process::Command::new(bin)
             .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
             .output()
-            .expect("remora image push");
+            .expect("pelagos image push");
         assert!(
             push_out.status.success(),
             "push failed: {}",
@@ -11258,7 +11258,7 @@ mod registry_auth {
         let pull2_out = std::process::Command::new(bin)
             .args(["image", "pull", "--insecure", &dest_ref])
             .output()
-            .expect("remora image pull from local registry");
+            .expect("pelagos image pull from local registry");
         assert!(
             pull2_out.status.success(),
             "pull from local registry failed: {}",
@@ -11293,9 +11293,9 @@ mod registry_auth {
     /// by docker/distribution ≥2.8; APR1/MD5 is no longer supported).
     /// Verifies four things:
     ///   1. Push **without** credentials fails (registry returns 401).
-    ///   2. After `remora image login --password-stdin`, push **succeeds**.
+    ///   2. After `pelagos image login --password-stdin`, push **succeeds**.
     ///   3. Pull from the authenticated registry also succeeds with credentials.
-    ///   4. After `remora image logout`, pull **fails** (credentials removed).
+    ///   4. After `pelagos image logout`, pull **fails** (credentials removed).
     ///
     /// This is the canonical end-to-end test that credential resolution,
     /// `login`, and `logout` are wired correctly against a real HTTP
@@ -11315,7 +11315,7 @@ mod registry_auth {
             return;
         }
 
-        let bin = env!("CARGO_BIN_EXE_remora");
+        let bin = env!("CARGO_BIN_EXE_pelagos");
         let port = find_free_port();
         let registry_addr = format!("127.0.0.1:{}", port);
         let registry_name = format!("test-auth-registry-{}", port);
@@ -11365,7 +11365,7 @@ mod registry_auth {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run registry:2 with auth");
+            .expect("pelagos run registry:2 with auth");
         assert!(run_status.success(), "failed to start auth registry");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -11442,7 +11442,7 @@ mod registry_auth {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("remora image login");
+            .expect("pelagos image login");
         {
             use std::io::Write as _;
             login_child
@@ -11516,7 +11516,7 @@ mod registry_auth {
             .args(["image", "logout", &registry_addr])
             .env("HOME", &home_path)
             .output()
-            .expect("remora image logout");
+            .expect("pelagos image logout");
         assert!(
             logout_out.status.success(),
             "logout failed: {}",
@@ -11560,15 +11560,15 @@ mod image_save_load {
     #[test]
     #[ignore]
     fn test_image_save_load_roundtrip() {
-        let bin = env!("CARGO_BIN_EXE_remora");
+        let bin = env!("CARGO_BIN_EXE_pelagos");
         let reference = "docker.io/library/alpine:latest";
-        let tar_path = "/tmp/remora-test-alpine-save.tar";
+        let tar_path = "/tmp/pelagos-test-alpine-save.tar";
 
         // ── 1. Pull alpine ────────────────────────────────────────────────────
         let pull = std::process::Command::new(bin)
             .args(["image", "pull", reference])
             .output()
-            .expect("remora image pull");
+            .expect("pelagos image pull");
         assert!(
             pull.status.success(),
             "pull failed:\n{}",
@@ -11580,7 +11580,7 @@ mod image_save_load {
         let save = std::process::Command::new(bin)
             .args(["image", "save", reference, "-o", tar_path])
             .output()
-            .expect("remora image save");
+            .expect("pelagos image save");
         assert!(
             save.status.success(),
             "save failed:\n{}",
@@ -11605,7 +11605,7 @@ mod image_save_load {
         let rm = std::process::Command::new(bin)
             .args(["image", "rm", reference])
             .output()
-            .expect("remora image rm");
+            .expect("pelagos image rm");
         assert!(
             rm.status.success(),
             "rm failed:\n{}",
@@ -11616,7 +11616,7 @@ mod image_save_load {
         let load = std::process::Command::new(bin)
             .args(["image", "load", "-i", tar_path])
             .output()
-            .expect("remora image load");
+            .expect("pelagos image load");
         assert!(
             load.status.success(),
             "load failed:\n{}",
@@ -11633,7 +11633,7 @@ mod image_save_load {
         let ls = std::process::Command::new(bin)
             .args(["image", "ls"])
             .output()
-            .expect("remora image ls");
+            .expect("pelagos image ls");
         let ls_out = String::from_utf8_lossy(&ls.stdout);
         assert!(
             ls_out.contains("alpine"),
@@ -11645,7 +11645,7 @@ mod image_save_load {
         let run = std::process::Command::new(bin)
             .args(["run", reference, "/bin/true"])
             .output()
-            .expect("remora run");
+            .expect("pelagos run");
         assert!(
             run.status.success(),
             "run after load failed:\n{}",
@@ -11674,7 +11674,7 @@ mod image_tag {
     #[test]
     #[ignore]
     fn test_image_tag_roundtrip() {
-        let bin = env!("CARGO_BIN_EXE_remora");
+        let bin = env!("CARGO_BIN_EXE_pelagos");
         let source = "docker.io/library/alpine:latest";
         let target = "my-alpine:tagged";
 
@@ -11682,7 +11682,7 @@ mod image_tag {
         let pull = std::process::Command::new(bin)
             .args(["image", "pull", source])
             .output()
-            .expect("remora image pull");
+            .expect("pelagos image pull");
         assert!(
             pull.status.success(),
             "pull failed:\n{}",
@@ -11693,7 +11693,7 @@ mod image_tag {
         let tag = std::process::Command::new(bin)
             .args(["image", "tag", source, target])
             .output()
-            .expect("remora image tag");
+            .expect("pelagos image tag");
         assert!(
             tag.status.success(),
             "tag failed:\n{}",
@@ -11704,7 +11704,7 @@ mod image_tag {
         let ls = std::process::Command::new(bin)
             .args(["image", "ls"])
             .output()
-            .expect("remora image ls");
+            .expect("pelagos image ls");
         let ls_out = String::from_utf8_lossy(&ls.stdout);
         assert!(ls_out.contains("alpine"), "source not in ls:\n{}", ls_out);
         assert!(
@@ -11717,7 +11717,7 @@ mod image_tag {
         let run = std::process::Command::new(bin)
             .args(["run", target, "/bin/true"])
             .output()
-            .expect("remora run");
+            .expect("pelagos run");
         assert!(
             run.status.success(),
             "run of tagged image failed:\n{}",
@@ -11728,13 +11728,13 @@ mod image_tag {
         let rm_src = std::process::Command::new(bin)
             .args(["image", "rm", source])
             .output()
-            .expect("remora image rm source");
+            .expect("pelagos image rm source");
         assert!(rm_src.status.success(), "rm source failed");
 
         let run2 = std::process::Command::new(bin)
             .args(["run", target, "/bin/true"])
             .output()
-            .expect("remora run tagged after rm source");
+            .expect("pelagos run tagged after rm source");
         assert!(
             run2.status.success(),
             "run of tagged image after source rm failed:\n{}",
@@ -11764,7 +11764,7 @@ mod healthcheck_tests {
     ///
     /// Requires: root + rootfs.
     ///
-    /// Starts a detached container and verifies that `remora exec` with
+    /// Starts a detached container and verifies that `pelagos exec` with
     /// `/bin/true` exits 0 and with `/bin/false` exits non-zero.
     ///
     /// Failure indicates the exec namespace-join path is broken or the
@@ -11783,8 +11783,8 @@ mod healthcheck_tests {
             }
         };
 
-        let bin = env!("CARGO_BIN_EXE_remora");
-        let name = "remora-healthcheck-exec-true-test";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-healthcheck-exec-true-test";
 
         // Cleanup any leftover state.
         let _ = std::process::Command::new(bin)
@@ -11809,14 +11809,14 @@ mod healthcheck_tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run");
-        assert!(run_status.success(), "remora run -d failed");
+            .expect("pelagos run");
+        assert!(run_status.success(), "pelagos run -d failed");
 
         // Poll until state.json has a non-zero pid. The parent writes state.json
         // immediately (pid=0) before forking; the watcher child updates it with the
         // real container PID once the process spawns. We must wait for that second
-        // write, otherwise remora exec sees pid=0 and reports "not running".
-        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        // write, otherwise pelagos exec sees pid=0 and reports "not running".
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut last_state = String::from("(not yet written)");
         while std::time::Instant::now() < deadline {
@@ -11841,17 +11841,17 @@ mod healthcheck_tests {
         let true_result = std::process::Command::new(bin)
             .args(["exec", name, "/bin/true"])
             .status()
-            .expect("remora exec /bin/true");
-        assert!(true_result.success(), "remora exec /bin/true should exit 0");
+            .expect("pelagos exec /bin/true");
+        assert!(true_result.success(), "pelagos exec /bin/true should exit 0");
 
         // /bin/false should exit non-zero
         let false_result = std::process::Command::new(bin)
             .args(["exec", name, "/bin/false"])
             .status()
-            .expect("remora exec /bin/false");
+            .expect("pelagos exec /bin/false");
         assert!(
             !false_result.success(),
-            "remora exec /bin/false should exit non-zero"
+            "pelagos exec /bin/false should exit non-zero"
         );
 
         // Stop the container.
@@ -11885,8 +11885,8 @@ mod healthcheck_tests {
             }
         };
 
-        let bin = env!("CARGO_BIN_EXE_remora");
-        let name = "remora-healthcheck-healthy-test";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-healthcheck-healthy-test";
 
         // Cleanup any leftover state.
         let _ = std::process::Command::new(bin)
@@ -11911,11 +11911,11 @@ mod healthcheck_tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run");
-        assert!(run_status.success(), "remora run -d failed");
+            .expect("pelagos run");
+        assert!(run_status.success(), "pelagos run -d failed");
 
         // Poll until state.json appears (watcher child writes it after container starts).
-        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             if std::path::Path::new(&state_path).exists() {
@@ -11930,7 +11930,7 @@ mod healthcheck_tests {
 
         // Patch state.json to inject health_config so the watcher's health monitor
         // picks it up on next state poll. Note: this test patches after-the-fact so
-        // we rely on the monitor being started externally (e.g. remora run --health-cmd).
+        // we rely on the monitor being started externally (e.g. pelagos run --health-cmd).
         // For now this test exercises the state.json format and polling logic.
         let state_data = std::fs::read_to_string(&state_path).expect("read state.json");
         let mut state: serde_json::Value = serde_json::from_str(&state_data).unwrap();
@@ -12005,8 +12005,8 @@ mod healthcheck_tests {
             }
         };
 
-        let bin = env!("CARGO_BIN_EXE_remora");
-        let name = "remora-healthcheck-unhealthy-test";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-healthcheck-unhealthy-test";
 
         let _ = std::process::Command::new(bin)
             .args(["rm", "-f", name])
@@ -12029,11 +12029,11 @@ mod healthcheck_tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("remora run");
-        assert!(run_status.success(), "remora run -d failed");
+            .expect("pelagos run");
+        assert!(run_status.success(), "pelagos run -d failed");
 
         // Poll until state.json appears.
-        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             if std::path::Path::new(&state_path).exists() {
@@ -12248,26 +12248,26 @@ mod console_socket_tests {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
 
-    fn run_remora(args: &[&str]) -> (String, String, bool) {
+    fn run_pelagos(args: &[&str]) -> (String, String, bool) {
         // "create" spawns a long-lived shim that holds stdout/stderr pipe write-ends open.
         // output() would block until the container exits. Use status() + temp-file for stderr
         // so we return as soon as the create process itself exits.
         if args.first() == Some(&"create") {
             let tmp = tempfile::NamedTempFile::new().expect("tempfile for stderr");
             let stderr_file = tmp.reopen().expect("reopen stderr tempfile");
-            let status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            let status = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
                 .args(args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::from(stderr_file))
                 .status()
-                .expect("failed to run remora create");
+                .expect("failed to run pelagos create");
             let stderr = std::fs::read_to_string(tmp.path()).unwrap_or_default();
             return (String::new(), stderr, status.success());
         }
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args(args)
             .output()
-            .expect("failed to run remora binary");
+            .expect("failed to run pelagos binary");
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -12314,7 +12314,7 @@ mod console_socket_tests {
     /// Requires: root, rootfs.
     ///
     /// Creates an OCI bundle with `process.terminal: true` and provides a
-    /// Unix socket via `--console-socket`. After `remora create`, asserts that:
+    /// Unix socket via `--console-socket`. After `pelagos create`, asserts that:
     /// 1. The socket received exactly one fd via SCM_RIGHTS (the PTY master).
     /// 2. Writing to the received fd and reading back from it works (PTY loopback),
     ///    confirming it is a valid PTY master.
@@ -12362,12 +12362,12 @@ mod console_socket_tests {
 
         let id = format!("test-oci-console-{}", std::process::id());
 
-        // Spawn remora create in a thread so we can simultaneously accept the fd.
+        // Spawn pelagos create in a thread so we can simultaneously accept the fd.
         let bundle_str = bundle_dir.path().to_str().unwrap().to_owned();
         let socket_str = socket_path.to_str().unwrap().to_owned();
         let id_clone = id.clone();
         let create_thread = std::thread::spawn(move || {
-            run_remora(&[
+            run_pelagos(&[
                 "create",
                 "--bundle",
                 &bundle_str,
@@ -12394,7 +12394,7 @@ mod console_socket_tests {
         drop(conn);
 
         let (_, stderr, ok) = create_thread.join().unwrap();
-        assert!(ok, "remora create failed: {}", stderr);
+        assert!(ok, "pelagos create failed: {}", stderr);
         assert!(
             received_fd >= 0,
             "did not receive a valid fd via SCM_RIGHTS"
@@ -12407,8 +12407,8 @@ mod console_socket_tests {
         unsafe { libc::close(received_fd) };
 
         // Cleanup.
-        run_remora(&["kill", &id, "SIGKILL"]);
+        run_pelagos(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
-        run_remora(&["delete", &id]);
+        run_pelagos(&["delete", &id]);
     }
 }

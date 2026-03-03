@@ -1,6 +1,6 @@
 //! Demonstrates seccomp syscall filtering for container security.
 //!
-//! This example shows how to use remora's seccomp support to block dangerous
+//! This example shows how to use pelagos's seccomp support to block dangerous
 //! system calls that could lead to container escape or privilege escalation.
 //!
 //! # Running

@@ -34,8 +34,8 @@ fi
 
 echo ""
 echo "=== orphaned overlay dirs ==="
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp/remora-$(id -u)}/remora"
-for base in "$runtime_dir" /run/remora; do
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp/pelagos-$(id -u)}/pelagos"
+for base in "$runtime_dir" /run/pelagos; do
     if [ -d "$base" ]; then
         found=0
         for d in "$base"/overlay-*; do

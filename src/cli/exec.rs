@@ -1,4 +1,4 @@
-//! `remora exec` — run a command inside a running container.
+//! `pelagos exec` — run a command inside a running container.
 
 use super::{check_liveness, parse_user, read_state, ContainerStatus};
 use pelagos::container::{Command, Namespace, Stdio};

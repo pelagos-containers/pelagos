@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# bench-coldstart.sh — measure remora container cold-start latency
+# bench-coldstart.sh — measure pelagos container cold-start latency
 #
 # Usage:
 #   sudo ./scripts/bench-coldstart.sh [--runs N] [--warmup N] [--compare]
 #
-# Requires: root (remora run needs namespaces), hyperfine, alpine image pulled.
+# Requires: root (pelagos run needs namespaces), hyperfine, alpine image pulled.
 #
 # Outputs:
-#   - Median / mean / stddev cold-start time for remora
+#   - Median / mean / stddev cold-start time for pelagos
 #   - With --compare: also benchmarks crun and runc if available
 #   - Results written to scripts/bench-results.md (appended with timestamp)
 #
 # The measured command is the minimal useful workload:
-#   remora run --rm alpine /bin/true
+#   pelagos run --rm alpine /bin/true
 # This exercises: image layer mount, namespace creation, cgroup setup,
 # seccomp compile+load, exec, and teardown.
 
 set -euo pipefail
 
-REMORA="${REMORA:-$(dirname "$0")/../target/release/remora}"
+REMORA="${REMORA:-$(dirname "$0")/../target/release/pelagos}"
 RUNS="${RUNS:-20}"
 WARMUP="${WARMUP:-3}"
 COMPARE=0
@@ -44,7 +44,7 @@ if ! command -v hyperfine &>/dev/null; then
 fi
 
 if [[ ! -x "$REMORA" ]]; then
-    echo "error: remora binary not found at $REMORA"
+    echo "error: pelagos binary not found at $REMORA"
     echo "       build with: cargo build --release"
     exit 1
 fi
@@ -53,14 +53,14 @@ REMORA_VERSION="$("$REMORA" --version 2>/dev/null || echo unknown)"
 KERNEL="$(uname -r)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-echo "=== remora cold-start benchmark ==="
+echo "=== pelagos cold-start benchmark ==="
 echo "Binary:  $REMORA ($REMORA_VERSION)"
 echo "Kernel:  $KERNEL"
 echo "Runs:    $RUNS (warmup: $WARMUP)"
 echo ""
 
 CMDS=("$REMORA run --rm alpine /bin/true")
-LABELS=("remora")
+LABELS=("pelagos")
 
 if [[ $COMPARE -eq 1 ]]; then
     for rt in crun runc; do
@@ -105,7 +105,7 @@ fi
     echo "- **Kernel:** $KERNEL"
     echo "- **Binary:** $REMORA_VERSION"
     echo "- **Runs:** $RUNS (warmup: $WARMUP)"
-    echo "- **Command:** \`remora run --rm alpine /bin/true\`"
+    echo "- **Command:** \`pelagos run --rm alpine /bin/true\`"
     echo "- **Result:** $MEDIAN_MS"
     echo ""
     cat /tmp/bench-hyperfine.md

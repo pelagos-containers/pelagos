@@ -1,5 +1,5 @@
 #!/bin/bash
-# Integration test runner for remora
+# Integration test runner for pelagos
 #
 # Most tests require root privileges to create namespaces and perform
 # privileged operations like chroot, capability management, etc.
@@ -18,7 +18,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "==> Running remora integration tests"
+echo "==> Running pelagos integration tests"
 echo "==> Note: Some tests may be skipped if not running as root"
 echo ""
 

@@ -12,7 +12,7 @@ set -uo pipefail
 PASS=0
 FAIL=0
 SKIP=0
-BINARY="./target/debug/remora"
+BINARY="./target/debug/pelagos"
 
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -57,7 +57,7 @@ check_exit_fail() {
 }
 
 # Run a detached container without hanging on inherited fds.
-# Usage: run_detach [remora run args...]
+# Usage: run_detach [pelagos run args...]
 # The forked watcher child inherits the shell's stdout fd, so $(...) would
 # block until the watcher exits.  We avoid this by redirecting to a temp file
 # and closing fds in the subshell.
@@ -106,7 +106,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --- Build ---
-echo "==> Building remora..."
+echo "==> Building pelagos..."
 cargo build 2>&1
 
 # --- Ensure alpine image ---
@@ -512,8 +512,8 @@ echo ""
 ALPINE_ROOTFS=""
 if [ -d "alpine-rootfs" ]; then
     ALPINE_ROOTFS="$(pwd)/alpine-rootfs"
-elif [ -d "/var/lib/remora/rootfs/alpine-rootfs" ]; then
-    ALPINE_ROOTFS="/var/lib/remora/rootfs/alpine-rootfs"
+elif [ -d "/var/lib/pelagos/rootfs/alpine-rootfs" ]; then
+    ALPINE_ROOTFS="/var/lib/pelagos/rootfs/alpine-rootfs"
 fi
 
 if [ -n "$ALPINE_ROOTFS" ]; then
@@ -564,7 +564,7 @@ OCIJSON
     # State should fail after delete — either error output or missing dir
     if echo "$OUT" | grep -qi "error\|not found"; then
         pass "oci state dir removed"
-    elif [ ! -d "/run/remora/e2e-oci" ]; then
+    elif [ ! -d "/run/pelagos/e2e-oci" ]; then
         pass "oci state dir removed"
     else
         fail "oci state dir removed"

@@ -16,7 +16,7 @@
 #
 # Options:
 #   BLOG_PORT=N    Override the published host port (default 8080)
-#   REMORA=path    Override remora binary
+#   PELAGOS=path    Override pelagos binary
 
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -30,34 +30,34 @@ SCRIPT_DIR="examples/compose/web-stack"
 WEB_STACK_DIR="examples/web-stack"
 BLOG_PORT="${BLOG_PORT:-8080}"
 PROJECT="web-graph"
-REMORA="${REMORA:-}"
+PELAGOS="${REMORA:-}"
 
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 log() { echo -e "\n${CYAN}==>${NC} ${BOLD}$*${NC}"; }
 
-# Auto-detect remora binary.
-if [ -z "$REMORA" ]; then
-    if [ -f "./target/debug/remora" ]; then
-        REMORA="./target/debug/remora"
-    elif [ -f "./target/release/remora" ]; then
-        REMORA="./target/release/remora"
+# Auto-detect pelagos binary.
+if [ -z "$PELAGOS" ]; then
+    if [ -f "./target/debug/pelagos" ]; then
+        PELAGOS="./target/debug/pelagos"
+    elif [ -f "./target/release/pelagos" ]; then
+        PELAGOS="./target/release/pelagos"
     else
-        echo "==> Building remora..."
-        cargo build --bin remora
-        REMORA="./target/debug/remora"
+        echo "==> Building pelagos..."
+        cargo build --bin pelagos
+        PELAGOS="./target/debug/pelagos"
     fi
 fi
 
 # ── Pull base image ────────────────────────────────────────────────────────
 
 log "Checking base image..."
-if "$REMORA" image ls 2>/dev/null | grep -q "alpine:latest"; then
+if "$PELAGOS" image ls 2>/dev/null | grep -q "alpine:latest"; then
     echo "  alpine:latest already present"
 else
     echo "  pulling alpine:latest..."
-    "$REMORA" image pull alpine:latest
+    "$PELAGOS" image pull alpine:latest
 fi
 
 # ── Build web-stack images ─────────────────────────────────────────────────
@@ -65,11 +65,11 @@ fi
 log "Building web-stack images..."
 for svc in redis app proxy; do
     tag="web-stack-${svc}:latest"
-    if "$REMORA" image ls 2>/dev/null | grep -q "$tag"; then
+    if "$PELAGOS" image ls 2>/dev/null | grep -q "$tag"; then
         echo "  $tag already built"
     else
         echo "  building $tag..."
-        "$REMORA" build -t "web-stack-${svc}" --network bridge "$WEB_STACK_DIR/${svc}"
+        "$PELAGOS" build -t "web-stack-${svc}" --network bridge "$WEB_STACK_DIR/${svc}"
     fi
 done
 
@@ -78,4 +78,4 @@ done
 log "Running compose-graph.reml (project: $PROJECT, port: $BLOG_PORT)"
 echo
 BLOG_PORT="$BLOG_PORT" RUST_LOG=info \
-    "$REMORA" compose up -f "$SCRIPT_DIR/compose-graph.reml" -p "$PROJECT"
+    "$PELAGOS" compose up -f "$SCRIPT_DIR/compose-graph.reml" -p "$PROJECT"

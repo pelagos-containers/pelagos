@@ -3,7 +3,7 @@
 # Remora Monitoring Stack Demo
 # ============================
 # Builds Prometheus + Loki + Grafana images, starts the stack with
-# `remora compose up`, and runs smoke tests against the live services.
+# `pelagos compose up`, and runs smoke tests against the live services.
 #
 # Usage:  sudo ./examples/compose/monitoring/run.sh
 #
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REMORA="${REMORA:-remora}"
+PELAGOS="${PELAGOS:-pelagos}"
 GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
 
 RED='\033[0;31m'
@@ -38,8 +38,8 @@ for arg in "$@"; do
     esac
 done
 
-command -v "$REMORA" >/dev/null 2>&1 || \
-    die "remora not found.  Run: cargo build --release && sudo REMORA=\$PWD/target/release/remora $0"
+command -v "$PELAGOS" >/dev/null 2>&1 || \
+    die "pelagos not found.  Run: cargo build --release && sudo PELAGOS=\$PWD/target/release/pelagos $0"
 
 # ── Build Phase ───────────────────────────────────────────────────
 

@@ -10,11 +10,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-REMORA="./target/debug/remora"
+REMORA="./target/debug/pelagos"
 NAME="hc-smoke-test"
 IMAGE="hc-test:latest"
 CONTEXT="scripts/hc-test-context"
-STATE_PATH="/run/remora/containers/${NAME}/state.json"
+STATE_PATH="/run/pelagos/containers/${NAME}/state.json"
 
 cleanup() {
     echo ""

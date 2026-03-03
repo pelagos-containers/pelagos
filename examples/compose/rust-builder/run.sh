@@ -3,7 +3,7 @@
 # Remora Rust Builder Stack Demo
 # ==============================
 # Builds a Rust build environment with sccache, starts the container with
-# `remora compose up`, and runs smoke tests via `remora exec`.
+# `pelagos compose up`, and runs smoke tests via `pelagos exec`.
 #
 # Usage:  sudo ./examples/compose/rust-builder/run.sh
 #
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REMORA="${REMORA:-remora}"
+PELAGOS="${PELAGOS:-pelagos}"
 PROJECT="rust-builder"
 CONTAINER="${PROJECT}-rust-builder"
 
@@ -38,8 +38,8 @@ for arg in "$@"; do
     esac
 done
 
-command -v "$REMORA" >/dev/null 2>&1 || \
-    die "remora not found.  Run: cargo build --release && sudo REMORA=\$PWD/target/release/remora $0"
+command -v "$PELAGOS" >/dev/null 2>&1 || \
+    die "pelagos not found.  Run: cargo build --release && sudo PELAGOS=\$PWD/target/release/pelagos $0"
 
 # ── Build Phase ───────────────────────────────────────────────────
 
@@ -72,7 +72,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for the container to appear in `remora ps`
+# Wait for the container to appear in `pelagos ps`
 log "Waiting for container to start..."
 for i in $(seq 1 30); do
     if $REMORA ps 2>/dev/null | grep -q "$CONTAINER"; then

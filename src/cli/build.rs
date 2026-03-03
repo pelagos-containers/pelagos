@@ -1,4 +1,4 @@
-//! `remora build` — build an image from a Remfile.
+//! `pelagos build` — build an image from a Remfile.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -90,7 +90,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 return Err(format!(
                     "unknown network '{}' — use a mode (none, bridge, pasta, auto) \
-                     or create it first: remora network create {} --subnet CIDR",
+                     or create it first: pelagos network create {} --subnet CIDR",
                     name, name
                 )
                 .into());

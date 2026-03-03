@@ -1,4 +1,4 @@
-//! `remora image` — pull, list, remove, push, login, logout for OCI images.
+//! `pelagos image` — pull, list, remove, push, login, logout for OCI images.
 
 use pelagos::image::{
     self, blob_exists, extract_layer, layer_dirs, layer_exists, list_images, load_image,
@@ -72,7 +72,7 @@ pub fn cmd_image_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if images.is_empty() {
-        println!("No images found. Use 'remora image pull <name>' to pull one.");
+        println!("No images found. Use 'pelagos image pull <name>' to pull one.");
         return Ok(());
     }
     println!("{:<30} {:<15} DIGEST", "REFERENCE", "LAYERS");

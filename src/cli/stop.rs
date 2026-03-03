@@ -1,4 +1,4 @@
-//! `remora stop` — send SIGTERM to a running container.
+//! `pelagos stop` — send SIGTERM to a running container.
 
 use super::{check_liveness, read_state, write_state, ContainerStatus};
 

@@ -22,7 +22,7 @@ pub enum BuildError {
     #[error("FROM must be the first instruction")]
     MissingFrom,
 
-    #[error("image '{0}' not found locally; run 'remora image pull {0}' first")]
+    #[error("image '{0}' not found locally; run 'pelagos image pull {0}' first")]
     ImageNotFound(String),
 
     #[error("RUN command failed with exit code {0}")]
@@ -901,8 +901,8 @@ pub fn execute_build(
         _ => return Err(BuildError::MissingFrom),
     };
 
-    // Load .remignore patterns (if present) for COPY filtering.
-    let remignore = load_remignore(context_dir);
+    // Load .pelagosignore patterns (if present) for COPY filtering.
+    let remignore = load_pelagosignore(context_dir);
 
     // Split into stages (multi-stage builds).
     let stages = split_into_stages(instructions);
@@ -968,7 +968,7 @@ pub fn execute_build(
 
     image::save_image(&manifest)?;
 
-    // Generate and persist the OCI config JSON so `remora image push` can use it.
+    // Generate and persist the OCI config JSON so `pelagos image push` can use it.
     let oci_config_json = generate_oci_config_json(&manifest.config, &manifest.layers);
     if let Err(e) = image::save_oci_config(&manifest.reference, &oci_config_json) {
         log::warn!(
@@ -1309,7 +1309,7 @@ fn execute_add_archive(
         )));
     }
 
-    // Check .remignore on the archive file itself.
+    // Check .pelagosignore on the archive file itself.
     if let Some(gi) = remignore {
         let rel = src_path.strip_prefix(context_dir).unwrap_or(&src_path);
         if gi.matched(rel, false).is_ignore() {
@@ -1397,7 +1397,7 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
         return Ok(digest);
     }
 
-    // Persist the raw blob for future `remora image push`.
+    // Persist the raw blob for future `pelagos image push`.
     image::save_blob(&digest, &tar_gz_bytes)?;
     image::save_blob_diffid(&digest, &diff_id)?;
 
@@ -1491,12 +1491,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), io::Error> {
 }
 
 // ---------------------------------------------------------------------------
-// .remignore support
+// .pelagosignore support
 // ---------------------------------------------------------------------------
 
-/// Load `.remignore` patterns from the build context root, if the file exists.
-fn load_remignore(context_dir: &Path) -> Option<ignore::gitignore::Gitignore> {
-    let path = context_dir.join(".remignore");
+/// Load `.pelagosignore` patterns from the build context root, if the file exists.
+fn load_pelagosignore(context_dir: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let path = context_dir.join(".pelagosignore");
     if !path.is_file() {
         return None;
     }
@@ -1505,7 +1505,7 @@ fn load_remignore(context_dir: &Path) -> Option<ignore::gitignore::Gitignore> {
     match builder.build() {
         Ok(gi) => Some(gi),
         Err(e) => {
-            log::warn!("failed to parse .remignore: {}", e);
+            log::warn!("failed to parse .pelagosignore: {}", e);
             None
         }
     }
@@ -2057,7 +2057,7 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         assert_eq!(substitute_vars("$A-${B}-$$", &vars), "1-2-$");
     }
 
-    // -- .remignore tests --
+    // -- .pelagosignore tests --
 
     #[test]
     fn test_copy_dir_filtered_excludes() {

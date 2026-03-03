@@ -43,12 +43,12 @@ bzip2 = { version = "0.5", features = ["static"] }  # bz2 decompression; static 
 xz2 = { version = "0.1", features = ["static"] }    # xz decompression; static links liblzma for musl portability
 
 [[bin]]
-name = "remora"
+name = "pelagos"
 path = "src/main.rs"
 
 [[bin]]
-name = "remora-dns"
-path = "src/bin/remora-dns.rs"
+name = "pelagos-dns"
+path = "src/bin/pelagos-dns.rs"
 
 [dev-dependencies]
 serial_test = "3"

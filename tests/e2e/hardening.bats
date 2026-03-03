@@ -3,15 +3,15 @@
 #
 # End-to-end verification that spawn_service applies all four security
 # hardening defaults (seccomp, capability drop, no-new-privs, PID namespace)
-# to every container started via `remora compose up`.
+# to every container started via `pelagos compose up`.
 #
 # These tests close the gap that unit + integration tests cannot: they exercise
 # the full binary path through cmd_compose_up_reml → spawn_service.
 #
 # Prerequisites:
 #   - Run as root (sudo -E bats tests/e2e/hardening.bats)
-#   - alpine:latest pulled (remora image pull alpine:latest)
-#   - remora binary built (cargo build)
+#   - alpine:latest pulled (pelagos image pull alpine:latest)
+#   - pelagos binary built (cargo build)
 
 load helpers.bash
 

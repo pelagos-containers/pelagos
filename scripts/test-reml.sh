@@ -43,7 +43,7 @@ for arg in "$@"; do
 done
 
 BLOG_PORT="${BLOG_PORT:-8080}"
-REMORA="${REMORA:-./target/release/remora}"
+REMORA="${REMORA:-./target/release/pelagos}"
 COMPOSE_REML="examples/compose/web-stack/compose.reml"
 COMPOSE_REM="examples/compose/web-stack/compose.rem"
 WEB_STACK_DIR="examples/web-stack"
@@ -132,7 +132,7 @@ fi
 echo
 
 # ── Build ──────────────────────────────────────────────────────────
-log "Phase 2a: build remora (release)"
+log "Phase 2a: build pelagos (release)"
 step "Running: cargo build --release"
 cargo build --release --quiet
 step "Binary: $REMORA"
@@ -165,7 +165,7 @@ echo "  Look for the on-ready hook lines tagged [lisp]."
 echo
 
 # Capture supervisor output to a temp file so we can grep it after teardown.
-LOGFILE="$(mktemp /tmp/remora-reml-test-XXXXXX.log)"
+LOGFILE="$(mktemp /tmp/pelagos-reml-test-XXXXXX.log)"
 step "Log file: $LOGFILE"
 
 BLOG_PORT="$BLOG_PORT" RUST_LOG=info \

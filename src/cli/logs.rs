@@ -1,4 +1,4 @@
-//! `remora logs` — print or follow a container's output.
+//! `pelagos logs` — print or follow a container's output.
 
 use super::read_state;
 use std::io::{self, Write};

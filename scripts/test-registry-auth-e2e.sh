@@ -28,7 +28,7 @@
 # Must run as root (overlay + port forwarding require CAP_SYS_ADMIN).
 set -uo pipefail
 
-BINARY="${BINARY:-./target/debug/remora}"
+BINARY="${BINARY:-./target/debug/pelagos}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CREDS_FILE="${CREDS_FILE:-${SCRIPT_DIR}/e2e-creds.env}"
 
@@ -44,7 +44,7 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ ! -x "$BINARY" ]]; then
-    echo "ERROR: remora binary not found at $BINARY — run 'cargo build' first."
+    echo "ERROR: pelagos binary not found at $BINARY — run 'cargo build' first."
     exit 1
 fi
 
@@ -124,7 +124,7 @@ run_private_suite() {
     echo "================================================================"
 
     local tmphome
-    tmphome=$(mktemp -d /tmp/remora-e2e-home.XXXXXX)
+    tmphome=$(mktemp -d /tmp/pelagos-e2e-home.XXXXXX)
 
     echo ""
     echo "--- Setup: ensure alpine available ---"
@@ -140,7 +140,7 @@ run_private_suite() {
         env HOME="$tmphome" "$BINARY" image push alpine --dest "$image"
 
     echo ""
-    echo "--- Test 2: remora image login ---"
+    echo "--- Test 2: pelagos image login ---"
     check_output_contains "login prints 'Login Succeeded'" "Login Succeeded" \
         env HOME="$tmphome" "$BINARY" image login \
             --username "$user" --password-stdin "$registry" <<<"$token"
@@ -172,7 +172,7 @@ run_private_suite() {
         _fail "pull: 'Done:' not found in output"
         echo "    output: $pull_out"
     fi
-    check_output_contains "image appears in 'remora image ls'" "$registry" \
+    check_output_contains "image appears in 'pelagos image ls'" "$registry" \
         env HOME="$tmphome" "$BINARY" image ls
 
     echo ""
@@ -203,7 +203,7 @@ run_private_suite() {
     fi
 
     echo ""
-    echo "--- Test 7: remora image logout ---"
+    echo "--- Test 7: pelagos image logout ---"
     check_ok "logout succeeds" \
         env HOME="$tmphome" "$BINARY" image logout "$registry"
     if [[ -f "$tmphome/.docker/config.json" ]] && \
@@ -232,7 +232,7 @@ run_private_suite() {
 #
 # Prerequisites: the repository must already be configured as public on the
 # registry before running this suite.  The first push makes the image
-# available; visibility is controlled by repository settings, not by remora.
+# available; visibility is controlled by repository settings, not by pelagos.
 #
 # Arguments: profile  registry  user  token  image
 # ---------------------------------------------------------------------------
@@ -251,7 +251,7 @@ run_public_suite() {
     echo "================================================================"
 
     local tmphome
-    tmphome=$(mktemp -d /tmp/remora-e2e-home.XXXXXX)
+    tmphome=$(mktemp -d /tmp/pelagos-e2e-home.XXXXXX)
 
     echo ""
     echo "--- Setup: ensure alpine available ---"
@@ -267,7 +267,7 @@ run_public_suite() {
         env HOME="$tmphome" "$BINARY" image push alpine --dest "$image"
 
     echo ""
-    echo "--- Test 2: remora image login ---"
+    echo "--- Test 2: pelagos image login ---"
     check_output_contains "login prints 'Login Succeeded'" "Login Succeeded" \
         env HOME="$tmphome" "$BINARY" image login \
             --username "$user" --password-stdin "$registry" <<<"$token"
@@ -299,7 +299,7 @@ run_public_suite() {
         _fail "pull: 'Done:' not found in output"
         echo "    output: $pull_out"
     fi
-    check_output_contains "image appears in 'remora image ls'" "$registry" \
+    check_output_contains "image appears in 'pelagos image ls'" "$registry" \
         env HOME="$tmphome" "$BINARY" image ls
 
     echo ""
@@ -330,7 +330,7 @@ run_public_suite() {
     fi
 
     echo ""
-    echo "--- Test 7: remora image logout ---"
+    echo "--- Test 7: pelagos image logout ---"
     check_ok "logout succeeds" \
         env HOME="$tmphome" "$BINARY" image logout "$registry"
     if [[ -f "$tmphome/.docker/config.json" ]] && \

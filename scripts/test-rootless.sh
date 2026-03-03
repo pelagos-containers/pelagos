@@ -11,7 +11,7 @@ set -euo pipefail
 PASS=0
 FAIL=0
 SKIP=0
-BINARY="./target/debug/remora"
+BINARY="./target/debug/pelagos"
 
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -74,7 +74,7 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 # --- Build ---
-echo "==> Building remora..."
+echo "==> Building pelagos..."
 cargo build 2>&1
 
 # --- Ensure alpine image ---

@@ -1,8 +1,8 @@
 //! Centralised path resolution for all Remora filesystem locations.
 //!
-//! Root mode uses system directories (`/var/lib/remora/`, `/run/remora/`).
-//! Rootless mode uses per-user XDG directories (`~/.local/share/remora/`,
-//! `$XDG_RUNTIME_DIR/remora/`).
+//! Root mode uses system directories (`/var/lib/pelagos/`, `/run/pelagos/`).
+//! Rootless mode uses per-user XDG directories (`~/.local/share/pelagos/`,
+//! `$XDG_RUNTIME_DIR/pelagos/`).
 
 use std::path::PathBuf;
 
@@ -13,15 +13,15 @@ pub fn is_rootless() -> bool {
 
 /// Persistent data directory.
 ///
-/// - Root (or system store already initialised): `/var/lib/remora/`
-/// - Rootless with no system store: `$XDG_DATA_HOME/remora/` (default `~/.local/share/remora/`)
+/// - Root (or system store already initialised): `/var/lib/pelagos/`
+/// - Rootless with no system store: `$XDG_DATA_HOME/pelagos/` (default `~/.local/share/pelagos/`)
 ///
-/// If `/var/lib/remora/` already exists we always use it, regardless of the
+/// If `/var/lib/pelagos/` already exists we always use it, regardless of the
 /// current UID.  This means a non-root user can pull images into the same
-/// store that `sudo remora` uses, once root has initialised the directory
+/// store that `sudo pelagos` uses, once root has initialised the directory
 /// (which happens automatically on the first root pull/run).
 pub fn data_dir() -> PathBuf {
-    let system_dir = PathBuf::from("/var/lib/remora");
+    let system_dir = PathBuf::from("/var/lib/pelagos");
     // Use the system store if it already exists OR if we are root.
     if system_dir.exists() || !is_rootless() {
         return system_dir;
@@ -29,29 +29,29 @@ pub fn data_dir() -> PathBuf {
     // Pure rootless: system store has never been initialised, use XDG dir.
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("remora");
+            return PathBuf::from(xdg).join("pelagos");
         }
     }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/remora");
+        return PathBuf::from(home).join(".local/share/pelagos");
     }
     // Last resort: /tmp fallback (unlikely on any real system).
-    PathBuf::from(format!("/tmp/remora-data-{}", unsafe { libc::getuid() }))
+    PathBuf::from(format!("/tmp/pelagos-data-{}", unsafe { libc::getuid() }))
 }
 
 /// Ephemeral runtime directory.
 ///
-/// - Root: `/run/remora/`
-/// - Rootless: `$XDG_RUNTIME_DIR/remora/` (fallback `/tmp/remora-<uid>/`, mode 0700)
+/// - Root: `/run/pelagos/`
+/// - Rootless: `$XDG_RUNTIME_DIR/pelagos/` (fallback `/tmp/pelagos-<uid>/`, mode 0700)
 pub fn runtime_dir() -> PathBuf {
     if is_rootless() {
         if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
             if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("remora");
+                return PathBuf::from(xdg).join("pelagos");
             }
         }
         let uid = unsafe { libc::getuid() };
-        let fallback = PathBuf::from(format!("/tmp/remora-{}", uid));
+        let fallback = PathBuf::from(format!("/tmp/pelagos-{}", uid));
         // Best-effort create with 0700.
         if !fallback.exists() {
             let _ = std::fs::create_dir_all(&fallback);
@@ -63,7 +63,7 @@ pub fn runtime_dir() -> PathBuf {
         }
         fallback
     } else {
-        PathBuf::from("/run/remora")
+        PathBuf::from("/run/pelagos")
     }
 }
 
@@ -102,7 +102,7 @@ pub fn build_cache_dir() -> PathBuf {
 /// Raw compressed blob store: `<data>/blobs/`.
 ///
 /// Stores the original `.tar.gz` bytes for each layer, keyed by digest.
-/// Required for `remora image push`.
+/// Required for `pelagos image push`.
 pub fn blobs_dir() -> PathBuf {
     data_dir().join("blobs")
 }
@@ -336,7 +336,7 @@ mod tests {
         let rt = runtime_dir();
         assert!(dns_config_dir().starts_with(&rt));
         assert!(dns_pid_file().starts_with(&rt));
-        assert!(dns_network_file("remora0").starts_with(&rt));
+        assert!(dns_network_file("pelagos0").starts_with(&rt));
         assert_eq!(
             dns_network_file("frontend"),
             dns_config_dir().join("frontend")
@@ -348,7 +348,7 @@ mod tests {
         let rt = runtime_dir();
         assert!(dns_backend_file().starts_with(&rt));
         assert!(dns_dnsmasq_conf().starts_with(&rt));
-        assert!(dns_hosts_file("remora0").starts_with(&rt));
+        assert!(dns_hosts_file("pelagos0").starts_with(&rt));
         assert_eq!(
             dns_hosts_file("frontend"),
             dns_config_dir().join("hosts.frontend")

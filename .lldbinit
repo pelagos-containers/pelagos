@@ -1,8 +1,8 @@
-target create ./target/debug/remora
+target create ./target/debug/pelagos
 settings set target.process.stop-on-exec true
 settings set --  target.run-args --exe /bin/ash --uid 1001 --gid 1001 --rootfs ./alpine-rootfs
 settings set target.process.follow-fork-mode child
-break set -n remora::main
+break set -n pelagos::main
 break set -n nix::sched::sched_linux_like::clone
 break set -n unshare::child::child_after_clone
 

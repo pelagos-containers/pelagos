@@ -239,8 +239,8 @@ fn spawn_fuse_overlayfs(
 
 /// Resolve a container's bridge IP by name.
 ///
-/// Searches CLI state (`/run/remora/containers/{name}/state.json`) and OCI state
-/// (`/run/remora/{name}/state.json`). Returns the bridge IP string if the container
+/// Searches CLI state (`/run/pelagos/containers/{name}/state.json`) and OCI state
+/// (`/run/pelagos/{name}/state.json`). Returns the bridge IP string if the container
 /// is running and has bridge networking, or an error otherwise.
 pub fn resolve_container_ip(name: &str) -> io::Result<String> {
     // Try CLI state first.
@@ -535,7 +535,7 @@ pub struct TmpfsMount {
 /// A kernel filesystem mount (proc, sysfs, devpts, mqueue, cgroup, etc.).
 ///
 /// Used by the OCI bundle handler to mount special filesystems that are specified
-/// in `config.json` rather than being auto-detected by remora.
+/// in `config.json` rather than being auto-detected by pelagos.
 #[derive(Debug, Clone)]
 pub struct KernelMount {
     /// Filesystem type passed to `mount(2)` (e.g. `"proc"`, `"sysfs"`, `"devpts"`).
@@ -563,7 +563,7 @@ pub struct OverlayConfig {
     pub lower_dirs: Vec<PathBuf>,
 }
 
-/// A named volume backed by a host directory under `/var/lib/remora/volumes/<name>/`.
+/// A named volume backed by a host directory under `/var/lib/pelagos/volumes/<name>/`.
 ///
 /// Volumes provide persistent storage that survives container restarts.
 ///
@@ -576,7 +576,7 @@ pub struct OverlayConfig {
 ///     .spawn()?;
 /// ```
 pub struct Volume {
-    /// The volume name (used as directory name under `/var/lib/remora/volumes/`).
+    /// The volume name (used as directory name under `/var/lib/pelagos/volumes/`).
     pub name: String,
     /// Resolved absolute host path to the volume directory.
     pub path: PathBuf,
@@ -701,7 +701,7 @@ pub struct Command {
     // Overlay filesystem (upper + work dirs; lower = chroot_dir).
     overlay: Option<OverlayConfig>,
     // OCI sync: (ready_write_fd, listen_fd). Used by cmd_create to block the container
-    // in pre_exec until "remora start" connects to exec.sock.
+    // in pre_exec until "pelagos start" connects to exec.sock.
     oci_sync: Option<(i32, i32)>,
     // PTY slave fd for OCI terminal mode (process.terminal = true).
     // When set, pre_exec calls setsid()+dup2(slave,0/1/2)+TIOCSCTTY before exec.
@@ -1193,7 +1193,7 @@ impl Command {
 
     /// Override the cgroup path/name for this container (OCI `linux.cgroupsPath`).
     ///
-    /// By default remora names the cgroup `remora-{child_pid}`. When the OCI config
+    /// By default pelagos names the cgroup `pelagos-{child_pid}`. When the OCI config
     /// specifies `linux.cgroupsPath`, pass it here to use that name instead.
     pub fn with_cgroup_path(mut self, path: impl Into<String>) -> Self {
         self.cgroup_config.get_or_insert_with(Default::default).path = Some(path.into());
@@ -1351,7 +1351,7 @@ impl Command {
     /// - [`NetworkMode::Loopback`](crate::network::NetworkMode::Loopback) — create an
     ///   isolated network namespace with only the loopback interface (`lo`, 127.0.0.1).
     /// - [`NetworkMode::Bridge`](crate::network::NetworkMode::Bridge) — create an isolated
-    ///   network namespace connected to the `remora0` bridge (172.19.0.x/24).
+    ///   network namespace connected to the `pelagos0` bridge (172.19.0.x/24).
     ///
     /// `Loopback` and `Bridge` modes automatically add [`Namespace::NET`] to the
     /// namespace set, so you don't need to call `.with_namespaces(Namespace::NET)` separately.
@@ -1368,11 +1368,11 @@ impl Command {
     /// Command::new("/bin/sh").with_network(NetworkMode::Bridge).spawn()?;
     /// ```
     pub fn with_network(mut self, mode: crate::network::NetworkMode) -> Self {
-        // Normalize Bridge → BridgeNamed("remora0") so internal code only
+        // Normalize Bridge → BridgeNamed("pelagos0") so internal code only
         // needs to match BridgeNamed(_).
         let mode = match mode {
             crate::network::NetworkMode::Bridge => {
-                crate::network::NetworkMode::BridgeNamed("remora0".into())
+                crate::network::NetworkMode::BridgeNamed("pelagos0".into())
             }
             other => other,
         };
@@ -1466,7 +1466,7 @@ impl Command {
     /// Write DNS nameservers into the container's `/etc/resolv.conf`.
     ///
     /// Writes nameserver lines to a per-container temp file under
-    /// `/run/remora/dns-{pid}-{n}/resolv.conf` (never touches the shared rootfs)
+    /// `/run/pelagos/dns-{pid}-{n}/resolv.conf` (never touches the shared rootfs)
     /// and bind-mounts it over `/etc/resolv.conf` inside the container.
     /// The temp file is removed in `wait()` / `wait_with_output()`.
     ///
@@ -1521,7 +1521,7 @@ impl Command {
     /// themselves reside on an overlayfs mount.
     ///
     /// The merged mount point is created by Remora at
-    /// `/run/remora/overlay-{pid}-{n}/merged/` and removed after `wait()`.
+    /// `/run/pelagos/overlay-{pid}-{n}/merged/` and removed after `wait()`.
     ///
     /// # Examples
     ///
@@ -1549,7 +1549,7 @@ impl Command {
     ///
     /// `layer_dirs` must be ordered **top-first** (as overlayfs expects for `lowerdir=`).
     /// The bottom (last) layer is used as the chroot directory.  An ephemeral upper and
-    /// work directory are auto-created under `/run/remora/overlay-{pid}-{n}/` and removed
+    /// work directory are auto-created under `/run/pelagos/overlay-{pid}-{n}/` and removed
     /// after `wait()`.
     ///
     /// Automatically enables `Namespace::MOUNT` and `/proc` mount.
@@ -1603,9 +1603,9 @@ impl Command {
 
     /// Configure OCI create/start synchronization.
     ///
-    /// Internal — used by `remora create`. The child's pre_exec writes its PID
+    /// Internal — used by `pelagos create`. The child's pre_exec writes its PID
     /// to `ready_write_fd`, then blocks on `accept(listen_fd)` waiting for
-    /// `remora start` to connect and send a byte.
+    /// `pelagos start` to connect and send a byte.
     pub fn with_oci_sync(mut self, ready_write_fd: i32, listen_fd: i32) -> Self {
         self.oci_sync = Some((ready_write_fd, listen_fd));
         self
@@ -1613,7 +1613,7 @@ impl Command {
 
     /// Wire a PTY slave fd as the container's stdin/stdout/stderr.
     ///
-    /// Used by `remora create` when `process.terminal: true`. The pre_exec
+    /// Used by `pelagos create` when `process.terminal: true`. The pre_exec
     /// closure calls `setsid()`, `dup2(slave, 0/1/2)`, and `TIOCSCTTY` so the
     /// container process gets a controlling terminal backed by the PTY.
     ///
@@ -1932,7 +1932,7 @@ impl Command {
     /// Override the rootfs mount propagation applied after chroot/pivot_root.
     ///
     /// Pass `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE`, or `MS_UNBINDABLE` (optionally OR'd
-    /// with `MS_REC`). By default remora applies `MS_PRIVATE | MS_REC`.
+    /// with `MS_REC`). By default pelagos applies `MS_PRIVATE | MS_REC`.
     pub fn with_rootfs_propagation(mut self, flags: libc::c_ulong) -> Self {
         self.rootfs_propagation = Some(flags);
         self
@@ -3798,7 +3798,7 @@ impl Command {
 
                 // Step 8: OCI create/start synchronization.
                 // Signals the parent that setup is complete (writes PID to ready_write_fd),
-                // then blocks on accept(listen_fd) until "remora start" connects.
+                // then blocks on accept(listen_fd) until "pelagos start" connects.
                 // After receiving the start byte, pre_exec returns → exec happens.
                 if let Some((ready_w, listen_fd)) = oci_sync {
                     // Write our PID (4 bytes, native-endian) to signal "created".
@@ -3807,7 +3807,7 @@ impl Command {
                     libc::write(ready_w, pid_bytes.as_ptr() as *const libc::c_void, 4);
                     libc::close(ready_w);
 
-                    // Block until "remora start" connects and sends one byte.
+                    // Block until "pelagos start" connects and sends one byte.
                     let conn = libc::accept4(listen_fd, ptr::null_mut(), ptr::null_mut(), 0);
                     if conn >= 0 {
                         let mut buf = [0u8; 1];
@@ -3818,7 +3818,7 @@ impl Command {
                 }
 
                 // Step 8.5: Set UID/GID after OCI sync.
-                // Placed AFTER the OCI sync so that "remora create" succeeds (container
+                // Placed AFTER the OCI sync so that "pelagos create" succeeds (container
                 // reaches "created" state) even when the target UID is not yet mapped in
                 // the user namespace at setup time.  All privileged operations (mounts,
                 // chroot, /proc, capabilities, ns joins) have already completed above.
@@ -5871,7 +5871,7 @@ pub struct Child {
     pasta: Option<crate::network::PastaSetup>,
     /// Overlay merged-dir created before fork; removed after the child exits.
     overlay_merged_dir: Option<PathBuf>,
-    /// Per-container DNS temp dir (`/run/remora/dns-{pid}-{n}/`); removed after child exits.
+    /// Per-container DNS temp dir (`/run/pelagos/dns-{pid}-{n}/`); removed after child exits.
     dns_temp_dir: Option<PathBuf>,
     /// Per-container hosts temp dir; removed after child exits.
     hosts_temp_dir: Option<PathBuf>,

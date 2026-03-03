@@ -5,7 +5,7 @@
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
-    "remora only supports Linux (requires kernel namespaces, cgroups v2, and seccomp-BPF)"
+    "pelagos only supports Linux (requires kernel namespaces, cgroups v2, and seccomp-BPF)"
 );
 
 pub mod build;

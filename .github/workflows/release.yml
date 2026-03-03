@@ -13,10 +13,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            artifact: remora-x86_64-linux
+            artifact: pelagos-x86_64-linux
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-            artifact: remora-aarch64-linux
+            artifact: pelagos-aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - name: Prepare artifact
         run: |
-          cp target/${{ matrix.target }}/release/remora ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/pelagos ${{ matrix.artifact }}
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
       - name: Verify static binary
         run: |

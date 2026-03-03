@@ -1,4 +1,4 @@
-//! `remora network` — manage named networks.
+//! `pelagos network` — manage named networks.
 
 use pelagos::network::{Ipv4Net, NetworkDef};
 
@@ -31,8 +31,8 @@ fn validate_name(name: &str) -> Result<(), String> {
 
 /// Compute the bridge interface name for a network.
 fn bridge_name_for(name: &str) -> String {
-    if name == "remora0" {
-        "remora0".to_string()
+    if name == "pelagos0" {
+        "pelagos0".to_string()
     } else {
         format!("rm-{}", name)
     }
@@ -125,7 +125,7 @@ pub fn cmd_network_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if nets.is_empty() {
-        println!("No networks. Use: remora network create <name> --subnet CIDR");
+        println!("No networks. Use: pelagos network create <name> --subnet CIDR");
         return Ok(());
     }
 
@@ -146,8 +146,8 @@ pub fn cmd_network_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if name == "remora0" {
-        return Err("cannot remove the default network 'remora0'".into());
+    if name == "pelagos0" {
+        return Err("cannot remove the default network 'pelagos0'".into());
     }
 
     let config_dir = pelagos::paths::network_config_dir(name);
@@ -190,7 +190,7 @@ pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn cmd_network_inspect(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let net = if name == "remora0" {
+    let net = if name == "pelagos0" {
         pelagos::network::bootstrap_default_network()?
     } else {
         NetworkDef::load(name)?

@@ -1,4 +1,4 @@
-//! `remora cleanup` — remove stale network namespaces, overlay dirs, and DNS temp dirs
+//! `pelagos cleanup` — remove stale network namespaces, overlay dirs, and DNS temp dirs
 //! left behind by containers that exited without proper teardown.
 
 use std::path::Path;
@@ -12,14 +12,14 @@ pub fn cmd_cleanup() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Stale named network namespaces: /run/netns/rem-{pid}-{n}
     cleaned += cleanup_netns()?;
 
-    // 2. Stale overlay dirs: /run/remora/overlay-{pid}-{n}/
-    cleaned += cleanup_dir_pattern("/run/remora", "overlay-")?;
+    // 2. Stale overlay dirs: /run/pelagos/overlay-{pid}-{n}/
+    cleaned += cleanup_dir_pattern("/run/pelagos", "overlay-")?;
 
-    // 3. Stale DNS temp dirs: /run/remora/dns-{pid}-{n}/
-    cleaned += cleanup_dir_pattern("/run/remora", "dns-")?;
+    // 3. Stale DNS temp dirs: /run/pelagos/dns-{pid}-{n}/
+    cleaned += cleanup_dir_pattern("/run/pelagos", "dns-")?;
 
-    // 4. Stale hosts temp dirs: /run/remora/hosts-{pid}-{n}/
-    cleaned += cleanup_dir_pattern("/run/remora", "hosts-")?;
+    // 4. Stale hosts temp dirs: /run/pelagos/hosts-{pid}-{n}/
+    cleaned += cleanup_dir_pattern("/run/pelagos", "hosts-")?;
 
     if cleaned == 0 {
         println!("No stale resources found.");
@@ -76,7 +76,7 @@ fn cleanup_netns() -> Result<u32, Box<dyn std::error::Error>> {
     Ok(count)
 }
 
-/// Remove orphaned `/run/remora/{prefix}*` directories where the owning PID is dead.
+/// Remove orphaned `/run/pelagos/{prefix}*` directories where the owning PID is dead.
 fn cleanup_dir_pattern(parent: &str, prefix: &str) -> Result<u32, Box<dyn std::error::Error>> {
     let parent = Path::new(parent);
     if !parent.is_dir() {

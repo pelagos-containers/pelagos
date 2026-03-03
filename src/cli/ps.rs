@@ -1,5 +1,5 @@
-//! `remora ps` — list containers.
-//! `remora container inspect` — show detailed container state as JSON.
+//! `pelagos ps` — list containers.
+//! `pelagos container inspect` — show detailed container state as JSON.
 
 use super::{
     check_liveness, format_age, list_containers, read_state, write_state, ContainerStatus,
@@ -30,9 +30,9 @@ pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     if states.is_empty() {
         if all {
-            println!("No containers found. Use 'remora run' to start one.");
+            println!("No containers found. Use 'pelagos run' to start one.");
         } else {
-            println!("No containers running. Use 'remora run' to start one.");
+            println!("No containers running. Use 'pelagos run' to start one.");
         }
         return Ok(());
     }

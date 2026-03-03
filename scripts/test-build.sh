@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test the `remora build` feature end-to-end.
+# Test the `pelagos build` feature end-to-end.
 #
 # Must run as root (use -E to preserve rustup/cargo environment):
 #   sudo -E scripts/test-build.sh
@@ -8,7 +8,7 @@ set -uo pipefail
 PASS=0
 FAIL=0
 SKIP=0
-BINARY="./target/debug/remora"
+BINARY="./target/debug/pelagos"
 TMPDIR=""
 
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -55,7 +55,7 @@ if ! $BINARY image ls 2>/dev/null | grep -q alpine; then
     $BINARY image pull alpine
 fi
 
-TMPDIR=$(mktemp -d /tmp/remora-test-build.XXXXXX)
+TMPDIR=$(mktemp -d /tmp/pelagos-test-build.XXXXXX)
 echo "Using temp dir: $TMPDIR"
 echo
 

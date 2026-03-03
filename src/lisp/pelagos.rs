@@ -34,7 +34,7 @@ pub struct PendingCompose {
 ///
 /// Hooks registered by `(on-ready ...)` are accumulated into `hooks`.
 /// A `compose-up` call stores its spec in `pending`.
-pub fn register_remora_builtins(
+pub fn register_pelagos_builtins(
     env: &Env,
     hooks: Rc<RefCell<HookMap>>,
     pending: Rc<RefCell<PendingCompose>>,

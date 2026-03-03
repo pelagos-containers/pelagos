@@ -8,8 +8,8 @@
 #
 # Prerequisites:
 #   - Run as root (sudo -E bats tests/e2e/lifecycle.bats)
-#   - alpine:latest pulled (remora image pull alpine:latest)
-#   - remora binary built (cargo build)
+#   - alpine:latest pulled (pelagos image pull alpine:latest)
+#   - pelagos binary built (cargo build)
 
 load helpers.bash
 
@@ -31,18 +31,18 @@ teardown_file() {
 # ---------------------------------------------------------------------------
 
 @test "compose up writes project state file" {
-    [[ -f "/run/remora/compose/${PROJECT}/state.json" ]]
+    [[ -f "/run/pelagos/compose/${PROJECT}/state.json" ]]
 }
 
 @test "compose ps shows probe as running" {
-    run "$REMORA" compose ps -f "$FIXTURE" -p "$PROJECT"
+    run "$PELAGOS" compose ps -f "$FIXTURE" -p "$PROJECT"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "probe" ]]
     [[ "$output" =~ "running" ]]
 }
 
 @test "compose ps header contains SERVICE CONTAINER STATUS PID columns" {
-    run "$REMORA" compose ps -f "$FIXTURE" -p "$PROJECT"
+    run "$PELAGOS" compose ps -f "$FIXTURE" -p "$PROJECT"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "SERVICE" ]]
     [[ "$output" =~ "CONTAINER" ]]
@@ -51,7 +51,7 @@ teardown_file() {
 }
 
 @test "probe container name is scoped as PROJECT-SERVICE" {
-    run "$REMORA" compose ps -f "$FIXTURE" -p "$PROJECT"
+    run "$PELAGOS" compose ps -f "$FIXTURE" -p "$PROJECT"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "${PROJECT}-probe" ]]
 }
@@ -72,5 +72,5 @@ teardown_file() {
     sleep 1
 
     # State file should be gone
-    [[ ! -f "/run/remora/compose/${PROJECT}/state.json" ]]
+    [[ ! -f "/run/pelagos/compose/${PROJECT}/state.json" ]]
 }

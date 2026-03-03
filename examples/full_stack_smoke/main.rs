@@ -32,7 +32,7 @@ use std::env;
 const ALPINE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 fn register_container(name: &str, pid: i32, ip: &str, rootfs: &str) {
-    let dir = format!("/run/remora/containers/{}", name);
+    let dir = format!("/run/pelagos/containers/{}", name);
     std::fs::create_dir_all(&dir).expect("create container state dir");
     let state = serde_json::json!({
         "name": name,
@@ -51,7 +51,7 @@ fn register_container(name: &str, pid: i32, ip: &str, rootfs: &str) {
 }
 
 fn unregister_container(name: &str) {
-    let dir = format!("/run/remora/containers/{}", name);
+    let dir = format!("/run/pelagos/containers/{}", name);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -129,7 +129,7 @@ fn main() {
     let rootfs_str = rootfs.to_str().unwrap();
 
     // Create overlay upper+work dirs for each container.
-    let tmp = std::env::temp_dir().join("remora-smoke");
+    let tmp = std::env::temp_dir().join("pelagos-smoke");
     let _ = std::fs::remove_dir_all(&tmp);
     let server_upper = tmp.join("server-upper");
     let server_work = tmp.join("server-work");

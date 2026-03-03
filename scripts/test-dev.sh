@@ -10,7 +10,7 @@ set -euo pipefail
 
 PASS=0
 FAIL=0
-BINARY="./target/debug/remora"
+BINARY="./target/debug/pelagos"
 
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -36,7 +36,7 @@ check_not_contains() {
 }
 
 # Build first.
-echo "==> Building remora..."
+echo "==> Building pelagos..."
 cargo build 2>&1
 
 if [ "${1:-}" = "--rootless" ]; then

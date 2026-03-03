@@ -8,12 +8,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 // Legacy constants kept as documentation — all code now uses crate::paths::*.
-// pub const IMAGES_DIR: &str = "/var/lib/remora/images";
-// pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
+// pub const IMAGES_DIR: &str = "/var/lib/pelagos/images";
+// pub const LAYERS_DIR: &str = "/var/lib/pelagos/layers";
 
-/// Look up the GID of the `remora` system group, if it exists.
-fn remora_group_gid() -> Option<libc::gid_t> {
-    let name = std::ffi::CString::new("remora").ok()?;
+/// Look up the GID of the `pelagos` system group, if it exists.
+fn pelagos_group_gid() -> Option<libc::gid_t> {
+    let name = std::ffi::CString::new("pelagos").ok()?;
     let gr = unsafe { libc::getgrnam(name.as_ptr()) };
     if gr.is_null() {
         None
@@ -24,8 +24,8 @@ fn remora_group_gid() -> Option<libc::gid_t> {
 
 /// Ensure the image store directories exist with correct ownership and mode.
 ///
-/// If the `remora` system group exists (created by `scripts/setup.sh`):
-///   `images/`, `layers/`, `build-cache/` → root:remora 0775
+/// If the `pelagos` system group exists (created by `scripts/setup.sh`):
+///   `images/`, `layers/`, `build-cache/` → root:pelagos 0775
 /// Otherwise (system not yet set up, or pure rootless):
 ///   → root:root 0755 (root-only access)
 ///
@@ -37,8 +37,8 @@ fn ensure_image_dirs() -> io::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    let remora_gid = remora_group_gid();
-    let mode = if remora_gid.is_some() { 0o775 } else { 0o755 };
+    let pelagos_gid = pelagos_group_gid();
+    let mode = if pelagos_gid.is_some() { 0o775 } else { 0o755 };
 
     for dir in [
         crate::paths::layers_dir(),
@@ -51,7 +51,7 @@ fn ensure_image_dirs() -> io::Result<()> {
             #[cfg(unix)]
             {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;
-                if let Some(gid) = remora_gid {
+                if let Some(gid) = pelagos_gid {
                     let path_cstr = std::ffi::CString::new(dir.as_os_str().as_bytes())
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     // u32::MAX == (uid_t)-1: POSIX "don't change owner".

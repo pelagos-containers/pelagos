@@ -10,7 +10,7 @@
 //!
 //! # Naming
 //!
-//! Each container's cgroup is named `remora-{child_pid}` to guarantee uniqueness
+//! Each container's cgroup is named `pelagos-{child_pid}` to guarantee uniqueness
 //! across concurrent containers.
 
 use cgroups_rs::{
@@ -96,7 +96,7 @@ pub struct CgroupConfig {
     pub net_priorities: Vec<(String, u64)>,
 
     /// Explicit cgroup path from OCI `linux.cgroupsPath`.
-    /// If set, used as-is as the cgroup name/path; otherwise defaults to `remora-{pid}`.
+    /// If set, used as-is as the cgroup name/path; otherwise defaults to `pelagos-{pid}`.
     pub path: Option<String>,
 }
 
@@ -114,7 +114,7 @@ pub struct CgroupDeviceRule {
     pub access: String,
 }
 
-/// Create a cgroup named `remora-{child_pid}`, apply configured limits, and add
+/// Create a cgroup named `pelagos-{child_pid}`, apply configured limits, and add
 /// the child process to it.
 ///
 /// Returns the live [`Cgroup`] handle — the caller must call [`teardown_cgroup`]
@@ -128,7 +128,7 @@ pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
     let name = cfg
         .path
         .clone()
-        .unwrap_or_else(|| format!("remora-{}", child_pid));
+        .unwrap_or_else(|| format!("pelagos-{}", child_pid));
     let hier = hierarchies::auto();
 
     let mut builder = CgroupBuilder::new(&name);

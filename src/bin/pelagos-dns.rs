@@ -1,6 +1,6 @@
-//! `remora-dns` — lightweight DNS daemon for container name resolution.
+//! `pelagos-dns` — lightweight DNS daemon for container name resolution.
 //!
-//! Usage: `remora-dns --config-dir <dir>`
+//! Usage: `pelagos-dns --config-dir <dir>`
 //!
 //! Listens on gateway IPs from per-network config files, resolves container
 //! names to their bridge IPs, and forwards unknown queries to upstream DNS.
@@ -340,10 +340,10 @@ impl ServerState {
                         socket: sock,
                         network_name: net_name.to_string(),
                     });
-                    eprintln!("remora-dns: listening on {}", bind_addr);
+                    eprintln!("pelagos-dns: listening on {}", bind_addr);
                 }
                 Err(e) => {
-                    eprintln!("remora-dns: failed to bind {}: {}", bind_addr, e);
+                    eprintln!("pelagos-dns: failed to bind {}: {}", bind_addr, e);
                 }
             }
         }
@@ -424,18 +424,18 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let config_dir = if let Some(pos) = args.iter().position(|a| a == "--config-dir") {
         args.get(pos + 1).map(PathBuf::from).unwrap_or_else(|| {
-            eprintln!("remora-dns: --config-dir requires a path argument");
+            eprintln!("pelagos-dns: --config-dir requires a path argument");
             std::process::exit(1);
         })
     } else {
-        eprintln!("Usage: remora-dns --config-dir <dir>");
+        eprintln!("Usage: pelagos-dns --config-dir <dir>");
         std::process::exit(1);
     };
 
     // Write PID file.
     let pid_file = config_dir.join("pid");
     if let Err(e) = std::fs::write(&pid_file, format!("{}", unsafe { libc::getpid() })) {
-        eprintln!("remora-dns: failed to write PID file: {}", e);
+        eprintln!("pelagos-dns: failed to write PID file: {}", e);
         std::process::exit(1);
     }
 
@@ -448,13 +448,13 @@ fn main() {
     state.reload();
 
     if !state.has_entries() {
-        eprintln!("remora-dns: no entries found, exiting");
+        eprintln!("pelagos-dns: no entries found, exiting");
         let _ = std::fs::remove_file(&pid_file);
         return;
     }
 
     eprintln!(
-        "remora-dns: started with {} network(s)",
+        "pelagos-dns: started with {} network(s)",
         state.configs.len()
     );
 
@@ -465,10 +465,10 @@ fn main() {
         if reload_flag.swap(false, Ordering::SeqCst) {
             state.reload();
             if !state.has_entries() {
-                eprintln!("remora-dns: no entries remaining, exiting");
+                eprintln!("pelagos-dns: no entries remaining, exiting");
                 break;
             }
-            eprintln!("remora-dns: reloaded, {} network(s)", state.configs.len());
+            eprintln!("pelagos-dns: reloaded, {} network(s)", state.configs.len());
         }
 
         // Poll all sockets with a short timeout.
@@ -496,15 +496,15 @@ fn main() {
 
     // Cleanup PID file.
     let _ = std::fs::remove_file(&pid_file);
-    eprintln!("remora-dns: stopped");
+    eprintln!("pelagos-dns: stopped");
 }
 
 /// Handle a DNS query: resolve locally or forward upstream.
 fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Option<Vec<u8>> {
     let query = parse_dns_query(packet)?;
 
-    // Strip `.remora` suffix if present.
-    let name = query.qname.strip_suffix(".remora").unwrap_or(&query.qname);
+    // Strip `.pelagos` suffix if present.
+    let name = query.qname.strip_suffix(".pelagos").unwrap_or(&query.qname);
 
     // Strip any trailing dot.
     let name = name.strip_suffix('.').unwrap_or(name);
@@ -580,9 +580,9 @@ mod tests {
 
     #[test]
     fn test_parse_dotted_name() {
-        let packet = make_a_query("mycontainer.remora");
+        let packet = make_a_query("mycontainer.pelagos");
         let query = parse_dns_query(&packet).expect("should parse");
-        assert_eq!(query.qname, "mycontainer.remora");
+        assert_eq!(query.qname, "mycontainer.pelagos");
     }
 
     #[test]
@@ -645,16 +645,16 @@ mod tests {
 
     #[test]
     fn test_parse_qname_labels() {
-        // Manually encode "app.remora": [3]app[6]remora[0]
+        // Manually encode "app.pelagos": [3]app[7]pelagos[0]
         let mut buf = Vec::new();
         buf.push(3);
         buf.extend_from_slice(b"app");
         buf.push(6);
-        buf.extend_from_slice(b"remora");
+        buf.extend_from_slice(b"pelagos");
         buf.push(0);
 
         let (name, pos) = parse_qname(&buf, 0).expect("should parse");
-        assert_eq!(name, "app.remora");
+        assert_eq!(name, "app.pelagos");
         assert_eq!(pos, buf.len());
     }
 

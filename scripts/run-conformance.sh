@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Run opencontainers/runtime-tools conformance suite against remora.
+# Run opencontainers/runtime-tools conformance suite against pelagos.
 # Must be run as root (sudo -E ./scripts/run-conformance.sh).
 # Requires runtime-tools built at /home/cb/Projects/runtime-tools.
 
 set -euo pipefail
 
 RUNTIME_TOOLS=/home/cb/Projects/runtime-tools
-REMORA=$(realpath "$(dirname "$0")/../target/debug/remora")
+REMORA=$(realpath "$(dirname "$0")/../target/debug/pelagos")
 RESULTS_FILE=$(realpath "$(dirname "$0")/../rt-results.txt")
 
 if [ ! -f "$REMORA" ]; then
-    echo "remora binary not found at $REMORA — run 'sudo -E cargo build' first" >&2
+    echo "pelagos binary not found at $REMORA — run 'sudo -E cargo build' first" >&2
     exit 1
 fi
 
 export PATH="$(dirname "$REMORA"):$PATH"
-export RUNTIME=remora
+export RUNTIME=pelagos
 
 # Run from runtime-tools dir so tests find rootfs-amd64.tar.gz and runtimetest
 cd "$RUNTIME_TOOLS"
@@ -28,7 +28,7 @@ declare -a failures=()
 # Tests known to be permanently unsupported (cgroupv2 stub in runtime-tools)
 CGROUP_SKIP_PATTERN="linux_cgroups_"
 
-echo "=== remora OCI conformance ($(date)) ===" | tee "$RESULTS_FILE"
+echo "=== pelagos OCI conformance ($(date)) ===" | tee "$RESULTS_FILE"
 echo "" | tee -a "$RESULTS_FILE"
 
 for testbin in validation/*/*.t; do
@@ -41,7 +41,7 @@ for testbin in validation/*/*.t; do
         continue
     fi
 
-    output=$(sudo PATH="$(dirname "$REMORA"):$PATH" RUNTIME=remora "$testbin" 2>&1 || true)
+    output=$(sudo PATH="$(dirname "$REMORA"):$PATH" RUNTIME=pelagos "$testbin" 2>&1 || true)
     not_ok_count=$(echo "$output" | grep -c "^not ok" || true)
     ok_count=$(echo "$output" | grep -c "^ok" || true)
 

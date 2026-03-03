@@ -1,4 +1,4 @@
-//! `remora volume` — manage named volumes.
+//! `pelagos volume` — manage named volumes.
 
 use pelagos::container::Volume;
 
@@ -46,7 +46,7 @@ pub fn cmd_volume_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if names.is_empty() {
-        println!("No volumes. Use: remora volume create <name>");
+        println!("No volumes. Use: pelagos volume create <name>");
         return Ok(());
     }
 

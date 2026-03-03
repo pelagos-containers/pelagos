@@ -1,4 +1,4 @@
-//! `remora rm` — remove a container.
+//! `pelagos rm` — remove a container.
 
 use super::{check_liveness, container_dir, read_state, ContainerStatus};
 
@@ -24,7 +24,7 @@ pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>>
             }
         } else {
             return Err(format!(
-                "container '{}' is running; use --force to remove it or `remora stop {}` first",
+                "container '{}' is running; use --force to remove it or `pelagos stop {}` first",
                 name, name
             )
             .into());

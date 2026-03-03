@@ -1,4 +1,4 @@
-//! CLI shared types, helpers, and state management for `remora run/ps/stop/rm/logs`.
+//! CLI shared types, helpers, and state management for `pelagos run/ps/stop/rm/logs`.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -58,7 +58,7 @@ pub fn rootfs_store() -> PathBuf {
 ///
 /// Accepts either a filesystem path (absolute or relative) that points to an
 /// existing directory, or a name registered in the rootfs store
-/// (`/var/lib/remora/rootfs/<name>` — a directory or symlink).
+/// (`/var/lib/pelagos/rootfs/<name>` — a directory or symlink).
 pub fn rootfs_path(name: &str) -> std::io::Result<PathBuf> {
     // If the argument is a path to an existing directory, use it directly.
     let as_path = PathBuf::from(name);
@@ -222,7 +222,7 @@ pub fn generate_name() -> std::io::Result<String> {
         .unwrap_or(0);
     let next = n + 1;
     std::fs::write(&counter, next.to_string())?;
-    Ok(format!("remora-{}", next))
+    Ok(format!("pelagos-{}", next))
 }
 
 // ---------------------------------------------------------------------------

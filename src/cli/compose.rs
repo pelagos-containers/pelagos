@@ -1,4 +1,4 @@
-//! `remora compose` — multi-service orchestration with S-expression compose files.
+//! `pelagos compose` — multi-service orchestration with S-expression compose files.
 //! Supports both `.rem` (static S-expression) and `.reml` (Lisp program) formats.
 
 use super::{
@@ -908,7 +908,7 @@ fn resolve_image(
     let normalised = normalise_image_reference(image_ref);
     let m = image::load_image(&normalised).map_err(|e| {
         format!(
-            "image '{}' not found locally (run 'remora image pull {}'): {}",
+            "image '{}' not found locally (run 'pelagos image pull {}'): {}",
             image_ref, image_ref, e
         )
     })?;

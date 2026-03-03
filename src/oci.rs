@@ -110,10 +110,10 @@ pub struct OciLinux {
     pub devices: Vec<OciDevice>,
     pub seccomp: Option<OciSeccomp>,
     /// Mount propagation of the rootfs: "shared" | "slave" | "private" | "unbindable".
-    /// Defaults to "rprivate" (remora makes all mounts private by default).
+    /// Defaults to "rprivate" (pelagos makes all mounts private by default).
     pub rootfs_propagation: Option<String>,
     /// Absolute path for the container's cgroup (e.g. "/myapp/container1").
-    /// If absent, remora auto-generates a path.
+    /// If absent, pelagos auto-generates a path.
     pub cgroups_path: Option<String>,
 }
 
@@ -1238,11 +1238,11 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
 /// hook sequentially in that joined namespace. The parent waits for the child.
 ///
 /// Mount namespace is intentionally excluded: by the time `createContainer` /
-/// `startContainer` hooks are called in remora's lifecycle the container process
+/// `startContainer` hooks are called in pelagos's lifecycle the container process
 /// has already called `pivot_root`, so the mount namespace's filesystem view is
 /// the container rootfs — the hook binary (on the host) would not be found.
 /// OCI runtimes that run hooks before `pivot_root` (e.g. runc) can join the mount
-/// namespace; remora joins the remaining namespaces (net, uts, ipc).
+/// namespace; pelagos joins the remaining namespaces (net, uts, ipc).
 ///
 /// PID namespace is excluded for the same reason: `setns(CLONE_NEWPID)` only
 /// affects `pid_for_children`; the calling process is not moved.
@@ -1508,12 +1508,12 @@ fn send_fd_to_console_socket(socket_path: &Path, fd: i32) -> io::Result<()> {
     send_fd_on_socket(stream.as_raw_fd(), fd)
 }
 
-/// `remora create <id> --bundle <bundle>` — set up container, suspend before exec.
+/// `pelagos create <id> --bundle <bundle>` — set up container, suspend before exec.
 ///
 /// Forks a shim that calls `command.spawn()`. The container's pre_exec writes
 /// its PID to a ready pipe (signalling "created"), then blocks on accept().
 /// The parent reads the PID, writes state.json, and exits. The shim is orphaned
-/// and waits for the container; `remora start` later unblocks it.
+/// and waits for the container; `pelagos start` later unblocks it.
 ///
 /// `console_socket` — when `process.terminal: true` the runtime allocates a PTY,
 /// wires the slave to the container's stdio, and sends the master fd to this
@@ -1532,7 +1532,7 @@ pub fn cmd_create(
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
-                "container '{}' already exists — run 'remora delete {}' first",
+                "container '{}' already exists — run 'pelagos delete {}' first",
                 id, id
             ),
         ));
@@ -1549,7 +1549,7 @@ pub fn cmd_create(
     }
     let (ready_r, ready_w) = (pipe_fds[0], pipe_fds[1]);
 
-    // Listen socket: grandchild blocks on accept() until "remora start" connects.
+    // Listen socket: grandchild blocks on accept() until "pelagos start" connects.
     let sock_path = exec_sock_path(id);
     let listen_fd = create_listen_socket(&sock_path).inspect_err(|_e| unsafe {
         libc::close(ready_r);
@@ -1804,7 +1804,7 @@ pub fn cmd_create(
     }
 }
 
-/// `remora start <id>` — signal the container to exec.
+/// `pelagos start <id>` — signal the container to exec.
 pub fn cmd_start(id: &str) -> io::Result<()> {
     let state = read_state(id)?;
     if state.status != "created" {
@@ -2131,7 +2131,7 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// `remora kill <id> <signal>` — send a signal to the container process.
+/// `pelagos kill <id> <signal>` — send a signal to the container process.
 pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
     let state = read_state(id)?;
 
@@ -2311,7 +2311,7 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// `remora delete <id>` — remove state dir after container has stopped.
+/// `pelagos delete <id>` — remove state dir after container has stopped.
 pub fn cmd_delete_force(id: &str) -> io::Result<()> {
     // Force-delete: kill the container first if it's still running.
     if let Ok(state) = read_state(id) {

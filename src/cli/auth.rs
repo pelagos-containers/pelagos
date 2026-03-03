@@ -316,7 +316,7 @@ fn registry_keys(registry: &str) -> Vec<String> {
         .trim_end_matches('/');
     // docker.io and index.docker.io are the same registry.  oci-client's
     // resolve_registry() maps "docker.io" → "index.docker.io", but users
-    // naturally run `remora image login docker.io`, so we need to search
+    // naturally run `pelagos image login docker.io`, so we need to search
     // both forms regardless of which one was presented.
     match bare {
         "docker.io" | "index.docker.io" => vec![
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn test_call_credential_helper_get() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let helper_path = tmp.path().join("docker-credential-fake-remora-test");
+        let helper_path = tmp.path().join("docker-credential-fake-pelagos-test");
         std::fs::write(
             &helper_path,
             "#!/bin/sh\necho '{\"Username\":\"testuser\",\"Secret\":\"testpass\"}'\n",
@@ -567,7 +567,7 @@ mod tests {
         let new_path = format!("{}:{}", tmp.path().display(), original_path);
         std::env::set_var("PATH", &new_path);
 
-        let result = call_credential_helper("fake-remora-test", "ghcr.io");
+        let result = call_credential_helper("fake-pelagos-test", "ghcr.io");
 
         std::env::set_var("PATH", original_path);
 
@@ -582,7 +582,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         // Write fake helper binary.
-        let helper_path = tmp.path().join("docker-credential-fake-remora-test2");
+        let helper_path = tmp.path().join("docker-credential-fake-pelagos-test2");
         std::fs::write(
             &helper_path,
             "#!/bin/sh\necho '{\"Username\":\"helperuser\",\"Secret\":\"helperpass\"}'\n",
@@ -597,7 +597,7 @@ mod tests {
         std::fs::create_dir_all(&docker_dir).unwrap();
         let static_auth = base64_encode(b"staticuser:staticpass");
         let config = serde_json::json!({
-            "credHelpers": { "ghcr.io": "fake-remora-test2" },
+            "credHelpers": { "ghcr.io": "fake-pelagos-test2" },
             "auths": { "ghcr.io": { "auth": static_auth } }
         });
         std::fs::write(

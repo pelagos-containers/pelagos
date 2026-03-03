@@ -1,7 +1,7 @@
 //! Container health monitor — runs as a thread inside the watcher process.
 //!
 //! Periodically executes the health check command inside the container's
-//! namespaces (via namespace-join, same mechanism as `remora exec`) and
+//! namespaces (via namespace-join, same mechanism as `pelagos exec`) and
 //! updates `state.json` with the current [`HealthStatus`].
 
 use super::{check_liveness, read_state, write_state, HealthConfig, HealthStatus};

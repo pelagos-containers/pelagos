@@ -502,7 +502,7 @@ fn main() {
             console_socket,
             pid_file,
         } => match bundle.or(bundle_positional) {
-            None => Err("remora create: --bundle <path> is required".into()),
+            None => Err("pelagos create: --bundle <path> is required".into()),
             Some(bundle_path) => pelagos::oci::cmd_create(
                 &id,
                 &bundle_path,
@@ -528,7 +528,7 @@ fn main() {
     let code = match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("remora: error: {}", e);
+            eprintln!("pelagos: error: {}", e);
             1
         }
     };

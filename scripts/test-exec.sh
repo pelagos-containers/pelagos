@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Test script for `remora exec`.  Run with:  sudo -E ./test-exec.sh
+# Test script for `pelagos exec`.  Run with:  sudo -E ./test-exec.sh
 #
 # Cleans up containers on exit regardless of success or failure.
 

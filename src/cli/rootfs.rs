@@ -1,4 +1,4 @@
-//! `remora rootfs` — manage the local rootfs store.
+//! `pelagos rootfs` — manage the local rootfs store.
 
 use super::rootfs_store;
 use std::os::unix::fs::symlink;
@@ -66,7 +66,7 @@ pub fn cmd_rootfs_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if items.is_empty() {
-        println!("No rootfs images. Use: remora rootfs import <name> <path>");
+        println!("No rootfs images. Use: pelagos rootfs import <name> <path>");
         return Ok(());
     }
 

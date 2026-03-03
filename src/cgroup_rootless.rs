@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// A rootless cgroup created under the user's delegated subtree.
 pub struct RootlessCgroup {
-    /// Absolute path, e.g. `/sys/fs/cgroup/user.slice/.../remora-<pid>`.
+    /// Absolute path, e.g. `/sys/fs/cgroup/user.slice/.../pelagos-<pid>`.
     pub path: PathBuf,
 }
 
@@ -77,7 +77,7 @@ pub fn setup_rootless_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<R
     let parent = self_cgroup_path()?;
     let controllers = available_controllers(&parent)?;
 
-    let name = format!("remora-{}", child_pid);
+    let name = format!("pelagos-{}", child_pid);
     let cg_path = parent.join(&name);
 
     fs::create_dir(&cg_path)?;

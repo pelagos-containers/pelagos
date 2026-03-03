@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stress and edge-case tests for remora.
+# Stress and edge-case tests for pelagos.
 #
 # Covers: concurrent bridge containers (IPAM), NAT refcount, signal
 # propagation, cleanup after crashes, combined resource limits, OCI
@@ -12,7 +12,7 @@ set -uo pipefail
 PASS=0
 FAIL=0
 SKIP=0
-BINARY="./target/debug/remora"
+BINARY="./target/debug/pelagos"
 
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -81,7 +81,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --- Build ---
-echo "==> Building remora..."
+echo "==> Building pelagos..."
 cargo build 2>&1
 
 # --- Ensure alpine image ---
@@ -113,7 +113,7 @@ echo "--- Collecting bridge IPs ---"
 sleep 3
 IPS=()
 for NAME in "${BRIDGE_NAMES[@]}"; do
-    STATE_FILE="/run/remora/containers/$NAME/state.json"
+    STATE_FILE="/run/pelagos/containers/$NAME/state.json"
     if [ -f "$STATE_FILE" ]; then
         # serde_json may serialize with or without spaces around colon
         IP=$(grep -oE '"bridge_ip"\s*:\s*"[0-9.]+"' "$STATE_FILE" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
@@ -162,7 +162,7 @@ if has_cmd nft; then
     sleep 2
 
     echo "--- Checking NAT refcount file ---"
-    REFCOUNT_FILE="/run/remora/nat_refcount"
+    REFCOUNT_FILE="/run/pelagos/nat_refcount"
     if [ -f "$REFCOUNT_FILE" ]; then
         RC=$(cat "$REFCOUNT_FILE" 2>/dev/null || echo "0")
         if [ "$RC" -ge 3 ]; then
@@ -262,7 +262,7 @@ echo "--- Test: foreground exit → no leaked overlay merged dirs ---"
 $BINARY run --name stress-overlay alpine /bin/true 2>/dev/null || true
 sleep 1
 # Check for leaked overlay merged dirs
-MERGED_COUNT=$(find /run/remora/ -maxdepth 2 -name 'merged' -type d 2>/dev/null | wc -l)
+MERGED_COUNT=$(find /run/pelagos/ -maxdepth 2 -name 'merged' -type d 2>/dev/null | wc -l)
 # Some merged dirs may exist from other containers — just check ours is gone
 pass "foreground exit cleanup (merged dirs: $MERGED_COUNT)"
 $BINARY rm -f stress-overlay 2>/dev/null || true
@@ -304,8 +304,8 @@ echo ""
 ALPINE_ROOTFS=""
 if [ -d "alpine-rootfs" ]; then
     ALPINE_ROOTFS="$(pwd)/alpine-rootfs"
-elif [ -d "/var/lib/remora/rootfs/alpine-rootfs" ]; then
-    ALPINE_ROOTFS="/var/lib/remora/rootfs/alpine-rootfs"
+elif [ -d "/var/lib/pelagos/rootfs/alpine-rootfs" ]; then
+    ALPINE_ROOTFS="/var/lib/pelagos/rootfs/alpine-rootfs"
 fi
 
 if [ -n "$ALPINE_ROOTFS" ]; then

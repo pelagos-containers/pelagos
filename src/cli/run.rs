@@ -1,4 +1,4 @@
-//! `remora run` — create and start a container.
+//! `pelagos run` — create and start a container.
 
 use super::{
     check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[derive(Debug, clap::Args)]
 #[clap(trailing_var_arg = true)]
 pub struct RunArgs {
-    /// Container name (auto-generated if omitted: remora-1, remora-2, …)
+    /// Container name (auto-generated if omitted: pelagos-1, pelagos-2, …)
     #[clap(long)]
     pub name: Option<String>,
 
@@ -181,7 +181,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         let config = pelagos::paths::network_config_dir(net_name).join("config.json");
         if !config.exists() {
             return Err(format!(
-                "additional network '{}' not found — create it first: remora network create {} --subnet CIDR",
+                "additional network '{}' not found — create it first: pelagos network create {} --subnet CIDR",
                 net_name, net_name
             ).into());
         }
@@ -251,7 +251,7 @@ fn build_image_run(
         let normalised = normalise_image_reference(image_ref);
         let m = image::load_image(&normalised).map_err(|e| {
             format!(
-                "image '{}' not found locally (run 'remora image pull {}'): {}",
+                "image '{}' not found locally (run 'pelagos image pull {}'): {}",
                 image_ref, image_ref, e
             )
         })?;
@@ -572,7 +572,7 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>
             } else {
                 Err(format!(
                     "unknown network '{}' — use a mode (none, loopback, bridge, pasta) \
-                     or create it first: remora network create {} --subnet CIDR",
+                     or create it first: pelagos network create {} --subnet CIDR",
                     name, name
                 )
                 .into())
@@ -773,7 +773,7 @@ fn run_detached(
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("remora watcher: spawn failed: {}", e);
+                    eprintln!("pelagos watcher: spawn failed: {}", e);
                     unsafe { libc::_exit(1) };
                 }
             };
@@ -820,7 +820,7 @@ fn run_detached(
             let exit = match child.wait() {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("remora watcher: wait failed: {}", e);
+                    eprintln!("pelagos watcher: wait failed: {}", e);
                     unsafe { libc::_exit(1) };
                 }
             };
