@@ -20,7 +20,7 @@
 //! sudo -E cargo run --example secure_container
 //! ```
 
-use remora::container::{Command, Namespace, Stdio};
+use pelagos::container::{Command, Namespace, Stdio};
 use std::env;
 
 fn main() {

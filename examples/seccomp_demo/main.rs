@@ -15,7 +15,7 @@
 //! sudo -E cargo run --example seccomp_demo
 //! ```
 
-use remora::container::{Command, Namespace, Stdio};
+use pelagos::container::{Command, Namespace, Stdio};
 use std::env;
 use std::fs;
 use std::io::Write;

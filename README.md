@@ -1,6 +1,6 @@
 # Remora
 
-[![CI](https://github.com/skeptomai/remora/actions/workflows/ci.yml/badge.svg)](https://github.com/skeptomai/remora/actions/workflows/ci.yml)
+[![CI](https://github.com/skeptomai/pelagos/actions/workflows/ci.yml/badge.svg)](https://github.com/skeptomai/pelagos/actions/workflows/ci.yml)
 
 **Remora** is a daemonless Linux container runtime written in Rust. It can run a
 single container or orchestrate a multi-service stack — and its primary interface
@@ -160,7 +160,7 @@ scripting reference.
 ## Installation
 
 Download a pre-built static binary from the
-[Releases](https://github.com/skeptomai/remora/releases) page (x86_64 and
+[Releases](https://github.com/skeptomai/pelagos/releases) page (x86_64 and
 aarch64 Linux, statically linked musl), or build from source:
 
 ```bash

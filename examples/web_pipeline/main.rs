@@ -22,8 +22,8 @@
 //! sudo -E cargo run --example web_pipeline
 //! ```
 
-use remora::container::{Command, Namespace, Stdio};
-use remora::network::NetworkMode;
+use pelagos::container::{Command, Namespace, Stdio};
+use pelagos::network::NetworkMode;
 use std::env;
 
 const ALPINE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
