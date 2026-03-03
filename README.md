@@ -1,8 +1,8 @@
-# Remora
+# Pelagos
 
 [![CI](https://github.com/skeptomai/pelagos/actions/workflows/ci.yml/badge.svg)](https://github.com/skeptomai/pelagos/actions/workflows/ci.yml)
 
-**Remora** is a daemonless Linux container runtime written in Rust. It can run a
+**Pelagos** is a daemonless Linux container runtime written in Rust. It can run a
 single container or orchestrate a multi-service stack — and its primary interface
 is a Lisp scripting language, not YAML.
 
@@ -11,7 +11,7 @@ run a migration before the app starts, wait for a port to be ready, react to
 failure with cleanup logic, or build a dependency graph that executes in parallel.
 A runtime that is programmable from first principles.
 
-Remora is also an embeddable Rust library, making it possible to add container
+Pelagos is also an embeddable Rust library, making it possible to add container
 isolation directly to your own programs without spawning a daemon or shelling out
 to Docker.
 
@@ -22,7 +22,7 @@ security, scripting, and more.
 
 ## What makes it different
 
-| | Remora | Docker | runc |
+| | Pelagos | Docker | runc |
 |--|--------|--------|------|
 | Daemon required | ❌ | ✅ | ❌ |
 | Library API | ✅ | ❌ | ❌ |
@@ -40,7 +40,7 @@ opt back in with `:cap-add`.
 
 ## The `.reml` scripting interface
 
-Remora's compose files are Lisp programs, not config schemas. A minimal stack:
+Pelagos compose files are Lisp programs, not config schemas. A minimal stack:
 
 ```lisp
 (define-service svc-db "db"
@@ -109,9 +109,9 @@ scripting reference.
 - **Read-only rootfs:** `MS_RDONLY` remount makes the filesystem immutable
 - **Masked paths:** `/proc/kcore`, `/sys/firmware`, and others hidden
 - **Landlock LSM:** per-path filesystem rules via Linux 5.13+ kernel interface
-- **Structural TOCTOU immunity:** remora uses a single-threaded `pre_exec` hook and
+- **Structural TOCTOU immunity:** Pelagos uses a single-threaded `pre_exec` hook and
   never re-execs itself — the architecture that drives the November 2025 runc CVE
-  cluster (CVE-2025-31133, CVE-2025-52565, CVE-2025-52881) does not exist in remora.
+  cluster (CVE-2025-31133, CVE-2025-52565, CVE-2025-52881) does not exist in Pelagos.
   See [docs/SECURITY.md](docs/SECURITY.md) for details.
 
 ### Networking
@@ -214,7 +214,7 @@ sudo -E remora compose up -f examples/compose/imperative/compose.reml -p demo
 ## Rust Library API
 
 ```rust
-use remora::container::{Command, Namespace};
+use pelagos::container::{Command, Namespace};
 
 let mut child = Command::new("/bin/sh")
     .args(&["-c", "echo hello from container"])

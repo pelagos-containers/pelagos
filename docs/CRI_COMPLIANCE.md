@@ -22,12 +22,12 @@ kubelet
 
 ---
 
-## Where remora sits today
+## Where Pelagos sits today
 
-Remora implements the **OCI Runtime Spec** layer (bottom of the stack above)
+Pelagos implements the **OCI Runtime Spec** layer (bottom of the stack above)
 and its own higher-level CLI on top of that. It is not CRI-compliant.
 
-| Layer | Remora status |
+| Layer | Pelagos status |
 |-------|---------------|
 | OCI Runtime Spec (`create/start/state/kill/delete`) | Partial ✅ — `src/oci.rs` |
 | OCI image pull + layer store | ✅ — `src/image.rs`, `src/cli/image.rs` |
@@ -36,7 +36,7 @@ and its own higher-level CLI on top of that. It is not CRI-compliant.
 | Pod sandbox concept | ❌ |
 | CNI integration | ❌ |
 | Container log management (CRI format) | ❌ |
-| Daemon architecture | ❌ — remora is a CLI |
+| Daemon architecture | ❌ — Pelagos is a CLI |
 
 ### Fastest path to Kubernetes without a CRI rewrite
 
@@ -44,7 +44,7 @@ Write a **containerd shim** (`containerd-shim-remora-v1`). A shim is a small
 process that containerd forks per-container; it speaks the containerd shim v2
 protocol and calls an OCI runtime. Implementing the shim protocol is
 significantly less work than a full CRI server, and containerd handles pod
-sandboxes, CNI, and image management itself. Remora's existing OCI lifecycle
+sandboxes, CNI, and image management itself. Pelagos's existing OCI lifecycle
 commands are used as-is.
 
 ---
@@ -52,7 +52,7 @@ commands are used as-is.
 ## Full CRI implementation plan
 
 This is a significant but tractable project. Everything listed below builds on
-existing remora internals rather than replacing them.
+existing Pelagos internals rather than replacing them.
 
 ---
 
@@ -115,7 +115,7 @@ than creating their own.
 - Store sandbox state (ID → PID, netns path, IP) in runtime state directory
 - `StopPodSandbox` / `RemovePodSandbox`: teardown + cleanup
 
-**Note:** this is the architecturally novel piece. Remora currently assumes one
+**Note:** this is the architecturally novel piece. Pelagos currently assumes one
 container = one network namespace. Pod sandboxes require decoupling network
 setup from container spawn.
 
@@ -123,7 +123,7 @@ setup from container spawn.
 
 ### Phase C5 — CNI integration
 
-**Goal:** replace remora's built-in bridge/NAT networking with CNI plugins for
+**Goal:** replace Pelagos's built-in bridge/NAT networking with CNI plugins for
 pod networking.
 
 **Work:**
@@ -132,7 +132,7 @@ pod networking.
 - `RunPodSandbox` calls CNI `ADD` to configure the pod's netns
 - `StopPodSandbox` calls CNI `DEL` to clean up
 - Support reading CNI config from `/etc/cni/net.d/` (standard location)
-- Keep remora's built-in networking for `remora run` / `remora compose` —
+- Keep Pelagos's built-in networking for `remora run` / `remora compose` —
   CNI is only used when driven via CRI
 
 Standard CNI plugins (`bridge`, `host-local`, `loopback`) from
@@ -154,7 +154,7 @@ Standard CNI plugins (`bridge`, `host-local`, `loopback`) from
 - `RemoveContainer`: cleanup state + overlay
 - `ListContainers` / `ContainerStatus`: read runtime state directory
 
-This maps closely to existing remora container machinery; the main addition is
+This maps closely to existing Pelagos container machinery; the main addition is
 reading `ContainerConfig` from the CRI protobuf instead of CLI flags.
 
 ---

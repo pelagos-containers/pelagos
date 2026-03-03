@@ -1,4 +1,4 @@
-# Remora Development Roadmap
+# Pelagos Development Roadmap
 
 **Last Updated:** 2026-02-20
 **Current Status:** Image build complete — `remora build -t <tag> .`
@@ -204,7 +204,7 @@ Build custom OCI images from Remfiles (simplified Dockerfiles).
 
 ## Imperative Runtime Builtins ✅ (Feb 25, 2026)
 
-Make Lisp the **primary programming interface** to Remora's runtime, not just
+Make Lisp the **primary programming interface** to Pelagos's runtime, not just
 a config DSL.  `.reml` files can now directly orchestrate containers without
 using `compose-up`.
 

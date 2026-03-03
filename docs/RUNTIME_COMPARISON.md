@@ -1,11 +1,11 @@
-# Remora vs Established Container Runtimes
+# Pelagos vs Established Container Runtimes
 
 **Last Updated:** 2026-02-20
 **Compared Against:** runc (OCI reference), Docker Engine, Podman
 
 ---
 
-## What Remora Is
+## What Pelagos Is
 
 - ✅ Low-level container runtime **library** (like liblxc, not like Docker)
 - ✅ Focused on Linux namespaces, seccomp, cgroups, and native networking
@@ -23,7 +23,7 @@
 - ❌ Not implemented
 - 🚫 Out of scope
 
-| Feature | Remora | runc | Docker | Notes |
+| Feature | Pelagos | runc | Docker | Notes |
 |---------|--------|------|--------|-------|
 | **Namespaces** |
 | UTS | ✅ | ✅ | ✅ | |
@@ -92,7 +92,7 @@
 
 ---
 
-## Remora Strengths
+## Pelagos Strengths
 
 - **Rust library API** — embed containers directly in Rust applications, no daemon
 - **No CNI dependency** — native loopback, bridge, and NAT without external plugins

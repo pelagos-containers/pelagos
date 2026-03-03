@@ -1,6 +1,6 @@
-# OCI Runtime Spec Conformance — Remora
+# OCI Runtime Spec Conformance — Pelagos
 
-This document tracks the gap between remora's current OCI implementation and full
+This document tracks the gap between Pelagos's current OCI implementation and full
 compliance with the [OCI Runtime Specification v1.2](https://github.com/opencontainers/runtime-spec).
 It is the working reference for the conformance epic (GitHub issue #11).
 
@@ -38,7 +38,7 @@ this compliance work.
 
 ### Phase 1 — CLI Interface (Prerequisite)
 
-**The conformance harness cannot invoke remora at all without these.**
+**The conformance harness cannot invoke Pelagos at all without these.**
 
 | Item | Status | Notes |
 |------|--------|-------|
@@ -57,7 +57,7 @@ by also accepting bundle as a positional fallback.
 
 ### Phase 2 — Mount Type Dispatch
 
-**Most OCI bundles specify these mounts; remora silently skips them (falls to bind-mount).**
+**Most OCI bundles specify these mounts; Pelagos silently skips them (falls to bind-mount).**
 
 A standard OCI bundle `config.json` includes:
 
@@ -97,7 +97,7 @@ Options from the OCI config (`nosuid`, `noexec`, `nodev`, `ro`, etc.) override t
 
 ### Phase 3 — Capability Name Table
 
-**OCI bundles specify capabilities by name; remora only maps ~12 of ~40.**
+**OCI bundles specify capabilities by name; Pelagos only maps ~12 of ~40.**
 
 Current `oci_cap_to_flag` in `src/oci.rs` handles:
 `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`,
@@ -159,7 +159,7 @@ OCI hook types and where they run:
 | `poststart` | host | after entry-point execs ✓ |
 | `poststop` | host | after container exits ✓ |
 
-Current remora: `createRuntime` ✓, `createContainer` runs in host ns (wrong), `startContainer` not implemented.
+Current Pelagos: `createRuntime` ✓, `createContainer` runs in host ns (wrong), `startContainer` not implemented.
 
 **`createContainer` fix:** After reading the ready pipe (container's namespaces are up, container
 is blocking on `accept(exec.sock)`), the parent can `setns()` into the container's mount/net/uts
@@ -180,7 +180,7 @@ Implementation in `container.rs`: extend `oci_sync` from `Option<(ready_w, liste
 ## Implementation Order
 
 ```
-Phase 1: CLI flags          — prerequisite; runtime-tools can invoke remora
+Phase 1: CLI flags          — prerequisite; runtime-tools can invoke Pelagos
 Phase 2: Mount types        — most bundles use proc/sysfs/devpts; tests fail without it
 Phase 3: Capability table   — mechanical; blocks several conformance tests
 Phase 4: State + signals    — quick; needed for state and kill tests

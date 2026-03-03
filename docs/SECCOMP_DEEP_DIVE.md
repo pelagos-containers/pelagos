@@ -1,4 +1,4 @@
-# Seccomp Deep Dive: Implementation Guide for Remora
+# Seccomp Deep Dive: Implementation Guide for Pelagos
 
 **Date:** 2026-02-16
 **Purpose:** Comprehensive analysis of seccomp implementation for Phase 1

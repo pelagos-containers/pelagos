@@ -1,6 +1,6 @@
-# Remora Security Model
+# Pelagos Security Model
 
-This document describes remora's security architecture, default hardening posture,
+This document describes Pelagos's security architecture, default hardening posture,
 and structural properties that make it immune to certain classes of container escape
 vulnerabilities.
 
@@ -48,14 +48,14 @@ filesystem.
 
 ### Why remora is immune by construction
 
-Remora uses a fundamentally different process model:
+Pelagos uses a fundamentally different process model:
 
 1. **Single-threaded child setup.** After `fork()`, all namespace operations
    (`unshare`, `pivot_root`, mount setup, capability drop, seccomp application)
    run inside the child process via a `pre_exec` hook. There is no concurrent
    privileged parent thread writing into container-visible paths.
 
-2. **No self re-exec.** Remora never re-opens `/proc/self/exe` or re-invokes
+2. **No self re-exec.** Pelagos never re-opens `/proc/self/exe` or re-invokes
    itself to enter a namespace. The `/proc/self/exe` race window that drives
    CVE-2025-52881 does not exist.
 

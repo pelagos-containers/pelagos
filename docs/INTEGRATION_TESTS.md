@@ -1,4 +1,4 @@
-# Remora Integration Test Reference
+# Pelagos Integration Test Reference
 
 Every integration test in `tests/integration_tests.rs` is documented here.
 **When adding a new integration test, add its entry to this file in the same commit.**
@@ -933,7 +933,7 @@ output) and runs `ls /proc/self` inside. Failure indicates the OCI mount-type di
 
 Invokes `remora create --bundle <path> <id>` (named flag, OCI-standard form) and verifies the
 container reaches "created" state. Failure indicates the `--bundle` CLI flag is not accepted,
-which would prevent the `opencontainers/runtime-tools` conformance harness from invoking remora.
+which would prevent the `opencontainers/runtime-tools` conformance harness from invoking Pelagos.
 
 ### `test_oci_create_pid_file`
 **Requires:** root, rootfs
@@ -1067,7 +1067,7 @@ with no address — no connectivity is possible.
 **Requires:** non-root user, rootfs, pasta installed
 
 Same assertions as `test_pasta_interface_exists` but specifically exercises the rootless
-auto-detection path: `Namespace::USER` is not set explicitly — remora adds it automatically
+auto-detection path: `Namespace::USER` is not set explicitly — Pelagos adds it automatically
 when `getuid() != 0`. Confirms that the USER+NET two-phase unshare and pasta still coexist
 correctly when rootless mode is triggered implicitly.
 

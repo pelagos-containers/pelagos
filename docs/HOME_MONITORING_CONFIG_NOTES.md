@@ -1,4 +1,4 @@
-# Home Monitoring Stack — Config Adaptations for Remora
+# Home Monitoring Stack — Config Adaptations for Pelagos
 
 The stack was originally designed for Kubernetes + kube-prometheus-stack (Helm).
 The `monitoring-setup/` directory contains the original Helm charts. The
@@ -12,7 +12,7 @@ The `monitoring-setup/` directory contains the original Helm charts. The
 Most config files are identical to what you'd write for plain Docker Compose:
 `prometheus.yml`, `alertmanager.yml`, `graphite_mapping.yaml`, and the Grafana
 datasource provisioning YAML are standard upstream formats that didn't need
-modification for remora. Only two things required deliberate adaptation.
+modification for Pelagos. Only two things required deliberate adaptation.
 
 ---
 
@@ -25,16 +25,16 @@ modification for remora. Only two things required deliberate adaptation.
     - targets: ['localhost:9090']
 ```
 
-**Remora version:**
+**Pelagos version:**
 ```yaml
 - job_name: prometheus
   static_configs:
     - targets: ['prometheus:9090']
 ```
 
-**Why:** Inside a remora container, `localhost` is not a hostname — it's the
+**Why:** Inside a Pelagos container, `localhost` is not a hostname — it's the
 loopback address of the container itself. Prometheus is a separate container, so
-`localhost:9090` reaches nothing. Remora's built-in DNS service discovery
+`localhost:9090` reaches nothing. Pelagos's built-in DNS service discovery
 registers each service under its compose service name, so `prometheus` resolves
 to the correct container IP on the `monitoring` bridge network. All other
 scrape targets in `prometheus.yml` already used service names (`snmp-exporter`,
@@ -80,20 +80,20 @@ is a contradiction.
 (command "sh" "-c" "cp /conf/mktxp.conf /config/mktxp.conf && mktxp --cfg-dir /config export")
 ```
 
-This pattern — staging a read-only file into a tmpfs — is the idiomatic remora
+This pattern — staging a read-only file into a tmpfs — is the idiomatic Pelagos
 approach for any service that mutates its own config directory.
 
 ---
 
 ## mktxp — user resolution
 
-mktxp's image declares `USER mktxp` in its Dockerfile. Remora (like Docker)
+mktxp's image declares `USER mktxp` in its Dockerfile. Pelagos (like Docker)
 applies the image's default user when starting the container. But `mktxp` is an
 image-internal user defined in the image's `/etc/passwd` — it doesn't exist on
-the host. Remora's original user resolution looked up usernames in the *host*
+the host. Pelagos's original user resolution looked up usernames in the *host*
 `/etc/passwd`, causing a startup failure.
 
-**Fix (in remora itself):** `parse_user_in_layers()` reads `/etc/passwd` from
+**Fix (in Pelagos itself):** `parse_user_in_layers()` reads `/etc/passwd` from
 the image layers before falling back to the host. This mirrors Docker's
 behaviour and is required for any image that defines its own non-root user.
 
@@ -144,7 +144,7 @@ scrapes the exporter and tells it which router to walk. This requires a
       replacement: snmp-exporter:9116  # but actually HTTP-connect here
 ```
 
-This is standard snmp-exporter configuration; it works identically in remora,
+This is standard snmp-exporter configuration; it works identically in Pelagos,
 Docker Compose, and Kubernetes.
 
 ---
@@ -190,11 +190,11 @@ CMD ["python", "-u", "/app/truenas_api_exporter.py"]
 ```
 
 `start-monitoring.sh` checks for the image with `remora image ls` and builds it
-if absent. Three bugs in remora's build engine were uncovered and fixed during
+if absent. Three bugs in Pelagos's build engine were uncovered and fixed during
 this process:
 
 1. **EINVAL on overlay mount** — Debian-based images (python:3.11-slim is
-   Debian) have repeated layer digests for empty marker layers. Remora's
+   Debian) have repeated layer digests for empty marker layers. Pelagos's
    `execute_run()` didn't deduplicate `lowerdir` entries; overlayfs returns
    EINVAL for duplicates. Fixed with HashSet deduplication.
 

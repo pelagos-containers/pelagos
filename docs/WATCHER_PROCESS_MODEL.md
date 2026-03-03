@@ -1,7 +1,7 @@
-# Remora Watcher Process Model
+# Pelagos Watcher Process Model
 
 This document describes the process tree, thread inventory, namespace isolation, and
-known limitations of Remora's detached container runtime model.
+known limitations of Pelagos's detached container runtime model.
 
 ---
 

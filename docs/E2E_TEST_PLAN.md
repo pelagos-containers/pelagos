@@ -2,7 +2,7 @@
 
 ## Context
 
-Remora has 72 integration tests exercising the **library API** and three E2E scripts (`test-dev.sh`, `test-rootless.sh`, `test-exec.sh`), but no comprehensive test of the **CLI binary** in root mode. Many CLI subcommands (`ps`, `stop`, `rm`, `logs`, `rootfs`, `volume`, `image`) have zero E2E coverage. Stress scenarios (concurrent containers, signal propagation, cleanup after crashes) are also untested.
+Pelagos has 72 integration tests exercising the **library API** and three E2E scripts (`test-dev.sh`, `test-rootless.sh`, `test-exec.sh`), but no comprehensive test of the **CLI binary** in root mode. Many CLI subcommands (`ps`, `stop`, `rm`, `logs`, `rootfs`, `volume`, `image`) have zero E2E coverage. Stress scenarios (concurrent containers, signal propagation, cleanup after crashes) are also untested.
 
 We need two new scripts:
 1. **`scripts/test-e2e.sh`** — comprehensive root-mode CLI E2E (~12 sections)

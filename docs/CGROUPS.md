@@ -1,4 +1,4 @@
-# Cgroups in Remora: Analysis and Strategy
+# Cgroups in Pelagos: Analysis and Strategy
 
 **Date:** 2026-02-16
 **Status:** Research complete, dependency added for future expansion
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-This document explains our approach to Linux control groups (cgroups) in Remora, compares cgroups v1 vs v2, analyzes available Rust libraries, and outlines our implementation strategy.
+This document explains our approach to Linux control groups (cgroups) in Pelagos, compares cgroups v1 vs v2, analyzes available Rust libraries, and outlines our implementation strategy.
 
 **Current Status:**
 - ✅ Using `rlimits` for basic resource limits (FDs, memory, CPU time)
@@ -116,7 +116,7 @@ This document explains our approach to Linux control groups (cgroups) in Remora,
 
 ### What We Use Now
 
-Remora currently uses **rlimits** (resource limits) for basic resource control:
+Pelagos currently uses **rlimits** (resource limits) for basic resource control:
 
 ```rust
 Command::new("/bin/sh")
@@ -302,7 +302,7 @@ docker run \
 - `private`: Container sees only its own cgroup subtree (more isolated)
 - `host`: Container sees all host cgroups (less isolated, more debugging)
 
-**Remora:** We have `Namespace::CGROUP` available for private mode.
+**Pelagos:** We have `Namespace::CGROUP` available for private mode.
 
 ### What runc Does
 
@@ -509,5 +509,5 @@ We're following industry best practices:
 ---
 
 **Last Updated:** 2026-02-16
-**Author:** Research and analysis for remora container runtime
+**Author:** Research and analysis for Pelagos container runtime
 **Status:** Dependency added, implementation deferred until needed

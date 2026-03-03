@@ -32,7 +32,7 @@ sudo ./start.sh --down       # stop
 ## Relation to examples/compose/monitoring/
 
 `examples/compose/monitoring/` is a self-contained demo stack (Alpine +
-APK-built Prometheus/Loki/Grafana) designed to showcase remora's compose
+APK-built Prometheus/Loki/Grafana) designed to showcase Pelagos's compose
 features. It has no connection to this production stack.
 
 This stack uses upstream production images, real device targets, and reads

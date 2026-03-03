@@ -1,6 +1,6 @@
 # Volumes, Bind Mounts, and Overlay Filesystems
 
-This document explains how Remora handles persistent storage (volumes), host
+This document explains how Pelagos handles persistent storage (volumes), host
 directory mapping (bind mounts), temporary in-memory filesystems (tmpfs), and
 copy-on-write layered filesystems (overlayfs). It covers both the library API
 and the CLI, and describes how these features compose with each other.
@@ -77,7 +77,7 @@ remora run alpine --read-only --tmpfs /tmp -- /bin/sh
 
 ## Named Volumes
 
-Named volumes are host directories managed by Remora. They provide persistent
+Named volumes are host directories managed by Pelagos. They provide persistent
 storage that survives container restarts and can be shared between containers.
 
 ### Storage Location
@@ -157,7 +157,7 @@ modified. The rootfs is completely untouched.
 
 ### Multi-Layer Overlay (OCI Images)
 
-OCI images consist of multiple layers stacked on top of each other. Remora
+OCI images consist of multiple layers stacked on top of each other. Pelagos
 mounts them as a single overlayfs with multiple `lowerdir=` entries.
 
 ```rust
@@ -178,7 +178,7 @@ Command::new("/bin/sh")
 
 ### Rootless Overlay
 
-- **Kernel 5.11+**: Native overlay with the `userxattr` mount option. Remora
+- **Kernel 5.11+**: Native overlay with the `userxattr` mount option. Pelagos
   auto-detects this capability.
 - **Fallback**: `fuse-overlayfs` is spawned by the parent process before fork.
   The child uses the pre-mounted FUSE filesystem transparently.

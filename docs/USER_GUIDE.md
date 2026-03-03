@@ -1,6 +1,6 @@
-# Remora User Guide
+# Pelagos User Guide
 
-Remora is a lightweight Linux container runtime with a CLI similar to Podman or nerdctl,
+Pelagos is a lightweight Linux container runtime with a CLI similar to Podman or nerdctl,
 plus a Rust library API for embedding container isolation into your own programs.
 
 ---
@@ -92,7 +92,7 @@ remora rm mybox
 
 ## OCI Images
 
-Remora can pull images directly from OCI registries (Docker Hub, etc.) using anonymous
+Pelagos can pull images directly from OCI registries (Docker Hub, etc.) using anonymous
 authentication. Image pull works both as root and rootless.
 
 ```bash
@@ -112,7 +112,7 @@ sudo remora run -i alpine /bin/sh   # root
 remora image rm alpine
 ```
 
-Remora automatically sets up a multi-layer overlayfs mount with an ephemeral upper/work
+Pelagos automatically sets up a multi-layer overlayfs mount with an ephemeral upper/work
 directory (writes are discarded when the container exits). Image config (Env, Cmd,
 Entrypoint, WorkingDir) is applied as defaults that CLI flags override.
 
@@ -131,7 +131,7 @@ as root is not visible rootless, and vice versa.
 
 ## Building Images
 
-Remora can build custom images from a **Remfile** (simplified Dockerfile). The build
+Pelagos can build custom images from a **Remfile** (simplified Dockerfile). The build
 process is daemonless (Buildah-style) — each `RUN` instruction spawns a container,
 snapshots the overlay upper directory as a new layer, and stores it in the layer cache.
 
@@ -303,7 +303,7 @@ sudo remora run -i myapp:latest /bin/sh   # override CMD with interactive shell
 ```bash
 # Create a build context
 mkdir myapp && cd myapp
-echo '<h1>Hello from Remora</h1>' > index.html
+echo '<h1>Hello from Pelagos</h1>' > index.html
 
 cat > Remfile <<'EOF'
 FROM alpine:latest
@@ -443,8 +443,8 @@ sudo remora compose down -v
 
 ### `depends-on` and Health Checks
 
-`depends-on` controls startup order. Without a health check, Remora just verifies the
-dependency process is alive. With a health check, Remora polls until the check passes
+`depends-on` controls startup order. Without a health check, Pelagos just verifies the
+dependency process is alive. With a health check, Pelagos polls until the check passes
 (60-second timeout, 250ms interval).
 
 #### Shorthand: `:ready-port N`
@@ -504,7 +504,7 @@ dependency process is alive. With a health check, Remora polls until the check p
 ## Compose Lisp Files (`.reml`)
 
 For complex stacks — parameterised services, loops, conditionals, shared templates — write
-a `.reml` (Remora Lisp) file instead of a static `.rem` file. `compose up` auto-detects the
+a `.reml` (Pelagos Lisp) file instead of a static `.rem` file. `compose up` auto-detects the
 format by file extension and dispatches accordingly. Default discovery tries `compose.reml`
 first, then falls back to `compose.rem`.
 
@@ -919,7 +919,7 @@ sudo remora run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/s
 
 ### DNS Backend
 
-Remora supports two DNS backends for container name resolution on bridge networks:
+Pelagos supports two DNS backends for container name resolution on bridge networks:
 
 - **builtin** (default): the embedded `remora-dns` daemon — minimal, zero-dependency A-record server with upstream forwarding
 - **dnsmasq**: production-grade DNS with caching, AAAA support, EDNS, and DNSSEC
@@ -934,7 +934,7 @@ sudo remora run --network bridge --nat --dns-backend dnsmasq alpine /bin/sh
 sudo REMORA_DNS_BACKEND=dnsmasq remora run --network bridge --nat alpine /bin/sh
 ```
 
-If dnsmasq is requested but not found on PATH, Remora logs a warning and falls back to the builtin backend.
+If dnsmasq is requested but not found on PATH, Pelagos logs a warning and falls back to the builtin backend.
 
 ### Container Linking
 
@@ -1001,11 +1001,11 @@ sudo remora run --read-only --tmpfs /tmp --tmpfs /run alpine /bin/sh
 
 ### Overlay (with OCI images)
 
-When using OCI images, Remora automatically creates a multi-layer overlayfs mount. The
+When using OCI images, Pelagos automatically creates a multi-layer overlayfs mount. The
 base image layers are read-only; writes go to an ephemeral upper directory that is
 discarded when the container exits.
 
-In rootless mode, Remora uses the `userxattr` mount option (kernel 5.11+) or falls back
+In rootless mode, Pelagos uses the `userxattr` mount option (kernel 5.11+) or falls back
 to `fuse-overlayfs` automatically. See [Rootless Overlay](#rootless-overlay) for details.
 
 ---
@@ -1099,7 +1099,7 @@ fsize, memlock, stack, core, rss, msgqueue, nice, rtprio.
 
 ## Rootless Mode
 
-Remora auto-detects rootless mode when run without sudo (`getuid() != 0`). No flag
+Pelagos auto-detects rootless mode when run without sudo (`getuid() != 0`). No flag
 needed — just omit `sudo`.
 
 ```bash
@@ -1126,11 +1126,11 @@ remora run -i --network pasta alpine /bin/sh
 
 ### Rootless Overlay
 
-Remora uses overlayfs with the `userxattr` mount option on kernel 5.11+. This stores
+Pelagos uses overlayfs with the `userxattr` mount option on kernel 5.11+. This stores
 whiteout metadata in `user.*` extended attributes instead of `trusted.*`, which doesn't
 require `CAP_SYS_ADMIN`.
 
-On older kernels, Remora automatically falls back to
+On older kernels, Pelagos automatically falls back to
 [fuse-overlayfs](https://github.com/containers/fuse-overlayfs). If neither works, you'll
 see a clear error with instructions.
 
@@ -1203,7 +1203,7 @@ remora run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 
 ## OCI Runtime Interface
 
-For integration with container managers like containerd or CRI-O, Remora implements the
+For integration with container managers like containerd or CRI-O, Pelagos implements the
 OCI Runtime Spec lifecycle commands. These operate on OCI bundles (a directory with
 `config.json` and `rootfs/`).
 
@@ -1232,7 +1232,7 @@ returns as soon as the container is in the "created" state.
 
 ## Rust Library API
 
-For developers embedding Remora as a library in Rust programs.
+For developers embedding Pelagos as a library in Rust programs.
 
 ### The Command Builder
 
@@ -1304,7 +1304,7 @@ let status = session.run()?;
 ## Advanced: Local Rootfs
 
 For development or testing, you can bypass OCI images and use a local rootfs directory
-directly. This is mainly useful for Remora contributors and custom rootfs builds.
+directly. This is mainly useful for Pelagos contributors and custom rootfs builds.
 
 ```bash
 # Build a rootfs from Docker:
@@ -1312,7 +1312,7 @@ scripts/build-rootfs-docker.sh       # requires Docker + sudo
 # or from an Alpine tarball:
 scripts/build-rootfs-tarball.sh      # requires sudo
 
-# Register it with Remora:
+# Register it with Pelagos:
 sudo remora rootfs import alpine ./alpine-rootfs
 
 # List registered rootfs entries:
@@ -1376,7 +1376,7 @@ $XDG_RUNTIME_DIR/remora/     (fallback: /tmp/remora-$UID/)
 
 ## Testing
 
-Remora has several layers of tests. Unit tests and lint run without root; everything
+Pelagos has several layers of tests. Unit tests and lint run without root; everything
 else requires `sudo -E` to preserve the rustup/cargo environment.
 
 ### 1. Unit Tests + Lint (no root)

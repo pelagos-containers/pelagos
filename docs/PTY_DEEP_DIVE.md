@@ -27,7 +27,7 @@ ability to run an interactive shell — it's about running it *properly*.
 ### Mode 1: Non-interactive (tests/examples)
 
 ```
-Remora ──fork──► ash -c "echo hello"
+Pelagos ──fork──► ash -c "echo hello"
                   │
                   └─► runs command, prints output, exits
 ```
@@ -55,12 +55,12 @@ Your terminal (FD 0/1/2)
 ### Mode 3: PTY (what we'd be building)
 
 ```
-Your terminal ──► PTY master (Remora relay) ──► PTY slave ──► ash
-Your screen   ◄── PTY master (Remora relay) ◄── PTY slave ◄── ash
+Your terminal ──► PTY master (Pelagos relay) ──► PTY slave ──► ash
+Your screen   ◄── PTY master (Pelagos relay) ◄── PTY slave ◄── ash
 ```
 
 - The container gets its own *synthetic* terminal (the PTY slave)
-- Remora sits in between, forwarding bytes
+- Pelagos sits in between, forwarding bytes
 - ash still sees `isatty(0) == true`
 
 ---
@@ -73,9 +73,9 @@ being precise about what a PTY actually buys us.
 ### 1. Process isolation / session management
 
 With inherited terminal, the container process is in the **same session** as
-Remora. That means:
+Pelagos. That means:
 
-- `Ctrl+C` sends `SIGINT` to the entire process group, which may include Remora
+- `Ctrl+C` sends `SIGINT` to the entire process group, which may include Pelagos
   itself and other unrelated processes
 - The container can interfere with the terminal state of the parent session
 - If the container crashes and corrupts terminal settings, your whole shell is affected
@@ -99,12 +99,12 @@ close and reopen the master fd to detach/reattach.
 With inherited terminal, `SIGWINCH` goes to the container directly and terminal
 size changes work automatically (they already share the same terminal).
 
-With a PTY, Remora must forward resize events explicitly. This is extra work
+With a PTY, Pelagos must forward resize events explicitly. This is extra work
 that the inherited approach gets for free.
 
 ### 4. Logging / auditing / multiplexing
 
-With a PTY relay in the middle, Remora can:
+With a PTY relay in the middle, Pelagos can:
 - Record all input/output (audit trail)
 - Multiplex one container to multiple viewers
 - Inject input programmatically
@@ -139,7 +139,7 @@ simulate a hardware serial terminal. It has two ends:
 │                    Linux Kernel                     │
 │                                                     │
 │   PTY Master fd          PTY Slave fd               │
-│   (held by Remora)       (given to container)       │
+│   (held by Pelagos)       (given to container)       │
 │        │                       │                    │
 │        └───────────────────────┘                    │
 │           bidirectional byte pipe                   │
@@ -148,7 +148,7 @@ simulate a hardware serial terminal. It has two ends:
 └─────────────────────────────────────────────────────┘
 ```
 
-**PTY master**: Remora holds this. It's the "outside" of the terminal.
+**PTY master**: Pelagos holds this. It's the "outside" of the terminal.
 Everything written to master appears as input to the slave. Everything the
 slave writes appears as output from master.
 
@@ -166,7 +166,7 @@ hardware terminal. `isatty()` returns `true`.
 
 ## The Relay Loop
 
-With a PTY, Remora becomes a **relay** between your actual terminal and the
+With a PTY, Pelagos becomes a **relay** between your actual terminal and the
 container's PTY:
 
 ```
@@ -174,7 +174,7 @@ Your terminal (raw mode)
        │  ▲
        │  │  raw bytes
        ▼  │
-  Remora relay loop          ← poll() on two fds simultaneously
+  Pelagos relay loop          ← poll() on two fds simultaneously
        │  ▲
        │  │  raw bytes
        ▼  │
@@ -203,11 +203,11 @@ But with a PTY relay, you want every keypress to go to the container
 kernel) handles echo and line editing for the container. If your host terminal
 also does this, you get double-echo and broken behavior.
 
-So Remora must:
+So Pelagos must:
 1. Put the host terminal into raw mode before the relay starts
 2. Restore it to cooked mode when the container exits
 
-If Remora crashes without restoring the terminal, your shell is left in raw
+If Pelagos crashes without restoring the terminal, your shell is left in raw
 mode — no echo, broken Enter key. You'd need to type `reset` blind to recover.
 
 ---
@@ -215,7 +215,7 @@ mode — no echo, broken Enter key. You'd need to type `reset` blind to recover.
 ## Window Resize (SIGWINCH)
 
 When you resize your terminal window, the kernel sends `SIGWINCH`
-(window change) to the foreground process. Remora must:
+(window change) to the foreground process. Pelagos must:
 
 1. Catch `SIGWINCH`
 2. Query the new terminal size with `TIOCGWINSZ` ioctl
@@ -229,9 +229,9 @@ window.
 ## Signal Handling
 
 With the current **inherited terminal** approach, signals work — but they're
-broad. Because the container process is in the same session as Remora and your
+broad. Because the container process is in the same session as Pelagos and your
 shell, `Ctrl+C` sends `SIGINT` to the entire foreground process group, which
-includes Remora itself. For simple cases this is fine. For complex cases (nested
+includes Pelagos itself. For simple cases this is fine. For complex cases (nested
 process groups, job control inside the container), it breaks down.
 
 With a PTY, `Ctrl+C` goes to the PTY slave's terminal discipline, which
@@ -309,7 +309,7 @@ Command::new("/bin/ash")
 Command::new("/bin/ash")
     .with_pty(true)   // ← new method
     .spawn()?
-// Remora runs the relay loop internally, blocks until container exits
+// Pelagos runs the relay loop internally, blocks until container exits
 ```
 
 Or a separate method:
@@ -322,7 +322,7 @@ Command::new("/bin/ash")
 
 ---
 
-## What PTY Implementation Adds to Remora
+## What PTY Implementation Adds to Pelagos
 
 We already have interactive shells via `Stdio::Inherit`. PTY gives us proper
 terminal semantics:
@@ -350,7 +350,7 @@ inside the container when you care about signal isolation:
 
 ---
 
-## Related Remora Docs
+## Related Pelagos Docs
 
 - `CLAUDE.md` — development guidelines
 - `READONLY_ROOTFS.md` — read-only rootfs implementation

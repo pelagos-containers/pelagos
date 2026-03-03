@@ -1,6 +1,6 @@
 # Feature Gaps vs. Finch / Docker Desktop
 
-This document tracks the delta between Remora and a full Docker Desktop / Finch
+This document tracks the delta between Pelagos and a full Docker Desktop / Finch
 equivalent.  The goal is to whittle this list down over time.  Items are roughly
 ordered by impact.
 
@@ -12,17 +12,17 @@ ordered by impact.
 containerd (daemon) + runc (runtime) + BuildKit (image builder) into a single
 `brew install finch`.  It is integration and packaging work, not runtime work.
 
-**Remora** is the opposite end of the stack: it implements container isolation,
+**Pelagos** is the opposite end of the stack: it implements container isolation,
 networking, image management, and orchestration from scratch on Linux kernel
 interfaces, with no daemon and no CNI plugins underneath.
 
-The natural comparison is **Remora vs. runc** (same layer), but Remora extends
+The natural comparison is **Pelagos vs. runc** (same layer), but Pelagos extends
 upward into networking, image management, and programmable orchestration as
 first-class concerns — territory runc explicitly does not cover.
 
 ---
 
-## What Remora already has
+## What Pelagos already has
 
 | Capability | Notes |
 |------------|-------|
@@ -121,7 +121,7 @@ tar format so images can be exchanged with Docker hosts without a registry.
 
 #### Mac / Windows host support
 Finch's primary value proposition is the Lima VM wrapper that makes Linux
-containers work transparently on Mac.  Remora is Linux-only by nature — all the
+containers work transparently on Mac.  Pelagos is Linux-only by nature — all the
 interesting code is Linux kernel interfaces.  A Lima-based wrapper (`remora-mac`
 or similar) could provide the same experience, but this is a separate packaging
 project, not a runtime gap.

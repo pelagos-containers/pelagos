@@ -1,6 +1,6 @@
 # Testing Guide
 
-Remora's integration tests are organized into **11 categorized modules** in
+Pelagos's integration tests are organized into **11 categorized modules** in
 `tests/integration_tests.rs`. Each module can be run independently using
 Cargo's test name filter.
 

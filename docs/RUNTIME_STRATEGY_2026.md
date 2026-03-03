@@ -1,7 +1,7 @@
-# Remora Runtime Strategy — 2026
+# Pelagos Runtime Strategy — 2026
 
-This document analyzes the container runtime landscape as of early 2026, compares remora to
-major open-source runtimes, and identifies specific technical opportunities where remora can
+This document analyzes the container runtime landscape as of early 2026, compares Pelagos to
+major open-source runtimes, and identifies specific technical opportunities where Pelagos can
 differentiate.
 
 ---
@@ -15,13 +15,13 @@ differentiate.
 | **runc** | Go | ≥ 4.14 | ~352 | Reference implementation; ubiquitous |
 | **crun** | C | ≥ 4.14 | ~153 | Fastest; smallest binary; default in Podman |
 | **youki** | Rust | ≥ 5.4 | ~198 | OCI-compliant Rust runtime; growing adoption |
-| **remora** | Rust | ≥ 5.4 | ~150–200* | Integrated CLI+API; DNS SD; compose |
+| **Pelagos** | Rust | ≥ 5.4 | ~150–200* | Integrated CLI+API; DNS SD; compose |
 
 *Estimated from profile similarity to youki. Not yet benchmarked against a standard suite.
 
 **crun** leads on raw cold-start latency because it avoids Go's garbage collector and runtime
-initialization. Remora and youki are structurally competitive: both are Rust, both avoid GC
-pauses. Remora's current advantage over youki is the integrated feature set (DNS service
+initialization. Pelagos and youki are structurally competitive: both are Rust, both avoid GC
+pauses. Pelagos's current advantage over youki is the integrated feature set (DNS service
 discovery, compose, image build) rather than raw speed.
 
 ### The Hypervisor / Strong-Isolation Tier
@@ -33,12 +33,12 @@ discovery, compose, image build) rather than raw speed.
 | **Firecracker** | Lightweight KVM VM | 125 ms startup; <5 MB VMM RSS | AWS Lambda / Fargate; FaaS ephemeral workloads |
 | **QEMU/KVM** | Full VM | 1–5 s boot | Legacy compatibility; nested virt |
 
-Remora operates in the OCI low-level tier. These runtimes are not direct competitors; they
-serve workloads requiring hardware-level isolation that remora explicitly does not attempt.
+Pelagos operates in the OCI low-level tier. These runtimes are not direct competitors; they
+serve workloads requiring hardware-level isolation that Pelagos explicitly does not attempt.
 
 ### Adjacent Runtimes
 
-| Runtime | Focus | Relevance to Remora |
+| Runtime | Focus | Relevance to Pelagos |
 |---------|-------|---------------------|
 | **LXC / Incus** | Long-lived system containers; full OS images | Different mental model; not OCI; no overlap |
 | **Ocre** | IoT/embedded; Wasm + OCI; Zephyr/bare-metal | Niche but growing; Wasm integration is relevant |
@@ -60,9 +60,9 @@ All three exploit the same structural weakness: runc writes into `/proc` or `/de
 container initialization *before* the process is fully isolated in its namespace, creating
 a window where a malicious container can swap a path component.
 
-**Why remora is structurally immune to this class:**
+**Why Pelagos is structurally immune to this class:**
 
-Remora uses a `pre_exec` hook that runs *inside the child process after `fork()` but before
+Pelagos uses a `pre_exec` hook that runs *inside the child process after `fork()` but before
 `exec()`*. All namespace operations (`unshare`, `pivot_root`, seccomp filter application)
 happen atomically within a single-threaded child. There is no privileged parent thread
 writing into container-visible paths while the container namespace is being constructed.
@@ -83,20 +83,20 @@ Wasm modules as container images. As of 2026:
 - Kubernetes has experimental Wasm node support via `kwasm-operator`
 - OCI image spec v1.1 added `application/wasm` media type
 
-**Remora opportunity:** Implement a `WasmMode` backend in `run.rs` that detects
+**Pelagos opportunity:** Implement a `WasmMode` backend in `run.rs` that detects
 `application/wasm` media type in the image manifest and delegates to a local `wasmtime`
-or `wasmer` process instead of spawning a namespaced container. This would position remora
+or `wasmer` process instead of spawning a namespaced container. This would position Pelagos
 as a unified OCI runner for both Linux containers and Wasm modules — something no other
 Rust-native CLI runtime currently does end-to-end.
 
 ---
 
-## Security Mechanisms Not Yet in Remora
+## Security Mechanisms Not Yet in Pelagos
 
 ### 1. AppArmor / SELinux Profiles
 
 Every production deployment of runc/containerd uses either AppArmor or SELinux for
-mandatory access control. Neither is implemented in remora. This is the single largest
+mandatory access control. Neither is implemented in Pelagos. This is the single largest
 gap for production/compliance use cases.
 
 - AppArmor: write a profile template in `data/`; apply via `aa_change_profile()` in pre_exec
@@ -112,7 +112,7 @@ it requires no policy daemon, no root, and no pre-installed profiles. A process 
 self-restrict its own filesystem access via `landlock_create_ruleset()` / `landlock_add_rule()`
 / `landlock_restrict_self()`.
 
-**Remora is the first production OCI-compatible runtime to ship Landlock integration.**
+**Pelagos is the first production OCI-compatible runtime to ship Landlock integration.**
 runc has an open issue (#3500, open since 2022); youki has a tracking issue but no
 implementation.
 
@@ -133,7 +133,7 @@ specific syscalls from the container and handle them in userspace — instead of
 the process or returning `EPERM`. This is how `sysbox` implements `/dev/fuse` access and
 how `gVisor` patches select syscalls.
 
-Use cases for remora:
+Use cases for Pelagos:
 - Allow `mount()` only for specific paths without granting `CAP_SYS_ADMIN`
 - Mediate `ptrace()` for debugging containers
 - Intercept `socket(AF_INET)` calls to implement per-container firewall policy in userspace
@@ -146,7 +146,7 @@ io_uring is blocked by default in Docker/runc seccomp profiles due to historical
 escalation bugs (CVE-2022-29582, CVE-2023-2163). As of kernel 6.6, `io_uring`'s security
 model is significantly hardened.
 
-Remora could offer an opt-in `with_seccomp_iouring()` profile that allows io_uring only
+Pelagos could offer an opt-in `with_seccomp_iouring()` profile that allows io_uring only
 after verifying kernel ≥ 6.6 at runtime. This lets high-performance server workloads
 (databases, proxies) use io_uring safely inside containers.
 
@@ -168,8 +168,8 @@ traditional containers:
 | Lifecycle | Long-lived | Seconds to minutes |
 | Observability | Logs | Syscall traces; resource attribution |
 
-Remora's Rust API is well-suited for embedding in agent frameworks. Specific features
-that would make remora the preferred embedded runtime for AI sandboxing:
+Pelagos's Rust API is well-suited for embedding in agent frameworks. Specific features
+that would make Pelagos the preferred embedded runtime for AI sandboxing:
 
 1. **CRIU checkpoint/restore** — snapshot a warm container and restore it in <50 ms for
    repeated invocations of the same language runtime (Python interpreter + imports).
@@ -179,7 +179,7 @@ that would make remora the preferred embedded runtime for AI sandboxing:
    a seccomp profile update.
 
 **Priority: Strategic.** This is the highest-growth use case for lightweight runtimes
-in 2026. A remora crate published to crates.io with a clean async API would enable
+in 2026. A Pelagos crate published to crates.io with a clean async API would enable
 embedding in Rust-based agent frameworks directly.
 
 ---
@@ -194,9 +194,9 @@ The Kinvolk/Benchmark suite (OCI runtime bench) measures:
 | RSS at idle (MB) | 3.1 | 4.8 | 6.2 |
 | `execve` overhead vs bare | 1.03× | 1.07× | 1.18× |
 
-Remora is not yet in this benchmark suite. To add remora:
+Pelagos is not yet in this benchmark suite. To add Pelagos:
 1. Implement the full OCI runtime spec lifecycle (currently partial)
-2. Submit a PR to the benchmark repo with a remora shim config
+2. Submit a PR to the benchmark repo with a Pelagos shim config
 3. Run the suite with `sudo benchmark.sh --runtime remora`
 
 **Target:** Median cold-start ≤ 180 ms (between crun and youki), RSS ≤ 4 MB.
@@ -210,9 +210,9 @@ Remora is not yet in this benchmark suite. To add remora:
 - OCI image pull (subset)
 - No MMU required
 
-Remora's kernel dependency (≥ 5.4, full MMU, cgroups v2) makes it unsuitable for MCU
+Pelagos's kernel dependency (≥ 5.4, full MMU, cgroups v2) makes it unsuitable for MCU
 targets. However, for **Linux-based embedded systems** (Raspberry Pi, industrial PCs,
-automotive SoCs running AGL/Yocto), remora is competitive. A static binary <10 MB with
+automotive SoCs running AGL/Yocto), Pelagos is competitive. A static binary <10 MB with
 no daemon would be attractive in these environments.
 
 **Recommended action:** Add a `cargo build --features minimal` profile that strips
@@ -232,9 +232,9 @@ As of 2026, Rust-native container components include:
 | Firecracker VMM | ✅ | KVM VMM; not OCI |
 | containerd | ❌ Go | Daemon-based |
 | BuildKit | ❌ Go | Image builder |
-| **remora** | ✅ | Runtime + CLI + image + compose + DNS |
+| **Pelagos** | ✅ | Runtime + CLI + image + compose + DNS |
 
-Remora is the only Rust project that integrates the full stack: runtime API, CLI,
+Pelagos is the only Rust project that integrates the full stack: runtime API, CLI,
 image pull/build, compose orchestration, and DNS service discovery. This breadth is
 both a strength (less context-switching for users) and a risk (more surface to maintain).
 
@@ -261,7 +261,7 @@ In descending order of strategic impact:
 
 ## Summary
 
-Remora is structurally sound and already feature-complete for most developer use cases.
+Pelagos is structurally sound and already feature-complete for most developer use cases.
 The primary gaps versus production-grade runtimes are:
 
 1. **AppArmor/SELinux** — mandatory for regulated deployments

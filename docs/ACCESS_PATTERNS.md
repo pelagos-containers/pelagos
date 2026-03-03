@@ -1,7 +1,7 @@
 # Container Access Patterns
 
 How to reach a running container from outside — from the host, another machine,
-or a browser. Covers remora's current support and how the patterns map to
+or a browser. Covers Pelagos's current support and how the patterns map to
 Kubernetes equivalents.
 
 ---
@@ -20,11 +20,11 @@ they start, so you can't always declare ports at launch time. `port-forward` is
 a development convenience for reaching something that's already running
 somewhere in the cluster.
 
-**Remora today:** Not applicable as a use case. You control exactly when
+**Pelagos today:** Not applicable as a use case. You control exactly when
 containers start and what ports they expose, so declaring `(port 3000 3000)` in
 `compose.rem` is already the right answer. The scenario that motivates
 `kubectl port-forward` — needing to reach a container whose ports weren't
-declared at launch — doesn't arise in remora.
+declared at launch — doesn't arise in Pelagos.
 
 ---
 
@@ -38,7 +38,7 @@ host.
 `30000–32767` range (or you declare one), and every node in the cluster binds
 it.
 
-**Remora today:** Fully supported. `(port 9090 9090)` in `compose.rem` or
+**Pelagos today:** Fully supported. `(port 9090 9090)` in `compose.rem` or
 `--publish 9090:9090` on `remora run` binds port 9090 on the host and forwards
 it to port 9090 in the container via nftables DNAT + a userspace TCP proxy for
 localhost access. Works on both `localhost` and the machine's LAN IP.
@@ -64,7 +64,7 @@ balancer. Locally it binds to the node's IP on the declared port.
 (klipper-lb) handles this automatically. On minikube: `minikube tunnel` is
 required.
 
-**Remora today:** Functionally identical to NodePort on a single host. There is
+**Pelagos today:** Functionally identical to NodePort on a single host. There is
 no distinction between a "load balancer IP" and "localhost" — the host *is* the
 node. `(port 80 80)` achieves the same result. No gap for single-host use.
 
@@ -81,10 +81,10 @@ allocating a separate host port per service.
 resources and routes accordingly. k3s ships Traefik by default. minikube
 provides nginx-ingress as an addon.
 
-**Remora today:** No built-in ingress controller. However, all the infrastructure
+**Pelagos today:** No built-in ingress controller. However, all the infrastructure
 needed to run one is present: named networks, DNS service discovery, and port
 mapping. Add Traefik or Caddy as a service in `compose.rem` — it can reach all
-other services by name via remora's DNS daemon.
+other services by name via Pelagos's DNS daemon.
 
 **Example** — adding Caddy as an ingress to the monitoring stack:
 ```lisp
@@ -111,13 +111,13 @@ Add to `/etc/hosts`:
 ```
 
 Then `http://grafana.local` routes through Caddy to the grafana container by
-service name. No remora changes required — just configuration.
+service name. No Pelagos changes required — just configuration.
 
 ---
 
 ## Summary
 
-| Pattern | Kubernetes | Remora | Status |
+| Pattern | Kubernetes | Pelagos | Status |
 |---------|-----------|--------|--------|
 | Ad-hoc port forward | `kubectl port-forward` | Not applicable — ports declared at launch | N/A |
 | Static host port | `NodePort` | `(port X X)` in compose | ✅ Full support |
@@ -143,6 +143,6 @@ has a dedicated host port:
 | plex-exporter | 9594 | http://localhost:9594/metrics |
 
 Container-to-container traffic (e.g. Prometheus scraping exporters) uses
-service names (`mktxp`, `snmp-exporter`, etc.) which resolve via remora's
+service names (`mktxp`, `snmp-exporter`, etc.) which resolve via Pelagos's
 built-in DNS daemon on the `monitoring` bridge network. These names are not
 reachable from the host.

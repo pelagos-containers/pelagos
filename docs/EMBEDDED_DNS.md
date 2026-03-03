@@ -1,7 +1,7 @@
-# Embedded DNS: How Docker Does It and Future Options for Remora
+# Embedded DNS: How Docker Does It and Future Options for Pelagos
 
 **Status:** Research notes — not currently planned for implementation.
-Remora uses `/etc/hosts` injection for container-to-container name resolution.
+Pelagos uses `/etc/hosts` injection for container-to-container name resolution.
 This document captures how Docker's embedded DNS works, in case we want to
 revisit a dynamic DNS approach later.
 
@@ -61,9 +61,9 @@ networks. It's not just `/etc/hosts` — it's a full UDP/TCP DNS listener.
 
 ---
 
-## Remora's Current Approach: /etc/hosts Injection
+## Pelagos's Current Approach: /etc/hosts Injection
 
-Remora injects `/etc/hosts` entries via bind-mount at container start time.
+Pelagos injects `/etc/hosts` entries via bind-mount at container start time.
 This is the same mechanism Docker used for the legacy `--link` feature before
 user-defined networks existed.
 
@@ -79,7 +79,7 @@ user-defined networks existed.
 - **Static**: Links resolved at spawn time. If a target container restarts
   with a new IP, the `/etc/hosts` entry becomes stale.
 - **No upstream forwarding**: External DNS still requires a separate
-  `nameserver` entry (handled by Remora's existing `with_dns()`)
+  `nameserver` entry (handled by Pelagos's existing `with_dns()`)
 - **No round-robin**: Can't load-balance across multiple containers with
   the same service name
 - **No dynamic discovery**: New containers aren't visible to already-running
@@ -87,7 +87,7 @@ user-defined networks existed.
 
 ---
 
-## If We Ever Want Embedded DNS in Remora
+## If We Ever Want Embedded DNS in Pelagos
 
 ### Minimal viable approach
 
@@ -136,7 +136,7 @@ A queries, but handling edge cases (TCP fallback, EDNS, truncation, timeouts,
 multiple upstream servers) adds up. The iptables/nftables plumbing for port
 redirection adds another layer.
 
-Worth revisiting if Remora ever needs orchestration-level service discovery
+Worth revisiting if Pelagos ever needs orchestration-level service discovery
 or dynamic container-to-container resolution.
 
 ---

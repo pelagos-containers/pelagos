@@ -1,4 +1,4 @@
-# Remora Lisp Executor Model
+# Pelagos Lisp Executor Model
 
 **Status:** Implemented (v0.13.x+)
 **Location:** `src/lisp/runtime.rs`, `src/lisp/stdlib.lisp`
@@ -13,7 +13,7 @@ steps that must complete before an app starts, health checks that gate
 dependent services — none of these can be expressed declaratively.  They
 require a programming language.
 
-Remora's `.reml` format is that language.  This document describes the
+Pelagos's `.reml` format is that language.  This document describes the
 executor model: how dependency graphs are declared, how data flows between
 nodes, and how the two executors differ.
 
@@ -521,7 +521,7 @@ The model is a simplified π-calculus.  Processes communicate by sending
 and receiving values on named channels; the dependency structure *is* the
 communication pattern.
 
-| π-calculus concept | Remora equivalent |
+| π-calculus concept | Pelagos equivalent |
 |--------------------|-------------------|
 | Process | `start` future |
 | Channel | Lisp name binding (`define`) |

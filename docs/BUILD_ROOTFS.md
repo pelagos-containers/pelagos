@@ -1,6 +1,6 @@
 # Building Alpine Linux Rootfs
 
-Remora requires an Alpine Linux root filesystem to run containers. You have two options:
+Pelagos requires an Alpine Linux root filesystem to run containers. You have two options:
 
 ## Option 1: Using Docker (Recommended)
 
@@ -76,7 +76,7 @@ file alpine-rootfs/bin/busybox
 After building, test with:
 
 ```bash
-# Build remora first
+# Build Pelagos first
 cargo build
 
 # Run the CLI
@@ -111,7 +111,7 @@ The tarball script only supports x86_64 and aarch64. Use the Docker script inste
 ### Permission errors during extraction
 Both scripts use `sudo` for extraction to preserve file ownership and permissions. This is normal and required.
 
-### "alpine-rootfs not found" when running remora
+### "alpine-rootfs not found" when running Pelagos
 Make sure you're running from the project root directory where `alpine-rootfs/` was created.
 
 ## Cleaning Up
@@ -140,4 +140,4 @@ Then run either build script again.
 - ✅ You want to pin a specific Alpine version
 - ✅ You prefer downloading directly from Alpine
 
-Both produce equivalent rootfs environments suitable for remora containers.
+Both produce equivalent rootfs environments suitable for Pelagos containers.

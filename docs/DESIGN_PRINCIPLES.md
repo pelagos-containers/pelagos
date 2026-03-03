@@ -1,6 +1,6 @@
-# Remora Design Principles
+# Pelagos Design Principles
 
-These principles guide every decision in Remora — from API design to file
+These principles guide every decision in Pelagos — from API design to file
 formats to error handling. They are non-negotiable unless explicitly revised
 here.
 
@@ -17,7 +17,7 @@ No feature is worth compromising isolation. Defaults must be secure:
 
 ## 2. Library First, CLI Second
 
-Remora is a **library** that happens to ship a CLI. The public Rust API in
+Pelagos is a **library** that happens to ship a CLI. The public Rust API in
 `src/lib.rs` and `src/container.rs` is the primary interface. The CLI is a
 thin consumer of the library.
 
@@ -42,7 +42,7 @@ is a conscious trade-off documented in the code, not the default approach.
 
 ## 4. No Daemon
 
-Remora has no long-running daemon process. Each `remora run` is
+Pelagos has no long-running daemon process. Each `remora run` is
 self-contained. State lives on the filesystem, not in a server's memory.
 Compose supervisors are per-project and ephemeral — they exit when their
 services do.

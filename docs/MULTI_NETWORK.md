@@ -2,7 +2,7 @@
 
 ## Motivation
 
-Today Remora has exactly one bridge: `remora0` (172.19.0.0/24). Every container
+Today Pelagos has exactly one bridge: `remora0` (172.19.0.0/24). Every container
 using `--network bridge` lands on the same L2 segment with the same IP pool.
 This works, but it means:
 
@@ -18,7 +18,7 @@ This works, but it means:
   everywhere."
 
 Docker solves this with `docker network create` — user-defined bridge networks
-with per-network subnets, isolation, and DNS. This document plans Remora's
+with per-network subnets, isolation, and DNS. This document plans Pelagos's
 equivalent.
 
 ---
