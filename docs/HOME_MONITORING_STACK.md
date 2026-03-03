@@ -2,7 +2,7 @@
 
 The home monitoring stack lives in the
 [home-monitoring](https://github.com/skeptomai/home-monitoring) repository
-under `remora/`. It is a real production deployment of `remora compose`
+under `pelagos/`. It is a real production deployment of `pelagos compose`
 monitoring home infrastructure: MikroTik router, TrueNAS NAS, and Plex
 Media Server.
 
@@ -22,7 +22,7 @@ Media Server.
 ## Running
 
 ```bash
-cd ~/Projects/home-monitoring/remora
+cd ~/Projects/home-monitoring/pelagos
 sudo ./start.sh              # start (background)
 sudo ./start.sh --foreground # start with live logs
 ./check.sh                   # endpoint health check

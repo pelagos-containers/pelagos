@@ -2,7 +2,7 @@
 //!
 //! Resolution order:
 //! 1. CLI flags (`username` + `password`)
-//! 2. Environment variables (`REMORA_REGISTRY_USER` + `REMORA_REGISTRY_PASS`)
+//! 2. Environment variables (`PELAGOS_REGISTRY_USER` + `PELAGOS_REGISTRY_PASS`)
 //! 3. `~/.docker/config.json`:
 //!    a. `credHelpers[registry]` — per-registry credential helper
 //!    b. `credsStore` — global credential helper
@@ -31,8 +31,8 @@ pub fn resolve_auth(
     }
 
     // 2. Environment variables.
-    let env_user = std::env::var("REMORA_REGISTRY_USER").ok();
-    let env_pass = std::env::var("REMORA_REGISTRY_PASS").ok();
+    let env_user = std::env::var("PELAGOS_REGISTRY_USER").ok();
+    let env_pass = std::env::var("PELAGOS_REGISTRY_PASS").ok();
     if let (Some(u), Some(p)) = (env_user.as_deref(), env_pass.as_deref()) {
         if !u.is_empty() && !p.is_empty() {
             return RegistryAuth::Basic(u.to_string(), p.to_string());
@@ -459,11 +459,11 @@ mod tests {
 
     #[test]
     fn test_resolve_auth_env() {
-        std::env::set_var("REMORA_REGISTRY_USER", "envuser");
-        std::env::set_var("REMORA_REGISTRY_PASS", "envpass");
+        std::env::set_var("PELAGOS_REGISTRY_USER", "envuser");
+        std::env::set_var("PELAGOS_REGISTRY_PASS", "envpass");
         let auth = resolve_auth("example.com", None, None);
-        std::env::remove_var("REMORA_REGISTRY_USER");
-        std::env::remove_var("REMORA_REGISTRY_PASS");
+        std::env::remove_var("PELAGOS_REGISTRY_USER");
+        std::env::remove_var("PELAGOS_REGISTRY_PASS");
         match auth {
             RegistryAuth::Basic(u, p) => {
                 assert_eq!(u, "envuser");
@@ -475,11 +475,11 @@ mod tests {
 
     #[test]
     fn test_resolve_auth_cli_priority() {
-        std::env::set_var("REMORA_REGISTRY_USER", "envuser");
-        std::env::set_var("REMORA_REGISTRY_PASS", "envpass");
+        std::env::set_var("PELAGOS_REGISTRY_USER", "envuser");
+        std::env::set_var("PELAGOS_REGISTRY_PASS", "envpass");
         let auth = resolve_auth("example.com", Some("cliuser"), Some("clipass"));
-        std::env::remove_var("REMORA_REGISTRY_USER");
-        std::env::remove_var("REMORA_REGISTRY_PASS");
+        std::env::remove_var("PELAGOS_REGISTRY_USER");
+        std::env::remove_var("PELAGOS_REGISTRY_PASS");
         match auth {
             RegistryAuth::Basic(u, p) => {
                 assert_eq!(u, "cliuser");
@@ -491,8 +491,8 @@ mod tests {
 
     #[test]
     fn test_resolve_auth_anonymous() {
-        std::env::remove_var("REMORA_REGISTRY_USER");
-        std::env::remove_var("REMORA_REGISTRY_PASS");
+        std::env::remove_var("PELAGOS_REGISTRY_USER");
+        std::env::remove_var("PELAGOS_REGISTRY_PASS");
         let tmp = tempfile::tempdir().unwrap();
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", tmp.path());

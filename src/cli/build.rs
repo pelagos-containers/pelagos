@@ -41,7 +41,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Set DNS backend env var before any DNS calls so active_backend() picks it up.
     if let Some(ref backend) = args.dns_backend {
         // SAFETY: called early in single-threaded CLI startup, before spawning threads.
-        unsafe { std::env::set_var("REMORA_DNS_BACKEND", backend) };
+        unsafe { std::env::set_var("PELAGOS_DNS_BACKEND", backend) };
     }
 
     let context_dir = PathBuf::from(&args.context)

@@ -9709,7 +9709,7 @@ mod dns {
     ///
     /// Requires root + rootfs + dnsmasq installed.
     ///
-    /// Same as test_dns_resolves_container_name but with REMORA_DNS_BACKEND=dnsmasq.
+    /// Same as test_dns_resolves_container_name but with PELAGOS_DNS_BACKEND=dnsmasq.
     #[test]
     #[serial(nat)]
     fn test_dns_dnsmasq_resolves_container_name() {
@@ -9734,7 +9734,7 @@ mod dns {
         create_test_network(net_name, "10.90.11.0/24");
 
         // Set dnsmasq backend.
-        unsafe { std::env::set_var("REMORA_DNS_BACKEND", "dnsmasq") };
+        unsafe { std::env::set_var("PELAGOS_DNS_BACKEND", "dnsmasq") };
 
         // Spawn container A (long-running sleep).
         let mut server = Command::new("/bin/sleep")
@@ -9815,7 +9815,7 @@ mod dns {
         let _ = server.wait();
         cleanup_dns();
         cleanup_test_network(net_name);
-        unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
+        unsafe { std::env::remove_var("PELAGOS_DNS_BACKEND") };
     }
 
     /// Upstream forwarding works via dnsmasq backend.
@@ -9847,7 +9847,7 @@ mod dns {
         cleanup_dns();
         create_test_network(net_name, "10.90.12.0/24");
 
-        unsafe { std::env::set_var("REMORA_DNS_BACKEND", "dnsmasq") };
+        unsafe { std::env::set_var("PELAGOS_DNS_BACKEND", "dnsmasq") };
 
         // Spawn a holder container to create the bridge.
         let mut holder = Command::new("/bin/sleep")
@@ -9916,7 +9916,7 @@ mod dns {
         let _ = holder.wait();
         cleanup_dns();
         cleanup_test_network(net_name);
-        unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
+        unsafe { std::env::remove_var("PELAGOS_DNS_BACKEND") };
     }
 
     /// dnsmasq daemon starts and stops correctly with the dnsmasq backend.
@@ -9948,7 +9948,7 @@ mod dns {
         cleanup_dns();
         create_test_network(net_name, "10.90.13.0/24");
 
-        unsafe { std::env::set_var("REMORA_DNS_BACKEND", "dnsmasq") };
+        unsafe { std::env::set_var("PELAGOS_DNS_BACKEND", "dnsmasq") };
 
         // Spawn a holder container to create the bridge.
         let mut holder = Command::new("/bin/sleep")
@@ -10024,7 +10024,7 @@ mod dns {
         let _ = holder.wait();
         cleanup_dns();
         cleanup_test_network(net_name);
-        unsafe { std::env::remove_var("REMORA_DNS_BACKEND") };
+        unsafe { std::env::remove_var("PELAGOS_DNS_BACKEND") };
     }
 }
 
@@ -10776,30 +10776,30 @@ fn test_lisp_env_fallback_and_override() {
     use pelagos::lisp::Interpreter;
 
     // Ensure the test var is absent.
-    std::env::remove_var("_REMORA_TEST_PORT");
+    std::env::remove_var("_PELAGOS_TEST_PORT");
 
     let mut interp = Interpreter::new();
 
     // With var unset: should use the default 9999.
     let v = interp
         .eval_str(
-            r#"(let ((p (env "_REMORA_TEST_PORT")))
+            r#"(let ((p (env "_PELAGOS_TEST_PORT")))
                  (if (null? p) 9999 (string->number p)))"#,
         )
         .expect("eval failed");
     assert_eq!(v, pelagos::lisp::Value::Int(9999));
 
     // With var set: should use the provided value.
-    std::env::set_var("_REMORA_TEST_PORT", "1234");
+    std::env::set_var("_PELAGOS_TEST_PORT", "1234");
     let v2 = interp
         .eval_str(
-            r#"(let ((p (env "_REMORA_TEST_PORT")))
+            r#"(let ((p (env "_PELAGOS_TEST_PORT")))
                  (if (null? p) 9999 (string->number p)))"#,
         )
         .expect("eval failed");
     assert_eq!(v2, pelagos::lisp::Value::Int(1234));
 
-    std::env::remove_var("_REMORA_TEST_PORT");
+    std::env::remove_var("_PELAGOS_TEST_PORT");
 }
 
 #[test]

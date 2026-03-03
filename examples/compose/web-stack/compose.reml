@@ -1,4 +1,4 @@
-; Remora Blog — web-stack in Lisp  (compose.reml)
+; Pelagos Blog — web-stack in Lisp  (compose.reml)
 ;
 ; Architecture:
 ;
@@ -21,7 +21,7 @@
 ;; All tuneable values in one place.
 ;;
 ;; Override the published host port without editing this file:
-;;   BLOG_PORT=9090 sudo remora compose up -f compose.reml -p blog
+;;   BLOG_PORT=9090 sudo pelagos compose up -f compose.reml -p blog
 
 (define host-port
   (let ((p (env "BLOG_PORT")))

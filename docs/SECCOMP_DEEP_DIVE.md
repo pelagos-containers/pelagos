@@ -893,10 +893,10 @@ echo "PASS: All dangerous syscalls blocked"
 **Use `strace` to verify syscalls:**
 ```bash
 # Run container and trace syscalls
-strace -c remora --exe /bin/ls
+strace -c pelagos --exe /bin/ls
 
 # Check that blocked syscalls return EPERM
-strace -e ptrace remora --exe /usr/bin/ptrace 1
+strace -e ptrace pelagos --exe /usr/bin/ptrace 1
 # Should show: ptrace(...) = -1 EPERM (Operation not permitted)
 ```
 
@@ -1016,7 +1016,7 @@ Container crashes mysteriously because a required syscall is blocked.
 strace -c /bin/myapp
 
 # Run with permissive logging
-strace -f remora --exe /bin/myapp
+strace -f pelagos --exe /bin/myapp
 ```
 
 ---

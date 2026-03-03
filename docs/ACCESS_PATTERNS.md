@@ -39,7 +39,7 @@ host.
 it.
 
 **Pelagos today:** Fully supported. `(port 9090 9090)` in `compose.rem` or
-`--publish 9090:9090` on `remora run` binds port 9090 on the host and forwards
+`--publish 9090:9090` on `pelagos run` binds port 9090 on the host and forwards
 it to port 9090 in the container via nftables DNAT + a userspace TCP proxy for
 localhost access. Works on both `localhost` and the machine's LAN IP.
 

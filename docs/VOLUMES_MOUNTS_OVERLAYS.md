@@ -33,7 +33,7 @@ Command::new("/bin/sh")
 ### CLI
 
 ```bash
-remora run alpine -v /host/data:/container/data -- /bin/sh
+pelagos run alpine -v /host/data:/container/data -- /bin/sh
 ```
 
 When the source path is absolute (`/host/...`), the CLI creates a direct bind
@@ -70,7 +70,7 @@ Command::new("/bin/sh")
 ### CLI
 
 ```bash
-remora run alpine --read-only --tmpfs /tmp -- /bin/sh
+pelagos run alpine --read-only --tmpfs /tmp -- /bin/sh
 ```
 
 ---
@@ -84,15 +84,15 @@ storage that survives container restarts and can be shared between containers.
 
 | Mode     | Path                                                  |
 |----------|-------------------------------------------------------|
-| Root     | `/var/lib/remora/volumes/<name>/`                     |
-| Rootless | `$XDG_DATA_HOME/remora/volumes/<name>/` (or `~/.local/share/remora/volumes/<name>/`) |
+| Root     | `/var/lib/pelagos/volumes/<name>/`                     |
+| Rootless | `$XDG_DATA_HOME/pelagos/volumes/<name>/` (or `~/.local/share/pelagos/volumes/<name>/`) |
 
 Each volume is a plain directory — no metadata files or driver abstraction.
 
 ### API
 
 ```rust
-use remora::container::Volume;
+use pelagos::container::Volume;
 
 // Create a new volume (or open existing)
 let vol = Volume::create("mydata")?;
@@ -116,12 +116,12 @@ Volume::delete("mydata")?;
 ### CLI
 
 ```bash
-remora volume create mydata
-remora volume ls
-remora volume rm mydata
+pelagos volume create mydata
+pelagos volume ls
+pelagos volume rm mydata
 
 # Use in a container (auto-creates if it doesn't exist)
-remora run alpine -v mydata:/data -- /bin/sh
+pelagos run alpine -v mydata:/data -- /bin/sh
 ```
 
 ---
@@ -172,7 +172,7 @@ Command::new("/bin/sh")
 `with_image_layers()` automatically:
 - Sets the bottom layer as the chroot directory
 - Creates ephemeral `upper/` and `work/` directories at
-  `/run/remora/overlay-{pid}-{n}/`
+  `/run/pelagos/overlay-{pid}-{n}/`
 - Adds `Namespace::MOUNT` and proc mount
 - Cleans up the ephemeral directories on `wait()`
 
@@ -185,14 +185,14 @@ Command::new("/bin/sh")
 
 ### How the Build Engine Uses Overlay
 
-`remora build` uses overlay to snapshot each `RUN` instruction:
+`pelagos build` uses overlay to snapshot each `RUN` instruction:
 
 1. Mount all accumulated layers via `with_image_layers()`
 2. Run the command — writes land in the ephemeral upper directory
 3. Call `wait_preserve_overlay()` instead of `wait()` — this skips cleanup so
    the build engine can inspect the upper directory
 4. Tar + sha256-hash the upper directory contents → store as a new
-   content-addressable layer at `/var/lib/remora/layers/<sha256>/`
+   content-addressable layer at `/var/lib/pelagos/layers/<sha256>/`
 5. The next `RUN` instruction stacks this new layer on top
 
 Layers are deduplicated by sha256 digest.

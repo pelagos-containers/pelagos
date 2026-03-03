@@ -1,4 +1,4 @@
-; Remora Rust Builder Stack — compose.reml
+; Pelagos Rust Builder Stack — compose.reml
 ;
 ; Architecture:
 ;
@@ -15,10 +15,10 @@
 ;; ── Configuration ─────────────────────────────────────────────────
 ;;
 ;; Override memory/CPU without editing this file:
-;;   MEM=8g CPU=8.0 sudo remora compose up -f compose.reml -p rust-builder
+;;   MEM=8g CPU=8.0 sudo pelagos compose up -f compose.reml -p rust-builder
 ;;
 ;; Optional: point sccache at an S3 bucket for distributed caching:
-;;   SCCACHE_BUCKET=my-cache sudo remora compose up -f compose.reml -p rust-builder
+;;   SCCACHE_BUCKET=my-cache sudo pelagos compose up -f compose.reml -p rust-builder
 
 (define rust-edition "2021")
 
@@ -38,14 +38,14 @@
 
 ;; ── Service ───────────────────────────────────────────────────────
 ;;
-;; The container runs `sleep infinity` so that `remora exec` can be used
+;; The container runs `sleep infinity` so that `pelagos exec` can be used
 ;; to run builds interactively:
 ;;
-;;   remora exec rust-builder-rust-builder cargo build --release
+;;   pelagos exec rust-builder-rust-builder cargo build --release
 
 (define-service svc-builder "rust-builder"
   :image   "rust-builder:latest"
-  :command "sleep" "infinity"       ; stays alive for remora exec
+  :command "sleep" "infinity"       ; stays alive for pelagos exec
   :volume  "cargo-registry" "/root/.cargo/registry"
   :volume  "sccache-cache"  "/sccache-cache"
   :env     ("RUSTC_WRAPPER" . "sccache")

@@ -1,4 +1,4 @@
-; Remora Jupyter Stack — compose.reml
+; Pelagos Jupyter Stack — compose.reml
 ;
 ; Architecture:
 ;
@@ -15,7 +15,7 @@
 ;; ── Configuration ─────────────────────────────────────────────────
 ;;
 ;; Override the JupyterLab port without editing this file:
-;;   JUPYTER_PORT=9999 sudo remora compose up -f compose.reml -p jupyter
+;;   JUPYTER_PORT=9999 sudo pelagos compose up -f compose.reml -p jupyter
 
 (define jupyter-port
   (let ((p (env "JUPYTER_PORT")))

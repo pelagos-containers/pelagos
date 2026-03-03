@@ -329,7 +329,7 @@ terminal semantics:
 
 ```bash
 # These already work via Stdio::Inherit:
-sudo remora -r alpine-rootfs -e /bin/ash -u 0 -g 0
+sudo pelagos -r alpine-rootfs -e /bin/ash -u 0 -g 0
 # → interactive ash shell, ls works, colors work
 
 # PTY adds proper isolation — the container gets its own session:

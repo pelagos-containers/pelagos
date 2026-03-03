@@ -11,13 +11,13 @@
 #
 # Usage:
 #   # Load from creds file (GHCR token must be pre-expanded — see below):
-#   REMORA_E2E_GHCR_TOKEN=$(gh auth token) \
+#   PELAGOS_E2E_GHCR_TOKEN=$(gh auth token) \
 #   CREDS_FILE=scripts/.env \
 #   sudo -E scripts/test-registry-auth-e2e.sh
 #
 #   # Run only specific profiles:
-#   REMORA_E2E_REGISTRIES="ghcr-private dockerhub-public" \
-#   REMORA_E2E_GHCR_TOKEN=$(gh auth token) \
+#   PELAGOS_E2E_REGISTRIES="ghcr-private dockerhub-public" \
+#   PELAGOS_E2E_GHCR_TOKEN=$(gh auth token) \
 #   CREDS_FILE=scripts/.env \
 #   sudo -E scripts/test-registry-auth-e2e.sh
 #
@@ -176,11 +176,11 @@ run_private_suite() {
         env HOME="$tmphome" "$BINARY" image ls
 
     echo ""
-    echo "--- Test 5: REMORA_REGISTRY_USER / REMORA_REGISTRY_PASS env fallback ---"
+    echo "--- Test 5: PELAGOS_REGISTRY_USER / PELAGOS_REGISTRY_PASS env fallback ---"
     HOME="$tmphome" "$BINARY" image rm "$image" >/dev/null 2>&1 || true
     local pull_env
     pull_env=$(HOME="$tmphome" \
-        REMORA_REGISTRY_USER="$user" REMORA_REGISTRY_PASS="$token" \
+        PELAGOS_REGISTRY_USER="$user" PELAGOS_REGISTRY_PASS="$token" \
         "$BINARY" image pull "$image" 2>&1) || true
     if echo "$pull_env" | grep -q "Done:"; then
         _pass "env-var auth pull succeeded"
@@ -303,11 +303,11 @@ run_public_suite() {
         env HOME="$tmphome" "$BINARY" image ls
 
     echo ""
-    echo "--- Test 5: REMORA_REGISTRY_USER / REMORA_REGISTRY_PASS env fallback ---"
+    echo "--- Test 5: PELAGOS_REGISTRY_USER / PELAGOS_REGISTRY_PASS env fallback ---"
     HOME="$tmphome" "$BINARY" image rm "$image" >/dev/null 2>&1 || true
     local pull_env
     pull_env=$(HOME="$tmphome" \
-        REMORA_REGISTRY_USER="$user" REMORA_REGISTRY_PASS="$token" \
+        PELAGOS_REGISTRY_USER="$user" PELAGOS_REGISTRY_PASS="$token" \
         "$BINARY" image pull "$image" 2>&1) || true
     if echo "$pull_env" | grep -q "Done:"; then
         _pass "env-var auth pull succeeded"
@@ -382,55 +382,55 @@ _skip_profile() {
 # ---------------------------------------------------------------------------
 
 run_ghcr_private() {
-    local user="${REMORA_E2E_GHCR_USER:-}"
-    local token="${REMORA_E2E_GHCR_TOKEN:-}"
-    local image="${REMORA_E2E_GHCR_PRIVATE_IMAGE:-}"
+    local user="${PELAGOS_E2E_GHCR_USER:-}"
+    local token="${PELAGOS_E2E_GHCR_TOKEN:-}"
+    local image="${PELAGOS_E2E_GHCR_PRIVATE_IMAGE:-}"
     [[ -z "$user" || -z "$token" || -z "$image" ]] && {
-        _skip_profile "ghcr-private" "REMORA_E2E_GHCR_USER / _TOKEN / _PRIVATE_IMAGE not set"
+        _skip_profile "ghcr-private" "PELAGOS_E2E_GHCR_USER / _TOKEN / _PRIVATE_IMAGE not set"
         return
     }
     run_private_suite "ghcr-private" "ghcr.io" "$user" "$token" "$image"
 }
 
 run_ghcr_public() {
-    local user="${REMORA_E2E_GHCR_USER:-}"
-    local token="${REMORA_E2E_GHCR_TOKEN:-}"
-    local image="${REMORA_E2E_GHCR_PUBLIC_IMAGE:-}"
+    local user="${PELAGOS_E2E_GHCR_USER:-}"
+    local token="${PELAGOS_E2E_GHCR_TOKEN:-}"
+    local image="${PELAGOS_E2E_GHCR_PUBLIC_IMAGE:-}"
     [[ -z "$user" || -z "$token" || -z "$image" ]] && {
-        _skip_profile "ghcr-public" "REMORA_E2E_GHCR_USER / _TOKEN / _PUBLIC_IMAGE not set"
+        _skip_profile "ghcr-public" "PELAGOS_E2E_GHCR_USER / _TOKEN / _PUBLIC_IMAGE not set"
         return
     }
     run_public_suite "ghcr-public" "ghcr.io" "$user" "$token" "$image"
 }
 
 run_dockerhub_private() {
-    local user="${REMORA_E2E_DOCKERHUB_USER:-}"
-    local token="${REMORA_E2E_DOCKERHUB_TOKEN:-}"
-    local image="${REMORA_E2E_DOCKERHUB_PRIVATE_IMAGE:-}"
+    local user="${PELAGOS_E2E_DOCKERHUB_USER:-}"
+    local token="${PELAGOS_E2E_DOCKERHUB_TOKEN:-}"
+    local image="${PELAGOS_E2E_DOCKERHUB_PRIVATE_IMAGE:-}"
     [[ -z "$user" || -z "$token" || -z "$image" ]] && {
-        _skip_profile "dockerhub-private" "REMORA_E2E_DOCKERHUB_USER / _TOKEN / _PRIVATE_IMAGE not set"
+        _skip_profile "dockerhub-private" "PELAGOS_E2E_DOCKERHUB_USER / _TOKEN / _PRIVATE_IMAGE not set"
         return
     }
     run_private_suite "dockerhub-private" "docker.io" "$user" "$token" "$image"
 }
 
 run_dockerhub_public() {
-    local user="${REMORA_E2E_DOCKERHUB_USER:-}"
-    local token="${REMORA_E2E_DOCKERHUB_TOKEN:-}"
-    local image="${REMORA_E2E_DOCKERHUB_PUBLIC_IMAGE:-}"
+    local user="${PELAGOS_E2E_DOCKERHUB_USER:-}"
+    local token="${PELAGOS_E2E_DOCKERHUB_TOKEN:-}"
+    local image="${PELAGOS_E2E_DOCKERHUB_PUBLIC_IMAGE:-}"
     [[ -z "$user" || -z "$token" || -z "$image" ]] && {
-        _skip_profile "dockerhub-public" "REMORA_E2E_DOCKERHUB_USER / _TOKEN / _PUBLIC_IMAGE not set"
+        _skip_profile "dockerhub-public" "PELAGOS_E2E_DOCKERHUB_USER / _TOKEN / _PUBLIC_IMAGE not set"
         return
     }
     run_public_suite "dockerhub-public" "docker.io" "$user" "$token" "$image"
 }
 
 run_ecr() {
-    local registry="${REMORA_E2E_ECR_REGISTRY:-}"
-    local region="${REMORA_E2E_ECR_REGION:-}"
-    local image="${REMORA_E2E_ECR_IMAGE:-}"
+    local registry="${PELAGOS_E2E_ECR_REGISTRY:-}"
+    local region="${PELAGOS_E2E_ECR_REGION:-}"
+    local image="${PELAGOS_E2E_ECR_IMAGE:-}"
     [[ -z "$registry" || -z "$region" || -z "$image" ]] && {
-        _skip_profile "ecr" "REMORA_E2E_ECR_REGISTRY / _REGION / _IMAGE not set"
+        _skip_profile "ecr" "PELAGOS_E2E_ECR_REGISTRY / _REGION / _IMAGE not set"
         return
     }
     if ! command -v aws >/dev/null 2>&1; then
@@ -452,7 +452,7 @@ run_ecr() {
 # Main
 # ---------------------------------------------------------------------------
 
-REGISTRIES="${REMORA_E2E_REGISTRIES:-ghcr-private ghcr-public dockerhub-private dockerhub-public ecr}"
+REGISTRIES="${PELAGOS_E2E_REGISTRIES:-ghcr-private ghcr-public dockerhub-private dockerhub-public ecr}"
 
 echo "=== Remora registry auth E2E ==="
 echo "  Binary     : $BINARY"

@@ -14,7 +14,7 @@
 ;;;   compose-eager-parallel.reml — same model, but db and cache start in parallel
 ;;;
 ;;; Usage:
-;;;   sudo -E remora compose up -f compose-eager-sequential.reml -p eager-seq
+;;;   sudo -E pelagos compose up -f compose-eager-sequential.reml -p eager-seq
 
 ;; ── Service declarations ──────────────────────────────────────────────────
 

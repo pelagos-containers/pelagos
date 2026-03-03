@@ -2,8 +2,8 @@
 
 The stack was originally designed for Kubernetes + kube-prometheus-stack (Helm).
 The `monitoring-setup/` directory contains the original Helm charts. The
-`remora/` directory contains the rewritten config that runs under
-`remora compose`. This document records what changed and why.
+`pelagos/` directory contains the rewritten config that runs under
+`pelagos compose`. This document records what changed and why.
 
 ---
 
@@ -189,7 +189,7 @@ COPY truenas_api_exporter.py .
 CMD ["python", "-u", "/app/truenas_api_exporter.py"]
 ```
 
-`start-monitoring.sh` checks for the image with `remora image ls` and builds it
+`start-monitoring.sh` checks for the image with `pelagos image ls` and builds it
 if absent. Three bugs in Pelagos's build engine were uncovered and fixed during
 this process:
 

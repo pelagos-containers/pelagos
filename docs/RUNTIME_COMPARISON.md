@@ -10,7 +10,7 @@
 - ✅ Low-level container runtime **library** (like liblxc, not like Docker)
 - ✅ Focused on Linux namespaces, seccomp, cgroups, and native networking
 - ✅ Ergonomic Rust API for embedding containers in applications
-- ✅ OCI image pull + daemonless image build (`remora build`)
+- ✅ OCI image pull + daemonless image build (`pelagos build`)
 - ✅ OCI Runtime Spec v1.0.2 Phase 1 (create/start/state/kill/delete + config.json parsing)
 
 ---
@@ -40,7 +40,7 @@
 | Read-only rootfs | ✅ | ✅ | ✅ | `MS_RDONLY` remount |
 | Bind mounts (RW + RO) | ✅ | ✅ | ✅ | |
 | tmpfs mounts | ✅ | ✅ | ✅ | |
-| Named volumes | ✅ | ✅ | ✅ | Backed by `/var/lib/remora/volumes/` |
+| Named volumes | ✅ | ✅ | ✅ | Backed by `/var/lib/pelagos/volumes/` |
 | Overlay filesystem | ✅ | ✅ | ✅ | `with_overlay(upper, work)` |
 | **Security** |
 | Seccomp (Docker profile) | ✅ | ✅ | ✅ | Pure-Rust via `seccompiler` |
@@ -57,7 +57,7 @@
 | I/O bandwidth limits | ❌ | ✅ | ✅ | Requires block device numbers |
 | **Networking** |
 | Loopback isolation | ✅ | ✅ | ✅ | ioctl in pre_exec |
-| Bridge (veth + IPAM) | ✅ | ✅ | ✅ | `remora0`, 172.19.0.x/24 |
+| Bridge (veth + IPAM) | ✅ | ✅ | ✅ | `pelagos0`, 172.19.0.x/24 |
 | NAT / MASQUERADE | ✅ | ✅ | ✅ | nftables, reference-counted |
 | Port mapping (DNAT) | ✅ | 🚫 | ✅ | TCP; `with_port_forward()` |
 | DNS configuration | ✅ | ✅ | ✅ | `with_dns()` writes resolv.conf |
@@ -67,13 +67,13 @@
 | Interactive PTY | ✅ | ✅ | ✅ | `spawn_interactive()` |
 | SIGWINCH forwarding | ✅ | ✅ | ✅ | |
 | Signal sending | ⚠️ | ✅ | ✅ | Via `std::process::Child::kill()` |
-| Exec into container | ✅ | ✅ | ✅ | `remora exec` (ns join + PTY) |
+| Exec into container | ✅ | ✅ | ✅ | `pelagos exec` (ns join + PTY) |
 | **OCI** |
 | OCI config.json | ✅ | ✅ | ✅ | Phase 1 fields (see ROADMAP) |
 | OCI bundle format | ✅ | ✅ | ✅ | create/start/state/kill/delete |
 | OCI lifecycle hooks | ✅ | ✅ | ✅ | prestart/poststart/poststop |
 | **Image Build** |
-| Image build | ✅ | 🚫 | ✅ | `remora build` (Remfile), daemonless |
+| Image build | ✅ | 🚫 | ✅ | `pelagos build` (Remfile), daemonless |
 | **Rootless** |
 | Unprivileged mode | ✅ | ✅ | ✅ | Auto-detection, USER ns, pasta, overlay |
 | Subuid/subgid | ✅ | ✅ | ✅ | newuidmap/newgidmap helpers |

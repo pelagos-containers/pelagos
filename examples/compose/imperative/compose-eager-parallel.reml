@@ -15,7 +15,7 @@
 ;;;   compose-eager-sequential.reml — same model, strictly serial
 ;;;
 ;;; Usage:
-;;;   sudo -E remora compose up -f compose-eager-parallel.reml -p eager-par
+;;;   sudo -E pelagos compose up -f compose-eager-parallel.reml -p eager-par
 
 ;; ── Service declarations ──────────────────────────────────────────────────
 

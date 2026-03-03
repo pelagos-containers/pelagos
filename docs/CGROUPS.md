@@ -327,7 +327,7 @@ docker run \
 ```rust
 use cgroups_rs::Cgroup;
 
-let cgroup = Cgroup::new("remora_container_12345")?;
+let cgroup = Cgroup::new("pelagos_container_12345")?;
 
 let child = Command::new("/bin/sh")
     .with_namespaces(Namespace::MOUNT | Namespace::CGROUP)

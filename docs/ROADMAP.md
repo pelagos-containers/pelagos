@@ -1,7 +1,7 @@
 # Pelagos Development Roadmap
 
 **Last Updated:** 2026-02-20
-**Current Status:** Image build complete — `remora build -t <tag> .`
+**Current Status:** Image build complete — `pelagos build -t <tag> .`
 
 ---
 
@@ -37,7 +37,7 @@
 - Bind mounts RW and RO (`with_bind_mount`, `with_bind_mount_ro`)
 - tmpfs mounts (`with_tmpfs`) — writable scratch space inside read-only rootfs
 - Named volumes (`Volume::create/open/delete`, `with_volume`) backed by
-  `/var/lib/remora/volumes/<name>/`
+  `/var/lib/pelagos/volumes/<name>/`
 
 ### Phase 5 — Cgroups v2 Resource Management ✅
 - Memory hard limit (`with_cgroup_memory`)
@@ -54,25 +54,25 @@
   via `ioctl(SIOCSIFFLAGS)` inside `pre_exec`
 
 **N2 — Bridge**
-- `with_network(NetworkMode::Bridge)`: veth pair + `remora0` bridge (172.19.0.x/24)
+- `with_network(NetworkMode::Bridge)`: veth pair + `pelagos0` bridge (172.19.0.x/24)
 - Named netns created before fork → no race, no deadlock
-- File-locked IPAM at `/run/remora/next_ip`
+- File-locked IPAM at `/run/pelagos/next_ip`
 - Teardown (veth del + netns del) in `wait()` / `wait_with_output()`
 
 **N3 — NAT / MASQUERADE**
 - `with_nat()`: enables IP forwarding + installs nftables MASQUERADE rule
 - Reference-counted — shared across concurrent NAT containers
-- Removed atomically (`nft delete table ip remora`) when last NAT container exits
+- Removed atomically (`nft delete table ip pelagos`) when last NAT container exits
 
 **N4 — Port Mapping**
 - `with_port_forward(host_port, container_port)`: TCP DNAT via nftables prerouting
 - Flush-and-rebuild strategy on teardown — no handle tracking required
-- Shared `table ip remora` with N3; `disable_port_forwards` checks NAT refcount
+- Shared `table ip pelagos` with N3; `disable_port_forwards` checks NAT refcount
   before deleting the table
 
 **N5 — DNS**
 - `with_dns(&["1.1.1.1", "8.8.8.8"])`: writes to a per-container temp file at
-  `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it over `/etc/resolv.conf`
+  `/run/pelagos/dns-{pid}-{n}/resolv.conf` and bind-mounts it over `/etc/resolv.conf`
   inside the container — the shared rootfs is never modified
 - Requires `Namespace::MOUNT` and `with_chroot`; temp file removed in `wait()`
 
@@ -84,7 +84,7 @@ Layered rootfs using `overlayfs` — lower (read-only base) + upper (writable pe
 
 - `with_overlay(upper_dir, work_dir)`: requires `Namespace::MOUNT` + `with_chroot` (lower layer)
 - Lower layer (shared Alpine rootfs) is never modified — writes land in `upper_dir`
-- Merged mount point auto-created at `/run/remora/overlay-{pid}-{n}/merged/`; removed in `wait()`
+- Merged mount point auto-created at `/run/pelagos/overlay-{pid}-{n}/merged/`; removed in `wait()`
 - Compatible with `with_readonly_rootfs(true)`, bind mounts, and tmpfs
 - Foundation for image-layer-style workflows
 
@@ -94,11 +94,11 @@ Layered rootfs using `overlayfs` — lower (read-only base) + upper (writable pe
 
 Pull OCI images from registries and run containers directly from them.
 
-- `remora image pull <ref>`: native OCI registry pulls via `oci-client` (anonymous auth)
-- `remora image ls` / `remora image rm <ref>`: list and remove locally stored images
-- `remora run --image <ref> [cmd]`: run a container from a pulled image
-- Layers cached content-addressably at `/var/lib/remora/layers/<sha256>/`
-- Image metadata at `/var/lib/remora/images/<name>_<tag>/manifest.json`
+- `pelagos image pull <ref>`: native OCI registry pulls via `oci-client` (anonymous auth)
+- `pelagos image ls` / `pelagos image rm <ref>`: list and remove locally stored images
+- `pelagos run --image <ref> [cmd]`: run a container from a pulled image
+- Layers cached content-addressably at `/var/lib/pelagos/layers/<sha256>/`
+- Image metadata at `/var/lib/pelagos/images/<name>_<tag>/manifest.json`
 - Multi-layer overlayfs: `with_image_layers(layer_dirs)` API — multiple lower layers,
   ephemeral upper/work auto-created and cleaned up in `wait()`
 - Image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults; CLI overrides
@@ -117,16 +117,16 @@ Parse OCI `config.json` bundles and implement the standard container lifecycle.
 
 **OCI lifecycle:**
 ```bash
-remora create <id> <bundle>   # set up container, suspend before exec
-remora start <id>             # signal child to exec
-remora state <id>             # print JSON state to stdout
-remora kill <id> SIGTERM      # send signal to container process
-remora delete <id>            # tear down resources, remove state dir
+pelagos create <id> <bundle>   # set up container, suspend before exec
+pelagos start <id>             # signal child to exec
+pelagos state <id>             # print JSON state to stdout
+pelagos kill <id> SIGTERM      # send signal to container process
+pelagos delete <id>            # tear down resources, remove state dir
 ```
 
 **Implementation:** `src/oci.rs` — config/state types, path helpers, `cmd_*` functions.
-State stored at `/run/remora/<id>/state.json`. create/start sync via Unix socket
-at `/run/remora/<id>/exec.sock`. Double-fork shim ensures parent exits as soon
+State stored at `/run/pelagos/<id>/state.json`. create/start sync via Unix socket
+at `/run/pelagos/<id>/exec.sock`. Double-fork shim ensures parent exits as soon
 as "created" state is written.
 
 **OCI Phase 2 (complete):** `process.capabilities` ✅, `linux.maskedPaths` ✅,
@@ -176,8 +176,8 @@ Full internet access in rootless containers via [pasta](https://passt.top/passt/
 
 Run commands inside running containers — analogous to `docker exec`.
 
-- `remora exec <name> <command>`: run a process in a running container's namespaces
-- `remora exec -i <name> /bin/sh`: interactive mode with PTY
+- `pelagos exec <name> <command>`: run a process in a running container's namespaces
+- `pelagos exec -i <name> /bin/sh`: interactive mode with PTY
 - Options: `-e KEY=VALUE` (env), `-w /path` (workdir), `-u UID[:GID]` (user)
 - Namespace discovery: compares `/proc/{pid}/ns/*` inodes against `/proc/1/ns/*`
 - Environment inheritance: reads `/proc/{pid}/environ`, CLI `-e` overrides
@@ -192,7 +192,7 @@ Run commands inside running containers — analogous to `docker exec`.
 
 Build custom OCI images from Remfiles (simplified Dockerfiles).
 
-- `remora build -t <tag> [--file <path>] [--network bridge|pasta] [context]`
+- `pelagos build -t <tag> [--file <path>] [--network bridge|pasta] [context]`
 - Remfile instructions: FROM, RUN, COPY, CMD (JSON + shell), ENV, WORKDIR, EXPOSE
 - Daemonless build: overlay snapshot per RUN step, COPY as layer, config-only mutations
 - Content-addressable layer store with SHA-256 dedup

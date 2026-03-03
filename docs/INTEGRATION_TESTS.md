@@ -282,7 +282,7 @@ is required by the Linux kernel (two calls: bind, then remount-ro).
 **Requires:** root, rootfs
 
 Verifies that the CLI `-v host:container:ro` and `-v host:container:rw` suffixes are
-parsed correctly and produce the expected mount behaviour. Runs `remora run -v ...:ro`
+parsed correctly and produce the expected mount behaviour. Runs `pelagos run -v ...:ro`
 and asserts that a write inside the container fails (`exit=1`); then runs with `:rw`
 and asserts the write succeeds (`exit=0`).
 
@@ -347,7 +347,7 @@ Verifies the call returns a valid `ResourceStats` struct with `memory_current_by
 **Requires:** root, rootfs
 
 Spawns with `with_cgroup_memory(64MB)`, records the child PID, calls `wait()`, then
-checks that `/sys/fs/cgroup/remora-{pid}` no longer exists. Verifies that
+checks that `/sys/fs/cgroup/pelagos-{pid}` no longer exists. Verifies that
 `teardown_cgroup()` deletes the cgroup directory after the container exits.
 
 ### `test_cgroup_memory_swap`
@@ -405,7 +405,7 @@ Verifies that loopback is up with its standard address in an isolated net namesp
 
 Calls `with_network(NetworkMode::Bridge)`. `setup_bridge_network()` runs before fork,
 creating a named netns (`rem-{pid}-{n}`), a veth pair, assigning `172.19.0.x/24` to
-`eth0`, and attaching the host-side veth to `remora0`. The child joins the netns via
+`eth0`, and attaching the host-side veth to `pelagos0`. The child joins the netns via
 `setns()` in `pre_exec`. Runs `ip addr show eth0 | grep -q '172.19.0'` and verifies
 `BRIDGE_IP_OK` — confirming the container sees its assigned IP from the first
 instruction (no polling needed because setup is pre-fork).
@@ -449,7 +449,7 @@ uses an in-process `ioctl`.
 **Requires:** root, rootfs
 
 Runs `ping -c 1 -W 2 172.19.0.1` inside a bridge-mode container. Verifies actual
-layer-3 connectivity: ICMP echo traverses `eth0` → veth pair → `remora0` bridge →
+layer-3 connectivity: ICMP echo traverses `eth0` → veth pair → `pelagos0` bridge →
 host, which replies with `172.19.0.1`. This is the only test that exercises a real
 packet flowing through the full network stack, catching problems like missing ARP,
 misconfigured routes, or a veth not attached to the bridge.
@@ -466,7 +466,7 @@ Asserts:
 - Both IPs are non-empty and in the `172.19.0.x/24` range
 - The two IPs differ (`assert_ne!`)
 
-Exercises the `flock(LOCK_EX)` IPAM lock (concurrent writes to `/run/remora/next_ip`)
+Exercises the `flock(LOCK_EX)` IPAM lock (concurrent writes to `/run/pelagos/next_ip`)
 and the `AtomicU32` namespace-name counter under real concurrency.
 
 ---
@@ -474,7 +474,7 @@ and the `AtomicU32` namespace-name counter under real concurrency.
 ## Phase 6 N3 — NAT / MASQUERADE Tests
 
 These three tests share a global `NAT_TEST_LOCK` mutex so they run serially.
-All three check the nftables refcount state via `nft list table ip remora`,
+All three check the nftables refcount state via `nft list table ip pelagos`,
 which is global per-host state. Running them concurrently would cause spurious
 failures when one test's container exits and sees a non-zero refcount left by a
 sibling's still-running container.
@@ -483,7 +483,7 @@ sibling's still-running container.
 **Requires:** root, rootfs
 
 Spawns a bridge+NAT container running `sleep 2`. While it sleeps, runs
-`nft list table ip remora` on the host and asserts exit 0. Failure would
+`nft list table ip pelagos` on the host and asserts exit 0. Failure would
 indicate that `enable_nat()` did not install the MASQUERADE rule set, or that
 `nft` is not available on the host.
 
@@ -491,7 +491,7 @@ indicate that `enable_nat()` did not install the MASQUERADE rule set, or that
 **Requires:** root, rootfs
 
 Spawns a bridge+NAT container with `ash -c "exit 0"` (exits immediately). After
-`wait()`, runs `nft list table ip remora` and asserts non-zero exit. Failure
+`wait()`, runs `nft list table ip pelagos` and asserts non-zero exit. Failure
 would indicate that `disable_nat()` did not remove the nftables table (refcount
 not decremented to zero, or `nft delete table` failed silently).
 
@@ -499,7 +499,7 @@ not decremented to zero, or `nft delete table` failed silently).
 **Requires:** root, rootfs
 
 Spawns two bridge+NAT containers: A (`sleep 2`) and B (`sleep 4`). Waits for A,
-then asserts `nft list table ip remora` exits 0 (B still running — refcount ≥ 1).
+then asserts `nft list table ip pelagos` exits 0 (B still running — refcount ≥ 1).
 Waits for B, then asserts it exits non-zero (refcount hits 0, table removed).
 Failure would indicate the reference-counting logic in `enable_nat` /
 `disable_nat` is incorrect — either decrementing too eagerly (table gone while B
@@ -526,14 +526,14 @@ or `disable_nat()` is not cleaning them up.
 ## Phase 6 N4 — Port Mapping Tests
 
 These three tests share the `#[serial(nat)]` key with the N3 tests (port-forward
-rules live in the same `table ip remora`). All three use dedicated port numbers
+rules live in the same `table ip pelagos`). All three use dedicated port numbers
 (18080–18083) to avoid collision with real services on the host.
 
 ### `test_port_forward_rule_added` — N4
 **Requires:** root, rootfs
 
 Spawns a bridge+NAT container with `with_port_forward(18080, 80)` running `sleep 2`.
-While it sleeps, runs `nft list chain ip remora prerouting` and asserts exit 0 and
+While it sleeps, runs `nft list chain ip pelagos prerouting` and asserts exit 0 and
 that the output contains `dport 18080`. Failure would indicate that
 `enable_port_forwards()` did not install the DNAT rule, or that the prerouting chain
 was not created.
@@ -542,7 +542,7 @@ was not created.
 **Requires:** root, rootfs
 
 Spawns a bridge+NAT container with `with_port_forward(18081, 80)` that exits
-immediately (`ash -c "exit 0"`). After `wait()`, runs `nft list table ip remora`
+immediately (`ash -c "exit 0"`). After `wait()`, runs `nft list table ip pelagos`
 and asserts non-zero exit (table gone). Failure would indicate that
 `disable_port_forwards()` did not clean up nftables state, or that the port-forwards
 state file was not cleared.
@@ -605,7 +605,7 @@ FORWARD → bridge → container netns → container process → response back v
 **Requires:** root, rootfs
 
 Spawns a bridge+NAT container with `with_port_forward_udp(19095, 5000)`.
-After 200 ms, queries nftables (`nft list chain ip remora-remora0 prerouting`)
+After 200 ms, queries nftables (`nft list chain ip pelagos-pelagos0 prerouting`)
 and asserts the chain contains `udp dport 19095 dnat to <IP>:5000` and does NOT
 contain `tcp dport 19095` (UDP-only mappings must not generate TCP rules).
 
@@ -701,7 +701,7 @@ upper layer.
 Spawns a container with `with_overlay(upper, work)` that runs `true` (exits
 immediately). Records the specific merged dir path via `child.overlay_merged_dir()`
 before calling `wait()`. After `wait()`: asserts that neither the merged dir nor its
-parent (`/run/remora/overlay-{pid}-{n}/`) exist. Failure would indicate that `wait()`
+parent (`/run/pelagos/overlay-{pid}-{n}/`) exist. Failure would indicate that `wait()`
 failed to call `remove_dir` on the merged directory and its parent, leaving stale
 directories on the host. The test checks the specific path rather than scanning the
 whole directory to avoid false failures from other overlay tests running in parallel.
@@ -711,15 +711,15 @@ whole directory to avoid false failures from other overlay tests running in para
 ## OCI Lifecycle Tests
 
 These tests exercise the five OCI Runtime Spec v1.0.2 subcommands (`create`, `start`,
-`state`, `kill`, `delete`) via the `remora` binary. They use minimal OCI bundles with
+`state`, `kill`, `delete`) via the `pelagos` binary. They use minimal OCI bundles with
 `rootfs/` symlinked to the Alpine rootfs and inline `config.json`.
 
 ### `test_oci_create_start_state`
 **Requires:** root, rootfs
 
-Writes a minimal `config.json` running `sleep 2`. Runs `remora create`, asserts
-`remora state` returns `"created"`. Runs `remora start`, asserts `"running"`. Polls
-until the process exits, asserts `"stopped"`. Runs `remora delete`, asserts the state
+Writes a minimal `config.json` running `sleep 2`. Runs `pelagos create`, asserts
+`pelagos state` returns `"created"`. Runs `pelagos start`, asserts `"running"`. Polls
+until the process exits, asserts `"stopped"`. Runs `pelagos delete`, asserts the state
 dir is gone. Failure indicates broken create/start synchronization, incorrect
 state.json transitions, or wrong liveness detection via `kill(pid, 0)`.
 
@@ -727,7 +727,7 @@ state.json transitions, or wrong liveness detection via `kill(pid, 0)`.
 **Requires:** root, rootfs
 
 Spawns a long-running container (`sleep 60`), starts it, then sends `SIGKILL` via
-`remora kill` and polls until `remora state` reports `"stopped"`. Uses SIGKILL because
+`pelagos kill` and polls until `pelagos state` reports `"stopped"`. Uses SIGKILL because
 the container is PID 1 in a PID namespace — the kernel drops unhandled signals (like
 SIGTERM) for namespace-init processes. Failure indicates that `cmd_kill` is not finding
 the correct host-visible PID, or that liveness detection does not detect the exit.
@@ -736,7 +736,7 @@ the correct host-visible PID, or that liveness detection does not detect the exi
 **Requires:** root, rootfs
 
 Runs `/bin/true` through the full create→start→wait-for-stopped lifecycle, records
-the state dir path, runs `remora delete`, and asserts the directory is removed. Failure
+the state dir path, runs `pelagos delete`, and asserts the directory is removed. Failure
 indicates `cmd_delete` is not calling `remove_dir_all`, or is checking liveness
 incorrectly and refusing to delete a stopped container.
 
@@ -744,19 +744,19 @@ incorrectly and refusing to delete a stopped container.
 **Requires:** root, rootfs
 
 Starts `/bin/true`, waits 200ms for it to exit, then asserts: (1) the state directory
-still exists, and (2) `remora state` returns `"stopped"` without error. Then calls
-`remora delete` and verifies the state dir is removed.
+still exists, and (2) `pelagos state` returns `"stopped"` without error. Then calls
+`pelagos delete` and verifies the state dir is removed.
 
 Verifies the OCI spec requirement that `stopped` is a stable inspectable state owned by
-the runtime until `remora delete` — not cleaned up automatically on process exit. An
-orchestrator queries `remora state` after observing process exit, before calling delete.
+the runtime until `pelagos delete` — not cleaned up automatically on process exit. An
+orchestrator queries `pelagos state` after observing process exit, before calling delete.
 Failure indicates the runtime is removing state too early (issue #37 / #40).
 
 ### `test_oci_kill_short_lived`
 **Requires:** root, rootfs
 
-Starts `/bin/true`, waits 200ms (process exits), then calls `remora kill SIGKILL`
-*without* first calling `remora state`. Asserts kill returns success.
+Starts `/bin/true`, waits 200ms (process exits), then calls `pelagos kill SIGKILL`
+*without* first calling `pelagos state`. Asserts kill returns success.
 
 This is the `pidfile.t` scenario: the container process is gone but `state.json` still
 says `"running"` (cmd_state hasn't been called). `cmd_kill` must succeed — it gates only
@@ -766,8 +766,8 @@ concurrently). Failure indicates cmd_kill is incorrectly checking liveness (issu
 ### `test_oci_kill_stopped_fails`
 **Requires:** root, rootfs
 
-Starts `/bin/true`, waits 200ms, calls `remora state` (which writes `"stopped"` to
-`state.json`), then asserts `remora kill SIGKILL` returns an error.
+Starts `/bin/true`, waits 200ms, calls `pelagos state` (which writes `"stopped"` to
+`state.json`), then asserts `pelagos kill SIGKILL` returns an error.
 
 This is the `kill.t test 4` scenario: once `cmd_state` has persisted `"stopped"` to disk,
 subsequent kill attempts must fail per the OCI spec. Failure indicates either `cmd_state`
@@ -799,10 +799,10 @@ This is the foundation of the PID reuse detection fallback path in `cmd_state` a
 **Requires:** root, rootfs, Linux ≥ 5.3
 
 After `create` + `start` of a `sleep 30` container, asserts that:
-- `mgmt.sock` exists under `/run/remora/<id>/` (shim created it).
+- `mgmt.sock` exists under `/run/pelagos/<id>/` (shim created it).
 - Connecting to `mgmt.sock` and calling `recvmsg(SCM_RIGHTS)` yields a valid pidfd (≥ 0).
 - `is_pidfd_alive(pidfd)` returns `true` while the container is running.
-- After `remora kill SIGKILL`, `is_pidfd_alive` transitions to `false` within 5 s.
+- After `pelagos kill SIGKILL`, `is_pidfd_alive` transitions to `false` within 5 s.
 
 Failure indicates the shim failed to call `pidfd_open(2)` (kernel < 5.3 would skip it
 silently; a failure here means the mgmt loop exited early or the socket was never
@@ -812,7 +812,7 @@ This is the primary test for issue #44.
 ### `test_oci_pidfd_state_liveness`
 **Requires:** root, rootfs, Linux ≥ 5.3
 
-Runs a `true` container (exits immediately after start).  Polls `remora state` in a
+Runs a `true` container (exits immediately after start).  Polls `pelagos state` in a
 loop (100 ms intervals, 5 s timeout) and asserts it reaches `"stopped"`.
 
 Failure indicates that `cmd_state`'s pidfd-based liveness path (or its starttime
@@ -826,7 +826,7 @@ tests a longer-lived (`sleep 2`) container lifecycle.
 
 Creates a `config.json` with a `tmpfs` mount at `/scratch` and a process that writes
 to `/scratch/test.txt`. Runs the full create→start→stopped lifecycle and asserts that
-`remora delete` succeeds. Failure indicates that OCI `mounts` entries are not being
+`pelagos delete` succeeds. Failure indicates that OCI `mounts` entries are not being
 applied from `config.json`, or that tmpfs mount handling in `build_command()` is broken.
 
 ### `test_oci_capabilities`
@@ -889,7 +889,7 @@ parsing or the `with_sysctl()` / pre_exec write to `/proc/sys/` is broken.
 
 Creates a `config.json` with a `prestart` hook that touches a sentinel file, and a `poststop`
 hook that touches a different sentinel file. Asserts the prestart sentinel exists after
-`remora create` and the poststop sentinel exists after `remora delete`. Failure indicates
+`pelagos create` and the poststop sentinel exists after `pelagos delete`. Failure indicates
 that OCI `hooks` parsing or the `run_hooks()` placement in `cmd_create()` / `cmd_delete()`
 is broken.
 
@@ -931,14 +931,14 @@ output) and runs `ls /proc/self` inside. Failure indicates the OCI mount-type di
 ### `test_oci_create_bundle_flag`
 **Requires:** root, rootfs
 
-Invokes `remora create --bundle <path> <id>` (named flag, OCI-standard form) and verifies the
+Invokes `pelagos create --bundle <path> <id>` (named flag, OCI-standard form) and verifies the
 container reaches "created" state. Failure indicates the `--bundle` CLI flag is not accepted,
 which would prevent the `opencontainers/runtime-tools` conformance harness from invoking Pelagos.
 
 ### `test_oci_create_pid_file`
 **Requires:** root, rootfs
 
-Invokes `remora create --bundle <path> --pid-file <path> <id>` and verifies the pid file is
+Invokes `pelagos create --bundle <path> --pid-file <path> <id>` and verifies the pid file is
 written with a positive integer that matches the PID reported in `state.json`. Failure indicates
 `--pid-file` is not written or contains the wrong PID, which breaks containerd / CRI-O integration.
 
@@ -969,7 +969,7 @@ rely on predictable cgroup hierarchy placement (e.g. systemd-managed slices).
 **Requires:** root, rootfs
 
 Creates an OCI bundle with a `createContainer` hook script that writes the inode of
-`/proc/self/ns/mnt` to a temp file. After `remora create`, reads the recorded inode and compares
+`/proc/self/ns/mnt` to a temp file. After `pelagos create`, reads the recorded inode and compares
 it to the host's mount namespace inode (`/proc/1/ns/mnt`). Asserts they differ, confirming the
 hook executed inside the container's mount namespace. Failure means `createContainer` hooks run
 in the host namespace, violating the OCI spec and breaking runtimes that use these hooks to
@@ -981,7 +981,7 @@ inject config (e.g. seccomp, apparmor profiles) into the container environment.
 **Requires:** root, rootfs
 
 Creates an OCI bundle with a `startContainer` hook script that writes the inode of
-`/proc/self/ns/mnt` to a temp file. After `remora start`, reads the recorded inode and compares
+`/proc/self/ns/mnt` to a temp file. After `pelagos start`, reads the recorded inode and compares
 it to the host's mount namespace inode. Asserts they differ, confirming the hook executed inside
 the container's mount namespace before the user process was exec'd. Failure means `startContainer`
 hooks either do not run at all or run in the host namespace, violating the OCI spec.
@@ -1106,7 +1106,7 @@ in `pre_exec` (which makes the container process PID 1 in the new namespace) is 
 **Requires:** root, rootfs
 
 Starts container A on bridge networking, writes its state (including bridge IP) to
-`/run/remora/containers/link-test-a/state.json`, then starts container B with
+`/run/pelagos/containers/link-test-a/state.json`, then starts container B with
 `with_link("link-test-a")`. Reads B's `/etc/hosts` and verifies it contains A's bridge
 IP and hostname. Failure indicates that link resolution, hosts file generation, or the
 `/etc/hosts` bind-mount injection is broken.
@@ -1192,7 +1192,7 @@ dirs is broken.
 **Ignored by default** — run with `--ignored`
 
 End-to-end test of the full OCI image pipeline. Pulls `alpine:latest` from Docker Hub
-using the `remora` binary, loads the manifest, mounts layers via `with_image_layers()`,
+using the `pelagos` binary, loads the manifest, mounts layers via `with_image_layers()`,
 and runs `cat /etc/alpine-release` inside the container. Verifies the output is a valid
 Alpine version string. Failure indicates a regression anywhere in the chain: registry
 pull, layer extraction, manifest persistence, multi-layer overlay mount, or container exec.
@@ -1201,7 +1201,7 @@ pull, layer extraction, manifest persistence, multi-layer overlay mount, or cont
 
 ## Module: `exec`
 
-Tests for `remora exec` — running commands inside running containers via
+Tests for `pelagos exec` — running commands inside running containers via
 namespace join + `/proc/{pid}/root` chroot.
 
 ### `test_exec_basic`
@@ -1212,14 +1212,14 @@ see note below), then spawns an exec'd process (`/bin/cat /etc/os-release`) by
 joining the container's mount namespace via `setns()` + `fchdir()` +
 `chroot(".")` in a pre_exec callback. Verifies exit code 0 and non-empty output.
 
-Failure indicates that the setns + fchdir + chroot pattern used by `remora exec`
+Failure indicates that the setns + fchdir + chroot pattern used by `pelagos exec`
 is broken — either `setns()` fails, fchdir to the container root fd doesn't
 work, or the exec'd process can't see the container's filesystem.
 
 **Note:** PID namespace is omitted because `Namespace::PID` triggers a
 double-fork where `container.pid()` returns the intermediate process (which
 never execs and stays in the host namespaces), not the actual container. The
-real `remora exec` CLI gets the correct PID from state.json.
+real `pelagos exec` CLI gets the correct PID from state.json.
 
 ### `test_exec_sees_container_filesystem`
 **Requires:** root, rootfs
@@ -1249,7 +1249,7 @@ the exec'd process is broken.
 **Requires:** root
 
 Verifies that `kill(999999, 0)` returns false (PID not alive) and
-`/proc/999999/root` does not exist. This is the guard logic `remora exec`
+`/proc/999999/root` does not exist. This is the guard logic `pelagos exec`
 uses to reject exec into stopped containers.
 
 Failure indicates a kernel or procfs anomaly where dead PIDs still appear alive.
@@ -1257,12 +1257,12 @@ Failure indicates a kernel or procfs anomaly where dead PIDs still appear alive.
 ### `test_exec_joins_pid_namespace`
 **Requires:** root, rootfs
 
-Starts a detached container with `remora run -d --rootfs alpine /bin/sleep 30`.
+Starts a detached container with `pelagos run -d --rootfs alpine /bin/sleep 30`.
 The `--rootfs` path always enables `Namespace::PID`, so `state.pid` is the
 intermediate process P whose `/proc/P/ns/pid` is the host PID namespace, but
 `/proc/P/ns/pid_for_children` points to the container's PID namespace.
 
-Runs `remora exec <name> readlink /proc/self/ns/pid` and asserts the output
+Runs `pelagos exec <name> readlink /proc/self/ns/pid` and asserts the output
 matches `readlink /proc/{intermediate_pid}/ns/pid_for_children` read from the host.
 
 Failure indicates `discover_namespaces` is not using the `pid_for_children` fallback
@@ -1277,7 +1277,7 @@ PIDs instead of container-scoped PIDs.
 ### `test_watcher_kill_propagates_to_container`
 **Requires:** root, rootfs
 
-Starts a detached container with `remora run -d --rootfs alpine /bin/sleep 300`.
+Starts a detached container with `pelagos run -d --rootfs alpine /bin/sleep 300`.
 Reads `state.pid` (the intermediate process P), then reads P's `PPid` from
 `/proc/<P>/status` to find the watcher PID.  Sends `SIGKILL` to the watcher
 and polls for up to 3 seconds to verify the container process P also dies.
@@ -1312,7 +1312,7 @@ detecting that a timed-out probe child was successfully cleaned up.
 
 ## Log Relay Tests (`cli::relay` unit tests)
 
-These tests live directly in `src/cli/relay.rs` and run via `cargo test --bin remora`
+These tests live directly in `src/cli/relay.rs` and run via `cargo test --bin pelagos`
 (no root required).
 
 ### `cli::relay::tests::test_relay_captures_stdout_and_stderr`
@@ -1428,7 +1428,7 @@ not written to the sub-cgroup.
 **Requires:** non-root + rootfs + cgroup v2 delegation
 
 Spawns a rootless container with a memory cgroup, waits for it to exit,
-then checks that the sub-cgroup directory (`remora-{pid}`) under the
+then checks that the sub-cgroup directory (`pelagos-{pid}`) under the
 user's cgroup slice has been removed.
 
 Failure indicates `teardown_rootless_cgroup()` did not successfully
@@ -1724,7 +1724,7 @@ loading, bridge creation, IPAM allocation, or veth configuration.
 
 Spawns a container using `NetworkMode::Bridge` (the legacy enum variant) and
 verifies it gets a `172.19.0.x` IP, confirming that the `Bridge` →
-`BridgeNamed("remora0")` normalization and default network bootstrap work.
+`BridgeNamed("pelagos0")` normalization and default network bootstrap work.
 
 Failure indicates the backwards-compatibility path from `NetworkMode::Bridge`
 to the new per-network architecture is broken.
@@ -1733,7 +1733,7 @@ to the new per-network architecture is broken.
 **Requires:** root
 
 Bootstraps the default network and verifies the config file exists. This tests
-that the default `remora0` network is always available and cannot be removed.
+that the default `pelagos0` network is always available and cannot be removed.
 
 Failure indicates `bootstrap_default_network()` is not persisting the config.
 
@@ -1829,7 +1829,7 @@ Failure means the daemon lifecycle management is broken.
 ### `test_dns_dnsmasq_resolves_container_name`
 **Requires:** root, rootfs, dnsmasq installed
 
-Same as `test_dns_resolves_container_name` but with `REMORA_DNS_BACKEND=dnsmasq`.
+Same as `test_dns_resolves_container_name` but with `PELAGOS_DNS_BACKEND=dnsmasq`.
 Container B resolves container A by name via dnsmasq. Verifies the backend marker
 file says "dnsmasq" and the resolved IP matches A's bridge IP.
 
@@ -1876,7 +1876,7 @@ accumulate over time (especially from test panics or early returns).
 ### `test_sexpr_parse_compose_file`
 **Type:** No-root
 
-Parses a full compose file example through the S-expression parser (`remora::sexpr::parse`).
+Parses a full compose file example through the S-expression parser (`pelagos::sexpr::parse`).
 Verifies the top-level structure: the root is a list starting with `compose`, containing
 the expected number of declarations (networks, volumes, services).
 
@@ -1886,7 +1886,7 @@ nested lists, quoted strings, keyword arguments).
 ### `test_compose_parse_and_validate`
 **Type:** No-root
 
-Parses a compose file through the full pipeline (`remora::compose::parse_compose`) which
+Parses a compose file through the full pipeline (`pelagos::compose::parse_compose`) which
 includes S-expression parsing, AST-to-struct transformation, and cross-reference validation.
 Checks that all fields are correctly populated: networks with subnets, volumes, service
 names/images/networks/volumes/env/ports/memory, and dependency with `:ready-port`.
@@ -1897,7 +1897,7 @@ Failure means the compose model parser is dropping or misinterpreting fields fro
 **Type:** No-root
 
 Verifies topological sort of service dependencies: given web -> api -> db, the sort must
-produce db before api before web. Uses `remora::compose::topo_sort`.
+produce db before api before web. Uses `pelagos::compose::topo_sort`.
 
 Failure means services would be started in wrong order, causing dependency failures.
 
@@ -2212,7 +2212,7 @@ Steps:
 4. Call `remove_docker_config` and assert the entry is gone
 
 Failure means the login/logout lifecycle is broken; registry auth would silently
-fall back to anonymous even after `remora image login`.
+fall back to anonymous even after `pelagos image login`.
 
 ### `registry_auth::test_local_registry_push_pull_roundtrip` (`#[ignore]`)
 **Requires:** root, network (Docker Hub for `registry:2`), overlay support
@@ -2221,13 +2221,13 @@ Starts a `registry:2` OCI registry on a random ephemeral port with no
 authentication, then exercises the push → pull round-trip over plain HTTP:
 
 1. Pull `registry:2` from Docker Hub (if not already cached)
-2. Start `registry:2` with `remora run --detach -p <port>:5000`
+2. Start `registry:2` with `pelagos run --detach -p <port>:5000`
 3. Pull `alpine` (source image) to ensure it is in the local store
 4. Push `alpine` to `127.0.0.1:<port>/library/alpine:latest` with `--insecure`
 5. Assert push output contains `"Pushed"`
 6. Remove the local re-tagged reference so the subsequent pull is genuine
 7. Pull from the local registry with `--insecure`; assert success
-8. Assert the image appears in `remora image ls --format json`
+8. Assert the image appears in `pelagos image ls --format json`
 
 Failure indicates that either `--insecure` HTTP negotiation, blob upload, or
 manifest PUT is broken; any regression here would prevent push/pull from
@@ -2242,15 +2242,15 @@ is no longer supported). Uses a temporary `HOME` directory
 throughout to avoid touching the real `~/.docker/config.json`. Verifies four
 properties end-to-end:
 
-1. **Unauthenticated push fails** — `remora image push alpine --dest <registry>/<ref>
+1. **Unauthenticated push fails** — `pelagos image push alpine --dest <registry>/<ref>
    --insecure` exits non-zero when the registry returns 401.
-2. **`remora image login` writes credentials** — `--password-stdin` writes a
+2. **`pelagos image login` writes credentials** — `--password-stdin` writes a
    base64-encoded entry into `$TMPHOME/.docker/config.json`; the command prints
    `"Login Succeeded"`.
 3. **Authenticated push and pull succeed** — after login, push exits 0 and
    prints `"Pushed"`; after removing the local copy, pull exits 0 and
    downloads from the registry.
-4. **`remora image logout` removes credentials** — subsequent pull exits
+4. **`pelagos image logout` removes credentials** — subsequent pull exits
    non-zero (registry returns 401 again).
 
 Failure at step 1 means the registry isn't actually enforcing auth (test
@@ -2264,13 +2264,13 @@ means `logout` didn't remove the entry and the credential cache is leaking.
 Full save/load roundtrip test:
 
 1. **Pull** `docker.io/library/alpine:latest` from Docker Hub.
-2. **Save** it to `/tmp/remora-test-alpine-save.tar` via `remora image save`.
+2. **Save** it to `/tmp/pelagos-test-alpine-save.tar` via `pelagos image save`.
    Verifies the output file exists and contains an `oci-layout` tar entry
    (i.e., it is a valid OCI Image Layout archive).
-3. **Remove** the local image with `remora image rm`.
-4. **Load** back from the tar via `remora image load -i <tar>`.
+3. **Remove** the local image with `pelagos image rm`.
+4. **Load** back from the tar via `pelagos image load -i <tar>`.
    Verifies the command prints `"Loaded"`.
-5. **Verify** the image appears in `remora image ls`.
+5. **Verify** the image appears in `pelagos image ls`.
 6. **Run** `/bin/true` inside the loaded image to confirm it is fully usable.
 
 Failure at step 2 means `save` failed to find blobs (re-pull needed to
@@ -2283,8 +2283,8 @@ layers are present in the store but the image config or layer order is wrong.
 **Requires:** root, network (Docker Hub for `alpine`), overlay support
 
 1. **Pull** `docker.io/library/alpine:latest`.
-2. **Tag** it to `my-alpine:tagged` via `remora image tag`.
-3. **Verify** both references appear in `remora image ls`.
+2. **Tag** it to `my-alpine:tagged` via `pelagos image tag`.
+3. **Verify** both references appear in `pelagos image ls`.
 4. **Run** `/bin/true` in the tagged image — confirms layers and config are
    shared correctly between source and target references.
 5. **Remove** the source reference, then **run** the tagged image again —
@@ -2329,12 +2329,12 @@ Failure indicates a serde regression in `HealthConfig` — either a missing
 ### `healthcheck_tests::test_healthcheck_exec_true` (`#[ignore]`)
 **Requires:** root + rootfs
 
-Starts a detached container running `sleep 30` via the `remora` CLI, then:
+Starts a detached container running `sleep 30` via the `pelagos` CLI, then:
 
-1. Runs `remora exec <name> /bin/true` and asserts exit status 0.
-2. Runs `remora exec <name> /bin/false` and asserts non-zero exit status.
+1. Runs `pelagos exec <name> /bin/true` and asserts exit status 0.
+2. Runs `pelagos exec <name> /bin/false` and asserts non-zero exit status.
 
-Failure at step 1 means `remora exec` can't join the container's namespaces or
+Failure at step 1 means `pelagos exec` can't join the container's namespaces or
 `/bin/true` is missing from the rootfs. Failure at step 2 means the exit code
 is not being propagated correctly from the exec'd process.
 
@@ -2371,11 +2371,11 @@ Failure indicates the `HealthStatus::Unhealthy` serde variant is broken
 
 Creates an OCI bundle with `process.terminal: true` and provides a Unix socket
 path via `--console-socket`. The test binds a `UnixListener` on that path before
-running `remora create`, then accepts one connection and calls `recvmsg` to
+running `pelagos create`, then accepts one connection and calls `recvmsg` to
 receive the fd sent via `SCM_RIGHTS` ancillary data.
 
 Asserts:
-1. `remora create` exits 0.
+1. `pelagos create` exits 0.
 2. A connection is accepted within 5 seconds (the runtime connected and sent the fd).
 3. The received fd is `>= 0` (a valid file descriptor was transmitted).
 4. `isatty(received_fd) == 1` — the fd is a TTY, confirming it is the PTY master.

@@ -80,7 +80,7 @@ After building, test with:
 cargo build
 
 # Run the CLI
-sudo -E ./target/debug/remora \
+sudo -E ./target/debug/pelagos \
   --exe /bin/ash \
   --rootfs ./alpine-rootfs \
   --uid 1000 \

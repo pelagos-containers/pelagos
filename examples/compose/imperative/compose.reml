@@ -11,7 +11,7 @@
 ;;;   cache ──→ cache-url ─────────→ app
 ;;;
 ;;; Usage:
-;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
+;;;   sudo -E pelagos compose up -f compose.reml -p imperative-demo
 
 ;; ── Service declarations ──────────────────────────────────────────────────
 

@@ -25,9 +25,9 @@ Both follow the existing `test-rootless.sh` pattern.
 
 ### Section 1: Foreground Container Basics
 
-- `remora run alpine /bin/echo hello` → contains "hello"
-- `remora run alpine /bin/true` → exit 0
-- `remora run alpine /bin/false` → exit non-zero
+- `pelagos run alpine /bin/echo hello` → contains "hello"
+- `pelagos run alpine /bin/true` → exit 0
+- `pelagos run alpine /bin/false` → exit non-zero
 - `--hostname mybox` → `/bin/hostname` outputs "mybox"
 - `--workdir /tmp` → `/bin/pwd` outputs "/tmp"
 - `--user 1000:1000` → `/bin/id` contains "uid=1000" and "gid=1000"
@@ -39,13 +39,13 @@ Both follow the existing `test-rootless.sh` pattern.
 Core untested path: `run --detach` → `ps` → `logs` → `stop` → `rm`
 
 - Launch `--name e2e-detach --detach alpine /bin/sleep 300`
-- `remora ps` → contains "e2e-detach" and "running"
-- `remora ps -a` → also shows it
-- Launch `--name e2e-logs --detach ... 'echo log-marker'`; `remora logs e2e-logs` → contains "log-marker"
-- `remora stop e2e-detach` → exit 0
-- `remora ps` → no longer shows e2e-detach; `ps -a` → shows "exited"
-- `remora stop e2e-detach` again → error contains "not running"
-- `remora rm e2e-detach` → exit 0; `ps -a` → gone
+- `pelagos ps` → contains "e2e-detach" and "running"
+- `pelagos ps -a` → also shows it
+- Launch `--name e2e-logs --detach ... 'echo log-marker'`; `pelagos logs e2e-logs` → contains "log-marker"
+- `pelagos stop e2e-detach` → exit 0
+- `pelagos ps` → no longer shows e2e-detach; `ps -a` → shows "exited"
+- `pelagos stop e2e-detach` again → error contains "not running"
+- `pelagos rm e2e-detach` → exit 0; `ps -a` → gone
 - `rm` on running container without `--force` → error contains "is running"
 - `rm -f` on running container → exit 0
 - Name collision: second `run --name e2e-collision` → error "already exists"
@@ -123,9 +123,9 @@ Core untested path: `run --detach` → `ps` → `logs` → `stop` → `rm`
 ### Section 11: OCI Lifecycle Commands
 
 - Create OCI bundle from alpine-rootfs with minimal config.json
-- `remora create e2e-oci <bundle>` → `state` shows "created"
-- `remora start e2e-oci` → runs; `state` eventually shows "stopped"
-- `remora delete e2e-oci` → state dir removed
+- `pelagos create e2e-oci <bundle>` → `state` shows "created"
+- `pelagos start e2e-oci` → runs; `state` eventually shows "stopped"
+- `pelagos delete e2e-oci` → state dir removed
 
 ### Section 12: Error Cases
 
@@ -155,8 +155,8 @@ Core untested path: `run --detach` → `ps` → `logs` → `stop` → `rm`
 
 ### Section 3: Signal Propagation
 
-- `remora stop` sends SIGTERM → container exits (status "exited")
-- `remora rm -f` sends SIGKILL → container dies quickly (< 5s)
+- `pelagos stop` sends SIGTERM → container exits (status "exited")
+- `pelagos rm -f` sends SIGKILL → container dies quickly (< 5s)
 
 ### Section 4: Cleanup After Crash / Failure
 

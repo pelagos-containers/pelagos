@@ -8,7 +8,7 @@ vulnerabilities.
 
 ## Default Security Posture
 
-Every container spawned by remora — regardless of flags — receives the following
+Every container spawned by pelagos — regardless of flags — receives the following
 hardening automatically:
 
 | Mechanism | Implementation | Effect |
@@ -46,7 +46,7 @@ namespace is still being constructed. A malicious container can swap a path
 component during this window to redirect the privileged write onto the host
 filesystem.
 
-### Why remora is immune by construction
+### Why pelagos is immune by construction
 
 Pelagos uses a fundamentally different process model:
 
@@ -70,7 +70,7 @@ Pelagos uses a fundamentally different process model:
 
 This immunity is not a mitigation or a patch — it is a consequence of the
 architecture. A future runc-class vulnerability in the same TOCTOU family would
-need to find an entirely different attack surface in remora.
+need to find an entirely different attack surface in pelagos.
 
 For deeper analysis, see [RUNTIME_STRATEGY_2026.md](RUNTIME_STRATEGY_2026.md).
 

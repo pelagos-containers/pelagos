@@ -109,7 +109,7 @@ network namespace. Does not need to be a full DNS server — just enough to:
 
 **Resolution:**
 - Container names: read from a shared registry file
-  (`/run/remora/dns-registry.json`) protected by flock
+  (`/run/pelagos/dns-registry.json`) protected by flock
 - External queries: forward to upstream nameservers from `with_dns()` config
 
 **Container's resolv.conf:**

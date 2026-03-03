@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remora Compose Web Stack Demo
+# Pelagos Compose Web Stack Demo
 # ==============================
 # The same 3-container blog stack as examples/web-stack, but
 # orchestrated with `pelagos compose` instead of imperative shell.
@@ -34,31 +34,31 @@ command -v "$PELAGOS" >/dev/null 2>&1 || \
 # ── Build Phase ───────────────────────────────────────────────────
 # Images are built once from the existing web-stack Remfiles.
 
-if ! $REMORA image ls 2>/dev/null | grep -q "alpine:latest"; then
+if ! $PELAGOS image ls 2>/dev/null | grep -q "alpine:latest"; then
     log "Pulling alpine:latest..."
-    $REMORA image pull alpine:latest
+    $PELAGOS image pull alpine:latest
 fi
 
 for svc in redis app proxy; do
     tag="web-stack-${svc}:latest"
-    if $REMORA image ls 2>/dev/null | grep -q "$tag"; then
+    if $PELAGOS image ls 2>/dev/null | grep -q "$tag"; then
         log "Image ${BOLD}${tag}${NC} already built"
     else
         log "Building ${BOLD}${tag}${NC}..."
-        $REMORA build -t "web-stack-${svc}" --network bridge "$WEB_STACK_DIR/${svc}"
+        $PELAGOS build -t "web-stack-${svc}" --network bridge "$WEB_STACK_DIR/${svc}"
     fi
 done
 
 # ── Compose Up ────────────────────────────────────────────────────
 # One command replaces 50 lines of network/volume/container setup.
 
-log "Starting stack with ${BOLD}remora compose up${NC} (compose.reml)..."
-$REMORA compose up -f "$SCRIPT_DIR/compose.reml" -p blog --foreground &
+log "Starting stack with ${BOLD}pelagos compose up${NC} (compose.reml)..."
+$PELAGOS compose up -f "$SCRIPT_DIR/compose.reml" -p blog --foreground &
 COMPOSE_PID=$!
 
 cleanup() {
     log "Tearing down..."
-    $REMORA compose down -f "$SCRIPT_DIR/compose.reml" -p blog -v 2>/dev/null || true
+    $PELAGOS compose down -f "$SCRIPT_DIR/compose.reml" -p blog -v 2>/dev/null || true
     wait "$COMPOSE_PID" 2>/dev/null || true
     log "Done."
 }
@@ -84,10 +84,10 @@ BASE="http://127.0.0.1:8080"
 
 # Test 1: Static page
 BODY=$($CURL "$BASE/" 2>/dev/null || true)
-if echo "$BODY" | grep -q "Remora Blog"; then
-    ok "GET / — contains 'Remora Blog'"
+if echo "$BODY" | grep -q "Pelagos Blog"; then
+    ok "GET / — contains 'Pelagos Blog'"
 else
-    fail "GET / — expected 'Remora Blog' in response"
+    fail "GET / — expected 'Pelagos Blog' in response"
 fi
 
 # Test 2: Health check (proxied to app:5000)
@@ -133,7 +133,7 @@ fi
 # Test 6: Service list
 echo
 log "Service status:"
-$REMORA compose ps -f "$SCRIPT_DIR/compose.reml" -p blog
+$PELAGOS compose ps -f "$SCRIPT_DIR/compose.reml" -p blog
 
 # ── Summary ───────────────────────────────────────────────────────
 
@@ -142,9 +142,9 @@ echo -e "${BOLD}Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}"
 
 if [ "$fail" -gt 0 ]; then
     echo -e "\nCheck service logs:"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p blog redis"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p blog app"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p blog proxy"
+    echo "  $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p blog redis"
+    echo "  $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p blog app"
+    echo "  $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p blog proxy"
     echo -e "\nPress Enter to tear down..."
     read -r
 fi

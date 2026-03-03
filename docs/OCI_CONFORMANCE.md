@@ -167,7 +167,7 @@ namespaces and exec the hook programs. This mirrors `exec_in_container` but does
 entering the PID namespace (hooks are identified by host-side paths).
 
 **`startContainer` fix:** Add a second sync socket (`hooks.sock`) that the container's shim
-blocks on before calling `exec()`. After `remora start` sends the trigger byte to `exec.sock`,
+blocks on before calling `exec()`. After `pelagos start` sends the trigger byte to `exec.sock`,
 a hook-runner process (forked by `cmd_start`) joins the container namespaces, runs the
 startContainer hooks, then connects to `hooks.sock` to signal completion. Only then does
 the container exec.
@@ -200,7 +200,7 @@ All phases include integration tests and documentation updates.
   git clone https://github.com/opencontainers/runtime-tools
   cd runtime-tools
   make runtimetest
-  sudo RUNTIME=remora ./runtimetest
+  sudo RUNTIME=pelagos ./runtimetest
   ```
 - **Integration:** new tests in `tests/integration_tests.rs` for each behaviour
 - **Regression:** existing 84 integration tests must continue to pass

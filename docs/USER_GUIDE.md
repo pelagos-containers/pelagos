@@ -11,7 +11,7 @@ plus a Rust library API for embedding container isolation into your own programs
 
 ```bash
 git clone https://github.com/skeptomai/pelagos.git
-cd remora
+cd pelagos
 
 # Option A: Install to /usr/local/bin (recommended)
 scripts/install.sh
@@ -30,19 +30,19 @@ to a directory on your PATH.
 Verify the installation:
 
 ```bash
-remora --help
+pelagos --help
 ```
 
 ### Pull an Image
 
 ```bash
-# Rootless (images stored in ~/.local/share/remora/)
-remora image pull alpine
+# Rootless (images stored in ~/.local/share/pelagos/)
+pelagos image pull alpine
 
-# Or as root (images stored in /var/lib/remora/)
-sudo remora image pull alpine
+# Or as root (images stored in /var/lib/pelagos/)
+sudo pelagos image pull alpine
 
-remora image ls
+pelagos image ls
 ```
 
 ---
@@ -53,39 +53,39 @@ remora image ls
 
 ```bash
 # Pull and run — no root required
-remora image pull alpine
-remora run alpine /bin/echo hello
+pelagos image pull alpine
+pelagos run alpine /bin/echo hello
 
 # Interactive shell with internet (Ctrl-D to exit)
-remora run -i --network pasta alpine /bin/sh
+pelagos run -i --network pasta alpine /bin/sh
 
 # Check running containers
-remora ps
+pelagos ps
 ```
 
 ### Root (full feature set)
 
 ```bash
 # Run a one-shot command
-sudo remora run alpine /bin/echo hello
+sudo pelagos run alpine /bin/echo hello
 
 # Interactive shell (Ctrl-D to exit)
-sudo remora run -i alpine /bin/sh
+sudo pelagos run -i alpine /bin/sh
 
 # Detached (background) container
-sudo remora run -d --name mybox alpine \
+sudo pelagos run -d --name mybox alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
 # Check running containers
-remora ps
+pelagos ps
 
 # View logs
-remora logs mybox
-remora logs -f mybox         # follow (like tail -f)
+pelagos logs mybox
+pelagos logs -f mybox         # follow (like tail -f)
 
 # Stop and remove
-sudo remora stop mybox
-remora rm mybox
+sudo pelagos stop mybox
+pelagos rm mybox
 ```
 
 ---
@@ -97,19 +97,19 @@ authentication. Image pull works both as root and rootless.
 
 ```bash
 # Pull an image (rootless or root)
-remora image pull alpine
-remora image pull alpine:3.19
-remora image pull library/ubuntu:latest
+pelagos image pull alpine
+pelagos image pull alpine:3.19
+pelagos image pull library/ubuntu:latest
 
 # List local images
-remora image ls
+pelagos image ls
 
 # Run a container from an image
-remora run alpine /bin/sh           # rootless
-sudo remora run -i alpine /bin/sh   # root
+pelagos run alpine /bin/sh           # rootless
+sudo pelagos run -i alpine /bin/sh   # root
 
 # Remove a local image
-remora image rm alpine
+pelagos image rm alpine
 ```
 
 Pelagos automatically sets up a multi-layer overlayfs mount with an ephemeral upper/work
@@ -117,12 +117,12 @@ directory (writes are discarded when the container exits). Image config (Env, Cm
 Entrypoint, WorkingDir) is applied as defaults that CLI flags override.
 
 **Storage locations (root):**
-- `/var/lib/remora/images/` -- image manifests and config
-- `/var/lib/remora/layers/<sha256>/` -- content-addressable layer cache
+- `/var/lib/pelagos/images/` -- image manifests and config
+- `/var/lib/pelagos/layers/<sha256>/` -- content-addressable layer cache
 
 **Storage locations (rootless):**
-- `~/.local/share/remora/images/` -- image manifests and config
-- `~/.local/share/remora/layers/<sha256>/` -- content-addressable layer cache
+- `~/.local/share/pelagos/images/` -- image manifests and config
+- `~/.local/share/pelagos/layers/<sha256>/` -- content-addressable layer cache
 
 Root and rootless image stores are separate (matching Podman behavior). An image pulled
 as root is not visible rootless, and vice versa.
@@ -178,7 +178,7 @@ cause a parse error if used in a Remfile:
 | `HEALTHCHECK` | Not parsed |
 | `SHELL` | Not parsed; `RUN` always uses `/bin/sh -c` |
 | `STOPSIGNAL` | Not parsed |
-| `VOLUME` | Not parsed; use `remora volume` or `with_volume()` at runtime |
+| `VOLUME` | Not parsed; use `pelagos volume` or `with_volume()` at runtime |
 | `ONBUILD` | Not parsed |
 
 These **flags** are accepted by the parser but **silently ignored**:
@@ -207,7 +207,7 @@ COPY app-${VERSION}.tar.gz /tmp/
 
 - `$VAR` and `${VAR}` are substituted in all instructions after the `ARG` declaration
 - Use `$$` to produce a literal `$` (escape)
-- Override defaults with `--build-arg`: `remora build -t app --build-arg VERSION=2.0 .`
+- Override defaults with `--build-arg`: `pelagos build -t app --build-arg VERSION=2.0 .`
 - `ARG` before `FROM` is valid and allows parameterizing the base image (Docker-compatible)
 
 ### ADD vs COPY
@@ -268,34 +268,34 @@ into the image.
 
 ```bash
 # Build from Remfile in current directory
-sudo remora build -t myapp:latest .
+sudo pelagos build -t myapp:latest .
 
 # Build from a specific Remfile
-sudo remora build -t myapp:latest -f path/to/Remfile .
+sudo pelagos build -t myapp:latest -f path/to/Remfile .
 
 # Specify network mode for RUN steps (default: bridge for root, pasta for rootless)
-sudo remora build -t myapp:latest --network bridge .
+sudo pelagos build -t myapp:latest --network bridge .
 
 # Rootless build (uses pasta networking for RUN steps)
-remora build -t myapp:latest .
+pelagos build -t myapp:latest .
 ```
 
 The base image must be pulled locally first:
 
 ```bash
-remora image pull alpine
-remora build -t myapp:latest .
+pelagos image pull alpine
+pelagos build -t myapp:latest .
 ```
 
 ### Running Built Images
 
 Built images are stored in the same image store as pulled images and can be run
-with `remora run`:
+with `pelagos run`:
 
 ```bash
-sudo remora build -t myapp:latest .
-sudo remora run myapp:latest
-sudo remora run -i myapp:latest /bin/sh   # override CMD with interactive shell
+sudo pelagos build -t myapp:latest .
+sudo pelagos run myapp:latest
+sudo pelagos run -i myapp:latest /bin/sh   # override CMD with interactive shell
 ```
 
 ### Build Example
@@ -315,9 +315,9 @@ CMD ["/bin/sh", "-c", "cat index.html && echo $GREETING"]
 EOF
 
 # Pull base image, build, and run
-sudo remora image pull alpine
-sudo remora build -t myapp:latest .
-sudo remora run myapp:latest
+sudo pelagos image pull alpine
+sudo pelagos build -t myapp:latest .
+sudo pelagos run myapp:latest
 ```
 
 ### Multi-Stage Build Example
@@ -337,9 +337,9 @@ COPY --from=builder /src/target/release/myapp /usr/local/bin/myapp
 CMD ["/usr/local/bin/myapp"]
 EOF
 
-sudo remora image pull alpine
-sudo remora build -t myapp:latest .
-sudo remora build -t myapp:debug --build-arg PROFILE=debug .
+sudo pelagos image pull alpine
+sudo pelagos build -t myapp:latest .
+sudo pelagos build -t myapp:debug --build-arg PROFILE=debug .
 ```
 
 See `examples/multi-stage/` for a complete working example.
@@ -347,7 +347,7 @@ See `examples/multi-stage/` for a complete working example.
 ### `build` Reference
 
 ```
-remora build [OPTIONS] [CONTEXT]
+pelagos build [OPTIONS] [CONTEXT]
 ```
 
 | Flag | Short | Description |
@@ -367,56 +367,56 @@ remora build [OPTIONS] [CONTEXT]
 
 ```bash
 # List running containers
-remora ps
+pelagos ps
 
 # List all containers (including exited)
-remora ps --all
+pelagos ps --all
 
 # View logs (detached containers)
-remora logs <name>
-remora logs --follow <name>
+pelagos logs <name>
+pelagos logs --follow <name>
 
 # Stop a container (sends SIGTERM)
-sudo remora stop <name>
+sudo pelagos stop <name>
 
 # Remove a stopped container
-remora rm <name>
+pelagos rm <name>
 
 # Force remove (SIGKILL + remove even if running)
-remora rm --force <name>
+pelagos rm --force <name>
 ```
 
 ---
 
 ## Compose
 
-`remora compose` orchestrates multi-service applications using an S-expression compose file
+`pelagos compose` orchestrates multi-service applications using an S-expression compose file
 (default: `compose.rem`).
 
 ### Basic Usage
 
 ```bash
 # Start all services (daemonised)
-sudo remora compose up
+sudo pelagos compose up
 
 # Start in foreground
-sudo remora compose up --foreground
+sudo pelagos compose up --foreground
 
 # Use a custom file and project name
-sudo remora compose up -f mystack.rem -p myproject
+sudo pelagos compose up -f mystack.rem -p myproject
 
 # List services
-remora compose ps
+pelagos compose ps
 
 # View logs
-remora compose logs
-remora compose logs --follow api
+pelagos compose logs
+pelagos compose logs --follow api
 
 # Stop and remove all services
-sudo remora compose down
+sudo pelagos compose down
 
 # Stop and remove services + volumes
-sudo remora compose down -v
+sudo pelagos compose down -v
 ```
 
 ### Compose File Format
@@ -509,8 +509,8 @@ format by file extension and dispatches accordingly. Default discovery tries `co
 first, then falls back to `compose.rem`.
 
 ```bash
-sudo remora compose up -f compose.reml
-sudo remora compose up                   # tries compose.reml, then compose.rem
+sudo pelagos compose up -f compose.reml
+sudo pelagos compose up                   # tries compose.reml, then compose.rem
 ```
 
 ### Language
@@ -863,19 +863,19 @@ Run a command inside an already-running container by joining its namespaces:
 
 ```bash
 # Run a command
-remora exec mybox /bin/ls /
+pelagos exec mybox /bin/ls /
 
 # Interactive shell
-remora exec -i mybox /bin/sh
+pelagos exec -i mybox /bin/sh
 
 # With environment variables
-remora exec -e FOO=bar mybox /bin/env
+pelagos exec -e FOO=bar mybox /bin/env
 
 # With a specific working directory
-remora exec -w /tmp mybox /bin/pwd
+pelagos exec -w /tmp mybox /bin/pwd
 
 # As a specific user
-remora exec -u 1000:1000 mybox /bin/id
+pelagos exec -u 1000:1000 mybox /bin/id
 ```
 
 `exec` discovers the container's namespaces from `/proc/<pid>/ns/*` and joins them with
@@ -892,46 +892,46 @@ By default, containers have no network (`--network none`).
 
 ```bash
 # No network (default)
-sudo remora run alpine /bin/sh
+sudo pelagos run alpine /bin/sh
 
 # Loopback only (127.0.0.1, no external access)
-sudo remora run --network loopback alpine /bin/sh
+sudo pelagos run --network loopback alpine /bin/sh
 
-# Bridge networking (veth pair + remora0 bridge, 172.19.0.x/24)
-sudo remora run --network bridge --nat alpine /bin/sh
+# Bridge networking (veth pair + pelagos0 bridge, 172.19.0.x/24)
+sudo pelagos run --network bridge --nat alpine /bin/sh
 
 # Pasta (rootless, full internet access via user-mode networking)
-remora run --network pasta alpine /bin/sh    # no sudo needed
+pelagos run --network pasta alpine /bin/sh    # no sudo needed
 ```
 
 ### NAT, Port Forwarding, and DNS
 
 ```bash
 # Enable outbound internet (MASQUERADE via nftables)
-sudo remora run --network bridge --nat alpine /bin/sh
+sudo pelagos run --network bridge --nat alpine /bin/sh
 
 # Publish ports (host:container TCP forwarding)
-sudo remora run --network bridge --nat -p 8080:80 alpine /bin/sh
+sudo pelagos run --network bridge --nat -p 8080:80 alpine /bin/sh
 
 # Custom DNS servers
-sudo remora run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
+sudo pelagos run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
 ```
 
 ### DNS Backend
 
 Pelagos supports two DNS backends for container name resolution on bridge networks:
 
-- **builtin** (default): the embedded `remora-dns` daemon — minimal, zero-dependency A-record server with upstream forwarding
+- **builtin** (default): the embedded `pelagos-dns` daemon — minimal, zero-dependency A-record server with upstream forwarding
 - **dnsmasq**: production-grade DNS with caching, AAAA support, EDNS, and DNSSEC
 
-Select the backend via the `--dns-backend` flag or the `REMORA_DNS_BACKEND` environment variable:
+Select the backend via the `--dns-backend` flag or the `PELAGOS_DNS_BACKEND` environment variable:
 
 ```bash
 # Use dnsmasq for DNS (requires dnsmasq installed)
-sudo remora run --network bridge --nat --dns-backend dnsmasq alpine /bin/sh
+sudo pelagos run --network bridge --nat --dns-backend dnsmasq alpine /bin/sh
 
 # Or via environment variable
-sudo REMORA_DNS_BACKEND=dnsmasq remora run --network bridge --nat alpine /bin/sh
+sudo PELAGOS_DNS_BACKEND=dnsmasq pelagos run --network bridge --nat alpine /bin/sh
 ```
 
 If dnsmasq is requested but not found on PATH, Pelagos logs a warning and falls back to the builtin backend.
@@ -940,8 +940,8 @@ If dnsmasq is requested but not found on PATH, Pelagos logs a warning and falls 
 
 ```bash
 # Link containers by name (injects /etc/hosts entry)
-sudo remora run -d --name db --network bridge --nat alpine /bin/sh -c 'sleep 3600'
-sudo remora run --network bridge --nat --link db alpine /bin/sh -c 'ping -c1 db'
+sudo pelagos run -d --name db --network bridge --nat alpine /bin/sh -c 'sleep 3600'
+sudo pelagos run --network bridge --nat --link db alpine /bin/sh -c 'ping -c1 db'
 ```
 
 ### Rootless Networking
@@ -951,7 +951,7 @@ For rootless containers (no sudo), use `--network pasta`. This requires
 
 ```bash
 # Full internet access without root
-remora run --network pasta -i alpine /bin/sh
+pelagos run --network pasta -i alpine /bin/sh
 ```
 
 Bridge networking requires root and is rejected in rootless mode.
@@ -963,20 +963,20 @@ Bridge networking requires root and is rejected in rootless mode.
 ### Named Volumes
 
 Volumes persist data across container runs. They are stored in the data directory
-(root: `/var/lib/remora/volumes/`, rootless: `~/.local/share/remora/volumes/`).
+(root: `/var/lib/pelagos/volumes/`, rootless: `~/.local/share/pelagos/volumes/`).
 
 ```bash
 # Create a volume (works rootless)
-remora volume create mydata
+pelagos volume create mydata
 
 # List volumes
-remora volume ls
+pelagos volume ls
 
 # Use a volume (auto-created if it doesn't exist)
-remora run -v mydata:/data alpine /bin/sh
+pelagos run -v mydata:/data alpine /bin/sh
 
 # Remove a volume
-remora volume rm mydata
+pelagos volume rm mydata
 ```
 
 ### Bind Mounts
@@ -985,10 +985,10 @@ Map host directories into the container:
 
 ```bash
 # Read-write bind mount
-sudo remora run --bind /host/path:/container/path alpine /bin/sh
+sudo pelagos run --bind /host/path:/container/path alpine /bin/sh
 
 # Read-only bind mount
-sudo remora run --bind-ro /etc/hosts:/etc/hosts alpine /bin/sh
+sudo pelagos run --bind-ro /etc/hosts:/etc/hosts alpine /bin/sh
 ```
 
 ### tmpfs
@@ -996,7 +996,7 @@ sudo remora run --bind-ro /etc/hosts:/etc/hosts alpine /bin/sh
 In-memory writable directories (useful with `--read-only`):
 
 ```bash
-sudo remora run --read-only --tmpfs /tmp --tmpfs /run alpine /bin/sh
+sudo pelagos run --read-only --tmpfs /tmp --tmpfs /run alpine /bin/sh
 ```
 
 ### Overlay (with OCI images)
@@ -1015,19 +1015,19 @@ to `fuse-overlayfs` automatically. See [Rootless Overlay](#rootless-overlay) for
 ### Read-Only Rootfs
 
 ```bash
-sudo remora run --read-only alpine /bin/sh
+sudo pelagos run --read-only alpine /bin/sh
 # Combine with --tmpfs for writable scratch space
-sudo remora run --read-only --tmpfs /tmp alpine /bin/sh
+sudo pelagos run --read-only --tmpfs /tmp alpine /bin/sh
 ```
 
 ### Capabilities
 
 ```bash
 # Drop all capabilities (most restrictive)
-sudo remora run --cap-drop ALL alpine /bin/sh
+sudo pelagos run --cap-drop ALL alpine /bin/sh
 
 # Drop all, then add back specific ones
-sudo remora run --cap-drop ALL --cap-add NET_BIND_SERVICE alpine /bin/sh
+sudo pelagos run --cap-drop ALL --cap-add NET_BIND_SERVICE alpine /bin/sh
 ```
 
 Supported capabilities: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID,
@@ -1037,29 +1037,29 @@ NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, SYS_ADMIN, SYS_PTRACE.
 
 ```bash
 # Docker's default seccomp profile (recommended)
-sudo remora run --security-opt seccomp=default alpine /bin/sh
+sudo pelagos run --security-opt seccomp=default alpine /bin/sh
 
 # Minimal profile (tighter restrictions)
-sudo remora run --security-opt seccomp=minimal alpine /bin/sh
+sudo pelagos run --security-opt seccomp=minimal alpine /bin/sh
 
 # Disable seccomp entirely
-sudo remora run --security-opt seccomp=none alpine /bin/sh
+sudo pelagos run --security-opt seccomp=none alpine /bin/sh
 ```
 
 ### Other Security Options
 
 ```bash
 # Prevent privilege escalation via setuid/setgid binaries
-sudo remora run --security-opt no-new-privileges alpine /bin/sh
+sudo pelagos run --security-opt no-new-privileges alpine /bin/sh
 
 # Mask sensitive kernel paths
-sudo remora run --masked-path /proc/kcore --masked-path /proc/sysrq-trigger alpine /bin/sh
+sudo pelagos run --masked-path /proc/kcore --masked-path /proc/sysrq-trigger alpine /bin/sh
 
 # Set kernel parameters inside container
-sudo remora run --sysctl net.ipv4.ip_forward=1 alpine /bin/sh
+sudo pelagos run --sysctl net.ipv4.ip_forward=1 alpine /bin/sh
 
 # Run as non-root user inside container
-sudo remora run --user 1000:1000 alpine /bin/id
+sudo pelagos run --user 1000:1000 alpine /bin/id
 ```
 
 ---
@@ -1070,26 +1070,26 @@ sudo remora run --user 1000:1000 alpine /bin/id
 
 ```bash
 # Memory limit (supports k, m, g suffixes)
-sudo remora run --memory 256m alpine /bin/sh
+sudo pelagos run --memory 256m alpine /bin/sh
 
 # CPU quota (fractional CPUs: 0.5 = 50% of one core)
-sudo remora run --cpus 0.5 alpine /bin/sh
+sudo pelagos run --cpus 0.5 alpine /bin/sh
 
 # CPU shares/weight (relative to other containers)
-sudo remora run --cpu-shares 512 alpine /bin/sh
+sudo pelagos run --cpu-shares 512 alpine /bin/sh
 
 # Max number of processes
-sudo remora run --pids-limit 50 alpine /bin/sh
+sudo pelagos run --pids-limit 50 alpine /bin/sh
 ```
 
 ### rlimits
 
 ```bash
 # Set file descriptor limit
-sudo remora run --ulimit nofile=1024:2048 alpine /bin/sh
+sudo pelagos run --ulimit nofile=1024:2048 alpine /bin/sh
 
 # Set max processes
-sudo remora run --ulimit nproc=100:200 alpine /bin/sh
+sudo pelagos run --ulimit nproc=100:200 alpine /bin/sh
 ```
 
 Supported ulimit resources: nofile (openfiles), nproc (maxproc), as (vmem), cpu,
@@ -1104,15 +1104,15 @@ needed — just omit `sudo`.
 
 ```bash
 # Pull and run — fully rootless
-remora image pull alpine
-remora run alpine /bin/echo hello
+pelagos image pull alpine
+pelagos run alpine /bin/echo hello
 
 # Interactive shell with internet
-remora run -i --network pasta alpine /bin/sh
+pelagos run -i --network pasta alpine /bin/sh
 ```
 
 **What works rootless:**
-- Image pull (`remora image pull`)
+- Image pull (`pelagos image pull`)
 - Image run with overlay filesystem (kernel 5.11+ native, or `fuse-overlayfs` fallback)
 - Named volumes (`-v mydata:/data`)
 - Loopback networking (`--network loopback`)
@@ -1150,9 +1150,9 @@ Rootless mode uses XDG Base Directory paths:
 
 | Purpose | Root path | Rootless path |
 |---------|-----------|---------------|
-| Images & layers | `/var/lib/remora/` | `~/.local/share/remora/` |
-| Volumes | `/var/lib/remora/volumes/` | `~/.local/share/remora/volumes/` |
-| Runtime state | `/run/remora/` | `$XDG_RUNTIME_DIR/remora/` |
+| Images & layers | `/var/lib/pelagos/` | `~/.local/share/pelagos/` |
+| Volumes | `/var/lib/pelagos/volumes/` | `~/.local/share/pelagos/volumes/` |
+| Runtime state | `/run/pelagos/` | `$XDG_RUNTIME_DIR/pelagos/` |
 
 Root and rootless stores are completely separate (same as Podman). An image pulled as
 root is not available in rootless mode, and vice versa.
@@ -1162,8 +1162,8 @@ root is not available in rootless mode, and vice versa.
 ## Complete `run` Reference
 
 ```
-remora run [OPTIONS] <IMAGE> [COMMAND [ARGS...]]
-remora run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
+pelagos run [OPTIONS] <IMAGE> [COMMAND [ARGS...]]
+pelagos run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 ```
 
 | Flag | Short | Description |
@@ -1209,23 +1209,23 @@ OCI Runtime Spec lifecycle commands. These operate on OCI bundles (a directory w
 
 ```bash
 # Create a container (fork shim, pause before exec)
-remora create mycontainer /path/to/bundle
+pelagos create mycontainer /path/to/bundle
 
 # Start it (signal shim to exec the process)
-remora start mycontainer
+pelagos start mycontainer
 
 # Query state (JSON output)
-remora state mycontainer
+pelagos state mycontainer
 # {"ociVersion":"1.0.2","id":"mycontainer","status":"running","pid":12345,...}
 
 # Send a signal
-remora kill mycontainer SIGTERM
+pelagos kill mycontainer SIGTERM
 
 # Clean up state directory
-remora delete mycontainer
+pelagos delete mycontainer
 ```
 
-State is stored under `/run/remora/<id>/`. The shim double-forks so `remora create`
+State is stored under `/run/pelagos/<id>/`. The shim double-forks so `pelagos create`
 returns as soon as the container is in the "created" state.
 
 ---
@@ -1237,7 +1237,7 @@ For developers embedding Pelagos as a library in Rust programs.
 ### The Command Builder
 
 ```rust
-use remora::container::{Command, Namespace, Stdio};
+use pelagos::container::{Command, Namespace, Stdio};
 
 let mut child = Command::new("/bin/sh")
     .with_chroot("/path/to/rootfs")
@@ -1313,16 +1313,16 @@ scripts/build-rootfs-docker.sh       # requires Docker + sudo
 scripts/build-rootfs-tarball.sh      # requires sudo
 
 # Register it with Pelagos:
-sudo remora rootfs import alpine ./alpine-rootfs
+sudo pelagos rootfs import alpine ./alpine-rootfs
 
 # List registered rootfs entries:
-remora rootfs ls
+pelagos rootfs ls
 
 # Run with a local rootfs (advanced):
-sudo remora run --rootfs alpine /bin/echo hello
+sudo pelagos run --rootfs alpine /bin/echo hello
 
 # Remove a rootfs entry:
-sudo remora rootfs rm alpine
+sudo pelagos rootfs rm alpine
 ```
 
 See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
@@ -1331,17 +1331,17 @@ See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
 
 ## Storage Layout
 
-### Root (`sudo remora ...`)
+### Root (`sudo pelagos ...`)
 
 ```
-/var/lib/remora/
+/var/lib/pelagos/
   rootfs/<name>              symlink to imported rootfs directory
   volumes/<name>/            named volume data
   images/<ref>/              OCI image manifests and config
   layers/<sha256>/           content-addressable layer cache
   container_counter          monotonic counter for auto-naming
 
-/run/remora/
+/run/pelagos/
   containers/<name>/
     state.json               container metadata and status
     stdout.log               captured stdout (detached mode)
@@ -1354,17 +1354,17 @@ See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
   dns-<pid>-<n>/             per-container resolv.conf
 ```
 
-### Rootless (`remora ...`)
+### Rootless (`pelagos ...`)
 
 ```
-~/.local/share/remora/       ($XDG_DATA_HOME/remora/)
+~/.local/share/pelagos/       ($XDG_DATA_HOME/pelagos/)
   rootfs/<name>              symlink to imported rootfs directory
   volumes/<name>/            named volume data
   images/<ref>/              OCI image manifests and config
   layers/<sha256>/           content-addressable layer cache
   container_counter          monotonic counter for auto-naming
 
-$XDG_RUNTIME_DIR/remora/     (fallback: /tmp/remora-$UID/)
+$XDG_RUNTIME_DIR/pelagos/     (fallback: /tmp/pelagos-$UID/)
   containers/<name>/
     state.json               container metadata and status
     stdout.log               captured stdout (detached mode)
@@ -1407,7 +1407,7 @@ and rootless mode. Requires an Alpine rootfs (pulled automatically or via
 sudo -E ./scripts/test-e2e.sh
 ```
 
-End-to-end CLI tests covering `remora run`, `ps`, `stop`, `rm`, `logs`, `exec`,
+End-to-end CLI tests covering `pelagos run`, `ps`, `stop`, `rm`, `logs`, `exec`,
 detached mode, environment variables, bind mounts, volumes, bridge networking,
 port forwarding, DNS, container linking, and security options. Builds the binary
 and runs real containers.
@@ -1418,7 +1418,7 @@ and runs real containers.
 sudo -E ./scripts/test-build.sh
 ```
 
-Tests `remora build` end-to-end: Remfile parsing, RUN steps with networking,
+Tests `pelagos build` end-to-end: Remfile parsing, RUN steps with networking,
 COPY, ENV, WORKDIR, CMD (JSON and shell form), multi-step builds, and image
 tagging. Verifies that built images can be run.
 
@@ -1442,7 +1442,7 @@ sudo PATH=$PWD/target/release:$PATH ./examples/web-stack/run.sh
 Builds and runs a 3-container blog stack (nginx → Bottle API → Redis) on bridge
 networking with container linking. Runs 5 HTTP verification tests. Unlike the
 other scripts, this one doesn't call `cargo build` internally — it expects
-`remora` in your PATH, so pass the release binary path via `PATH` instead of `-E`.
+`pelagos` in your PATH, so pass the release binary path via `PATH` instead of `-E`.
 
 ### Full Pre-Release Checklist
 
@@ -1472,16 +1472,16 @@ sudo PATH=$PWD/target/release:$PATH ./examples/web-stack/run.sh
 Pull an OCI image first:
 
 ```bash
-remora image pull alpine
-remora run alpine /bin/sh
+pelagos image pull alpine
+pelagos run alpine /bin/sh
 ```
 
 Or if using a local rootfs, import it:
 
 ```bash
 scripts/build-rootfs-docker.sh
-sudo remora rootfs import alpine ./alpine-rootfs
-sudo remora run --rootfs alpine /bin/sh
+sudo pelagos rootfs import alpine ./alpine-rootfs
+sudo pelagos run --rootfs alpine /bin/sh
 ```
 
 ### Permission denied / EPERM
@@ -1524,7 +1524,7 @@ dnf install passt
 
 ### Container exec fails with "no container namespaces found"
 
-The target container must be running. Check with `remora ps`.
+The target container must be running. Check with `pelagos ps`.
 
 ### Stale networking state after crash
 
@@ -1537,14 +1537,14 @@ To reset:
 
 ```bash
 # List and remove stale nftables tables
-sudo nft list tables | grep remora
-sudo nft delete table ip remora-remora0  # (or whatever table name)
+sudo nft list tables | grep pelagos
+sudo nft delete table ip pelagos-pelagos0  # (or whatever table name)
 
 # Clear stale refcount and port-forward files
-sudo rm -f /run/remora/networks/*/nat_refcount /run/remora/networks/*/port_forwards
+sudo rm -f /run/pelagos/networks/*/nat_refcount /run/pelagos/networks/*/port_forwards
 
 # Remove stale iptables FORWARD rules (if using iptables-nft)
-sudo iptables -S FORWARD | grep remora  # inspect first
+sudo iptables -S FORWARD | grep pelagos  # inspect first
 sudo iptables -D FORWARD -s 172.19.0.0/24 -j ACCEPT 2>/dev/null
 sudo iptables -D FORWARD -d 172.19.0.0/24 -j ACCEPT 2>/dev/null
 ```

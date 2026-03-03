@@ -52,7 +52,7 @@
 ;;;   db ──→ (then: compute db-url) ──→ migrate ──→ (then: start app) ──→ app
 ;;;
 ;;; Usage:
-;;;   sudo -E remora compose up -f compose-chain.reml -p chain-demo
+;;;   sudo -E pelagos compose up -f compose-chain.reml -p chain-demo
 
 ;; ── Service declarations ──────────────────────────────────────────────────
 

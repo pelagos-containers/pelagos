@@ -1,4 +1,4 @@
-; Remora Monitoring Stack — compose.reml
+; Pelagos Monitoring Stack — compose.reml
 ;
 ; Architecture:
 ;
@@ -17,7 +17,7 @@
 ;; ── Configuration ─────────────────────────────────────────────────
 ;;
 ;; Override the Grafana admin password without editing this file:
-;;   GRAFANA_PASSWORD=secret sudo remora compose up -f compose.reml -p monitoring
+;;   GRAFANA_PASSWORD=secret sudo pelagos compose up -f compose.reml -p monitoring
 
 (define grafana-password
   (let ((p (env "GRAFANA_PASSWORD")))

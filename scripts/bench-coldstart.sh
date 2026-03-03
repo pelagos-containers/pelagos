@@ -49,12 +49,12 @@ if [[ ! -x "$REMORA" ]]; then
     exit 1
 fi
 
-REMORA_VERSION="$("$REMORA" --version 2>/dev/null || echo unknown)"
+PELAGOS_VERSION="$("$REMORA" --version 2>/dev/null || echo unknown)"
 KERNEL="$(uname -r)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "=== pelagos cold-start benchmark ==="
-echo "Binary:  $REMORA ($REMORA_VERSION)"
+echo "Binary:  $REMORA ($PELAGOS_VERSION)"
 echo "Kernel:  $KERNEL"
 echo "Runs:    $RUNS (warmup: $WARMUP)"
 echo ""
@@ -103,7 +103,7 @@ fi
     echo "## $DATE"
     echo ""
     echo "- **Kernel:** $KERNEL"
-    echo "- **Binary:** $REMORA_VERSION"
+    echo "- **Binary:** $PELAGOS_VERSION"
     echo "- **Runs:** $RUNS (warmup: $WARMUP)"
     echo "- **Command:** \`pelagos run --rm alpine /bin/true\`"
     echo "- **Result:** $MEDIAN_MS"

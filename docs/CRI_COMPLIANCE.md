@@ -40,7 +40,7 @@ and its own higher-level CLI on top of that. It is not CRI-compliant.
 
 ### Fastest path to Kubernetes without a CRI rewrite
 
-Write a **containerd shim** (`containerd-shim-remora-v1`). A shim is a small
+Write a **containerd shim** (`containerd-shim-pelagos-v1`). A shim is a small
 process that containerd forks per-container; it speaks the containerd shim v2
 protocol and calls an OCI runtime. Implementing the shim protocol is
 significantly less work than a full CRI server, and containerd handles pod
@@ -58,14 +58,14 @@ existing Pelagos internals rather than replacing them.
 
 ### Phase C1 — Daemon architecture
 
-**Goal:** `remora daemon` — a long-running process that listens on a Unix socket
+**Goal:** `pelagos daemon` — a long-running process that listens on a Unix socket
 and dispatches commands.
 
 **Work:**
 - Add `tokio`-based main loop (already a dependency via `oci-client`)
 - Expose existing container/image operations as async handlers
 - Write PID file, handle SIGTERM gracefully
-- Systemd unit file (`remora.service`)
+- Systemd unit file (`pelagos.service`)
 
 **Why first:** everything else depends on a persistent process that kubelet can
 connect to.
@@ -95,7 +95,7 @@ connect to.
 - `ListImages` → wraps `list_images()`
 - `RemoveImage` → wraps `remove_image()`
 - `ImageStatus` → wraps `load_image()`
-- `ImageFsInfo` → report disk usage of `/var/lib/remora/layers/`
+- `ImageFsInfo` → report disk usage of `/var/lib/pelagos/layers/`
 
 This is largely a translation layer over existing code.
 
@@ -132,7 +132,7 @@ pod networking.
 - `RunPodSandbox` calls CNI `ADD` to configure the pod's netns
 - `StopPodSandbox` calls CNI `DEL` to clean up
 - Support reading CNI config from `/etc/cni/net.d/` (standard location)
-- Keep Pelagos's built-in networking for `remora run` / `remora compose` —
+- Keep Pelagos's built-in networking for `pelagos run` / `pelagos compose` —
   CNI is only used when driven via CRI
 
 Standard CNI plugins (`bridge`, `host-local`, `loopback`) from
@@ -202,14 +202,14 @@ the most new design work.
 Once C6 is complete, the runtime can be tested with:
 
 ```bash
-# Point kubelet at the remora CRI socket
-kubelet --container-runtime-endpoint=unix:///run/remora/cri.sock ...
+# Point kubelet at the pelagos CRI socket
+kubelet --container-runtime-endpoint=unix:///run/pelagos/cri.sock ...
 
 # Or use crictl for manual testing without a full cluster
-crictl --runtime-endpoint unix:///run/remora/cri.sock pull alpine
-crictl --runtime-endpoint unix:///run/remora/cri.sock runp pod.json
-crictl --runtime-endpoint unix:///run/remora/cri.sock create <pod-id> container.json pod.json
-crictl --runtime-endpoint unix:///run/remora/cri.sock start <container-id>
+crictl --runtime-endpoint unix:///run/pelagos/cri.sock pull alpine
+crictl --runtime-endpoint unix:///run/pelagos/cri.sock runp pod.json
+crictl --runtime-endpoint unix:///run/pelagos/cri.sock create <pod-id> container.json pod.json
+crictl --runtime-endpoint unix:///run/pelagos/cri.sock start <container-id>
 ```
 
 `crictl` (from `cri-tools`) is the standard way to exercise a CRI runtime

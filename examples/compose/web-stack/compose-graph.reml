@@ -1,6 +1,6 @@
 ;;; Web-stack — graph model (compose-graph.reml)
 ;;;
-;;; The same three-service Remora Blog stack as compose.reml, rewritten
+;;; The same three-service Pelagos Blog stack as compose.reml, rewritten
 ;;; using the declarative future graph instead of compose-up/supervisor.
 ;;;
 ;;; Architecture:
@@ -24,12 +24,12 @@
 ;;;                        supervisor.  You own the lifecycle.
 ;;;
 ;;; Prerequisites:
-;;;   sudo -E remora build -t web-stack-redis  examples/web-stack/redis
-;;;   sudo -E remora build -t web-stack-app    examples/web-stack/app
-;;;   sudo -E remora build -t web-stack-proxy  examples/web-stack/proxy
+;;;   sudo -E pelagos build -t web-stack-redis  examples/web-stack/redis
+;;;   sudo -E pelagos build -t web-stack-app    examples/web-stack/app
+;;;   sudo -E pelagos build -t web-stack-proxy  examples/web-stack/proxy
 ;;;
 ;;; Usage:
-;;;   sudo -E remora compose up -f examples/compose/web-stack/compose-graph.reml \
+;;;   sudo -E pelagos compose up -f examples/compose/web-stack/compose-graph.reml \
 ;;;                              -p web-graph
 
 ;; ── Configuration ─────────────────────────────────────────────────────────

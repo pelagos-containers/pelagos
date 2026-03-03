@@ -4,7 +4,7 @@
 //! - **Builtin** (default): the `pelagos-dns` daemon — minimal A-record server
 //! - **dnsmasq**: production-grade DNS with caching, AAAA, EDNS, DNSSEC
 //!
-//! Backend selection: `REMORA_DNS_BACKEND` env var or `--dns-backend` CLI flag.
+//! Backend selection: `PELAGOS_DNS_BACKEND` env var or `--dns-backend` CLI flag.
 //! Config files are stored in `<runtime>/dns/`, one per network. Both backends
 //! reload on SIGHUP when entries change.
 
@@ -22,11 +22,11 @@ pub enum DnsBackend {
 /// Returns the active DNS backend, cached for the lifetime of the process.
 ///
 /// Selection priority:
-/// 1. `REMORA_DNS_BACKEND` env var (`builtin` or `dnsmasq`)
+/// 1. `PELAGOS_DNS_BACKEND` env var (`builtin` or `dnsmasq`)
 /// 2. Default: `Builtin`
 pub fn active_backend() -> DnsBackend {
     static BACKEND: std::sync::OnceLock<DnsBackend> = std::sync::OnceLock::new();
-    *BACKEND.get_or_init(|| match std::env::var("REMORA_DNS_BACKEND").as_deref() {
+    *BACKEND.get_or_init(|| match std::env::var("PELAGOS_DNS_BACKEND").as_deref() {
         Ok("dnsmasq") => DnsBackend::Dnsmasq,
         _ => DnsBackend::Builtin,
     })

@@ -7,7 +7,7 @@ known limitations of Pelagos's detached container runtime model.
 
 ## Overview
 
-When you run `remora run -d <image>`, the CLI does **not** stay resident as a daemon.
+When you run `pelagos run -d <image>`, the CLI does **not** stay resident as a daemon.
 Instead it forks a lightweight _watcher process_ that owns the container's lifetime, then
 exits immediately (printing the container name). The user's shell is free; the watcher
 runs invisibly in the background.
@@ -19,7 +19,7 @@ runs invisibly in the background.
 ### Without PID Namespace
 
 ```
-remora run -d (parent)
+pelagos run -d (parent)
   └─ fork ──► watcher   [setsid → new session leader]
                  └─ cmd.spawn ──► container process   [PID 1 on host?  No — just some PID]
 ```
@@ -32,7 +32,7 @@ container process.
 ### With PID Namespace (Enabled — see § "Double-fork")
 
 ```
-remora run -d (parent)
+pelagos run -d (parent)
   └─ fork ──► watcher   [setsid]
                  └─ cmd.spawn ──► intermediate P   [host PID namespace; waits for C]
                                        └─ fork ──► C (PID 1 in container)   [new PID namespace]
@@ -64,7 +64,7 @@ shim (like `tini`) as the entry point is recommended for multi-child containers.
 
 ## Namespace Isolation
 
-### Rootfs-based runs (`remora run --rootfs …`)
+### Rootfs-based runs (`pelagos run --rootfs …`)
 
 ```
 Namespace::UTS | Namespace::MOUNT | Namespace::PID
@@ -72,7 +72,7 @@ Namespace::UTS | Namespace::MOUNT | Namespace::PID
 
 UTS, mount, and PID namespace are always enabled.
 
-### OCI image-based runs (`remora run <image>`)
+### OCI image-based runs (`pelagos run <image>`)
 
 **Before the fix in this commit:** only `MOUNT` (added by `with_image_layers`) and
 `NET` (added by `with_network`) were active — no UTS, **no PID**.
@@ -125,7 +125,7 @@ traffic from `localhost` (which nftables PREROUTING cannot intercept).
 
 TCP port forwarding uses a single tokio multi-threaded runtime
 (`new_multi_thread`, `min(available_parallelism, 4)` worker threads named
-`remora-tcp-proxy`). All accept loops and relay tasks are async tasks on this
+`pelagos-tcp-proxy`). All accept loops and relay tasks are async tasks on this
 pool. Connection count does **not** affect OS thread count.
 
 **Per watcher (all TCP-mapped ports share one runtime) — W worker threads:**
@@ -199,7 +199,7 @@ A future refactor could migrate UDP to an async model as well.
 When a container is configured with `with_user_namespace()` and the `use_id_helpers`
 flag is set (i.e., `newuidmap`/`newgidmap` helper binaries are used to write UID/GID
 maps), `Command::spawn()` creates one short-lived thread in the **calling process**
-(the watcher, for `remora run -d`) before the `fork()`:
+(the watcher, for `pelagos run -d`) before the `fork()`:
 
 | Thread | Purpose | Lifetime |
 |--------|----------|----------|
@@ -212,7 +212,7 @@ use; it exits immediately after writing the maps. It does not persist.
 
 ## Compose Supervisor Threads
 
-`remora compose up` runs a **supervisor process** (not a watcher) that directly manages
+`pelagos compose up` runs a **supervisor process** (not a watcher) that directly manages
 all service containers. Threads in the supervisor are per-service:
 
 | Thread | Purpose | Lifetime |
@@ -238,9 +238,9 @@ the supervisor is the watcher for all services.
 With PID namespace enabled, `child.pid()` returns the PID of the _intermediate process_
 (P), not PID 1 (C). This is the value stored as `state.pid` in `state.json` and used by:
 
-- **`remora ps`** — shows P's PID in the PID column
-- **`remora stop`** — sends `SIGTERM` to P; P exits; `PR_SET_PDEATHSIG` sends `SIGKILL` to C
-- **`remora exec`** — joins P's namespaces (see caveat below)
+- **`pelagos ps`** — shows P's PID in the PID column
+- **`pelagos stop`** — sends `SIGTERM` to P; P exits; `PR_SET_PDEATHSIG` sends `SIGKILL` to C
+- **`pelagos exec`** — joins P's namespaces (see caveat below)
 - **`check_liveness`** — checks `kill(P, 0)`; returns false only after P exits (which happens when C exits)
 
 This is correct: P is alive exactly as long as C is alive. Liveness and stop semantics
@@ -248,9 +248,9 @@ work as expected.
 
 ---
 
-## `remora exec` and PID Namespace Caveat
+## `pelagos exec` and PID Namespace Caveat
 
-`exec_in_container` (and `remora exec`) discover namespaces by comparing
+`exec_in_container` (and `pelagos exec`) discover namespaces by comparing
 `/proc/{pid}/ns/*` against `/proc/1/ns/*`. When PID namespace is active:
 
 - `/proc/P/ns/mnt` — **container's mount namespace** ✓ (P unshared MOUNT before forking C)
@@ -259,7 +259,7 @@ work as expected.
 - `/proc/P/ns/pid` — **host PID namespace** — same inode as `/proc/1/ns/pid` because P
   itself is in the host PID namespace (only P's *children* enter the new namespace)
 
-After the fix (GitHub issue #1), `remora exec` **does** join the container's PID
+After the fix (GitHub issue #1), `pelagos exec` **does** join the container's PID
 namespace. `discover_namespaces` checks `/proc/P/ns/pid_for_children` (Linux ≥ 3.8)
 as a fallback when the regular `pid` check finds no difference.
 
@@ -284,7 +284,7 @@ needed. The probe not being in the container's PID namespace does not affect cor
 
 | Signal | Sent to | Effect |
 |--------|---------|--------|
-| `SIGTERM` (from `remora stop`) | P (intermediate) | P dies → C gets `SIGKILL` via `PR_SET_PDEATHSIG` |
+| `SIGTERM` (from `pelagos stop`) | P (intermediate) | P dies → C gets `SIGKILL` via `PR_SET_PDEATHSIG` |
 | `SIGKILL` | P | Same effect |
 | `SIGTERM` | C (PID 1) | C handles or ignores per its signal handlers |
 
@@ -301,7 +301,7 @@ two-hop chain.
 
 | Limitation | Impact | Planned fix |
 |-----------|--------|-------------|
-| ~~`remora exec` does not join container PID namespace~~ | ~~`ps` in exec'd shell shows host PIDs~~ | **Fixed** — `pid_for_children` + double-fork (issue #1) |
+| ~~`pelagos exec` does not join container PID namespace~~ | ~~`ps` in exec'd shell shows host PIDs~~ | **Fixed** — `pid_for_children` + double-fork (issue #1) |
 | ~~Probe timeout does not SIGKILL the probe child~~ | ~~Hung probes consume a thread until OS reaps them~~ | **Fixed** — `exec_in_container_with_pid_sink` + SIGKILL on timeout (issue #2) |
 | ~~Thread-per-fd log relay~~ | ~~O(2) threads per container for I/O~~ | **Fixed** — single epoll relay thread in `src/cli/relay.rs` (issue #3) |
 | ~~UDP reply threads are never explicitly reaped~~ | ~~Thread joins on stop flag only; idle sessions may linger until stop~~ | **Fixed** — per-port threads joined in `teardown_network`; reply threads joined at end of `start_udp_proxy` (issue #4) |

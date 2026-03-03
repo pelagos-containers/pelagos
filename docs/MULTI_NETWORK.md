@@ -2,7 +2,7 @@
 
 ## Motivation
 
-Today Pelagos has exactly one bridge: `remora0` (172.19.0.0/24). Every container
+Today Pelagos has exactly one bridge: `pelagos0` (172.19.0.0/24). Every container
 using `--network bridge` lands on the same L2 segment with the same IP pool.
 This works, but it means:
 
@@ -29,11 +29,11 @@ equivalent.
 
 | Constant       | Value             | Used by                                   |
 |----------------|-------------------|-------------------------------------------|
-| `BRIDGE_NAME`  | `"remora0"`       | `ensure_bridge()`, veth attach, nftables  |
+| `BRIDGE_NAME`  | `"pelagos0"`       | `ensure_bridge()`, veth attach, nftables  |
 | `BRIDGE_GW`    | `"172.19.0.1"`    | container default route                   |
 | `BRIDGE_CIDR`  | `"172.19.0.1/24"` | bridge IP assignment                      |
 
-### Global state files (`src/paths.rs` → `/run/remora/`)
+### Global state files (`src/paths.rs` → `/run/pelagos/`)
 
 | File              | Purpose                    | Scope   |
 |-------------------|----------------------------|---------|
@@ -43,13 +43,13 @@ equivalent.
 
 ### Functions that assume a single bridge
 
-- `ensure_bridge()` — creates `remora0` with hardcoded CIDR
+- `ensure_bridge()` — creates `pelagos0` with hardcoded CIDR
 - `allocate_ip()` — always returns 172.19.0.x
 - `setup_bridge_network()` — no bridge name parameter; uses constants
 - `teardown_network()` — only knows about one bridge
 - `enable_nat()` / `disable_nat()` — nftables rules hardcode subnet + bridge name
 - `enable_port_forwards()` / `disable_port_forwards()` — same
-- `NFT_ADD_SCRIPT` — hardcoded `172.19.0.0/24` and `oifname != "remora0"`
+- `NFT_ADD_SCRIPT` — hardcoded `172.19.0.0/24` and `oifname != "pelagos0"`
 
 ### CLI (`src/cli/run.rs`)
 
@@ -67,7 +67,7 @@ specify which network a container should join.
 ### Core Concept: Named Networks
 
 A **network** is a named bridge with its own subnet, IPAM pool, NAT refcount,
-and port-forward list. The default network is called `"remora0"` and behaves
+and port-forward list. The default network is called `"pelagos0"` and behaves
 exactly as today (backwards compatible).
 
 ### Network Definition
@@ -76,7 +76,7 @@ exactly as today (backwards compatible).
 // src/network.rs
 
 pub struct NetworkDef {
-    pub name: String,           // bridge interface name, e.g. "remora0", "frontend"
+    pub name: String,           // bridge interface name, e.g. "pelagos0", "frontend"
     pub subnet: Ipv4Net,        // e.g. 10.0.1.0/24
     pub gateway: Ipv4Addr,      // e.g. 10.0.1.1 (always .1 of the subnet)
 }
@@ -85,24 +85,24 @@ pub struct NetworkDef {
 Where `Ipv4Net` is a simple struct holding a base address and prefix length
 (we can use the `ipnet` crate or a small hand-rolled type).
 
-### Persistence: `/var/lib/remora/networks/<name>/`
+### Persistence: `/var/lib/pelagos/networks/<name>/`
 
 ```
-/var/lib/remora/networks/
-  remora0/
-    config.json          # { "name": "remora0", "subnet": "172.19.0.0/24", "gateway": "172.19.0.1" }
+/var/lib/pelagos/networks/
+  pelagos0/
+    config.json          # { "name": "pelagos0", "subnet": "172.19.0.0/24", "gateway": "172.19.0.1" }
   frontend/
     config.json          # { "name": "frontend", "subnet": "10.0.1.0/24", "gateway": "10.0.1.1" }
 ```
 
 This directory is the source of truth for "what networks exist." Created by
-`remora network create`, read by `setup_bridge_network()`.
+`pelagos network create`, read by `setup_bridge_network()`.
 
-### Runtime State: `/run/remora/networks/<name>/`
+### Runtime State: `/run/pelagos/networks/<name>/`
 
 ```
-/run/remora/networks/
-  remora0/
+/run/pelagos/networks/
+  pelagos0/
     next_ip              # IPAM counter (per-network)
     nat_refcount         # NAT refcount (per-network)
     port_forwards        # DNAT entries (per-network)
@@ -112,31 +112,31 @@ This directory is the source of truth for "what networks exist." Created by
     port_forwards
 ```
 
-This replaces the current global `/run/remora/next_ip`, etc. Each network
+This replaces the current global `/run/pelagos/next_ip`, etc. Each network
 has its own independent pool and refcount.
 
-### CLI: `remora network` Subcommand
+### CLI: `pelagos network` Subcommand
 
 ```
-remora network create <name> --subnet <CIDR>
-remora network ls [--format json]
-remora network rm <name>
-remora network inspect <name>
+pelagos network create <name> --subnet <CIDR>
+pelagos network ls [--format json]
+pelagos network rm <name>
+pelagos network inspect <name>
 ```
 
 **`create`:**
 - Validates subnet doesn't overlap with any existing network
-- Writes `config.json` to `/var/lib/remora/networks/<name>/`
+- Writes `config.json` to `/var/lib/pelagos/networks/<name>/`
 - Does NOT create the bridge yet (lazy — created on first container)
 
 **`ls`:**
-- Lists all networks from `/var/lib/remora/networks/*/config.json`
+- Lists all networks from `/var/lib/pelagos/networks/*/config.json`
 - Shows name, subnet, gateway, active container count (optional)
 
 **`rm`:**
 - Refuses if any container is currently on the network
 - Deletes the bridge interface if it exists
-- Removes `/var/lib/remora/networks/<name>/` and `/run/remora/networks/<name>/`
+- Removes `/var/lib/pelagos/networks/<name>/` and `/run/pelagos/networks/<name>/`
 
 **`inspect`:**
 - Shows network config + current IPAM state + active containers
@@ -144,14 +144,14 @@ remora network inspect <name>
 ### CLI: `--network` Flag Changes
 
 ```
-# Current (unchanged — uses default remora0 bridge):
-remora run --network bridge alpine /bin/sh
+# Current (unchanged — uses default pelagos0 bridge):
+pelagos run --network bridge alpine /bin/sh
 
 # New — join a named network:
-remora run --network frontend alpine /bin/sh
+pelagos run --network frontend alpine /bin/sh
 
 # Explicit default:
-remora run --network remora0 alpine /bin/sh
+pelagos run --network pelagos0 alpine /bin/sh
 ```
 
 Parse logic: if the value is `"none"`, `"loopback"`, `"bridge"`, or `"pasta"`,
@@ -174,14 +174,14 @@ Command::new("/bin/sh")
 ```
 
 **Recommendation:** Add a `BridgeNamed(String)` variant to `NetworkMode`.
-`NetworkMode::Bridge` becomes sugar for `BridgeNamed("remora0".into())`.
+`NetworkMode::Bridge` becomes sugar for `BridgeNamed("pelagos0".into())`.
 Internally, both paths go through the same code.
 
 ### Default Network Bootstrap
 
-On first use (if `/var/lib/remora/networks/remora0/config.json` doesn't exist),
+On first use (if `/var/lib/pelagos/networks/pelagos0/config.json` doesn't exist),
 the default network is auto-created with the current hardcoded values:
-- name: `remora0`
+- name: `pelagos0`
 - subnet: `172.19.0.0/24`
 - gateway: `172.19.0.1`
 
@@ -218,7 +218,7 @@ pub fn network_port_forwards_file(name: &str) -> PathBuf {
 ```
 
 The old global `ipam_file()`, `nat_refcount_file()`, `port_forwards_file()`
-can either delegate to `network_*("remora0")` or be deprecated.
+can either delegate to `network_*("pelagos0")` or be deprecated.
 
 ### `src/network.rs`
 
@@ -241,7 +241,7 @@ from `net.name`).
 **`NFT_ADD_SCRIPT`** → **`build_nat_script(net: &NetworkDef)`**
 
 Generate the nftables script dynamically with the network's subnet and bridge
-name. Use a per-network nftables table name (e.g. `ip remora-frontend`) to
+name. Use a per-network nftables table name (e.g. `ip pelagos-frontend`) to
 avoid rule collisions between networks.
 
 **`enable_nat()` / `disable_nat()`** → accept `&NetworkDef`
@@ -273,7 +273,7 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, ...> {
     match s.to_ascii_lowercase().as_str() {
         "none" | "" => Ok(NetworkMode::None),
         "loopback" => Ok(NetworkMode::Loopback),
-        "bridge" => Ok(NetworkMode::BridgeNamed("remora0".into())),
+        "bridge" => Ok(NetworkMode::BridgeNamed("pelagos0".into())),
         "pasta" => Ok(NetworkMode::Pasta),
         name => {
             // Verify network exists
@@ -281,7 +281,7 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, ...> {
             if config_path.exists() {
                 Ok(NetworkMode::BridgeNamed(name.into()))
             } else {
-                Err(format!("network '{}' not found (create with: remora network create {})", name, name))
+                Err(format!("network '{}' not found (create with: pelagos network create {})", name, name))
             }
         }
     }
@@ -304,13 +304,13 @@ Add the `network` subcommand to clap.
 Each network gets its own nftables table to avoid rule collisions:
 
 ```
-table ip remora-remora0 {
+table ip pelagos-pelagos0 {
     chain postrouting { type nat hook postrouting priority 100; }
     chain forward { type filter hook forward priority 0; }
     chain prerouting { type nat hook prerouting priority -100; }
 }
 
-table ip remora-frontend {
+table ip pelagos-frontend {
     chain postrouting { ... }
     chain forward { ... }
     chain prerouting { ... }
@@ -326,7 +326,7 @@ The iptables FORWARD fallback rules also need to be per-subnet.
 
 ## Subnet Overlap Validation
 
-`remora network create` must reject subnets that overlap with existing
+`pelagos network create` must reject subnets that overlap with existing
 networks. For two CIDRs A and B, they overlap if A contains B's network
 address or B contains A's network address. This is straightforward with
 bitwise comparison of the masked addresses.
@@ -335,17 +335,17 @@ bitwise comparison of the masked addresses.
 
 ## Migration / Backwards Compatibility
 
-1. If `/var/lib/remora/networks/` doesn't exist (pre-multi-network install),
-   the first `--network bridge` or `remora network ls` auto-creates the
-   default `remora0` network definition.
+1. If `/var/lib/pelagos/networks/` doesn't exist (pre-multi-network install),
+   the first `--network bridge` or `pelagos network ls` auto-creates the
+   default `pelagos0` network definition.
 
-2. `--network bridge` continues to mean "use the default remora0 bridge."
+2. `--network bridge` continues to mean "use the default pelagos0 bridge."
    No CLI change required for existing users.
 
-3. Old global state files (`/run/remora/next_ip`, etc.) are migrated or
+3. Old global state files (`/run/pelagos/next_ip`, etc.) are migrated or
    ignored once per-network state takes over. Simplest approach: if
-   `/run/remora/networks/remora0/next_ip` doesn't exist but
-   `/run/remora/next_ip` does, copy it over on first access.
+   `/run/pelagos/networks/pelagos0/next_ip` doesn't exist but
+   `/run/pelagos/next_ip` does, copy it over on first access.
 
 ---
 
@@ -366,7 +366,7 @@ be a separate feature using ebtables/nftables bridge filtering rules.
 |-----------------------------|-----------|
 | `NetworkDef` struct + serde | Quick     |
 | `src/paths.rs` additions    | Quick     |
-| `remora network create/ls/rm/inspect` CLI | Moderate |
+| `pelagos network create/ls/rm/inspect` CLI | Moderate |
 | Parameterize `ensure_bridge` + `allocate_ip` | Moderate |
 | Parameterize `setup_bridge_network` + nftables | Moderate |
 | Update container builder + `NetworkMode` enum | Quick |
@@ -390,7 +390,7 @@ rules.
    (IFNAMSIZ − 1). Should we prefix user names (e.g. `rm-frontend` = 11 chars)
    or let users pick raw names and validate length?
 
-2. **Subnet defaults.** Should `remora network create frontend` auto-assign
+2. **Subnet defaults.** Should `pelagos network create frontend` auto-assign
    a subnet (next available /24 from a pool like 10.0.0.0/8), or always
    require `--subnet`? Auto-assignment is convenient; explicit is simpler to
    implement and reason about.

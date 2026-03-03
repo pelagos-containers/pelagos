@@ -29,14 +29,14 @@ first-class concerns — territory runc explicitly does not cover.
 | Container runtime | Namespaces (UTS/Mount/IPC/Net/PID/Cgroup), seccomp-BPF, capabilities, no-new-privileges, masked paths |
 | Security-by-default | All four hardening defaults applied unconditionally to every container |
 | OCI image pull | Authenticated pulls; `~/.docker/config.json`; env-var creds; content-addressable layer store |
-| OCI image push | `remora image push` — distributes built/pulled images; blob cache for roundtrip |
-| Registry login | `remora image login/logout` — writes `~/.docker/config.json` |
-| Image build | `remora build` — Remfile (Dockerfile-compatible), multi-stage, ARG, ADD (URLs + archives), build cache, `.remignore` |
+| OCI image push | `pelagos image push` — distributes built/pulled images; blob cache for roundtrip |
+| Registry login | `pelagos image login/logout` — writes `~/.docker/config.json` |
+| Image build | `pelagos build` — Remfile (Dockerfile-compatible), multi-stage, ARG, ADD (URLs + archives), build cache, `.remignore` |
 | Networking | Loopback, bridge, NAT, TCP port mapping, DNS service discovery, named networks, multi-network containers, pasta (rootless) |
-| Multi-service orchestration | `remora compose up/down/ps/logs` — Lisp DSL + futures graph executor |
+| Multi-service orchestration | `pelagos compose up/down/ps/logs` — Lisp DSL + futures graph executor |
 | Imperative scripting | `.reml` Lisp interpreter: `container-start`, `await-port`, `with-cleanup`, `guard`, parallel graph |
 | Interactive containers | PTY, SIGWINCH relay, terminal restore |
-| `remora exec` | Namespace join + PTY |
+| `pelagos exec` | Namespace join + PTY |
 | Volumes / bind mounts / tmpfs / overlay | Full filesystem flexibility |
 | Rootless mode | Pull, build, run, overlay (native or fuse), pasta networking |
 | OCI Runtime Spec | `create` / `start` / `state` / `kill` / `delete` lifecycle |
@@ -49,32 +49,32 @@ first-class concerns — territory runc explicitly does not cover.
 ### Critical (blocks real-world use)
 
 #### ~~Registry authentication~~ ✅ COMPLETE
-`remora image login <registry>` writes credentials to `~/.docker/config.json`.
-`remora image pull --username <u> --password <p>` authenticates pulls.
-Auth resolution order: CLI flags → `REMORA_REGISTRY_USER`/`REMORA_REGISTRY_PASS`
+`pelagos image login <registry>` writes credentials to `~/.docker/config.json`.
+`pelagos image pull --username <u> --password <p>` authenticates pulls.
+Auth resolution order: CLI flags → `PELAGOS_REGISTRY_USER`/`PELAGOS_REGISTRY_PASS`
 env vars → `~/.docker/config.json` (`credHelpers` / `credsStore` / `auths`) → Anonymous.
 Credential helpers fully supported: `docker-credential-ecr-login`, OS keychain, etc.
 
 ---
 
 #### ~~Image push~~ ✅ COMPLETE
-`remora image push <ref> [--dest <registry/repo:tag>]` distributes locally-stored
+`pelagos image push <ref> [--dest <registry/repo:tag>]` distributes locally-stored
 images via the OCI Distribution Spec.  Blobs are cached during pull/build in
-`/var/lib/remora/blobs/`; the OCI config JSON is stored alongside `manifest.json`.
+`/var/lib/pelagos/blobs/`; the OCI config JSON is stored alongside `manifest.json`.
 Auth uses the same resolution order as pull.
 
 ---
 
 ### Significant (limits daily usefulness)
 
-#### ~~`remora image save` / `remora image load`~~ ✅ COMPLETE
+#### ~~`pelagos image save` / `pelagos image load`~~ ✅ COMPLETE
 OCI Image Layout tar format.  Interoperable with Docker, Podman, skopeo, crane.
-`remora image save <ref> [-o file.tar]` and `remora image load [-i file.tar] [--tag ref]`.
+`pelagos image save <ref> [-o file.tar]` and `pelagos image load [-i file.tar] [--tag ref]`.
 
 ---
 
 #### ~~Proper image tagging~~ ✅ COMPLETE
-`remora image tag <source> <target>` — assigns a new local reference, shares layers.
+`pelagos image tag <source> <target>` — assigns a new local reference, shares layers.
 
 ---
 
@@ -86,7 +86,7 @@ The userspace relay uses per-client session sockets with 30-second idle eviction
 > **⚠️ Scaling note (future work):** The current userspace proxy uses one thread
 > per port mapping plus one thread per active UDP session. This is fine for
 > development workloads but scales poorly under high connection counts. A future
-> `remora network proxy` refactor should replace this with a `tokio` async task
+> `pelagos network proxy` refactor should replace this with a `tokio` async task
 > pool (already a dependency). Do not address this now.
 
 ---
@@ -122,7 +122,7 @@ tar format so images can be exchanged with Docker hosts without a registry.
 #### Mac / Windows host support
 Finch's primary value proposition is the Lima VM wrapper that makes Linux
 containers work transparently on Mac.  Pelagos is Linux-only by nature — all the
-interesting code is Linux kernel interfaces.  A Lima-based wrapper (`remora-mac`
+interesting code is Linux kernel interfaces.  A Lima-based wrapper (`pelagos-mac`
 or similar) could provide the same experience, but this is a separate packaging
 project, not a runtime gap.
 

@@ -4,7 +4,7 @@
 ;;; inspect its /proc entries and verify compose lifecycle operations.
 ;;;
 ;;; Usage:
-;;;   sudo -E remora compose up -f sleep-probe.reml -p <project> --foreground &
+;;;   sudo -E pelagos compose up -f sleep-probe.reml -p <project> --foreground &
 
 (compose-up
   (compose

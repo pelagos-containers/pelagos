@@ -197,7 +197,7 @@ The Kinvolk/Benchmark suite (OCI runtime bench) measures:
 Pelagos is not yet in this benchmark suite. To add Pelagos:
 1. Implement the full OCI runtime spec lifecycle (currently partial)
 2. Submit a PR to the benchmark repo with a Pelagos shim config
-3. Run the suite with `sudo benchmark.sh --runtime remora`
+3. Run the suite with `sudo benchmark.sh --runtime pelagos`
 
 **Target:** Median cold-start ≤ 180 ms (between crun and youki), RSS ≤ 4 MB.
 
@@ -249,7 +249,7 @@ In descending order of strategic impact:
 | 1 | Document structural CVE immunity (TOCTOU class) | Quick | High — marketing + security credibility |
 | 2 | AppArmor / SELinux profile support | Significant | High — production blocker for regulated env |
 | 3 | Landlock LSM integration | Moderate | High — first-mover; pure Rust; no deps |
-| 4 | Publish remora as a crate on crates.io | Quick | High — enables embedding in agent frameworks |
+| 4 | Publish pelagos as a crate on crates.io | Quick | High — enables embedding in agent frameworks |
 | 5 | `SECCOMP_RET_USER_NOTIF` supervisor mode | Significant | Medium-High — enables egress/mount policy |
 | 6 | Wasm/WASI shim mode (`WasmMode`) | Moderate | Medium — rides OCI+Wasm convergence trend |
 | 7 | OCI runtime bench submission | Quick | Medium — visibility + cold-start regression guard |
