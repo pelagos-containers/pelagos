@@ -2522,3 +2522,33 @@ the host→guest mapping to the wasmtime `--dir host::guest` flag.
 Reads the first 4 bytes of the compiled `hello.wasm` and verifies they equal
 `00 61 73 6d` (`\0asm`). Confirms that `rustc --target wasm32-wasip1` produces
 a valid Wasm binary that `is_wasm_binary()` would recognise.
+
+### `wasm::tests::test_wasmtime_cmd_identity_dir_mapping`
+**Type:** Unit, no runtime required
+
+Constructs a `WasiConfig` with a single identity-mapped preopened dir
+(`/data` → `/data`) and asserts `build_wasmtime_cmd` produces `--dir /data::/data`.
+
+### `wasm::tests::test_wasmtime_cmd_mapped_dir`
+**Type:** Unit, no runtime required — regression test
+
+Constructs a `WasiConfig` with host `/host/binddata` mapped to guest `/data`
+and asserts `build_wasmtime_cmd` produces `--dir /host/binddata::/data`, not
+the identity form `--dir /host/binddata::/host/binddata`.
+
+This is the direct regression guard for the bug where `--bind /host:/container`
+was silently ignored: the module received the host path as both host and guest,
+so any file opens at the container path failed.
+
+### `wasm::tests::test_wasmedge_cmd_mapped_dir`
+**Type:** Unit, no runtime required — regression test
+
+Same mapping check for WasmEdge (single-colon syntax: `--dir host:guest`).
+Asserts `build_wasmedge_cmd` produces `--dir /host/binddata:/data` and not
+the identity form.
+
+### `wasm::tests::test_wasmtime_cmd_env_vars`
+**Type:** Unit, no runtime required
+
+Constructs a `WasiConfig` with two env vars and asserts both appear as
+`--env KEY=val` in the wasmtime command args.

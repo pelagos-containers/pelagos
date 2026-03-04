@@ -279,4 +279,94 @@ mod tests {
         let _ = find_wasm_runtime(WasmRuntime::Wasmtime);
         let _ = find_wasm_runtime(WasmRuntime::WasmEdge);
     }
+
+    // ── Regression tests for host→guest dir mapping (fix: Vec<PathBuf> → Vec<(PathBuf,PathBuf)>) ──
+    //
+    // Before the fix, preopened_dirs was Vec<PathBuf> and both wasmtime and
+    // wasmedge received `--dir /host::/host` (identity), so a module that
+    // opened `/data/file` would fail when the bind-mount was specified as
+    // `--bind /host:/data`.
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn test_wasmtime_cmd_identity_dir_mapping() {
+        // with_wasi_preopened_dir("/data") → --dir /data::/data
+        let wasi = WasiConfig {
+            runtime: WasmRuntime::Wasmtime,
+            env: vec![],
+            preopened_dirs: vec![(PathBuf::from("/data"), PathBuf::from("/data"))],
+        };
+        let cmd = build_wasmtime_cmd(Path::new("wasmtime"), Path::new("app.wasm"), &[], &wasi);
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "/data::/data"),
+            "expected --dir /data::/data in args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_wasmtime_cmd_mapped_dir() {
+        // with_wasi_preopened_dir_mapped("/host/binddata", "/data") → --dir /host/binddata::/data
+        // This is the regression case: host path ≠ guest path.
+        let wasi = WasiConfig {
+            runtime: WasmRuntime::Wasmtime,
+            env: vec![],
+            preopened_dirs: vec![(PathBuf::from("/host/binddata"), PathBuf::from("/data"))],
+        };
+        let cmd = build_wasmtime_cmd(Path::new("wasmtime"), Path::new("app.wasm"), &[], &wasi);
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "/host/binddata::/data"),
+            "expected --dir /host/binddata::/data in args: {args:?}"
+        );
+        // Regression: must NOT produce the old identity-mapped form.
+        assert!(
+            !args.iter().any(|a| a == "/host/binddata::/host/binddata"),
+            "regression: produced identity mapping --dir /host/binddata::/host/binddata"
+        );
+    }
+
+    #[test]
+    fn test_wasmedge_cmd_mapped_dir() {
+        // wasmedge uses single-colon: --dir /host/binddata:/data
+        let wasi = WasiConfig {
+            runtime: WasmRuntime::WasmEdge,
+            env: vec![],
+            preopened_dirs: vec![(PathBuf::from("/host/binddata"), PathBuf::from("/data"))],
+        };
+        let cmd = build_wasmedge_cmd(Path::new("wasmedge"), Path::new("app.wasm"), &[], &wasi);
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "/host/binddata:/data"),
+            "expected --dir /host/binddata:/data in args: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/host/binddata:/host/binddata"),
+            "regression: produced identity mapping --dir /host/binddata:/host/binddata"
+        );
+    }
+
+    #[test]
+    fn test_wasmtime_cmd_env_vars() {
+        let wasi = WasiConfig {
+            runtime: WasmRuntime::Wasmtime,
+            env: vec![("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())],
+            preopened_dirs: vec![],
+        };
+        let cmd = build_wasmtime_cmd(Path::new("wasmtime"), Path::new("app.wasm"), &[], &wasi);
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "FOO=bar"),
+            "expected FOO=bar in args: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "BAZ=qux"),
+            "expected BAZ=qux in args: {args:?}"
+        );
+    }
 }
