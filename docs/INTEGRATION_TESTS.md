@@ -2597,3 +2597,45 @@ Failure indicates the P2 / Component Model execution path is broken: the
 `wasmtime_wasi::p2` linker setup, `Command::instantiate`, or `call_run` is not
 functioning correctly.  This test verifies the full component execution round-trip
 (component detection → P2 linker → WASI Command world → exit code 0).
+
+---
+
+## Build Regression Tests (`build_regression_tests`)
+
+These tests guard against specific bugs that were found and fixed. Each test is
+named after the failure mode it prevents.
+
+### `build_regression_tests::test_build_copy_then_chmod_layer_content_preserved`
+**Type:** Integration — requires root, alpine pre-pulled
+**Root:** yes  **Rootfs:** no (uses pulled alpine image layers)
+
+Regression test for the **overlayfs metacopy bug** (Linux 6.x+). When
+`metacopy=on` (the kernel default on modern kernels), a `chmod` in a RUN step
+only writes a *metadata inode* to the overlay upper directory — file data stays
+in the lower layer. The build engine reads `upper/` directly after container
+exit (the overlay mount is gone), so it gets zero bytes for any file that was
+only `chmod`'d, not written.
+
+Builds a minimal image (`FROM alpine` + `COPY script.sh` + `RUN chmod +x`),
+then reads the file bytes from every layer directory in the layer store and
+asserts the file is non-empty, non-zero, and starts with `#!`. This catches the
+regression at the layer-storage level without needing to run the resulting image.
+
+Failure indicates: `metacopy=off` is missing from a kernel overlay mount option
+in `container.rs`, or the build engine is reading the wrong directory.
+
+### `build_regression_tests::test_build_copy_chmod_run_produces_output`
+**Type:** Integration — requires root, alpine pre-pulled
+**Root:** yes  **Rootfs:** no (uses pulled alpine image layers)
+
+Full build-then-run regression test for the **overlayfs metacopy bug**. Builds
+the same `COPY script.sh + RUN chmod +x` image as above, then runs it via
+`Command::new("/bin/sh").args(["/usr/local/bin/script.sh"])` with
+`with_image_layers()` and asserts the expected output string appears.
+
+If `metacopy=off` is missing, the script will contain zeros, causing an exec
+format error or silent empty output instead of the expected string.
+
+Failure indicates: the file written by a COPY instruction loses its content
+after a subsequent `RUN chmod` step — the container returns no output or an
+exec error instead of the expected string.

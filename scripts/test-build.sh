@@ -26,6 +26,7 @@ cleanup() {
     $BINARY image rm "test-workdir:latest" 2>/dev/null || true
     $BINARY image rm "test-multi:latest" 2>/dev/null || true
     $BINARY image rm "test-runfail:latest" 2>/dev/null || true
+    $BINARY image rm "test-chmod:latest" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -352,6 +353,56 @@ if echo "$OUTPUT" | grep -qi "not found\|Remfile"; then
     pass "error mentions missing Remfile"
 else
     fail "error should mention Remfile not found (got: $OUTPUT)"
+fi
+
+echo
+
+# ---------------------------------------------------------------------------
+# Test 11: COPY + RUN chmod produces correct output
+#
+# Regression test for the overlayfs metacopy bug (Linux 6.x+).
+# When metacopy=on (default on Linux 6+), a chmod in a RUN step writes only a
+# metadata inode to the overlay upper directory; file data stays in the lower
+# layer. Reading upper/ directly after container exit then returns zero bytes.
+# Fix: metacopy=off in the overlay mount options in container.rs.
+# ---------------------------------------------------------------------------
+
+echo "=== Test 11: COPY script + RUN chmod produces correct output (metacopy regression) ==="
+
+mkdir -p "$TMPDIR/chmod-ctx"
+cat > "$TMPDIR/chmod-ctx/server.sh" <<'EOF'
+#!/bin/sh
+echo "hello-from-chmod-script"
+EOF
+
+cat > "$TMPDIR/chmod-ctx/Remfile" <<'EOF'
+FROM alpine
+COPY server.sh /usr/local/bin/server.sh
+RUN chmod +x /usr/local/bin/server.sh
+CMD ["/usr/local/bin/server.sh"]
+EOF
+
+if $BINARY build -t test-chmod:latest "$TMPDIR/chmod-ctx" 2>&1; then
+    pass "chmod build completed"
+else
+    fail "chmod build failed"
+fi
+
+OUTPUT=$($BINARY run test-chmod:latest 2>/dev/null)
+if echo "$OUTPUT" | grep -q "hello-from-chmod-script"; then
+    pass "COPY+chmod: script output correct"
+else
+    fail "COPY+chmod: output missing or empty (got: '$OUTPUT'). \
+Likely cause: overlayfs metacopy wrote a zero-byte upper inode for the chmod step. \
+Fix: ensure metacopy=off is in container.rs overlay mount options."
+fi
+
+# Also verify the file is readable and not empty inside the container.
+FILE_SIZE=$($BINARY run test-chmod:latest /bin/sh -c "wc -c < /usr/local/bin/server.sh" 2>/dev/null | tr -d ' ')
+if [ "$FILE_SIZE" -gt 0 ] 2>/dev/null; then
+    pass "COPY+chmod: file has non-zero size inside container ($FILE_SIZE bytes)"
+else
+    fail "COPY+chmod: file is empty or missing inside container (size: '$FILE_SIZE')"
 fi
 
 echo

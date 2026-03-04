@@ -12970,3 +12970,210 @@ mod wasm_embedded_tests {
         assert_eq!(code, 0, "component should exit with code 0");
     }
 }
+
+/// Regression tests for specific bugs that were fixed.
+///
+/// Each test is named after the bug it guards against and documents why the
+/// failure mode occurs so future engineers understand what they are protecting.
+mod build_regression_tests {
+    use super::*;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    fn cleanup_image(reference: &str) {
+        let _ = image::remove_image(reference);
+        // Do not remove layers: they are content-addressed and may be shared
+        // with pulled base images (alpine). Removing them here would break
+        // subsequent test runs that require those layers.
+    }
+
+    /// test_build_copy_then_chmod_layer_content_preserved
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for the overlayfs metacopy bug (Linux 6.x+).
+    ///
+    /// When metacopy=on (the default on Linux 6.x), a `chmod` in a RUN step
+    /// only writes a metadata inode to the upper directory — file data stays in
+    /// the lower layer. The build engine reads `upper/` directly after the
+    /// container exits (the overlay mount is gone at that point), so it gets
+    /// zero bytes for any file that was only chmod'd, not written.
+    ///
+    /// The fix is `metacopy=off` in the kernel overlay mount options in
+    /// container.rs. This test catches any regression at the layer-storage
+    /// level without needing to run the resulting image.
+    ///
+    /// Failure indicates: metacopy=off is missing from an overlay mount in
+    /// container.rs, or the build engine is reading the wrong directory.
+    #[test]
+    fn test_build_copy_then_chmod_layer_content_preserved() {
+        if !is_root() {
+            eprintln!("SKIP test_build_copy_then_chmod_layer_content_preserved: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_build_copy_then_chmod_layer_content_preserved: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            ctx.path().join("script.sh"),
+            b"#!/bin/sh\necho hello-from-chmod-test\n",
+        )
+        .unwrap();
+
+        let remfile = "\
+FROM alpine\n\
+COPY script.sh /usr/local/bin/script.sh\n\
+RUN chmod +x /usr/local/bin/script.sh\n\
+CMD [\"/usr/local/bin/script.sh\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-chmod-regression:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build with COPY + RUN chmod should succeed");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            assert!(
+                layers.len() >= 2,
+                "should have at least 2 layers (base + COPY + RUN)"
+            );
+
+            // Walk all layers for the script file; the effective content is
+            // from whichever layer last wrote it (overlayfs upper wins).
+            let mut found_content: Option<Vec<u8>> = None;
+            for layer_dir in &layers {
+                let script_path = layer_dir.join("usr/local/bin/script.sh");
+                if script_path.exists() {
+                    found_content = Some(std::fs::read(&script_path).unwrap());
+                }
+            }
+
+            let content =
+                found_content.expect("script.sh should exist in at least one layer directory");
+
+            assert!(
+                !content.is_empty(),
+                "script.sh must have non-empty content in layer store"
+            );
+            assert!(
+                !content.iter().all(|&b| b == 0),
+                "script.sh content is all zeros — overlayfs metacopy regression: \
+                 chmod only wrote a metadata inode to upper/, file data was not copied. \
+                 Fix: ensure metacopy=off is in overlay mount options in container.rs. \
+                 File size: {} bytes, first 16: {:?}",
+                content.len(),
+                &content[..content.len().min(16)]
+            );
+            assert_eq!(
+                &content[..2],
+                b"#!",
+                "script.sh should start with shebang (#!), got: {:?}",
+                &content[..content.len().min(4)]
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
+    /// test_build_copy_chmod_run_produces_output
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Full build-then-run regression test for the overlayfs metacopy bug.
+    /// Complements test_build_copy_then_chmod_layer_content_preserved by
+    /// actually executing the built image and asserting the expected output
+    /// appears. If metacopy=off is missing, the script will contain zeros,
+    /// causing "exec format error" or silent empty output.
+    ///
+    /// Failure indicates: the file written by a COPY instruction loses its
+    /// content after a subsequent RUN chmod step — the container returns no
+    /// output or an exec error instead of the expected string.
+    #[test]
+    fn test_build_copy_chmod_run_produces_output() {
+        if !is_root() {
+            eprintln!("SKIP test_build_copy_chmod_run_produces_output: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_build_copy_chmod_run_produces_output: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            ctx.path().join("script.sh"),
+            b"#!/bin/sh\necho hello-chmod-output\n",
+        )
+        .unwrap();
+
+        let remfile = "\
+FROM alpine\n\
+COPY script.sh /usr/local/bin/script.sh\n\
+RUN chmod +x /usr/local/bin/script.sh\n\
+CMD [\"/usr/local/bin/script.sh\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-chmod-run:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build should succeed");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("/bin/sh")
+                .args(["/usr/local/bin/script.sh"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("should spawn container from built image");
+
+            let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            let err = String::from_utf8_lossy(&stderr);
+
+            assert!(
+                status.success(),
+                "script.sh should exit 0; stderr={}",
+                err.trim()
+            );
+            assert!(
+                out.contains("hello-chmod-output"),
+                "expected 'hello-chmod-output' in output — got: '{}' (stderr: '{}'). \
+                 Likely cause: COPY+RUN chmod produces a zero-byte file due to \
+                 overlayfs metacopy (missing metacopy=off in container.rs).",
+                out.trim(),
+                err.trim()
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+}
