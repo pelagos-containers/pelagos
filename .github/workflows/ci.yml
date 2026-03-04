@@ -41,3 +41,37 @@ jobs:
         run: sudo ./scripts/reset-test-env.sh
       - name: Run integration tests
         run: sudo -E env "PATH=$PATH" cargo test --test integration_tests -- --test-threads=1
+
+  e2e-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2 passt
+      - name: Build rootfs
+        run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Reset test environment
+        run: sudo ./scripts/reset-test-env.sh
+      - name: Run e2e tests
+        run: sudo -E env "PATH=$PATH" bash scripts/test-e2e.sh
+
+  wasm-e2e-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasmtime
+        run: |
+          curl -fsSL https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Build pelagos
+        run: cargo build
+      - name: Run Wasm e2e tests
+        run: sudo -E env "PATH=$PATH" bash scripts/test-wasm-e2e.sh
