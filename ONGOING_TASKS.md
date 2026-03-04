@@ -16,12 +16,12 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #63 | feat(mac): AppArmor profile template (sub of #51) | feat |
 | #64 | feat(mac): SELinux process label support (sub of #51) | feat |
 | #67 | epic: deeper Wasm/WASI support | epic |
-| #69 | fix: integration test suite hangs locally (DNS tests) | bug/ACTIVE |
+| #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
 ## Current Baseline (2026-03-03, SHA df18ca1)
 
 - Unit tests: **290/290 pass** (4 new wasm regression tests added this session)
-- Integration tests: should be ~202 but **suite hangs locally** in `dns::` module — see #69
+- Integration tests: **202/202 pass, 8 ignored** (`--test-threads=1`, 37s) — #69 CLOSED (was env state, not code)
 - CI (GitHub Actions): **all 5 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests)
 - E2E tests: **7 Wasm e2e tests pass** (`scripts/test-wasm-e2e.sh`)
 
@@ -71,39 +71,12 @@ All work is tracked in GitHub Issues. This file is a brief index.
 Also: `docs/WASM_SUPPORT.md` created — three-layer architecture, CLI examples,
 comparison table vs runc/runwasi/Spin, limitations, roadmap pointing to epic #67.
 
-## Active Bug: Integration Test Suite Hangs (#69)
+## Bug #69 — RESOLVED
 
-**Symptom:** Running the full integration test suite locally hangs indefinitely
-in the `dns::` module. The CI integration-tests job runs in 90s fine (different
-environment — GitHub Actions Ubuntu, no leftover network state).
-
-**Diagnosis so far (2026-03-03):**
-- Confirmed via binary search: `dns::` module is the culprit
-- `dns::test_dns_daemon_lifecycle` — **passes individually** (~0s)
-- `dns::test_dns_dnsmasq_lifecycle` — **skipped** (dnsmasq not installed locally)
-- Remaining 6 DNS tests not yet individually confirmed before reboot
-
-**Root cause hypothesis:** An orphaned `pelagos-dns` process or a network
-namespace left over from a previous test run is blocking a subsequent test.
-The `reset-test-env.sh` script was also failing with exit 144 during this
-session, suggesting the local environment was in a bad state.
-
-**Plan after reboot:**
-1. Run `sudo scripts/reset-test-env.sh` (should work cleanly post-reboot)
-2. Run each DNS test individually with `timeout 30` to find the one that hangs:
-   ```bash
-   CARGO="$(rustup which cargo)"
-   for t in dns::test_dns_multi_network dns::test_dns_network_isolation \
-             dns::test_dns_resolves_container_name dns::test_dns_upstream_forward; do
-     echo -n "$t ... "
-     sudo env RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo PATH=$HOME/.cargo/bin:$PATH \
-       timeout 30 "$CARGO" test --test integration_tests "$t" -- --test-threads=1 2>&1 | tail -1
-     sudo killall pelagos-dns 2>/dev/null || true
-   done
-   ```
-3. Read the hanging test's implementation and fix: likely missing timeout on
-   DNS daemon wait, or blocking `wait()` with no cleanup path
-4. After fix, run full suite to confirm it completes
+Root cause was dirty local environment state from a previous crashed session
+(orphaned `pelagos-dns` processes, stale network namespaces). Post-reboot +
+`sudo scripts/reset-test-env.sh` + `--test-threads=1` → 202/202 pass in 37s.
+No code changes required. Issue closed.
 
 ## Wasm Epic #67 — Sub-issues
 
@@ -117,9 +90,8 @@ session, suggesting the local environment was in a bad state.
 P1 (Mixed Linux+Wasm compose validation) dropped — needs P2 (sockets) first to
 be meaningful.
 
-## Suggested Next Steps (after DNS fix)
+## Suggested Next Steps
 
-- Fix #69 (DNS hang) — must do first; full integration suite must pass locally
 - #52 (AppArmor/SELinux) — highest real-world security impact
 - #60 (io_uring seccomp profile) — useful complement to existing seccomp work
 - #61 (CRIU) — complex but differentiating checkpoint/restore feature
