@@ -129,6 +129,132 @@ as root is not visible rootless, and vice versa.
 
 ---
 
+## WebAssembly / WASI
+
+Pelagos runs WebAssembly modules from the same CLI and image store as Linux containers.
+No other general-purpose container runtime does this — runc, crun, and youki treat
+`.wasm` files as opaque executables and fail immediately at `exec()`. Wasm-native
+runtimes (runwasi, Spin, WasmEdge shim) go the other direction: Wasm only, no Linux
+OCI containers. Pelagos is the only runtime where both workload types share one CLI,
+one image store, one compose format, and one node.
+
+### How it works
+
+`spawn()` reads the first 4 bytes of the target program. WebAssembly modules always
+begin with `\0asm` (`0x00 0x61 0x73 0x6D`). If those bytes are present, the full
+Linux container machinery — namespaces, overlayfs, seccomp, pivot_root — is bypassed
+entirely and the module is handed to wasmtime or wasmedge. For ELF binaries, nothing
+changes.
+
+### Running a Wasm module directly
+
+```bash
+# From host filesystem — magic-byte detection triggers automatically
+sudo pelagos run /path/to/app.wasm
+
+# With WASI environment variables
+sudo pelagos run --env DATABASE_URL=postgres://... /path/to/app.wasm
+
+# With a preopened host directory mapped to a guest path
+sudo pelagos run --bind /host/data:/app/data /path/to/app.wasm
+```
+
+### Wasm OCI images
+
+```bash
+# Pull a Wasm image
+pelagos image pull ghcr.io/example/my-wasm-app:latest
+
+# TYPE column shows "wasm" or "linux"
+pelagos image ls
+# REPOSITORY                          TAG     TYPE   SIZE
+# ghcr.io/example/my-wasm-app        latest  wasm   1.8 MB
+# alpine                              latest  linux  3.2 MB
+
+# Run it — no rootfs, no overlayfs, starts in milliseconds
+sudo pelagos run ghcr.io/example/my-wasm-app:latest
+
+# With env and bind mounts
+sudo pelagos run \
+    --env CONFIG=/config/app.toml \
+    --bind /etc/myapp:/config \
+    ghcr.io/example/my-wasm-app:latest
+```
+
+### Building a Wasm OCI image
+
+Use `FROM scratch` in a Remfile with a build stage that produces a `.wasm` output.
+The build engine auto-detects the magic bytes and stores the layer with
+`application/wasm` OCI media type:
+
+```dockerfile
+FROM rust:latest AS builder
+RUN rustup target add wasm32-wasip1
+COPY . /src
+WORKDIR /src
+RUN cargo build --release --target wasm32-wasip1
+
+FROM scratch
+COPY --from=builder /src/target/wasm32-wasip1/release/myapp.wasm /myapp.wasm
+```
+
+```bash
+pelagos build -t myapp:wasm .
+pelagos image ls        # TYPE shows "wasm"
+sudo pelagos run myapp:wasm
+```
+
+### Runtime selection
+
+Pelagos tries wasmtime first, then wasmedge (`Auto` mode). To select explicitly:
+
+```bash
+sudo pelagos run --wasm-runtime wasmtime /path/to/app.wasm
+sudo pelagos run --wasm-runtime wasmedge /path/to/app.wasm
+```
+
+### containerd / Kubernetes
+
+Install the shim and add it to containerd's config to schedule Wasm pods via
+a `RuntimeClass` without a separate node agent:
+
+```bash
+sudo cp target/release/pelagos-shim-wasm \
+    /usr/local/bin/containerd-shim-pelagos-wasm-v1
+```
+
+```toml
+# /etc/containerd/config.toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.wasm]
+  runtime_type = "io.containerd.pelagos.wasm.v1"
+```
+
+```yaml
+# RuntimeClass for Kubernetes
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: pelagos-wasm
+handler: wasm
+```
+
+### Current limitations
+
+- **WASI surface is env + preopened dirs only.** WASI preview 2 sockets (TCP/UDP)
+  are not yet threaded through `WasiConfig`. Wasm modules that open outbound
+  network connections require a Linux container wrapping them for now.
+- **No Wasm Component Model.** Components are stored with the correct OCI media type
+  but executed identically to plain modules. Typed interface composition requires
+  embedding the wasmtime Rust crate (planned, behind `--features embedded-wasm`).
+- **Subprocess dispatch overhead.** Each invocation spawns a fresh wasmtime/wasmedge
+  process (~5ms). Fine for long-running services; high-frequency short-lived
+  invocations (>100/s) would benefit from a persistent VM pool (planned).
+
+See [`docs/WASM_SUPPORT.md`](WASM_SUPPORT.md) for the full architecture and
+comparison with runwasi, Spin, and WasmEdge.
+
+---
+
 ## Building Images
 
 Pelagos can build custom images from a **Remfile** (simplified Dockerfile). The build

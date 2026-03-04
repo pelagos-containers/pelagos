@@ -30,11 +30,21 @@ security, scripting, and more.
 | Imperative scripting | ✅ full language | ❌ | ❌ |
 | Security-by-default | ✅ all containers | opt-in | opt-in |
 | Rootless networking | ✅ pasta | ✅ | limited |
+| Linux + Wasm, one runtime | ✅ | ❌ | ❌ |
 
 **Security-by-default** means every container gets seccomp-BPF filtering,
 all capabilities dropped, no-new-privileges, masked kernel paths, and PID/UTS/IPC
 namespace isolation — without any flags. Services that need specific capabilities
 opt back in with `:cap-add`.
+
+**Linux and Wasm, unified.** No other general-purpose container runtime handles
+WebAssembly natively — runc, crun, and youki treat `.wasm` files as opaque
+executables and fail at `exec()`. Wasm-native runtimes (runwasi, Spin, WasmEdge
+shim) go the other direction: Wasm only, no Linux OCI containers. Pelagos is the
+only runtime where both workload types share one CLI, one image store, one compose
+format, and one node: `pelagos run alpine /bin/sh` and
+`pelagos run ghcr.io/example/my-app:latest` work the same way whether the image
+contains an ELF binary or a `.wasm` module. See [`docs/WASM_SUPPORT.md`](docs/WASM_SUPPORT.md).
 
 ---
 
@@ -142,6 +152,20 @@ scripting reference.
 - **Build:** `pelagos build -t myapp:latest` — Remfile (Dockerfile-compatible syntax)
   with multi-stage builds, ARG, ADD (URLs + archives), `.remignore`, build cache
 - **Manage:** `pelagos image ls` / `pelagos image rm`
+
+### WebAssembly / WASI
+- **Magic-byte dispatch:** `spawn()` reads the first 4 bytes; `\0asm` triggers the
+  Wasm path automatically — the full Linux machinery (namespaces, overlayfs, seccomp,
+  pivot_root) is bypassed entirely
+- **OCI Wasm images:** pull, run, and build Wasm images from any OCI registry;
+  `pelagos image ls` shows a `TYPE` column (`linux` / `wasm`)
+- **WASI env + bind mounts:** `--env` passthrough and `--bind host:guest` directory
+  mapping with correct host→guest distinction
+- **Runtime dispatch:** wasmtime or wasmedge, auto-detected from PATH
+- **containerd shim:** `containerd-shim-pelagos-wasm-v1` implements ttrpc shim v2 —
+  schedule Wasm pods in Kubernetes via a `RuntimeClass` without a separate node agent
+- **`pelagos build` Wasm target:** `FROM scratch` + a `.wasm` output auto-detected
+  by magic bytes, stored with `application/wasm` OCI media type
 
 ### Multi-Service Orchestration
 - **`pelagos compose up/down/ps/logs`:** dependency-ordered service lifecycle

@@ -16,6 +16,10 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #63 | feat(mac): AppArmor profile template (sub of #51) | feat |
 | #64 | feat(mac): SELinux process label support (sub of #51) | feat |
 | #67 | epic: deeper Wasm/WASI support | epic |
+| #70 | feat(wasm): mixed Linux+Wasm compose validation (P1) | feat |
+| #71 | feat(wasm): WASI preview 2 socket passthrough (P2) | feat |
+| #72 | feat(wasm): Component Model via embedded wasmtime (P3) | feat |
+| #73 | feat(wasm): persistent Wasm VM pool (P4) | feat/low-pri |
 | #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
 ## Current Baseline (2026-03-03, SHA 6e11187)
@@ -84,15 +88,18 @@ No code changes required. Issue closed.
 
 ## Wasm Epic #67 — Sub-issues
 
-| # | Title | Priority |
-|---|-------|----------|
-| P2 | WASI preview 2 socket passthrough | Medium |
-| P3 | Wasm Component Model execution | Low (needs embedded crate) |
-| P4 | Persistent Wasm VM pool | Low |
-| P5 | `pelagos build` Wasm target | **DONE** (#68) |
+| # | GH | Title | Priority |
+|---|----|-------|----------|
+| P1 | #70 | Mixed Linux+Wasm compose validation | Medium |
+| P2 | #71 | WASI preview 2 socket passthrough | Medium |
+| P3 | #72 | Wasm Component Model via embedded wasmtime | Low (significant dep) |
+| P4 | #73 | Persistent Wasm VM pool | Low (depends on P3) |
+| P5 | #68 | `pelagos build` Wasm target | **DONE** |
 
-P1 (Mixed Linux+Wasm compose validation) dropped — needs P2 (sockets) first to
-be meaningful.
+**P2/P3 socket note:** P2 threads socket flags through the subprocess CLI path
+(`build_wasmtime_cmd`). P3 adds a separate embedded path via `WasiCtxBuilder`.
+They coexist — P2 work is not thrown away. P3 must include socket support in
+its `WasiCtxBuilder` setup for parity.
 
 ## Next Session: Start Here
 
