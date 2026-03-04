@@ -20,7 +20,7 @@ sudo pelagos run alpine /bin/echo "hello from a container"
 
 That's it.  The image was fetched from Docker Hub, its layers were stacked into
 an overlay filesystem, and `/bin/echo` ran inside a Mount + UTS namespace with
-a fresh hostname.
+its own isolated hostname.
 
 **What's in a run?**
 
@@ -28,8 +28,9 @@ a fresh hostname.
 sudo pelagos run alpine /bin/sh -c "hostname && whoami && cat /etc/os-release"
 ```
 
-You get a fresh hostname, root (uid 0 inside the container), and a real Alpine
-environment — all without Docker.
+You get the container's own hostname (e.g. `pelagos-5`), root (uid 0 inside
+the container), and a real Alpine environment — all without Docker.  Pass
+`--hostname mybox` to choose a name explicitly.
 
 **Inspect what's running:**
 

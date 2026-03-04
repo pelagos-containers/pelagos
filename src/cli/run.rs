@@ -204,6 +204,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &port_forwards,
                 network_mode,
                 &additional_networks,
+                &name,
             )?;
             (rootfs_name.clone(), exe_and_args, cmd, None)
         } else {
@@ -219,6 +220,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &port_forwards,
                 network_mode,
                 &additional_networks,
+                &name,
             )?
         };
 
@@ -242,6 +244,7 @@ fn build_image_run(
     port_forwards: &[(u16, u16, pelagos::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
+    container_name: &str,
 ) -> Result<ImageRunResult, Box<dyn std::error::Error>> {
     use pelagos::image;
 
@@ -357,7 +360,7 @@ fn build_image_run(
     }
 
     // Apply shared CLI options (network, volumes, security, etc.)
-    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks)?;
+    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks, container_name)?;
 
     let health_config = manifest.config.healthcheck.clone();
     Ok((full_ref, exe_and_args, cmd, health_config))
@@ -385,6 +388,7 @@ fn build_command(
     port_forwards: &[(u16, u16, pelagos::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
+    container_name: &str,
 ) -> Result<Command, Box<dyn std::error::Error>> {
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
@@ -396,7 +400,7 @@ fn build_command(
         .with_proc_mount()
         .with_dev_mount();
 
-    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks)?;
+    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks, container_name)?;
     Ok(cmd)
 }
 
@@ -408,6 +412,7 @@ fn apply_cli_options(
     port_forwards: &[(u16, u16, pelagos::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
+    container_name: &str,
 ) -> Result<Command, Box<dyn std::error::Error>> {
     // Network
     if network_mode != NetworkMode::None {
@@ -522,10 +527,10 @@ fn apply_cli_options(
         cmd = cmd.with_cwd(w);
     }
 
-    // Hostname
-    if let Some(ref h) = args.hostname {
-        cmd = cmd.with_hostname(h);
-    }
+    // Hostname: explicit --hostname wins; otherwise default to the container name
+    // so the UTS namespace always shows something meaningful rather than the host's hostname.
+    let hostname = args.hostname.as_deref().unwrap_or(container_name);
+    cmd = cmd.with_hostname(hostname);
 
     // Cgroups
     if let Some(ref m) = args.memory {
