@@ -2384,3 +2384,82 @@ Failure modes:
 - If the runtime ignores `--console-socket`, no connection arrives → poll timeout.
 - If no fd is sent via `SCM_RIGHTS`, `received_fd == -1`.
 - If the wrong fd is sent (not a PTY), `isatty` returns 0.
+
+---
+
+## Wasm tests (`wasm_tests`)
+
+### `wasm_tests::test_wasm_binary_detection_magic`
+**Type:** API-only (no root, no rootfs, no runtime)
+
+Writes a file whose first 4 bytes are the WebAssembly magic (`\0asm`) and
+asserts `is_wasm_binary()` returns `true`.
+
+Failure indicates the magic constant or byte-read offset is wrong.
+
+### `wasm_tests::test_wasm_binary_detection_rejects_elf`
+**Type:** API-only
+
+Writes a file starting with ELF magic (`\x7fELF`) and asserts
+`is_wasm_binary()` returns `false`.
+
+Failure indicates a false positive that would misroute native binaries to the
+Wasm runtime.
+
+### `wasm_tests::test_extract_wasm_layer_stores_module`
+**Type:** Requires root or pelagos-group write access to layer store
+
+Writes a synthetic Wasm blob to a temp file, calls `extract_wasm_layer()`, and
+asserts that `<layer_dir>/module.wasm` exists with identical content.
+
+Skips if the caller cannot write to `/var/lib/pelagos/layers/`. Failure
+indicates the Wasm layer extractor is not creating the output file or the atomic
+rename is broken.
+
+### `wasm_tests::test_is_wasm_image_detects_wasm_manifest`
+**Type:** API-only
+
+Constructs an `ImageManifest` with a Wasm OCI mediaType in `layer_types` and
+asserts `is_wasm_image()` returns `true`.
+
+Failure indicates the mediaType check in `ImageManifest` is not reading
+`layer_types` correctly.
+
+### `wasm_tests::test_is_wasm_image_false_for_linux_image`
+**Type:** API-only
+
+Constructs an `ImageManifest` with a standard tar+gzip mediaType and asserts
+`is_wasm_image()` returns `false`.
+
+Failure indicates a false positive that would misroute Linux containers to the
+Wasm runtime.
+
+### `wasm_tests::test_is_wasm_image_backwards_compat_empty_layer_types`
+**Type:** API-only
+
+Constructs an `ImageManifest` with an empty `layer_types` vec (simulating an
+image recorded before Wasm support was added) and asserts `is_wasm_image()`
+returns `false` without panicking.
+
+Failure indicates backward-compatibility with old manifest.json files is broken.
+
+### `wasm_tests::test_old_manifest_json_deserialises_without_layer_types`
+**Type:** API-only
+
+Deserialises a JSON manifest that lacks the `layer_types` field (as written by
+older pelagos versions) and asserts it deserialises successfully with
+`layer_types` defaulting to an empty vec.
+
+Failure indicates `#[serde(default)]` is missing on `layer_types`, which would
+crash on startup when loading cached images.
+
+### `wasm_tests::test_wasm_spawn_via_command_builder`
+**Type:** Skipped if no Wasm runtime installed
+
+Writes a minimal valid Wasm module (magic + version header only, no sections) to
+a temp file, spawns it via `Command::new(path).with_wasm_runtime(Auto).spawn()`,
+and waits for it to exit.
+
+Verifies that the Wasm fast-path in `spawn()` runs end-to-end without panicking.
+No assertion on exit code — an empty module may trap in the runtime, which is
+acceptable.

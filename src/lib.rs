@@ -25,3 +25,4 @@ pub mod paths;
 pub mod pty;
 pub mod seccomp;
 pub mod sexpr;
+pub mod wasm;

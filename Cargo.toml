@@ -41,6 +41,7 @@ ignore = "0.4"  # Gitignore-style pattern matching for .remignore
 ureq = "2"      # Blocking HTTP client for ADD URL downloads
 bzip2 = { version = "0.5", features = ["static"] }  # bz2 decompression; static links libbz2 for musl portability
 xz2 = { version = "0.1", features = ["static"] }    # xz decompression; static links liblzma for musl portability
+containerd-shim = "0.10"  # Shim v2 protocol (ttrpc) for containerd-shim-pelagos-wasm-v1 binary
 
 [[bin]]
 name = "pelagos"
@@ -49,6 +50,10 @@ path = "src/main.rs"
 [[bin]]
 name = "pelagos-dns"
 path = "src/bin/pelagos-dns.rs"
+
+[[bin]]
+name = "pelagos-shim-wasm"
+path = "src/bin/pelagos-shim-wasm.rs"
 
 [dev-dependencies]
 serial_test = "3"

@@ -75,17 +75,19 @@ pub fn cmd_image_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("No images found. Use 'pelagos image pull <name>' to pull one.");
         return Ok(());
     }
-    println!("{:<30} {:<15} DIGEST", "REFERENCE", "LAYERS");
+    println!("{:<30} {:<10} {:<6} DIGEST", "REFERENCE", "LAYERS", "TYPE");
     for img in &images {
         let short_digest = if img.digest.len() > 19 {
             &img.digest[7..19]
         } else {
             &img.digest
         };
+        let type_tag = if img.is_wasm_image() { "wasm" } else { "linux" };
         println!(
-            "{:<30} {:<15} {}",
+            "{:<30} {:<10} {:<6} {}",
             img.reference,
             img.layers.len(),
+            type_tag,
             short_digest
         );
     }
@@ -220,24 +222,34 @@ async fn pull_image(
 
     let mut cached = 0usize;
     let mut downloaded = 0usize;
+    let mut layer_digests: Vec<String> = Vec::new();
+    let mut layer_types: Vec<String> = Vec::new();
+
     for (i, layer_desc) in manifest.layers.iter().enumerate() {
         let layer_digest = &layer_desc.digest;
+        let media_type = layer_desc.media_type.as_str();
+        let is_wasm = pelagos::wasm::is_wasm_media_type(media_type);
+
         if layer_exists(layer_digest) && blob_exists(layer_digest) {
             cached += 1;
             println!(
-                "  Layer {}/{}: {} (cached)",
+                "  Layer {}/{}: {} (cached{})",
                 i + 1,
                 manifest.layers.len(),
-                &layer_digest[7..19.min(layer_digest.len())]
+                &layer_digest[7..19.min(layer_digest.len())],
+                if is_wasm { ", wasm" } else { "" }
             );
+            layer_digests.push(layer_digest.clone());
+            layer_types.push(media_type.to_string());
             continue;
         }
 
         println!(
-            "  Layer {}/{}: {} (downloading...)",
+            "  Layer {}/{}: {} (downloading{}...)",
             i + 1,
             manifest.layers.len(),
-            &layer_digest[7..19.min(layer_digest.len())]
+            &layer_digest[7..19.min(layer_digest.len())],
+            if is_wasm { ", wasm" } else { "" }
         );
 
         let mut blob_data: Vec<u8> = Vec::new();
@@ -249,22 +261,27 @@ async fn pull_image(
         // Persist the raw blob for future push operations.
         image::save_blob(layer_digest, &blob_data)?;
 
-        // Extract the layer for container use.
+        // Extract the layer for container use, branching on mediaType.
         if !layer_exists(layer_digest) {
             let mut tmp = tempfile::NamedTempFile::new()?;
             tmp.write_all(&blob_data)?;
             tmp.flush()?;
-            extract_layer(layer_digest, tmp.path())?;
+            if is_wasm {
+                image::extract_wasm_layer(layer_digest, tmp.path())?;
+            } else {
+                extract_layer(layer_digest, tmp.path())?;
+            }
         }
+        layer_digests.push(layer_digest.clone());
+        layer_types.push(media_type.to_string());
         downloaded += 1;
     }
-
-    let layer_digests: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
 
     let img_manifest = ImageManifest {
         reference: reference.to_string(),
         digest,
         layers: layer_digests,
+        layer_types,
         config,
     };
     save_image(&img_manifest)?;
@@ -615,6 +632,7 @@ pub fn cmd_image_tag(source: &str, target: &str) -> Result<(), Box<dyn std::erro
         reference: target_ref.clone(),
         digest: manifest.digest,
         layers: manifest.layers,
+        layer_types: manifest.layer_types,
         config: manifest.config,
     };
     save_image(&new_manifest)?;
@@ -912,6 +930,7 @@ pub fn cmd_image_load(
             reference: reference.clone(),
             digest: manifest_digest.to_string(),
             layers: layer_digests,
+            layer_types: Vec::new(), // loaded archives have no Wasm layer type metadata
             config,
         };
         // save_image creates image_dir; save_oci_config must come after.

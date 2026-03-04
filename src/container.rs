@@ -471,7 +471,7 @@ impl Namespace {
 ///     .spawn()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stdio {
     /// Inherit stdio from parent process
     ///
@@ -745,6 +745,13 @@ pub struct Command {
     user_notif_syscalls: Vec<i64>,
     // Handler invoked by the supervisor thread for each intercepted syscall.
     user_notif_handler: Option<std::sync::Arc<dyn crate::notif::SyscallHandler>>,
+    // Wasm/WASI runtime configuration. When set (or auto-detected by magic bytes),
+    // spawn() routes through crate::wasm::spawn_wasm() instead of the Linux fork path.
+    wasi_config: Option<crate::wasm::WasiConfig>,
+    // Cached stdio modes for forwarding to the Wasm runtime subprocess.
+    stdio_in: Stdio,
+    stdio_out: Stdio,
+    stdio_err: Stdio,
 }
 
 impl Command {
@@ -801,6 +808,10 @@ impl Command {
             landlock_rules: Vec::new(),
             user_notif_syscalls: Vec::new(),
             user_notif_handler: None,
+            wasi_config: None,
+            stdio_in: Stdio::Inherit,
+            stdio_out: Stdio::Inherit,
+            stdio_err: Stdio::Inherit,
         }
     }
 
@@ -816,6 +827,7 @@ impl Command {
 
     /// Configure stdin for the child process.
     pub fn stdin(mut self, cfg: Stdio) -> Self {
+        self.stdio_in = cfg;
         self.inner.stdin(cfg);
         self
     }
@@ -832,12 +844,14 @@ impl Command {
 
     /// Configure stdout for the child process.
     pub fn stdout(mut self, cfg: Stdio) -> Self {
+        self.stdio_out = cfg;
         self.inner.stdout(cfg);
         self
     }
 
     /// Configure stderr for the child process.
     pub fn stderr(mut self, cfg: Stdio) -> Self {
+        self.stdio_err = cfg;
         self.inner.stderr(cfg);
         self
     }
@@ -2046,11 +2060,62 @@ impl Command {
         self.with_bind_mount(vol.path.clone(), target)
     }
 
+    // -----------------------------------------------------------------------
+    // Wasm/WASI builder methods
+    // -----------------------------------------------------------------------
+
+    /// Select the Wasm runtime to use when executing a `.wasm` module.
+    ///
+    /// Calling this method forces Wasm execution mode regardless of the binary's
+    /// magic bytes. Use `WasmRuntime::Auto` to let pelagos choose (wasmtime
+    /// preferred, WasmEdge as fallback).
+    pub fn with_wasm_runtime(mut self, runtime: crate::wasm::WasmRuntime) -> Self {
+        let cfg = self.wasi_config.get_or_insert_with(Default::default);
+        cfg.runtime = runtime;
+        self
+    }
+
+    /// Set a WASI environment variable that is passed to the Wasm module.
+    ///
+    /// These supplement (not replace) the process environment set via
+    /// [`Command::env`].
+    pub fn with_wasi_env(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        let cfg = self.wasi_config.get_or_insert_with(Default::default);
+        cfg.env.push((key.into(), val.into()));
+        self
+    }
+
+    /// Preopen a host directory for WASI filesystem access.
+    ///
+    /// The directory is mapped with an identity mount (same path on host and
+    /// inside the Wasm module's WASI filesystem view).
+    pub fn with_wasi_preopened_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let cfg = self.wasi_config.get_or_insert_with(Default::default);
+        cfg.preopened_dirs.push(path.into());
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn
+    // -----------------------------------------------------------------------
+
     /// Spawn the child process with configured namespaces and settings.
     ///
     /// This combines namespace creation, chroot, and user pre_exec callbacks
     /// into a single pre_exec hook for std::process::Command.
     pub fn spawn(mut self) -> Result<Child, Error> {
+        // --- Wasm fast-path ---
+        // If a WASI config was explicitly set, or the program binary starts with
+        // the WebAssembly magic bytes, bypass the Linux fork/exec path entirely
+        // and delegate to an installed Wasm runtime (wasmtime / wasmedge).
+        let wasi_cfg = self.wasi_config.take();
+        let prog_path = std::path::PathBuf::from(self.inner.get_program());
+        let use_wasm =
+            wasi_cfg.is_some() || crate::wasm::is_wasm_binary(&prog_path).unwrap_or(false);
+        if use_wasm {
+            return self.spawn_wasm_impl(prog_path, wasi_cfg.unwrap_or_default());
+        }
+
         // Compile seccomp filter in parent process (requires allocation, can't be done in pre_exec)
         let seccomp_filter: Option<seccompiler::BpfProgram> =
             if let Some(prog) = self.seccomp_program.take() {
@@ -4042,6 +4107,53 @@ impl Command {
             fuse_overlay_child,
             fuse_overlay_merged,
             supervisor_thread,
+        })
+    }
+
+    /// Inner implementation: spawn a Wasm module through an external runtime.
+    ///
+    /// Called by `spawn()` when a WASI config is present or magic bytes are detected.
+    /// Bypasses the Linux fork/namespace path entirely; the Wasm runtime process
+    /// is wrapped in a `Child` with all Linux-specific fields set to `None`.
+    fn spawn_wasm_impl(
+        self,
+        prog_path: std::path::PathBuf,
+        wasi: crate::wasm::WasiConfig,
+    ) -> Result<Child, Error> {
+        let extra_args: Vec<std::ffi::OsString> =
+            self.inner.get_args().map(|a| a.to_owned()).collect();
+
+        let stdin = match self.stdio_in {
+            Stdio::Inherit => std::process::Stdio::inherit(),
+            Stdio::Null => std::process::Stdio::null(),
+            Stdio::Piped => std::process::Stdio::piped(),
+        };
+        let stdout = match self.stdio_out {
+            Stdio::Inherit => std::process::Stdio::inherit(),
+            Stdio::Null => std::process::Stdio::null(),
+            Stdio::Piped => std::process::Stdio::piped(),
+        };
+        let stderr = match self.stdio_err {
+            Stdio::Inherit => std::process::Stdio::inherit(),
+            Stdio::Null => std::process::Stdio::null(),
+            Stdio::Piped => std::process::Stdio::piped(),
+        };
+
+        let inner = crate::wasm::spawn_wasm(&prog_path, &extra_args, &wasi, stdin, stdout, stderr)
+            .map_err(Error::Io)?;
+
+        Ok(Child {
+            inner,
+            cgroup: None,
+            network: None,
+            secondary_networks: Vec::new(),
+            pasta: None,
+            overlay_merged_dir: None,
+            dns_temp_dir: None,
+            hosts_temp_dir: None,
+            fuse_overlay_child: None,
+            fuse_overlay_merged: None,
+            supervisor_thread: None,
         })
     }
 

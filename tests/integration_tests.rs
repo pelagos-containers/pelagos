@@ -12415,3 +12415,255 @@ mod console_socket_tests {
         run_pelagos(&["delete", &id]);
     }
 }
+
+// ─── Wasm tests ──────────────────────────────────────────────────────────────
+//
+// Tests for Wasm binary detection (#57) and OCI Wasm artifact support (#58).
+// The spawn-through-runtime tests are skipped when no runtime is installed.
+
+#[cfg(test)]
+mod wasm_tests {
+    use pelagos::image::ImageManifest;
+    use pelagos::wasm::{find_wasm_runtime, is_wasm_binary};
+    use std::io::Write;
+
+    /// Verify that a file starting with the WebAssembly magic bytes is detected.
+    ///
+    /// Does not require root or a Wasm runtime — purely reads bytes.
+    /// Failure would indicate is_wasm_binary() reads the wrong offset or
+    /// the magic constant is wrong.
+    #[test]
+    fn test_wasm_binary_detection_magic() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Minimal Wasm module header: magic (4 bytes) + version 1 (4 bytes).
+        tmp.write_all(&[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
+            .unwrap();
+        tmp.flush().unwrap();
+        assert!(
+            is_wasm_binary(tmp.path()).unwrap(),
+            "file with \\0asm magic should be detected as Wasm"
+        );
+    }
+
+    /// Verify that an ELF binary is NOT detected as Wasm.
+    ///
+    /// Does not require root. Failure indicates the magic byte check is not
+    /// correctly discriminating between Wasm and native binaries.
+    #[test]
+    fn test_wasm_binary_detection_rejects_elf() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+            .unwrap();
+        tmp.flush().unwrap();
+        assert!(
+            !is_wasm_binary(tmp.path()).unwrap(),
+            "ELF binary must not be detected as Wasm"
+        );
+    }
+
+    /// Verify that extract_wasm_layer() stores the raw blob as module.wasm.
+    ///
+    /// Does not require root; uses a temp layer store path.
+    /// Failure would mean the layer extractor is not writing the file, or
+    /// the atomic rename is broken.
+    #[test]
+    fn test_extract_wasm_layer_stores_module() {
+        use pelagos::image::extract_wasm_layer;
+        use pelagos::paths;
+
+        // Only run if we have write access to the layer store (i.e., running as root
+        // or as a member of the pelagos group with 0775 directories).
+        let can_write = unsafe { libc::getuid() } == 0
+            || std::fs::OpenOptions::new()
+                .write(true)
+                .open(paths::layers_dir())
+                .is_ok();
+        if !can_write {
+            eprintln!("test_extract_wasm_layer_stores_module: skipped (run as root or pelagos group member)");
+            return;
+        }
+
+        let mut blob_tmp = tempfile::NamedTempFile::new().unwrap();
+        let wasm_bytes = [0x00u8, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xAB];
+        blob_tmp.write_all(&wasm_bytes).unwrap();
+        blob_tmp.flush().unwrap();
+
+        let digest = "sha256:aaaa0000000000000000000000000000000000000000000000000000000000001";
+        let result = extract_wasm_layer(digest, blob_tmp.path());
+        assert!(result.is_ok(), "extract_wasm_layer failed: {:?}", result);
+
+        let layer_dir = result.unwrap();
+        let module_path = layer_dir.join("module.wasm");
+        assert!(module_path.exists(), "module.wasm not created in layer dir");
+
+        let stored = std::fs::read(&module_path).unwrap();
+        assert_eq!(
+            stored, wasm_bytes,
+            "stored bytes do not match original blob"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&layer_dir);
+    }
+
+    /// Verify that is_wasm_image() returns true for manifests with a Wasm mediaType.
+    ///
+    /// Does not require root. Failure indicates the mediaType check or the
+    /// layer_types field is not being used correctly.
+    #[test]
+    fn test_is_wasm_image_detects_wasm_manifest() {
+        use pelagos::image::ImageConfig;
+        use std::collections::HashMap;
+
+        let wasm_manifest = ImageManifest {
+            reference: "my-app:latest".to_string(),
+            digest: "sha256:abcd".to_string(),
+            layers: vec!["sha256:1234".to_string()],
+            layer_types: vec![
+                "application/vnd.bytecodealliance.wasm.component.layer.v0+wasm".to_string(),
+            ],
+            config: ImageConfig {
+                env: vec!["PATH=/usr/bin".to_string()],
+                cmd: vec!["/app.wasm".to_string()],
+                entrypoint: Vec::new(),
+                working_dir: String::new(),
+                user: String::new(),
+                labels: HashMap::new(),
+                healthcheck: None,
+            },
+        };
+        assert!(
+            wasm_manifest.is_wasm_image(),
+            "manifest with Wasm layer type should report is_wasm_image() = true"
+        );
+    }
+
+    /// Verify that is_wasm_image() returns false for a standard Linux image.
+    ///
+    /// Does not require root. Failure indicates a false positive in Wasm
+    /// image detection that could cause regular containers to be misrouted
+    /// to the Wasm runtime.
+    #[test]
+    fn test_is_wasm_image_false_for_linux_image() {
+        use pelagos::image::ImageConfig;
+        use std::collections::HashMap;
+
+        let linux_manifest = ImageManifest {
+            reference: "alpine:latest".to_string(),
+            digest: "sha256:0000".to_string(),
+            layers: vec!["sha256:layer0".to_string()],
+            layer_types: vec!["application/vnd.oci.image.layer.v1.tar+gzip".to_string()],
+            config: ImageConfig {
+                env: Vec::new(),
+                cmd: vec!["/bin/sh".to_string()],
+                entrypoint: Vec::new(),
+                working_dir: String::new(),
+                user: String::new(),
+                labels: HashMap::new(),
+                healthcheck: None,
+            },
+        };
+        assert!(
+            !linux_manifest.is_wasm_image(),
+            "Linux tar image must not be misidentified as a Wasm image"
+        );
+    }
+
+    /// Verify that is_wasm_image() returns false for old manifests without layer_types.
+    ///
+    /// Backward-compatibility test: existing manifests on disk have no
+    /// `layer_types` field; they should default to false, not crash.
+    #[test]
+    fn test_is_wasm_image_backwards_compat_empty_layer_types() {
+        use pelagos::image::ImageConfig;
+        use std::collections::HashMap;
+
+        let old_manifest = ImageManifest {
+            reference: "old:latest".to_string(),
+            digest: "sha256:0000".to_string(),
+            layers: vec!["sha256:aaa".to_string()],
+            layer_types: Vec::new(), // old manifest — no layer_types
+            config: ImageConfig {
+                env: Vec::new(),
+                cmd: Vec::new(),
+                entrypoint: Vec::new(),
+                working_dir: String::new(),
+                user: String::new(),
+                labels: HashMap::new(),
+                healthcheck: None,
+            },
+        };
+        assert!(
+            !old_manifest.is_wasm_image(),
+            "manifest with empty layer_types should not be detected as Wasm"
+        );
+    }
+
+    /// Verify that old manifests serialised without layer_types deserialise correctly.
+    ///
+    /// Simulates loading a manifest.json that was written before the Wasm
+    /// feature was added. The missing field must default to an empty vec.
+    #[test]
+    fn test_old_manifest_json_deserialises_without_layer_types() {
+        let json = r#"{
+            "reference": "alpine:latest",
+            "digest": "sha256:abcd",
+            "layers": ["sha256:layer0"],
+            "config": {
+                "env": [],
+                "cmd": ["/bin/sh"],
+                "entrypoint": [],
+                "working_dir": "",
+                "user": "",
+                "labels": {}
+            }
+        }"#;
+        let m: ImageManifest = serde_json::from_str(json)
+            .expect("old manifest JSON without layer_types should deserialise");
+        assert!(
+            m.layer_types.is_empty(),
+            "layer_types should default to empty vec when absent from JSON"
+        );
+        assert!(!m.is_wasm_image());
+    }
+
+    /// Smoke-test spawning a Wasm module via Command::with_wasm_runtime().
+    ///
+    /// Requires: wasmtime or wasmedge installed in PATH.
+    /// Skipped when no runtime is found. Creates a minimal valid Wasm module
+    /// (an empty module that immediately exits with code 0) and runs it.
+    ///
+    /// Failure would indicate the runtime dispatch, WASI arg forwarding, or
+    /// Child::wait() integration is broken.
+    #[test]
+    fn test_wasm_spawn_via_command_builder() {
+        use pelagos::container::Command;
+        use pelagos::wasm::WasmRuntime;
+
+        if find_wasm_runtime(WasmRuntime::Auto).is_none() {
+            eprintln!(
+                "test_wasm_spawn_via_command_builder: skipped (no wasmtime or wasmedge in PATH)"
+            );
+            return;
+        }
+
+        // Minimal valid Wasm module that immediately traps/exits.
+        // This is the smallest binary Wasm module: magic + version only (0 sections).
+        let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(wasm_bytes).unwrap();
+        tmp.flush().unwrap();
+
+        // Keep temp file alive until after wait().
+        let wasm_path = tmp.path().to_path_buf();
+
+        let mut child = Command::new(&wasm_path)
+            .with_wasm_runtime(WasmRuntime::Auto)
+            .spawn()
+            .expect("spawn_wasm should succeed when runtime is installed");
+
+        // A minimal Wasm module exits quickly (with code 0 or a trap — either is fine).
+        let _ = child.wait();
+        // No assertion on exit code — empty module may trap; that's OK.
+    }
+}

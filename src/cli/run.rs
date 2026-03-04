@@ -7,6 +7,7 @@ use super::{
 };
 use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
 use pelagos::network::NetworkMode;
+use pelagos::wasm::WasmRuntime;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -257,6 +258,51 @@ fn build_image_run(
         })?;
         (normalised, m)
     };
+
+    // --- Wasm image fast-path ---
+    // If every layer is a Wasm blob, skip overlayfs/namespaces and run via
+    // the system Wasm runtime (wasmtime / wasmedge).
+    if manifest.is_wasm_image() {
+        let wasm_path = manifest
+            .wasm_module_path()
+            .ok_or("Wasm image has no module.wasm layer — re-pull the image")?;
+        let exe_and_args: Vec<String> = if !cmd_args.is_empty() {
+            cmd_args.to_vec()
+        } else {
+            // Default WASI argv[0] is the wasm path itself.
+            vec![wasm_path.to_string_lossy().into_owned()]
+        };
+        let wasm_str = wasm_path.to_string_lossy().into_owned();
+        let extra_args = &exe_and_args[1..];
+
+        let mut cmd = Command::new(&wasm_str)
+            .args(extra_args)
+            .with_wasm_runtime(WasmRuntime::Auto);
+
+        // Pass image env vars as WASI env.
+        for env_str in &manifest.config.env {
+            if let Some((k, v)) = env_str.split_once('=') {
+                cmd = cmd.with_wasi_env(k, v);
+            }
+        }
+
+        // Extra WASI CLI env vars.
+        for env_str in &args.env {
+            if let Some((k, v)) = env_str.split_once('=') {
+                cmd = cmd.with_wasi_env(k, v);
+            }
+        }
+
+        // Bind-mount requested dirs become WASI preopened dirs.
+        for bind_str in &args.bind {
+            if let Some((host, _)) = bind_str.split_once(':') {
+                cmd = cmd.with_wasi_preopened_dir(host);
+            }
+        }
+
+        let health_config = manifest.config.healthcheck.clone();
+        return Ok((full_ref, exe_and_args, cmd, health_config));
+    }
 
     // Resolve layer directories (top-first for overlayfs).
     let layers = image::layer_dirs(&manifest);

@@ -962,6 +962,7 @@ pub fn execute_build(
     let manifest = ImageManifest {
         reference,
         digest,
+        layer_types: Vec::new(), // built images are always standard tar layers
         layers,
         config,
     };

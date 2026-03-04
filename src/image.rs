@@ -136,8 +136,36 @@ pub struct ImageManifest {
     pub digest: String,
     /// Ordered layer digests, bottom to top.
     pub layers: Vec<String>,
+    /// OCI mediaType for each layer, parallel to `layers`.
+    ///
+    /// Empty string or absent means a standard `application/vnd.oci.image.layer.v1.tar+gzip`
+    /// layer. A Wasm mediaType means the layer contains a raw `.wasm` module blob.
+    /// Old manifests without this field deserialise cleanly to an all-empty vec.
+    #[serde(default)]
+    pub layer_types: Vec<String>,
     /// Parsed image configuration.
     pub config: ImageConfig,
+}
+
+impl ImageManifest {
+    /// Returns `true` if any layer carries a Wasm module blob.
+    pub fn is_wasm_image(&self) -> bool {
+        self.layer_types
+            .iter()
+            .any(|t| crate::wasm::is_wasm_media_type(t))
+    }
+
+    /// Returns the path to the Wasm module file stored in the last Wasm layer,
+    /// or `None` if this is not a Wasm image.
+    pub fn wasm_module_path(&self) -> Option<std::path::PathBuf> {
+        // Find the topmost Wasm layer (last in bottom-to-top order).
+        self.layers
+            .iter()
+            .zip(self.layer_types.iter())
+            .rev()
+            .find(|(_, t)| crate::wasm::is_wasm_media_type(t))
+            .map(|(digest, _)| layer_dir(digest).join("module.wasm"))
+    }
 }
 
 /// Convert an image reference like `"alpine:latest"` to a safe directory name (`"alpine_latest"`).
@@ -281,6 +309,34 @@ pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
     }
 
     // Ensure parent dir exists and rename partial → final.
+    std::fs::create_dir_all(dest.parent().unwrap())?;
+    std::fs::rename(&partial, &dest)?;
+
+    Ok(dest)
+}
+
+/// Extract a raw Wasm module blob into the content-addressable layer store.
+///
+/// Unlike `extract_layer()`, the blob is not a tarball — it is a raw `.wasm`
+/// file. The file is stored as `<layer_dir>/module.wasm` using the same atomic
+/// partial-then-rename pattern as the tar extractor.
+///
+/// Returns the path to the extracted layer directory.
+pub fn extract_wasm_layer(digest: &str, wasm_blob_path: &std::path::Path) -> io::Result<PathBuf> {
+    ensure_image_dirs()?;
+    let dest = layer_dir(digest);
+    if dest.is_dir() {
+        return Ok(dest);
+    }
+
+    let partial = dest.with_extension("partial");
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial)?;
+    }
+    std::fs::create_dir_all(&partial)?;
+
+    std::fs::copy(wasm_blob_path, partial.join("module.wasm"))?;
+
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&partial, &dest)?;
 
@@ -492,6 +548,7 @@ mod tests {
             reference: "test:latest".to_string(),
             digest: "sha256:000".to_string(),
             layers: vec!["sha256:aaa".to_string(), "sha256:bbb".to_string()],
+            layer_types: vec![String::new(), String::new()],
             config: ImageConfig {
                 env: vec!["PATH=/usr/bin".to_string()],
                 cmd: vec!["/bin/sh".to_string()],
@@ -515,6 +572,7 @@ mod tests {
             reference: "test:latest".to_string(),
             digest: "sha256:000".to_string(),
             layers: vec!["sha256:bottom".to_string(), "sha256:top".to_string()],
+            layer_types: Vec::new(),
             config: ImageConfig {
                 env: Vec::new(),
                 cmd: Vec::new(),
