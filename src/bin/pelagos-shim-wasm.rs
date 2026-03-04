@@ -123,11 +123,13 @@ impl shim::Task for WasmShim {
 
         let (wasm_path, extra_args, wasi_env) = parse_oci_config(&config_json)?;
 
+        // Map the OCI bundle rootfs to "/" inside the Wasm module so that
+        // standard Unix paths (e.g. /etc, /tmp) are accessible correctly.
         let rootfs = s.bundle.join("rootfs");
         let wasi = pelagos::wasm::WasiConfig {
             runtime: pelagos::wasm::WasmRuntime::Auto,
             env: wasi_env,
-            preopened_dirs: vec![(rootfs.clone(), rootfs)],
+            preopened_dirs: vec![(rootfs, std::path::PathBuf::from("/"))],
         };
 
         let child = pelagos::wasm::spawn_wasm(
