@@ -166,7 +166,7 @@ fn native_rootless_overlay_supported() -> bool {
             let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
             let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
             let opts = format!(
-                "lowerdir={},upperdir={},workdir={},userxattr",
+                "lowerdir={},upperdir={},workdir={},userxattr,metacopy=off",
                 lower.display(),
                 upper.display(),
                 work.display()
@@ -2948,7 +2948,7 @@ impl Command {
                             Some(merged)
                         } else {
                             let mut opts_str = format!(
-                                "lowerdir={},upperdir={},workdir={}",
+                                "lowerdir={},upperdir={},workdir={},metacopy=off",
                                 lower.to_string_lossy(),
                                 upper.to_string_lossy(),
                                 work.to_string_lossy()
@@ -4971,7 +4971,7 @@ impl Command {
                             Some(merged)
                         } else {
                             let mut opts_str = format!(
-                                "lowerdir={},upperdir={},workdir={}",
+                                "lowerdir={},upperdir={},workdir={},metacopy=off",
                                 lower.to_string_lossy(),
                                 upper.to_string_lossy(),
                                 work.to_string_lossy()
