@@ -2568,3 +2568,32 @@ mean every `proc_exit` call is treated as an execution error).
 
 This test confirms the in-process path works without `wasmtime` or `wasmedge`
 in PATH, and that the exit code propagation round-trip is correct.
+
+### `wasm_embedded_tests::test_wasm_component_detection_from_bytes`
+**Type:** Unit, requires `--features embedded-wasm`
+**Root:** no  **Rootfs:** no
+
+Writes synthetic 8-byte Wasm headers to two temp files — one with the plain
+module version tag (`01 00 00 00`) and one with the component version tag
+(`0d 00 01 00`) — and asserts `is_wasm_component_binary` returns `false` and
+`true` respectively.
+
+Failure indicates the component-vs-module byte detection is broken: either the
+version-byte comparison is inverted, or the function is erroring rather than
+returning `Ok(bool)` for valid inputs.  This is the gating check that routes
+execution to the P1 (module) or P2 (component) embedded path.
+
+### `wasm_embedded_tests::test_wasm_embedded_component_exit_code`
+**Type:** Unit, requires `--features embedded-wasm`, `wasm32-wasip2` Rust target
+**Root:** no  **Rootfs:** no
+
+Compiles a trivial Rust `fn main() { println!("component ok"); }` to a
+`wasm32-wasip2` Wasm Component using `rustc` at test time, then loads and
+executes it in-process via `run_embedded_component`.  Asserts the exit code is
+0.  Skips gracefully if `rustc` is not found or `wasm32-wasip2` is not
+installed.
+
+Failure indicates the P2 / Component Model execution path is broken: the
+`wasmtime_wasi::p2` linker setup, `Command::instantiate`, or `call_run` is not
+functioning correctly.  This test verifies the full component execution round-trip
+(component detection → P2 linker → WASI Command world → exit code 0).

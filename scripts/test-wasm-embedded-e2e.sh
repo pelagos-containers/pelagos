@@ -223,6 +223,108 @@ BIND_OUT=$("$BINARY" run \
     "$TEST_IMAGE_REF" 2>&1)
 check_contains "$BIND_OUT" "file:embed test" "run: --bind dir visible as /data inside Wasm"
 
+# ── Component Model (P3b) ────────────────────────────────────────────────────
+#
+# Compile hello.rs to a wasm32-wasip2 component (Rust 1.82+) and run it via
+# the embedded P2 / Component Model path.  Skipped if wasm32-wasip2 is not
+# available in the current toolchain.
+
+echo ""
+echo "--- Component Model (P3b) ---"
+
+COMP_IMAGE_REF="pelagos-embedded-component-e2e:latest"
+
+cleanup_all_extended() {
+    "$BINARY" image rm "$COMP_IMAGE_REF" 2>/dev/null || true
+    cleanup_all
+}
+trap 'cleanup_all_extended' EXIT
+
+COMP_WASM_BIN="${WORK_DIR}/hello-component.wasm"
+COMP_SKIP=0
+
+# Check for wasm32-wasip2 target availability.
+if ! rustc --print target-list 2>/dev/null | grep -q "wasm32-wasip2"; then
+    if has_cmd rustup; then
+        echo "  Installing wasm32-wasip2 target via rustup..."
+        rustup target add wasm32-wasip2 2>/dev/null || true
+    fi
+fi
+
+if ! rustc --print target-list 2>/dev/null | grep -q "wasm32-wasip2"; then
+    skip "wasm32-wasip2 target not available — skipping component tests"
+    COMP_SKIP=1
+fi
+
+if [ "$COMP_SKIP" -eq 0 ]; then
+    echo "  Compiling hello.rs → wasm32-wasip2 (Component Model)..."
+    if ! rustc --target wasm32-wasip2 --edition 2021 \
+            -o "$COMP_WASM_BIN" "$WASM_SRC" 2>"${WORK_DIR}/rustc-comp.err"; then
+        echo "  SKIP: failed to compile wasm32-wasip2 component:"
+        cat "${WORK_DIR}/rustc-comp.err"
+        skip "wasm32-wasip2 compilation failed"
+        COMP_SKIP=1
+    else
+        echo "  hello-component.wasm: $(wc -c < "$COMP_WASM_BIN") bytes"
+    fi
+fi
+
+if [ "$COMP_SKIP" -eq 0 ]; then
+    # Build a Wasm image from the component (FROM scratch + COPY).
+    COMP_CTX="${WORK_DIR}/comp-context"
+    mkdir -p "$COMP_CTX"
+    cp "$COMP_WASM_BIN" "${COMP_CTX}/hello.wasm"
+    cat > "${COMP_CTX}/Remfile" <<'REMEOF'
+FROM scratch
+COPY hello.wasm /hello.wasm
+REMEOF
+
+    COMP_BUILD_OUT=$("$BINARY" build -t "$COMP_IMAGE_REF" "$COMP_CTX" 2>&1)
+    COMP_BUILD_RC=$?
+    if [ "$COMP_BUILD_RC" -ne 0 ]; then
+        fail "pelagos build (component) exited with code $COMP_BUILD_RC"
+        echo "    build output: $COMP_BUILD_OUT"
+    else
+        pass "pelagos build (component) succeeded"
+
+        # Verify the image shows the component media type.
+        COMP_LS_OUT=$("$BINARY" image ls 2>&1)
+        check_contains "$COMP_LS_OUT" "pelagos-embedded-component-e2e" \
+            "image ls lists the component image"
+
+        echo ""
+        echo "--- 4. pelagos run — Component Model basic output ---"
+
+        COMP_RUN_OUT=$("$BINARY" run "$COMP_IMAGE_REF" 2>&1)
+        check_contains "$COMP_RUN_OUT" "hello embedded wasm" \
+            "component run: prints 'hello embedded wasm'"
+        check_not_contains "$COMP_RUN_OUT" "no Wasm runtime found" \
+            "component run: no 'runtime not found' error"
+
+        echo ""
+        echo "--- 5. pelagos run — Component Model env passthrough (--env) ---"
+
+        COMP_ENV_OUT=$("$BINARY" run \
+            --env EMBED_VAR=compval \
+            "$COMP_IMAGE_REF" 2>&1)
+        check_contains "$COMP_ENV_OUT" "env:EMBED_VAR=compval" \
+            "component run: --env value reaches the component"
+
+        echo ""
+        echo "--- 6. pelagos run — Component Model preopened directory (--bind) ---"
+
+        COMP_BIND_DIR="${WORK_DIR}/compbinddata"
+        mkdir -p "$COMP_BIND_DIR"
+        echo "component bind test" > "${COMP_BIND_DIR}/test.txt"
+
+        COMP_BIND_OUT=$("$BINARY" run \
+            --bind "${COMP_BIND_DIR}:/data" \
+            "$COMP_IMAGE_REF" 2>&1)
+        check_contains "$COMP_BIND_OUT" "file:component bind test" \
+            "component run: --bind dir visible as /data inside component"
+    fi
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 export PATH="$ORIG_PATH"

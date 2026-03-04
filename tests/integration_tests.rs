@@ -12845,8 +12845,11 @@ mod wasm_build_tests {
 /// Tests for the embedded-wasm feature (in-process wasmtime execution).
 #[cfg(all(test, feature = "embedded-wasm"))]
 mod wasm_embedded_tests {
-    use pelagos::wasm::{run_embedded_module, WasiConfig};
-    use wasmtime::{Engine, Module};
+    use pelagos::wasm::{
+        is_wasm_component_binary, run_embedded_component, run_embedded_module, WasiConfig,
+    };
+    use wasmtime::component::Component;
+    use wasmtime::{Config, Engine, Module};
 
     /// test_wasm_embedded_exit_code
     ///
@@ -12871,5 +12874,99 @@ mod wasm_embedded_tests {
         let module = Module::new(&engine, wat.as_bytes()).unwrap();
         let code = run_embedded_module(&engine, &module, &[], &WasiConfig::default()).unwrap();
         assert_eq!(code, 7, "embedded wasm should return exit code 7");
+    }
+
+    /// test_wasm_component_detection_from_bytes
+    ///
+    /// Requires: --features embedded-wasm
+    /// Root: no   Rootfs: no
+    ///
+    /// Writes synthetic 8-byte headers to temp files and checks that
+    /// `is_wasm_component_binary` correctly distinguishes a component (bytes 4-7 ≠
+    /// `01 00 00 00`) from a plain module.  Fails if the version-tag comparison is
+    /// inverted or the function returns an error for valid inputs.
+    #[test]
+    fn test_wasm_component_detection_from_bytes() {
+        use std::io::Write as _;
+        // Plain module header: 0x01 00 00 00
+        let mut module_tmp = tempfile::NamedTempFile::new().unwrap();
+        module_tmp
+            .write_all(&[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
+            .unwrap();
+        module_tmp.flush().unwrap();
+        assert!(
+            !is_wasm_component_binary(module_tmp.path()).unwrap(),
+            "plain module must NOT be detected as component"
+        );
+
+        // Component header: 0x0d 00 01 00
+        let mut comp_tmp = tempfile::NamedTempFile::new().unwrap();
+        comp_tmp
+            .write_all(&[0x00, 0x61, 0x73, 0x6D, 0x0d, 0x00, 0x01, 0x00])
+            .unwrap();
+        comp_tmp.flush().unwrap();
+        assert!(
+            is_wasm_component_binary(comp_tmp.path()).unwrap(),
+            "component header must be detected as component"
+        );
+    }
+
+    /// test_wasm_embedded_component_exit_code
+    ///
+    /// Requires: --features embedded-wasm, wasm32-wasip2 Rust target
+    /// Root: no   Rootfs: no
+    ///
+    /// Compiles a minimal Rust Wasm component (wasm32-wasip2) at test time and
+    /// runs it in-process through `run_embedded_component`.  Asserts that stdout
+    /// output is produced and the exit code is 0.  Skips gracefully if the
+    /// wasm32-wasip2 target or rustc is unavailable.
+    /// Fails if component instantiation panics, the P2 linker setup is broken, or
+    /// `call_run` returns a non-zero exit code for a well-behaved module.
+    #[test]
+    fn test_wasm_embedded_component_exit_code() {
+        // Compile a trivial Rust source to wasm32-wasip2 component.
+        let src = r#"fn main() { println!("component ok"); }"#;
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let src_path = tmp_dir.path().join("hello.rs");
+        let wasm_path = tmp_dir.path().join("hello.wasm");
+        std::fs::write(&src_path, src).unwrap();
+
+        let compile = std::process::Command::new("rustc")
+            .args(["--target", "wasm32-wasip2", "--edition", "2021"])
+            .arg("-o")
+            .arg(&wasm_path)
+            .arg(&src_path)
+            .output();
+
+        let output = match compile {
+            Ok(o) => o,
+            Err(_) => {
+                eprintln!("SKIP test_wasm_embedded_component_exit_code: rustc not found");
+                return;
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("can't find crate")
+                || stderr.contains("error[E0463]")
+                || stderr.contains("target may not be installed")
+                || stderr.contains("unknown target triple")
+            {
+                eprintln!(
+                    "SKIP test_wasm_embedded_component_exit_code: wasm32-wasip2 target not available"
+                );
+                return;
+            }
+            panic!("rustc failed: {}", stderr);
+        }
+
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::from_file(&engine, &wasm_path).unwrap();
+        let code =
+            run_embedded_component(&engine, &component, &[], &WasiConfig::default()).unwrap();
+        assert_eq!(code, 0, "component should exit with code 0");
     }
 }

@@ -45,8 +45,8 @@ ureq = "2"      # Blocking HTTP client for ADD URL downloads
 bzip2 = { version = "0.5", features = ["static"] }  # bz2 decompression; static links libbz2 for musl portability
 xz2 = { version = "0.1", features = ["static"] }    # xz decompression; static links liblzma for musl portability
 containerd-shim = "0.10"  # Shim v2 protocol (ttrpc) for containerd-shim-pelagos-wasm-v1 binary
-wasmtime      = { version = "42", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
-wasmtime-wasi = { version = "42", optional = true, default-features = false, features = ["p1"] }
+wasmtime      = { version = "42", optional = true, default-features = false, features = ["cranelift", "runtime", "wat", "component-model"] }
+wasmtime-wasi = { version = "42", optional = true, default-features = false, features = ["p1", "p2"] }
 
 [[bin]]
 name = "pelagos"

@@ -69,6 +69,10 @@ pub struct WasiConfig {
     pub preopened_dirs: Vec<(PathBuf, PathBuf)>,
 }
 
+/// Wasm module version tag (bytes 4-7): `01 00 00 00`.
+/// Components share the `\0asm` magic but carry a different version tag.
+const WASM_MODULE_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+
 /// Returns `true` if the file at `path` begins with WebAssembly magic bytes.
 ///
 /// Returns `false` (not an error) when the file is missing, too short, or
@@ -83,6 +87,34 @@ pub fn is_wasm_binary(path: &Path) -> io::Result<bool> {
     let mut magic = [0u8; 4];
     match f.read_exact(&mut magic) {
         Ok(()) => Ok(magic == WASM_MAGIC),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Returns `true` if the file at `path` is a WebAssembly Component (not a plain module).
+///
+/// Both plain modules and components share the `\0asm` magic prefix.  They are
+/// distinguished by bytes 4-7: modules have `[0x01, 0x00, 0x00, 0x00]` (version 1),
+/// components have a different layer-type version tag (e.g. `[0x0d, 0x00, 0x01, 0x00]`).
+///
+/// Returns `false` (not an error) when the file is missing, too short, cannot be
+/// read, or does not start with the Wasm magic prefix.
+pub fn is_wasm_component_binary(path: &Path) -> io::Result<bool> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut header = [0u8; 8];
+    match f.read_exact(&mut header) {
+        Ok(()) => {
+            if header[..4] != WASM_MAGIC {
+                return Ok(false);
+            }
+            Ok(header[4..8] != WASM_MODULE_VERSION)
+        }
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),
     }
@@ -233,10 +265,34 @@ fn run_embedded_inner(
     extra_args: &[std::ffi::OsString],
     wasi: &WasiConfig,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    use wasmtime::{Engine, Module};
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, program)?;
-    run_embedded_module(&engine, &module, extra_args, wasi)
+    if is_wasm_component_binary(program).unwrap_or(false) {
+        log::info!(
+            "embedded wasm: '{}' is a component — using P2 path",
+            program.display()
+        );
+        run_embedded_component_file(program, extra_args, wasi)
+    } else {
+        use wasmtime::{Engine, Module};
+        let engine = Engine::default();
+        let module = Module::from_file(&engine, program)?;
+        run_embedded_module(&engine, &module, extra_args, wasi)
+    }
+}
+
+/// Load and run a Wasm Component file via embedded wasmtime (P2 / Component Model path).
+#[cfg(feature = "embedded-wasm")]
+fn run_embedded_component_file(
+    program: &Path,
+    extra_args: &[std::ffi::OsString],
+    wasi: &WasiConfig,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    use wasmtime::component::Component;
+    use wasmtime::{Config, Engine};
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::from_file(&engine, program)?;
+    run_embedded_component(&engine, &component, extra_args, wasi)
 }
 
 /// Execute a pre-compiled Wasm module synchronously via embedded wasmtime.
@@ -270,7 +326,11 @@ pub fn run_embedded_module(
         )?;
     }
 
-    let _ = extra_args; // argv forwarding deferred to P3b (component model)
+    // argv[0] = "module.wasm" (conventional placeholder), then caller-supplied args.
+    builder.arg("module.wasm");
+    for arg in extra_args {
+        builder.arg(arg.to_string_lossy());
+    }
 
     let wasi_ctx: WasiP1Ctx = builder.build_p1();
     let mut store = Store::new(engine, wasi_ctx);
@@ -285,6 +345,90 @@ pub fn run_embedded_module(
         Err(e) => {
             // proc_exit wraps I32Exit in the anyhow error chain (outer context is a
             // wasmtime backtrace frame); traverse the chain to find it.
+            if let Some(exit) = e
+                .chain()
+                .find_map(|ce| ce.downcast_ref::<wasmtime_wasi::I32Exit>())
+            {
+                Ok(exit.0)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// Execute a Wasm Component synchronously via embedded wasmtime (WASI Preview 2).
+///
+/// Uses the `wasi:cli/run` interface exported by WASI Command components.  The
+/// component must implement the `wasi:cli/run@0.2.0` world (produced by Rust's
+/// `wasm32-wasip2` target or `wasm-tools component new`).
+///
+/// Exposed as `pub` so integration tests can pass pre-loaded components without
+/// going through the filesystem.
+#[cfg(feature = "embedded-wasm")]
+pub fn run_embedded_component(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    extra_args: &[std::ffi::OsString],
+    wasi: &WasiConfig,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    use wasmtime::component::Linker;
+    use wasmtime::Store;
+    use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+    struct WasiState {
+        ctx: WasiCtx,
+        table: ResourceTable,
+    }
+
+    impl WasiView for WasiState {
+        fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+            wasmtime_wasi::WasiCtxView {
+                ctx: &mut self.ctx,
+                table: &mut self.table,
+            }
+        }
+    }
+
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdin().inherit_stdout().inherit_stderr();
+
+    // argv[0] = "module.wasm", then caller-supplied args.
+    builder.arg("module.wasm");
+    for arg in extra_args {
+        builder.arg(arg.to_string_lossy());
+    }
+
+    for (k, v) in &wasi.env {
+        builder.env(k, v);
+    }
+
+    for (host, guest) in &wasi.preopened_dirs {
+        builder.preopened_dir(
+            host,
+            guest.to_string_lossy(),
+            DirPerms::all(),
+            FilePerms::all(),
+        )?;
+    }
+
+    let state = WasiState {
+        ctx: builder.build(),
+        table: ResourceTable::new(),
+    };
+
+    let mut store = Store::new(engine, state);
+    let mut linker: Linker<WasiState> = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+
+    let command =
+        wasmtime_wasi::p2::bindings::sync::Command::instantiate(&mut store, component, &linker)?;
+
+    match command.wasi_cli_run().call_run(&mut store) {
+        Ok(Ok(())) => Ok(0),
+        Ok(Err(())) => Ok(1),
+        Err(e) => {
+            // proc_exit wraps I32Exit in the anyhow error chain; traverse the chain to find it.
             if let Some(exit) = e
                 .chain()
                 .find_map(|ce| ce.downcast_ref::<wasmtime_wasi::I32Exit>())
@@ -378,6 +522,42 @@ mod tests {
         let result = is_wasm_binary(Path::new("/tmp/__pelagos_nonexistent_abc123.wasm"));
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_is_wasm_component_binary_module_is_false() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Plain module: magic + version 01 00 00 00
+        tmp.write_all(&[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
+            .unwrap();
+        tmp.flush().unwrap();
+        assert!(!is_wasm_component_binary(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn test_is_wasm_component_binary_component_is_true() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Component: magic + component version 0d 00 01 00
+        tmp.write_all(&[0x00, 0x61, 0x73, 0x6D, 0x0d, 0x00, 0x01, 0x00])
+            .unwrap();
+        tmp.flush().unwrap();
+        assert!(is_wasm_component_binary(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn test_is_wasm_component_binary_too_short_is_false() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0x00, 0x61, 0x73, 0x6D]).unwrap(); // only 4 bytes
+        tmp.flush().unwrap();
+        assert!(!is_wasm_component_binary(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn test_is_wasm_component_binary_non_wasm_is_false() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"\x7fELF\x02\x01\x01\x00").unwrap();
+        tmp.flush().unwrap();
+        assert!(!is_wasm_component_binary(tmp.path()).unwrap());
     }
 
     #[test]

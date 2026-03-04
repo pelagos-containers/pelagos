@@ -18,17 +18,17 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #67 | epic: deeper Wasm/WASI support | epic |
 | #70 | feat(wasm): mixed Linux+Wasm compose validation (P1) | feat |
 | #71 | feat(wasm): WASI preview 2 socket passthrough (P2) | feat |
-| #72 | feat(wasm): Component Model via embedded wasmtime (P3) | feat |
+| #72 | feat(wasm): Component Model via embedded wasmtime (P3) | feat/CLOSED |
 | #73 | feat(wasm): persistent Wasm VM pool (P4) | feat/low-pri |
 | #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
 ## Current Baseline (2026-03-04, SHA pending)
 
-- Unit tests: **292/292 pass** (embedded-wasm feature), **290/290** (default)
-- Integration tests: **203/203 pass, 8 ignored** (`--test-threads=1`)
-- CI (GitHub Actions): **all 5 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests)
+- Unit tests: **296/296 pass** (embedded-wasm feature), **294/294** (default)
+- Integration tests: **205/205 pass, 8 ignored** (`--test-threads=1`)
+- CI (GitHub Actions): **all 6 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests, wasm-embedded-e2e-tests)
 - E2E tests: **7 Wasm subprocess e2e tests pass** (`scripts/test-wasm-e2e.sh`)
-- Embedded e2e tests: **8/8 pass** (`scripts/test-wasm-embedded-e2e.sh`, no wasmtime in PATH)
+- Embedded e2e tests: **14/14 pass** (`scripts/test-wasm-embedded-e2e.sh`, includes P3b component tests)
 
 **Note for next session:** Run integration tests with `--test-threads=1` to avoid
 network-state races between DNS tests. Always `sudo scripts/reset-test-env.sh`
@@ -89,6 +89,32 @@ No code changes required. Issue closed.
 
 ## Completed This Session (2026-03-04)
 
+### P3b — Wasm Component Model via embedded wasmtime (#72)
+
+**Feature gate:** `--features embedded-wasm` (same as P3a)
+
+- `src/wasm.rs`:
+  - `WASM_MODULE_VERSION`: const `[0x01, 0x00, 0x00, 0x00]` to distinguish modules from components
+  - `is_wasm_component_binary(path)`: reads bytes 4-7; returns `true` if magic matches but version ≠ module version
+  - `run_embedded_inner`: now detects component vs plain module, routes to P2 or P1 path
+  - `run_embedded_component_file`: private helper — loads component from disk with `component-model` engine, calls `run_embedded_component`
+  - `run_embedded_component(engine, component, extra_args, wasi)`: `pub` entry point — implements `WasiView` via `WasiState { ctx: WasiCtx, table: ResourceTable }`, builds P2 context, calls `wasmtime_wasi::p2::add_to_linker_sync` + `Command::instantiate` + `call_run`, handles `I32Exit` in error chain
+  - Fixed P3a argv TODO: `run_embedded_module` now calls `builder.arg("module.wasm")` + `builder.arg(arg)` for each extra arg
+  - 4 new unit tests: `test_is_wasm_component_binary_{module_is_false,component_is_true,too_short_is_false,non_wasm_is_false}`
+- `Cargo.toml`:
+  - wasmtime: added `"component-model"` to features
+  - wasmtime-wasi: added `"p2"` to features
+- `src/build.rs`:
+  - `detect_wasm_layers`: after renaming to `module.wasm`, checks `is_wasm_component_binary`; emits `"application/vnd.bytecodealliance.wasm.component.layer.v0+wasm"` for components, `"application/wasm"` for plain modules
+- `tests/integration_tests.rs`:
+  - `test_wasm_component_detection_from_bytes`: asserts module/component byte detection
+  - `test_wasm_embedded_component_exit_code`: compiles hello.rs → wasm32-wasip2 at test time, runs component in-process, asserts exit code 0; skips if wasm32-wasip2 unavailable
+- `scripts/test-wasm-embedded-e2e.sh`:
+  - Component section: checks/installs `wasm32-wasip2`, compiles to component, builds image, runs 3 tests (output, env, bind); 14/14 total pass
+- `.github/workflows/ci.yml`:
+  - `wasm-embedded-e2e-tests` job: added `wasm32-wasip2` to targets list
+- `docs/INTEGRATION_TESTS.md`: entries for 2 new integration tests
+
 ### P3a — Embedded wasmtime for plain Wasm modules
 
 **Feature gate:** `--features embedded-wasm`
@@ -121,7 +147,7 @@ No code changes required. Issue closed.
 |---|----|-------|----------|
 | P1 | #70 | Mixed Linux+Wasm compose validation | Medium |
 | P2 | #71 | WASI preview 2 socket passthrough | Medium |
-| P3 | #72 | Wasm Component Model via embedded wasmtime | Low (significant dep) |
+| P3 | #72 | Wasm Component Model via embedded wasmtime | **DONE** |
 | P4 | #73 | Persistent Wasm VM pool | Low (depends on P3) |
 | P5 | #68 | `pelagos build` Wasm target | **DONE** |
 

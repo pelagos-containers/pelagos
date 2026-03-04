@@ -883,8 +883,16 @@ fn detect_wasm_layers(layers: &[String]) -> Vec<String> {
                             return String::new();
                         }
                     }
-                    log::info!("layer {} detected as Wasm module", &digest[..16]);
-                    "application/wasm".to_string()
+                    let is_component =
+                        crate::wasm::is_wasm_component_binary(&module_path).unwrap_or(false);
+                    let media_type = if is_component {
+                        log::info!("layer {} detected as Wasm Component", &digest[..16]);
+                        "application/vnd.bytecodealliance.wasm.component.layer.v0+wasm"
+                    } else {
+                        log::info!("layer {} detected as Wasm module", &digest[..16]);
+                        "application/wasm"
+                    };
+                    media_type.to_string()
                 }
                 None => String::new(),
             }
