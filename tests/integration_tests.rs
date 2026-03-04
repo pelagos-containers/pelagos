@@ -12841,3 +12841,35 @@ mod wasm_build_tests {
         result.unwrap();
     }
 }
+
+/// Tests for the embedded-wasm feature (in-process wasmtime execution).
+#[cfg(all(test, feature = "embedded-wasm"))]
+mod wasm_embedded_tests {
+    use pelagos::wasm::{run_embedded_module, WasiConfig};
+    use wasmtime::{Engine, Module};
+
+    /// test_wasm_embedded_exit_code
+    ///
+    /// Requires: --features embedded-wasm
+    /// Root: no   Rootfs: no
+    ///
+    /// Compiles a minimal WAT module via wasmtime and runs it in-process through
+    /// `run_embedded_module`. Asserts the WASI exit code 7 is returned correctly.
+    /// Fails if embedded execution panics, returns the wrong code, or the
+    /// in-process path is broken (e.g. I32Exit not detected in error chain).
+    #[test]
+    fn test_wasm_embedded_exit_code() {
+        let engine = Engine::default();
+        // Minimal WASI module that calls proc_exit(7).
+        // WASI P1 requires a `memory` export; imports must precede definitions in WAT.
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+            (memory 1)
+            (export "memory" (memory 0))
+            (func $_start i32.const 7 call $proc_exit)
+            (export "_start" (func $_start)))"#;
+        let module = Module::new(&engine, wat.as_bytes()).unwrap();
+        let code = run_embedded_module(&engine, &module, &[], &WasiConfig::default()).unwrap();
+        assert_eq!(code, 7, "embedded wasm should return exit code 7");
+    }
+}

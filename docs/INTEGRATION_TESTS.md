@@ -2552,3 +2552,19 @@ the identity form.
 
 Constructs a `WasiConfig` with two env vars and asserts both appear as
 `--env KEY=val` in the wasmtime command args.
+
+### `wasm_embedded_tests::test_wasm_embedded_exit_code`
+**Type:** Unit, requires `--features embedded-wasm`
+**Root:** no  **Rootfs:** no
+
+Compiles a minimal WAT module (via `wasmtime::Module::new`) that calls
+`wasi_snapshot_preview1::proc_exit(7)` and runs it in-process through
+`run_embedded_module`. Asserts the function returns exit code 7.
+
+Failure indicates the embedded wasmtime execution path is broken: either
+`run_embedded_module` panics, the WASI P1 linker is not set up correctly,
+or `I32Exit` is not being detected in the anyhow error chain (which would
+mean every `proc_exit` call is treated as an execution error).
+
+This test confirms the in-process path works without `wasmtime` or `wasmedge`
+in PATH, and that the exit code propagation round-trip is correct.

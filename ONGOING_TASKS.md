@@ -22,12 +22,13 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #73 | feat(wasm): persistent Wasm VM pool (P4) | feat/low-pri |
 | #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
-## Current Baseline (2026-03-03, SHA 6e11187)
+## Current Baseline (2026-03-04, SHA pending)
 
-- Unit tests: **290/290 pass**
-- Integration tests: **202/202 pass, 8 ignored** (`--test-threads=1`, 37s)
+- Unit tests: **292/292 pass** (embedded-wasm feature), **290/290** (default)
+- Integration tests: **203/203 pass, 8 ignored** (`--test-threads=1`)
 - CI (GitHub Actions): **all 5 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests)
-- E2E tests: **7 Wasm e2e tests pass** (`scripts/test-wasm-e2e.sh`)
+- E2E tests: **7 Wasm subprocess e2e tests pass** (`scripts/test-wasm-e2e.sh`)
+- Embedded e2e tests: **8/8 pass** (`scripts/test-wasm-embedded-e2e.sh`, no wasmtime in PATH)
 
 **Note for next session:** Run integration tests with `--test-threads=1` to avoid
 network-state races between DNS tests. Always `sudo scripts/reset-test-env.sh`
@@ -85,6 +86,34 @@ Root cause was dirty local environment state from a previous crashed session
 (orphaned `pelagos-dns` processes, stale network namespaces). Post-reboot +
 `sudo scripts/reset-test-env.sh` + `--test-threads=1` → 202/202 pass in 37s.
 No code changes required. Issue closed.
+
+## Completed This Session (2026-03-04)
+
+### P3a — Embedded wasmtime for plain Wasm modules
+
+**Feature gate:** `--features embedded-wasm`
+
+- Added `[features]` to `Cargo.toml`; optional deps `wasmtime 42` + `wasmtime-wasi 42`
+- `src/wasm.rs`:
+  - `run_wasm_embedded(program, extra_args, wasi)` — public entry point, spawns a thread
+  - `run_embedded_module(engine, module, extra_args, wasi)` — inner function (pub for tests);
+    uses `wasmtime_wasi::p1::add_to_linker_sync` + `WasiCtxBuilder::build_p1()`
+  - I32Exit detection: traverses the full anyhow error chain (proc_exit wraps it in a backtrace context)
+  - 2 unit tests: `test_embedded_exit_zero`, `test_embedded_exit_nonzero`
+- `src/container.rs`:
+  - `ChildInner` enum: `Process(std::process::Child)` + `#[cfg] Embedded(Option<JoinHandle<i32>>)`
+  - `Child.inner` changed to `ChildInner`; `wait_inner()` helper handles both variants via `ExitStatusExt::from_raw`
+  - `spawn_wasm_impl()`: uses embedded path when all stdio is Inherit and feature is on
+  - Updated `pid()`, `take_stdout()`, `take_stderr()`, `wait()`, `wait_preserve_overlay()`,
+    `wait_with_output()`, `Drop` to dispatch on `ChildInner`
+- `tests/integration_tests.rs`: `wasm_embedded_tests::test_wasm_embedded_exit_code` (no root, no PATH runtime)
+- `docs/INTEGRATION_TESTS.md`: entry for the new integration test
+- **E2E test** (`scripts/test-wasm-embedded-e2e.sh`, 8/8 pass):
+  - Builds pelagos with `--features embedded-wasm`
+  - Compiles `scripts/wasm-embedded-context/hello.rs` → wasm32-wasip1
+  - Runs `pelagos build` on `scripts/wasm-embedded-context/Remfile` (FROM scratch + COPY)
+  - Strips wasmtime/wasmedge from PATH → proves in-process execution
+  - Tests: basic output, `--env` passthrough, `--bind` preopened dir
 
 ## Wasm Epic #67 — Sub-issues
 

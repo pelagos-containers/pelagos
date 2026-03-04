@@ -205,6 +205,136 @@ fn build_wasmedge_cmd(
     cmd
 }
 
+/// Run a Wasm module in-process via embedded wasmtime.
+///
+/// Only available with `--features embedded-wasm`. Runs synchronously — call
+/// from a dedicated thread when a non-blocking `Child` handle is needed.
+///
+/// Returns the WASI exit code (0 = success). Panics from the Wasm module are
+/// logged and mapped to exit code 1.
+#[cfg(feature = "embedded-wasm")]
+pub fn run_wasm_embedded(
+    program: &Path,
+    extra_args: &[std::ffi::OsString],
+    wasi: &WasiConfig,
+) -> i32 {
+    match run_embedded_inner(program, extra_args, wasi) {
+        Ok(code) => code,
+        Err(e) => {
+            log::error!("embedded wasm: {}", e);
+            1
+        }
+    }
+}
+
+#[cfg(feature = "embedded-wasm")]
+fn run_embedded_inner(
+    program: &Path,
+    extra_args: &[std::ffi::OsString],
+    wasi: &WasiConfig,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    use wasmtime::{Engine, Module};
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, program)?;
+    run_embedded_module(&engine, &module, extra_args, wasi)
+}
+
+/// Execute a pre-compiled Wasm module synchronously via embedded wasmtime.
+///
+/// Exposed as `pub` so integration tests in `tests/` can pass WAT-compiled modules
+/// without going through the filesystem.
+#[cfg(feature = "embedded-wasm")]
+pub fn run_embedded_module(
+    engine: &wasmtime::Engine,
+    module: &wasmtime::Module,
+    extra_args: &[std::ffi::OsString],
+    wasi: &WasiConfig,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    use wasmtime::{Linker, Store};
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+    use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
+
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdin().inherit_stdout().inherit_stderr();
+
+    for (k, v) in &wasi.env {
+        builder.env(k, v);
+    }
+
+    for (host, guest) in &wasi.preopened_dirs {
+        builder.preopened_dir(
+            host,
+            guest.to_string_lossy(),
+            DirPerms::all(),
+            FilePerms::all(),
+        )?;
+    }
+
+    let _ = extra_args; // argv forwarding deferred to P3b (component model)
+
+    let wasi_ctx: WasiP1Ctx = builder.build_p1();
+    let mut store = Store::new(engine, wasi_ctx);
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(engine);
+    p1::add_to_linker_sync(&mut linker, |s| s)?;
+
+    let instance = linker.instantiate(&mut store, module)?;
+    let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+
+    match start.call(&mut store, ()) {
+        Ok(()) => Ok(0),
+        Err(e) => {
+            // proc_exit wraps I32Exit in the anyhow error chain (outer context is a
+            // wasmtime backtrace frame); traverse the chain to find it.
+            if let Some(exit) = e
+                .chain()
+                .find_map(|ce| ce.downcast_ref::<wasmtime_wasi::I32Exit>())
+            {
+                Ok(exit.0)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "embedded-wasm"))]
+mod embedded_tests {
+    use super::*;
+    use wasmtime::{Engine, Module};
+
+    fn run_wat(wat: &str) -> i32 {
+        let engine = Engine::default();
+        let module = Module::new(&engine, wat.as_bytes()).unwrap();
+        run_embedded_module(&engine, &module, &[], &WasiConfig::default()).unwrap()
+    }
+
+    // WASI P1 requires modules to export a `memory` (used by many WASI syscalls).
+    // WAT requires imports before definitions, hence the import comes first.
+    const WAT_EXIT_0: &str = r#"(module
+        (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+        (memory 1)
+        (export "memory" (memory 0))
+        (func $_start i32.const 0 call $proc_exit)
+        (export "_start" (func $_start)))"#;
+
+    const WAT_EXIT_42: &str = r#"(module
+        (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+        (memory 1)
+        (export "memory" (memory 0))
+        (func $_start i32.const 42 call $proc_exit)
+        (export "_start" (func $_start)))"#;
+
+    #[test]
+    fn test_embedded_exit_zero() {
+        assert_eq!(run_wat(WAT_EXIT_0), 0);
+    }
+
+    #[test]
+    fn test_embedded_exit_nonzero() {
+        assert_eq!(run_wat(WAT_EXIT_42), 42);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
