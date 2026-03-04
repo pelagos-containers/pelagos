@@ -12667,3 +12667,177 @@ mod wasm_tests {
         // No assertion on exit code — empty module may trap; that's OK.
     }
 }
+
+// ─── Wasm build tests ────────────────────────────────────────────────────────
+
+mod wasm_build_tests {
+    use pelagos::build;
+    use pelagos::image;
+    use pelagos::network::NetworkMode;
+    use std::collections::HashMap;
+
+    /// Minimal valid Wasm module: magic bytes + version (no sections).
+    const WASM_MINIMAL: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+
+    fn requires_root() -> bool {
+        (unsafe { libc::getuid() }) != 0
+    }
+
+    fn cleanup(reference: &str, layers: &[String]) {
+        let _ = image::remove_image(reference);
+        for d in layers {
+            let _ = std::fs::remove_dir_all(image::layer_dir(d));
+        }
+    }
+
+    /// FROM scratch + COPY app.wasm → manifest has layer_types=["application/wasm"]
+    /// and module.wasm exists in the layer store.
+    #[test]
+    fn test_build_wasm_from_scratch_detects_mediatype() {
+        if requires_root() {
+            eprintln!("skipped: requires root");
+            return;
+        }
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("app.wasm"), WASM_MINIMAL).unwrap();
+
+        let instructions = build::parse_remfile("FROM scratch\nCOPY app.wasm /app.wasm\n").unwrap();
+        let tag = "pelagos-test-wasm-scratch:latest";
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build should succeed for FROM scratch + COPY .wasm");
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                manifest.is_wasm_image(),
+                "manifest should be detected as Wasm; layer_types={:?}",
+                manifest.layer_types
+            );
+            assert_eq!(manifest.layer_types, vec!["application/wasm"]);
+            let module_path = manifest
+                .wasm_module_path()
+                .expect("should have module path");
+            assert!(
+                module_path.exists(),
+                "module.wasm should exist at {}",
+                module_path.display()
+            );
+        });
+        cleanup(&manifest.reference, &manifest.layers);
+        result.unwrap();
+    }
+
+    /// Two COPY layers: plain text then .wasm → layer_types=["", "application/wasm"]
+    #[test]
+    fn test_build_wasm_second_layer_only() {
+        if requires_root() {
+            eprintln!("skipped: requires root");
+            return;
+        }
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("readme.txt"), b"hello").unwrap();
+        std::fs::write(ctx.path().join("app.wasm"), WASM_MINIMAL).unwrap();
+
+        let remfile = "FROM scratch\nCOPY readme.txt /readme.txt\nCOPY app.wasm /app.wasm\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-wasm-mixed:latest";
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build should succeed");
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(manifest.is_wasm_image());
+            assert_eq!(manifest.layer_types.len(), manifest.layers.len());
+            assert_eq!(
+                manifest.layer_types[0], "",
+                "readme.txt layer should not be Wasm"
+            );
+            assert_eq!(
+                manifest.layer_types[1], "application/wasm",
+                "app.wasm layer should be Wasm"
+            );
+        });
+        cleanup(&manifest.reference, &manifest.layers);
+        result.unwrap();
+    }
+
+    /// Plain text file should NOT be flagged as Wasm.
+    #[test]
+    fn test_build_non_wasm_layer_not_detected() {
+        if requires_root() {
+            eprintln!("skipped: requires root");
+            return;
+        }
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("hello.txt"), b"hello world").unwrap();
+
+        let instructions =
+            build::parse_remfile("FROM scratch\nCOPY hello.txt /hello.txt\n").unwrap();
+        let tag = "pelagos-test-nonwasm:latest";
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build should succeed");
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                !manifest.is_wasm_image(),
+                "plain text image must not be Wasm"
+            );
+            assert!(manifest.layer_types.iter().all(|t| t.is_empty()));
+        });
+        cleanup(&manifest.reference, &manifest.layers);
+        result.unwrap();
+    }
+
+    /// A file ending in .wasm but containing ELF bytes must NOT be detected
+    /// as Wasm (magic-byte guard against filename spoofing).
+    #[test]
+    fn test_build_elf_with_wasm_extension_not_detected() {
+        if requires_root() {
+            eprintln!("skipped: requires root");
+            return;
+        }
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("notreal.wasm"), b"\x7fELF\x02\x01\x01\x00").unwrap();
+
+        let instructions =
+            build::parse_remfile("FROM scratch\nCOPY notreal.wasm /notreal.wasm\n").unwrap();
+        let tag = "pelagos-test-fakewasm:latest";
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build should succeed");
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                !manifest.is_wasm_image(),
+                "ELF bytes with .wasm extension must not be detected as Wasm"
+            );
+        });
+        cleanup(&manifest.reference, &manifest.layers);
+        result.unwrap();
+    }
+}

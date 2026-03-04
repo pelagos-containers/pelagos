@@ -646,11 +646,15 @@ fn execute_stage(
             _ => unreachable!(),
         };
 
-        let normalised = normalise_image_reference(&base_ref);
-        let base_manifest = image::load_image(&normalised)
-            .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
-
-        (base_manifest.layers.clone(), base_manifest.config.clone())
+        // FROM scratch: empty base, no image to load.
+        if base_ref == "scratch" {
+            (Vec::new(), ImageConfig::default())
+        } else {
+            let normalised = normalise_image_reference(&base_ref);
+            let base_manifest = image::load_image(&normalised)
+                .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
+            (base_manifest.layers.clone(), base_manifest.config.clone())
+        }
     } else {
         // Stage without FROM (pre-FROM ARGs only).
         (Vec::new(), ImageConfig::default())
@@ -850,6 +854,75 @@ fn execute_copy_from_stage(
     )))
 }
 
+/// Scan build output layers for Wasm-only content.
+///
+/// Returns a parallel `Vec<String>` of OCI media types.  A layer that
+/// contains exactly one `.wasm` file (identified by magic bytes `\0asm`) gets
+/// `"application/wasm"`; all other layers get an empty string (standard
+/// tar+gzip).
+///
+/// As a side-effect, the detected `.wasm` file is renamed to `module.wasm`
+/// within the layer directory so that `ImageManifest::wasm_module_path()`
+/// can locate it regardless of the original filename (`app.wasm`, `main.wasm`,
+/// etc.).
+fn detect_wasm_layers(layers: &[String]) -> Vec<String> {
+    layers
+        .iter()
+        .map(|digest| {
+            let dir = image::layer_dir(digest);
+            match find_sole_wasm_file(&dir) {
+                Some(wasm_path) => {
+                    let module_path = dir.join("module.wasm");
+                    if wasm_path != module_path {
+                        if let Err(e) = std::fs::rename(&wasm_path, &module_path) {
+                            log::warn!(
+                                "wasm layer {}: could not rename to module.wasm: {}",
+                                &digest[..16],
+                                e
+                            );
+                            return String::new();
+                        }
+                    }
+                    log::info!("layer {} detected as Wasm module", &digest[..16]);
+                    "application/wasm".to_string()
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// Returns the path to the sole `.wasm` file if `layer_dir` contains exactly
+/// one file at any depth, that file has Wasm magic bytes, and nothing else.
+/// Returns `None` for standard (multi-file or non-Wasm) layers.
+fn find_sole_wasm_file(layer_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let files = collect_layer_files(layer_dir).ok()?;
+    if files.len() == 1 {
+        let path = &files[0];
+        if path.extension().and_then(|e| e.to_str()) == Some("wasm")
+            && crate::wasm::is_wasm_binary(path).unwrap_or(false)
+        {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+/// Recursively collect all regular files under `dir`.
+fn collect_layer_files(dir: &std::path::Path) -> io::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(collect_layer_files(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
 /// Execute a parsed Remfile and produce a tagged image.
 ///
 /// `context_dir` is the directory context for COPY instructions.
@@ -959,10 +1032,11 @@ pub fn execute_build(
         tag.to_string()
     };
 
+    let layer_types = detect_wasm_layers(&layers);
     let manifest = ImageManifest {
         reference,
         digest,
-        layer_types: Vec::new(), // built images are always standard tar layers
+        layer_types,
         layers,
         config,
     };
