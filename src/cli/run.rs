@@ -360,7 +360,14 @@ fn build_image_run(
     }
 
     // Apply shared CLI options (network, volumes, security, etc.)
-    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks, container_name)?;
+    cmd = apply_cli_options(
+        cmd,
+        args,
+        port_forwards,
+        network_mode,
+        additional_networks,
+        container_name,
+    )?;
 
     let health_config = manifest.config.healthcheck.clone();
     Ok((full_ref, exe_and_args, cmd, health_config))
@@ -400,7 +407,14 @@ fn build_command(
         .with_proc_mount()
         .with_dev_mount();
 
-    cmd = apply_cli_options(cmd, args, port_forwards, network_mode, additional_networks, container_name)?;
+    cmd = apply_cli_options(
+        cmd,
+        args,
+        port_forwards,
+        network_mode,
+        additional_networks,
+        container_name,
+    )?;
     Ok(cmd)
 }
 
