@@ -13622,19 +13622,21 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
     /// Asserts: the process exits non-zero and stderr contains "requires root".
     #[test]
     fn test_rootless_bridge_error() {
-        // Use the installed binary — the debug target/ path is inside /home/cb which nobody
-        // cannot traverse (drwx------).
-        let pelagos_bin = if std::path::Path::new("/usr/local/bin/pelagos").exists() {
-            "/usr/local/bin/pelagos"
-        } else {
-            // Fall back to the cargo binary; may fail if /home is not world-traversable.
-            env!("CARGO_BIN_EXE_pelagos")
-        };
+        // Copy binary to /tmp so nobody (uid 65534) can execute it regardless of
+        // whether the cargo target dir lives inside a non-world-traversable home dir.
+        let src = env!("CARGO_BIN_EXE_pelagos");
+        let tmp_bin = "/tmp/pelagos-rootless-test";
+        std::fs::copy(src, tmp_bin).expect("copy binary to /tmp");
+        // Make it world-executable.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp_bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
         let out = std::process::Command::new("sudo")
             .args([
                 "-u",
                 "#65534", // nobody uid
-                pelagos_bin,
+                tmp_bin,
                 "run",
                 "--network",
                 "bridge",
@@ -13644,6 +13646,9 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
             ])
             .output()
             .expect("failed to run pelagos as nobody");
+
+        let _ = std::fs::remove_file(tmp_bin);
+
         assert!(
             !out.status.success(),
             "expected non-zero exit from rootless bridge run"
