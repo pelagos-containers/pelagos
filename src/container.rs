@@ -6340,6 +6340,17 @@ impl Child {
     /// println!("CPU: {} ns", stats.cpu_usage_ns);
     /// println!("PIDs: {}", stats.pids_current);
     /// ```
+    /// Return the relative cgroup path for this container (e.g. `"pelagos-1234-0"`),
+    /// or `None` if no cgroup was configured.  The cgroup remains on the filesystem
+    /// until [`Child::wait`] is called, so this is safe to call after the container
+    /// process has exited.
+    pub fn cgroup_path(&self) -> Option<String> {
+        match self.cgroup.as_ref()? {
+            CgroupHandle::Root(cg) => Some(cg.path().to_string()),
+            CgroupHandle::Rootless(_) => None,
+        }
+    }
+
     pub fn resource_stats(&self) -> Result<crate::cgroup::ResourceStats, Error> {
         if let Some(ref cg) = self.cgroup {
             match cg {

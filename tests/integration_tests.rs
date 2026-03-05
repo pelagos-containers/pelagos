@@ -2234,15 +2234,14 @@ mod cgroups {
             .spawn()
             .expect("Failed to spawn with pids limit + PID namespace");
 
-        let waiter_pid = child.pid() as u32;
-        let grandchild_pid = wait_for_grandchild(waiter_pid)
-            .expect("grandchild PID not found — double-fork may be broken");
-
-        // Capture cgroup path while grandchild is still alive.  The process may
-        // exit quickly (ash as PID 1 exits on fork denial, killing its children),
-        // so we must grab the path before /proc/{grandchild} disappears.
-        let cg_path = cgroup_path_for_pid(grandchild_pid)
-            .expect("grandchild is not in a pelagos cgroup — cgroup assignment failed");
+        // Get the cgroup path directly from the Child handle — it is known at
+        // spawn time and does NOT require the grandchild to still be alive.
+        // The fork-bomb may cause ash (PID 1 in the namespace) to exit within
+        // milliseconds of spawning, which is why the previous approach
+        // (wait_for_grandchild → cgroup_path_for_pid) raced under suite load.
+        let cg_path = child
+            .cgroup_path()
+            .expect("no cgroup on child — cgroup was not configured");
 
         let pids_max = read_cgroup_file(&cg_path, "pids.max").expect("pids.max not found");
         assert_eq!(pids_max, "5", "pids.max mismatch: got {pids_max:?}");
