@@ -149,10 +149,15 @@ sudo pelagos run --read-only alpine /bin/sh -c "echo test > /readonly.txt" || tr
 **Resource limits — cap memory at 64 MB:**
 
 ```bash
-sudo pelagos run --memory 64m alpine /bin/sh -c \
-  'x=$(dd if=/dev/zero bs=1M count=200 2>/dev/null | tr "\0" "X"); echo done'
-# Killed by OOM — shell variable holds 200 MB, cgroup hard limit is 64 MB
+sudo pelagos run --memory 64m --tmpfs /tmp alpine /bin/sh -c \
+  'dd if=/dev/zero of=/tmp/fill bs=1M count=200; echo done'
+# Killed by OOM — tmpfs writes count against memory.max; dd never reaches 200 MB
 ```
+
+Writing to a `tmpfs` mount is the reliable trigger: tmpfs pages are anonymous
+memory and count directly against the cgroup limit.  Shell tricks like `$()` or
+pipes don't work because busybox ash buffers command substitutions to a temp
+file on disk rather than holding them in RAM.
 
 **Capabilities — drop everything, keep nothing:**
 
