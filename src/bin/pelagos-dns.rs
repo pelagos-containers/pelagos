@@ -23,6 +23,7 @@ const DNS_FLAG_AA: u16 = 0x0400; // Authoritative
 const DNS_FLAG_RD: u16 = 0x0100; // Recursion desired
 const DNS_FLAG_RA: u16 = 0x0080; // Recursion available
 const DNS_RCODE_NXDOMAIN: u16 = 3;
+const DNS_RCODE_SERVFAIL: u16 = 2;
 
 // ── DNS packet types ─────────────────────────────────────────────────────────
 
@@ -148,6 +149,24 @@ fn build_nodata(query: &DnsQuery) -> Vec<u8> {
     resp.extend_from_slice(&query.qtype.to_be_bytes());
     resp.extend_from_slice(&query.qclass.to_be_bytes());
 
+    resp
+}
+
+/// Build a SERVFAIL response. Used when all upstream servers fail to respond.
+/// Sending SERVFAIL (rcode=2) immediately lets the client fail fast rather than
+/// waiting for its own retry timeout (up to 30 s for nslookup).
+fn build_servfail(query: &DnsQuery) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(32);
+    resp.extend_from_slice(&query.id.to_be_bytes());
+    let flags: u16 = DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA | DNS_RCODE_SERVFAIL;
+    resp.extend_from_slice(&flags.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    encode_qname(&mut resp, &query.qname);
+    resp.extend_from_slice(&query.qtype.to_be_bytes());
+    resp.extend_from_slice(&query.qclass.to_be_bytes());
     resp
 }
 
@@ -549,7 +568,9 @@ fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Optio
         return Some(build_nxdomain(&query));
     }
 
-    forward_upstream(&query.raw, &upstream)
+    // Return SERVFAIL if all upstreams time out, so clients fail fast rather
+    // than waiting for their own retry timeout (up to 30 s for nslookup).
+    Some(forward_upstream(&query.raw, &upstream).unwrap_or_else(|| build_servfail(&query)))
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────

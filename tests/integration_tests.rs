@@ -9487,6 +9487,39 @@ mod dns {
     use super::*;
     use pelagos::network::{Ipv4Net, NetworkDef};
 
+    /// Wait until `port` is listening on `ip` (UDP), or return false on timeout.
+    /// Used to replace fixed sleeps before nslookup — avoids 30-second nslookup
+    /// timeouts when the daemon takes longer than the fixed sleep to bind.
+    fn wait_for_dns(ip: std::net::Ipv4Addr, port: u16, timeout_ms: u64) -> bool {
+        use std::net::{SocketAddr, UdpSocket};
+        use std::time::Duration;
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        // Send a minimal but valid DNS query for "." (root) and check for any response.
+        // Query: ID=0x1234, flags=0x0100 (RD), QDCOUNT=1, empty QNAME, TYPE=A, CLASS=IN
+        let probe = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01";
+        while std::time::Instant::now() < deadline {
+            let sock = match UdpSocket::bind("0.0.0.0:0") {
+                Ok(s) => s,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            };
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
+            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+            if sock.send_to(probe, addr).is_err() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            match sock.recv_from(&mut buf) {
+                Ok(_) => return true,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        false
+    }
+
     fn cleanup_test_network(name: &str) {
         let config_dir = pelagos::paths::network_config_dir(name);
         let _ = std::fs::remove_dir_all(&config_dir);
@@ -9579,8 +9612,12 @@ mod dns {
         )
         .expect("dns_add_entry");
 
-        // Give the daemon time to start and bind to the gateway.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait until the daemon is actually listening (up to 2s).
+        assert!(
+            wait_for_dns(net_def.gateway, 53, 2000),
+            "DNS daemon did not bind to {}:53 within 2s",
+            net_def.gateway
+        );
 
         // Spawn container B to resolve server-a.
         let resolve_cmd = format!(
@@ -9674,12 +9711,33 @@ mod dns {
         )
         .expect("dns_add_entry");
 
-        // Give daemon time to start and bind.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait until the daemon is actually listening (up to 2s).
+        assert!(
+            wait_for_dns(net_def.gateway, 53, 2000),
+            "DNS daemon did not bind to {}:53 within 2s",
+            net_def.gateway
+        );
 
-        // Resolve example.com via the gateway DNS.
+        // Sanity-check that the daemon can reach upstream DNS from the host
+        // before spinning up a container.  If upstream is unreachable the test
+        // is skipped rather than hanging for 30 s.
+        let upstream_ok = wait_for_dns("8.8.8.8".parse().unwrap(), 53, 1000);
+        if !upstream_ok {
+            eprintln!(
+                "Skipping test_dns_upstream_forward: upstream 8.8.8.8:53 not reachable from host"
+            );
+            pelagos::dns::dns_remove_entry(net_name, "dummy").ok();
+            unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+            let _ = holder.wait();
+            cleanup_dns();
+            cleanup_test_network(net_name);
+            return;
+        }
+
+        // Use `timeout` to cap nslookup at 10 s — prevents a 30 s hang if the
+        // daemon receives the query but upstream DNS is slow or unreachable.
         let resolve_cmd = format!(
-            "nslookup example.com {} 2>&1 || echo 'NSLOOKUP_FAILED'",
+            "timeout 10 nslookup example.com {} 2>&1 || echo 'NSLOOKUP_FAILED'",
             net_def.gateway
         );
         let mut client = Command::new("/bin/sh")
@@ -13555,5 +13613,46 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
 
         cleanup_image(tag);
         result.unwrap();
+    }
+
+    /// Verify that the rootless bridge guard fires when `pelagos run --network bridge` is invoked
+    /// as a non-root user.  Uses `sudo -u nobody` to execute the installed binary without root.
+    ///
+    /// Requires root (to use sudo) and `/usr/local/bin/pelagos` to be installed.
+    /// Asserts: the process exits non-zero and stderr contains "requires root".
+    #[test]
+    fn test_rootless_bridge_error() {
+        // Use the installed binary — the debug target/ path is inside /home/cb which nobody
+        // cannot traverse (drwx------).
+        let pelagos_bin = if std::path::Path::new("/usr/local/bin/pelagos").exists() {
+            "/usr/local/bin/pelagos"
+        } else {
+            // Fall back to the cargo binary; may fail if /home is not world-traversable.
+            env!("CARGO_BIN_EXE_pelagos")
+        };
+        let out = std::process::Command::new("sudo")
+            .args([
+                "-u",
+                "#65534", // nobody uid
+                pelagos_bin,
+                "run",
+                "--network",
+                "bridge",
+                "alpine",
+                "echo",
+                "hi",
+            ])
+            .output()
+            .expect("failed to run pelagos as nobody");
+        assert!(
+            !out.status.success(),
+            "expected non-zero exit from rootless bridge run"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("requires root"),
+            "expected 'requires root' in stderr, got: {}",
+            stderr
+        );
     }
 }
