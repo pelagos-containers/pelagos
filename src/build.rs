@@ -1484,9 +1484,10 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     image::save_blob(&digest, &tar_gz_bytes)?;
     image::save_blob_diffid(&digest, &diff_id)?;
 
-    // Copy directory contents to the layer store.
+    // Copy directory contents to the layer store with group-writable permissions
+    // so that pelagos-group members can remove root-created layers.
     let dest = image::layer_dir(&digest);
-    std::fs::create_dir_all(&dest)?;
+    image::create_store_dir(&dest)?;
     copy_dir_recursive(source_dir, &dest)?;
 
     log::debug!("created layer {}", &hex[..12]);

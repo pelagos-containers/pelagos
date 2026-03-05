@@ -63,6 +63,26 @@ fn ensure_image_dirs() -> io::Result<()> {
     Ok(())
 }
 
+/// Create a directory in the pelagos store with group-writable permissions.
+///
+/// `std::fs::create_dir_all` respects the process umask; when running as root
+/// (umask 0o022) this produces 0o755 dirs.  Even with the setgid bit on parent
+/// dirs, the new dir is `root:pelagos rwxr-sr-x` — the pelagos group cannot
+/// delete files inside it.  This helper explicitly chmods to 0o775 so that
+/// group members can remove images/layers that root created.
+#[cfg(unix)]
+pub fn create_store_dir(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn create_store_dir(path: &std::path::Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 // ---------------------------------------------------------------------------
 // Health check configuration
 // ---------------------------------------------------------------------------
@@ -442,7 +462,7 @@ fn set_opaque_xattr_userxattr(dir: &Path) -> io::Result<()> {
 pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
     ensure_image_dirs()?;
     let dir = image_dir(&manifest.reference);
-    std::fs::create_dir_all(&dir)?;
+    create_store_dir(&dir)?;
     let json =
         serde_json::to_string_pretty(manifest).map_err(|e| io::Error::other(e.to_string()))?;
     std::fs::write(dir.join("manifest.json"), json)

@@ -81,7 +81,7 @@ ok "/var/lib/pelagos (root:pelagos 0755)"
 # inherit the 'pelagos' group, so group members can write into them.
 # We also recursively chown any existing subdirs that were created by a
 # previous root pull before the setgid bit was in place.
-for subdir in images layers build-cache; do
+for subdir in images layers blobs build-cache; do
     mkdir -p "/var/lib/pelagos/$subdir"
     chown -R root:pelagos "/var/lib/pelagos/$subdir"
     chmod -R g+rwX "/var/lib/pelagos/$subdir"
