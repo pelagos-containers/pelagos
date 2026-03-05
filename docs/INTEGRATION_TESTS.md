@@ -341,10 +341,59 @@ would indicate the cgroup setup race has regressed.
 ### `test_cgroup_pids_limit`
 **Requires:** root, rootfs
 
-Sets `with_cgroup_pids_limit(4)` and forks 10 background `sleep 0` jobs in a shell
-loop. Some forks will be denied by `pids.max`. Verifies that the container completes
-(the shell handles fork failures gracefully) — tests that pids cgroup setup doesn't
-crash the container.
+Sets `with_cgroup_pids_limit(4)` and runs a shell loop that forks 10 background
+`sleep 2` jobs then calls the `wait` builtin. With `pids.max=4`, at most 3 background
+sleeps can start (shell = 1 slot); further forks are denied by the kernel. After 500 ms
+the test reads `pids.max` from the cgroup file to assert the limit was applied, then
+reads `pids.events` and checks that the `max` counter is greater than zero — kernel
+proof that at least one fork was denied. Failure would indicate the pids cgroup was
+never applied or the `pids.events` counter was not incremented.
+
+### `test_cgroup_pids_limit_pid_namespace`
+**Requires:** root, rootfs
+
+Same enforcement proof as `test_cgroup_pids_limit` but with `Namespace::PID` enabled,
+which triggers the double-fork code path. Uses `wait_for_grandchild()` to locate the
+real container process (grandchild, PID 1 in the namespace) via
+`/proc/{waiter}/task/{waiter}/children`.
+
+Reads `pids.max` from the grandchild's cgroup immediately to assert the limit was
+applied to the correct process, then sleeps 200 ms to allow the fork-bomb to run.
+ash (as PID 1 in the namespace) exits once a fork fails, taking its children with it;
+however the cgroup persists until `child.wait()` so `pids.events` is still readable.
+Asserts `pids.events max > 0` — kernel proof the limit was enforced on the container
+process even via the double-fork path. Failure would indicate the pre-fork cgroup
+race regression.
+
+### `test_cgroup_cpu_quota_pid_namespace`
+**Requires:** root, rootfs
+
+Sets `with_cgroup_cpu_quota(50_000, 1_000_000)` (5% CPU) with `Namespace::PID` and
+spawns `sleep 3`. Uses `wait_for_grandchild()` to find the real container process,
+reads its cgroup path from `/proc/{grandchild}/cgroup`, then reads
+`/sys/fs/cgroup/{cg}/cpu.max` from the host. Asserts the file starts with `"50000 "`,
+proving the CPU quota was applied to the actual container process (not just the
+intermediate waiter). Failure would indicate the cpu quota is either not applied or
+applied to the wrong process in the double-fork path.
+
+### `test_cgroup_cpuset_pid_namespace`
+**Requires:** root, rootfs
+
+Sets `with_cgroup_cpuset_cpus("0")` and `with_cgroup_cpuset_mems("0")` with
+`Namespace::PID` and spawns `sleep 3`. Uses `wait_for_grandchild()` to find the real
+container process, then reads `/proc/{grandchild}/status` from the HOST and checks the
+`Cpus_allowed_list` field. Asserts it equals `"0"`, proving the cpuset was applied
+to the actual container PID via the kernel scheduler. Failure would indicate the
+cpuset cgroup was not applied to the grandchild in the double-fork path.
+
+### `test_cgroup_resource_stats_pid_namespace`
+**Requires:** root, rootfs
+
+Spawns `sleep 3` with `with_cgroup_memory(32MB)` and `with_cgroup_pids_limit(16)`
+plus `Namespace::PID`. After 200 ms, calls `child.resource_stats()` and asserts
+`pids_current >= 1`. Verifies that `resource_stats()` can locate and read the cgroup
+of the grandchild process in the double-fork path. Failure would indicate the stats
+API cannot find the cgroup when a PID namespace is in use.
 
 ### `test_cgroup_cpu_shares`
 **Requires:** root, rootfs

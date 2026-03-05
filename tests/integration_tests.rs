@@ -49,6 +49,52 @@ fn get_test_rootfs() -> Option<PathBuf> {
 /// PATH on any Command that will run inside the container.
 const ALPINE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+// ---------------------------------------------------------------------------
+// Cgroup inspection helpers (used by enforcement tests)
+// ---------------------------------------------------------------------------
+
+/// Poll `/proc/{waiter}/task/{waiter}/children` until the grandchild PID
+/// appears (the kernel populates this after the fork returns in the parent).
+/// Returns the grandchild PID or `None` after ~1 s of polling.
+fn wait_for_grandchild(waiter_pid: u32) -> Option<u32> {
+    let path = format!("/proc/{}/task/{}/children", waiter_pid, waiter_pid);
+    for _ in 0..20 {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(pid) = contents
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                return Some(pid);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+/// Return the cgroup v2 relative path for `pid` by parsing `/proc/{pid}/cgroup`.
+/// On a pure v2 system the file has one line: `0::/some/path`.
+/// On a hybrid system we look for the pelagos-prefixed path on any line.
+fn cgroup_path_for_pid(pid: u32) -> Option<String> {
+    let content = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+    for line in content.lines() {
+        // cgroupv2 entry: "0::/path"
+        let path = line.splitn(3, ':').nth(2)?.trim_start_matches('/');
+        if path.starts_with("pelagos-") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Read a single cgroup setting file, e.g. `memory.max` or `cpu.max`.
+fn read_cgroup_file(cgroup_rel_path: &str, setting: &str) -> Option<String> {
+    std::fs::read_to_string(format!("/sys/fs/cgroup/{}/{}", cgroup_rel_path, setting))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 mod api {
     use super::*;
 
@@ -1738,14 +1784,21 @@ mod cgroups {
             return;
         };
 
-        // Try to allocate ~64 MB using dd. With a 32 MB cgroup limit the process
-        // should be OOM-killed (exit non-zero) or fail to allocate.
+        // Write 100 MB to tmpfs against a 32 MB memory limit (swap disabled).
+        // The OOM killer must fire and exit the container non-zero.
+        // Does NOT use Namespace::PID (single-fork path; PID-ns variant is separate).
         let mut child = Command::new("/bin/ash")
-            .args(["-c", "dd if=/dev/urandom of=/dev/null bs=1M count=64"])
+            .args([
+                "-c",
+                "dd if=/dev/zero of=/tmp/fill bs=1M count=100 2>/dev/null; echo done",
+            ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
-            .with_cgroup_memory(32 * 1024 * 1024) // 32 MB
+            .with_cgroup_memory(32 * 1024 * 1024) // 32 MB limit
+            .with_cgroup_memory_swap(0) // disable swap so limit is hard
+            .with_tmpfs("/tmp", "")
+            .with_dev_mount() // needed for /dev/zero
             .stdin(Stdio::Null)
             .stdout(Stdio::Null)
             .stderr(Stdio::Null)
@@ -1753,10 +1806,13 @@ mod cgroups {
             .expect("Failed to spawn with cgroup memory limit");
 
         let status = child.wait().expect("Failed to wait for child");
-        // dd reads stdin→stdout incrementally so it won't hit the RSS limit.
-        // The important thing is that the cgroup was created and the process ran.
-        // We just verify the container exits (success or OOM-killed).
-        let _ = status;
+        let killed = status.signal().is_some() || !status.success();
+        assert!(
+            killed,
+            "Container should be OOM-killed (signal={:?}, code={:?})",
+            status.signal(),
+            status.code()
+        );
     }
 
     #[test]
@@ -1771,13 +1827,19 @@ mod cgroups {
             return;
         };
 
-        // Limit to 4 PIDs (ash + subprocesses). Try to spawn 10 background jobs
-        // — at least some should fail. The shell exits 0 regardless, so we just
-        // verify that cgroup setup does not break container execution.
+        // pids.max=4: ash uses 1 slot; try to fork 10 background sleeps.
+        // The excess forks will be denied by the kernel.  After allowing time
+        // for the fork-bomb to run, we inspect pids.events from the HOST side:
+        // the `max` counter increments each time a fork() is denied — proving
+        // the limit is actually enforced and not just configured.
         let mut child = Command::new("/bin/ash")
             .args([
                 "-c",
-                "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0 & done; wait; echo done",
+                // Fork 10 background sleeps (2 s each) then `wait` — a shell
+                // builtin that blocks without forking, keeping ash alive for
+                // inspection.  pids.max=4 allows at most 3 background sleeps;
+                // the remaining 7 forks are denied by the kernel.
+                "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 2 & done; wait",
             ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
@@ -1789,9 +1851,31 @@ mod cgroups {
             .spawn()
             .expect("Failed to spawn with cgroup pids limit");
 
-        // Process should complete (even if some forks were denied by pids.max)
-        let status = child.wait().expect("Failed to wait for child");
-        let _ = status;
+        // Give the fork-bomb time to run (it completes in < 100 ms).
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let container_pid = child.pid() as u32;
+        let cg_path =
+            cgroup_path_for_pid(container_pid).expect("container is not in a pelagos cgroup");
+
+        // pids.max should reflect what we configured.
+        let pids_max = read_cgroup_file(&cg_path, "pids.max").expect("pids.max not found");
+        assert_eq!(pids_max, "4", "pids.max mismatch: got {pids_max:?}");
+
+        // pids.events: `max N` counts denied forks — must be > 0.
+        let events = read_cgroup_file(&cg_path, "pids.events").expect("pids.events not found");
+        let denied: u64 = events
+            .lines()
+            .find(|l| l.starts_with("max"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            denied > 0,
+            "pids.events shows 0 denied forks — pids.max=4 was not enforced (events={events:?})"
+        );
+
+        child.wait().expect("wait failed");
     }
 
     #[test]
@@ -2109,6 +2193,226 @@ mod cgroups {
             status.signal(),
             status.code()
         );
+    }
+
+    /// With `Namespace::PID` (double-fork), pids.max must be enforced on the
+    /// actual container process (grandchild), not on the intermediate waiter.
+    ///
+    /// Sets pids_limit=5 and tries to fork 20 background `sleep` processes.
+    /// The grandchild (ash, PID 1 in namespace) uses 1 slot; forks beyond 4
+    /// must be denied.  Asserts that the successful-fork count is < 20.
+    #[test]
+    fn test_cgroup_pids_limit_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_pids_limit_pid_namespace: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_pids_limit_pid_namespace: alpine-rootfs not found");
+            return;
+        };
+
+        // With Namespace::PID the double-fork produces an intermediate waiter (B)
+        // and the real container (C / grandchild).  We set pids_limit=5 so ash
+        // (C, 1 PID) can fork at most 4 background sleeps before the limit is
+        // hit.  We inspect pids.events on the HOST to prove denials occurred.
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                // Same pattern: fork 15 background sleeps (2 s each), then
+                // `wait` (shell builtin, no fork).  pids.max=5 allows ash (1)
+                // + 4 sleeps; the remaining 11 forks are denied.
+                "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 2 & done; wait",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_pids_limit(5) // grandchild=1, room for 4 sleeps
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with pids limit + PID namespace");
+
+        let waiter_pid = child.pid() as u32;
+        let grandchild_pid = wait_for_grandchild(waiter_pid)
+            .expect("grandchild PID not found — double-fork may be broken");
+
+        // Capture cgroup path while grandchild is still alive.  The process may
+        // exit quickly (ash as PID 1 exits on fork denial, killing its children),
+        // so we must grab the path before /proc/{grandchild} disappears.
+        let cg_path = cgroup_path_for_pid(grandchild_pid)
+            .expect("grandchild is not in a pelagos cgroup — cgroup assignment failed");
+
+        let pids_max = read_cgroup_file(&cg_path, "pids.max").expect("pids.max not found");
+        assert_eq!(pids_max, "5", "pids.max mismatch: got {pids_max:?}");
+
+        // Allow the fork-bomb to run and hit the pids.max limit.  ash (PID 1 in
+        // the namespace) will exit once it encounters a fork failure, but the
+        // cgroup persists until child.wait() so we can still read pids.events.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let events = read_cgroup_file(&cg_path, "pids.events").expect("pids.events not found");
+        let denied: u64 = events
+            .lines()
+            .find(|l| l.starts_with("max"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            denied > 0,
+            "pids.events shows 0 denied forks — pids.max=5 was not enforced on grandchild \
+             (events={events:?})"
+        );
+
+        child.wait().expect("wait failed");
+    }
+
+    /// With `Namespace::PID`, verify that the CPU quota (`cpu.max`) is applied
+    /// to the actual container process (grandchild) by inspecting the cgroup
+    /// file from the host side.  Reads `/proc/{grandchild}/cgroup` to locate
+    /// the pelagos cgroup and then checks `/sys/fs/cgroup/{name}/cpu.max`.
+    #[test]
+    fn test_cgroup_cpu_quota_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_cpu_quota_pid_namespace: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_cpu_quota_pid_namespace: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "sleep 3"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            // 5 % CPU: 50 ms CPU time per 1 000 ms period.
+            .with_cgroup_cpu_quota(50_000, 1_000_000)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cpu quota + PID namespace");
+
+        let waiter_pid = child.pid() as u32;
+
+        // Find the grandchild (the real container process) via the kernel's
+        // /proc children list; give it up to 1 s to appear.
+        let grandchild_pid = wait_for_grandchild(waiter_pid)
+            .expect("grandchild PID not found — PID namespace double-fork may be broken");
+
+        // Locate its cgroup from the host side.
+        let cg_path = cgroup_path_for_pid(grandchild_pid)
+            .expect("grandchild is not in a pelagos cgroup — cgroup assignment failed");
+
+        // Verify cpu.max reflects exactly what we configured.
+        let cpu_max =
+            read_cgroup_file(&cg_path, "cpu.max").expect("cpu.max file not found in cgroup");
+        // Kernel stores as "quota period" (µs).
+        assert!(
+            cpu_max.starts_with("50000 "),
+            "cpu.max should show 50000 quota; got: {cpu_max:?}"
+        );
+
+        child.wait().expect("wait failed");
+    }
+
+    /// With `Namespace::PID`, verify that `cpuset.cpus` is applied to the
+    /// actual container process.  Reads the grandchild's `/proc/{pid}/status`
+    /// from the HOST (not from inside the container) and checks
+    /// `Cpus_allowed_list` to confirm the kernel restricted the affinity.
+    #[test]
+    fn test_cgroup_cpuset_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_cpuset_pid_namespace: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_cpuset_pid_namespace: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "sleep 3"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_cpuset_cpus("0")
+            .with_cgroup_cpuset_mems("0")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cpuset + PID namespace");
+
+        let waiter_pid = child.pid() as u32;
+        let grandchild_pid = wait_for_grandchild(waiter_pid).expect("grandchild PID not found");
+
+        // Read the grandchild's cpuset affinity from the host /proc.
+        let status_path = format!("/proc/{}/status", grandchild_pid);
+        let status_content = std::fs::read_to_string(&status_path)
+            .expect("Failed to read /proc/{grandchild}/status");
+
+        let cpus_allowed = status_content
+            .lines()
+            .find(|l| l.starts_with("Cpus_allowed_list"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .expect("Cpus_allowed_list not found in /proc/status");
+
+        assert_eq!(
+            cpus_allowed, "0",
+            "grandchild cpuset should be restricted to CPU 0; got: {cpus_allowed:?}"
+        );
+
+        child.wait().expect("wait failed");
+    }
+
+    /// With `Namespace::PID`, verify that `child.resource_stats()` returns
+    /// live data for the actual container process (grandchild), not the
+    /// intermediate waiter.
+    ///
+    /// Asserts `pids_current >= 1` — confirming the grandchild is tracked in
+    /// the cgroup, not merely the waiter which uses negligible resources.
+    #[test]
+    fn test_cgroup_resource_stats_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_resource_stats_pid_namespace: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_resource_stats_pid_namespace: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "sleep 3"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(128 * 1024 * 1024)
+            .with_cgroup_pids_limit(16)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn for resource_stats PID-ns test");
+
+        // Give the grandchild time to start and enter the cgroup.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let stats: ResourceStats = child
+            .resource_stats()
+            .expect("resource_stats() failed for PID-ns container");
+
+        assert!(
+            stats.pids_current >= 1,
+            "pids_current should be >= 1 (grandchild is in cgroup); got {}",
+            stats.pids_current
+        );
+
+        child.wait().expect("wait failed");
     }
 }
 
