@@ -108,7 +108,7 @@ CMD ["/usr/local/bin/server.sh"]
 Build and run:
 
 ```bash
-pelagos build -t myserver:latest myapp/
+sudo pelagos build -t myserver:latest myapp/
 sudo pelagos run myserver:latest
 ```
 
@@ -153,7 +153,7 @@ CMD ["/app"]
 `apk add go` needs internet access, so pass `--network bridge`:
 
 ```bash
-pelagos build --network bridge -t mygoapp:latest mygoapp/
+sudo pelagos build --network bridge -t mygoapp:latest mygoapp/
 sudo pelagos run mygoapp:latest
 # Hello from Go! PID=1  Host=pelagos-12
 ```
