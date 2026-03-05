@@ -101,14 +101,40 @@ pub fn cmd_image_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 /// `docker.io/library/` prefix that `normalise_reference` adds for pulls.
 pub fn cmd_image_rm(reference: &str) -> Result<(), Box<dyn std::error::Error>> {
     let local_ref = add_default_tag(reference);
-    if remove_image(&local_ref).is_ok() {
-        println!("Removed image: {}", local_ref);
-        return Ok(());
+    match remove_image(&local_ref) {
+        Ok(()) => {
+            println!("Removed image: {}", local_ref);
+            return Ok(());
+        }
+        // ErrorKind::Other is our custom "image not found" sentinel from remove_image().
+        // Any other error (e.g. PermissionDenied) is a real failure — propagate it
+        // immediately rather than masking it by trying the normalised reference.
+        Err(e) if e.kind() != std::io::ErrorKind::Other => {
+            return Err(hint_permission(e).into());
+        }
+        Err(_) => {} // "not found" — fall through and try the fully-qualified reference
     }
     let full_ref = normalise_reference(reference);
-    remove_image(&full_ref)?;
+    remove_image(&full_ref).map_err(hint_permission)?;
     println!("Removed image: {}", full_ref);
     Ok(())
+}
+
+/// Append a setup hint to permission-denied errors on the image store.
+fn hint_permission(e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{}\nhint: run 'sudo ./scripts/setup.sh' to make the image store \
+                 writable by the pelagos group, then add yourself: \
+                 sudo usermod -aG pelagos $USER",
+                e
+            ),
+        )
+    } else {
+        e
+    }
 }
 
 /// Push a locally stored image to an OCI registry.

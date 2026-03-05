@@ -118,7 +118,20 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         network_mode,
         !args.no_cache,
         &build_args_map,
-    )?;
+    )
+    .map_err(|e| {
+        // Propagate as-is, but add a setup hint when the layer store is not writable.
+        let msg = e.to_string();
+        if msg.contains("Permission denied") || msg.contains("os error 13") {
+            format!(
+                "{}\nhint: the pelagos layer store requires write access.\n\
+                 Run 'sudo ./scripts/setup.sh' to fix permissions, or build with sudo.",
+                msg
+            )
+        } else {
+            msg
+        }
+    })?;
 
     eprintln!(
         "Successfully built {} ({} layers)",
