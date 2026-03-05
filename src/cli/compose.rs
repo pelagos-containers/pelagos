@@ -170,6 +170,16 @@ fn cmd_compose_up(
         }
     }
 
+    // Early rootless + bridge guard — compose bridge networks require root.
+    if pelagos::paths::is_rootless() && !compose.networks.is_empty() {
+        eprintln!(
+            "pelagos: compose bridge networks require root (CAP_NET_ADMIN / nftables).\n\
+             For rootless compose, remove (network ...) declarations and use --network pasta \
+             on individual services, or run with sudo."
+        );
+        std::process::exit(1);
+    }
+
     // Create scoped networks.
     let mut created_networks = Vec::new();
     for net in &compose.networks {

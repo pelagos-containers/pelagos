@@ -177,7 +177,7 @@ scripting reference.
 - **Interactive containers:** PTY, SIGWINCH relay, terminal restore
 - **`pelagos exec`:** run a command inside a running container (namespace join + PTY)
 - **OCI Runtime Spec:** `create` / `start` / `state` / `kill` / `delete` lifecycle
-- **Rootless:** pull, build, run, overlay, and pasta networking without root
+- **Rootless-first:** pull, build, run, overlay, and pasta networking without root — root is an opt-in escape hatch, not the default
 
 ---
 
@@ -199,6 +199,14 @@ cargo install --path .
 
 ## Quick Start
 
+Pelagos defaults to **rootless** — most operations work without `sudo`. Root is
+required only for bridge networking, NAT, port mapping, and OCI lifecycle commands
+(`create`/`start`/`kill`/`delete`). For internet access without root, use
+`--network pasta` (requires `pasta` from [passt.top](https://passt.top)).
+
+On kernel 5.11+ Pelagos uses native overlayfs with `userxattr` (zero-copy,
+kernel-native). On older kernels it falls back to `fuse-overlayfs` automatically.
+
 ### Rootless (no sudo)
 
 ```bash
@@ -209,7 +217,7 @@ pelagos run alpine /bin/echo hello
 pelagos run -i --network pasta alpine /bin/sh
 ```
 
-### Root (full feature set)
+### Root (bridge networking, NAT, port mapping)
 
 ```bash
 sudo pelagos run -i alpine /bin/sh

@@ -15,33 +15,37 @@ The simplest possible thing: run a command in an Alpine Linux container.
 
 ```bash
 pelagos image pull alpine
-sudo pelagos run alpine /bin/echo "hello from a container"
+pelagos run alpine /bin/echo "hello from a container"
 ```
 
-That's it.  The image was fetched from Docker Hub, its layers were stacked into
-an overlay filesystem, and `/bin/echo` ran inside a Mount + UTS namespace with
-its own isolated hostname.
+That's it — no `sudo` needed.  The image was fetched from Docker Hub, its layers
+were stacked into an overlay filesystem, and `/bin/echo` ran inside a Mount + UTS
+namespace with its own isolated hostname.
 
 **What's in a run?**
 
 ```bash
-sudo pelagos run alpine /bin/sh -c "hostname && whoami && cat /etc/os-release"
+pelagos run alpine /bin/sh -c "hostname && whoami && cat /etc/os-release"
 ```
 
 You get the container's own hostname (e.g. `pelagos-5`), root (uid 0 inside
 the container), and a real Alpine environment — all without Docker.  Pass
 `--hostname mybox` to choose a name explicitly.
 
+> **Root vs rootless:** `pelagos run` works rootless for most use cases.
+> Root (`sudo`) is only required for bridge networking, NAT, and port mapping.
+> Use `--network pasta` for rootless internet access.
+
 **Inspect what's running:**
 
 ```bash
 # In one terminal:
-sudo pelagos run --name mybox alpine /bin/sleep 30 &
+pelagos run --name mybox alpine /bin/sleep 30 &
 
 # In another:
-sudo pelagos ps
-sudo pelagos logs mybox
-sudo pelagos stop mybox
+pelagos ps
+pelagos logs mybox
+sudo pelagos stop mybox   # stop sends a signal — requires root for root containers
 ```
 
 **Exec into a running container:**
@@ -51,16 +55,16 @@ without interrupting its main process.
 
 ```bash
 # Start a long-running container
-sudo pelagos run --detach --name mybox alpine /bin/sleep 120
+pelagos run --detach --name mybox alpine /bin/sleep 120
 
 # Open a shell inside it (interactive PTY)
-sudo pelagos exec -i mybox /bin/sh
+pelagos exec -i mybox /bin/sh
 
 # Run a one-off command (non-interactive)
-sudo pelagos exec mybox /bin/sh -c "ps aux && cat /etc/hostname"
+pelagos exec mybox /bin/sh -c "ps aux && cat /etc/hostname"
 
 # Override working directory or user
-sudo pelagos exec --workdir /tmp --user 1000 mybox id
+pelagos exec --workdir /tmp --user 1000 mybox id
 ```
 
 `exec` discovers the container's namespaces automatically from `/proc/<pid>/ns/`
@@ -69,7 +73,7 @@ and joins them — the same isolation without spinning up a second rootfs.
 **Auto-remove on exit:**
 
 ```bash
-sudo pelagos run --rm alpine /bin/echo "I vanish when I'm done"
+pelagos run --rm alpine /bin/echo "I vanish when I'm done"
 # No cleanup needed — container state is deleted automatically
 ```
 
@@ -108,8 +112,8 @@ CMD ["/usr/local/bin/server.sh"]
 Build and run:
 
 ```bash
-sudo pelagos build -t myserver:latest myapp/
-sudo pelagos run myserver:latest
+pelagos build -t myserver:latest myapp/
+pelagos run myserver:latest
 ```
 
 **Multi-stage build** — keep your images lean.
@@ -150,11 +154,17 @@ COPY --from=builder /app /app
 CMD ["/app"]
 ```
 
-`apk add go` needs internet access, so pass `--network bridge`:
+`apk add go` needs internet access during the build.  Rootless builds use
+`--network pasta` by default; if you're running as root and want bridge instead:
 
 ```bash
+# Rootless (default — pasta networking for RUN steps):
+pelagos build -t mygoapp:latest mygoapp/
+
+# Root with explicit bridge networking:
 sudo pelagos build --network bridge -t mygoapp:latest mygoapp/
-sudo pelagos run mygoapp:latest
+
+pelagos run mygoapp:latest
 # Hello from Go! PID=1  Host=pelagos-12
 ```
 
@@ -230,16 +240,20 @@ sudo pelagos run alpine /usr/bin/strace /bin/true 2>&1 | head -5
 **Networking modes:**
 
 ```bash
-# Loopback only (default for most workloads)
-sudo pelagos run --network loopback alpine /bin/sh -c "ping -c1 8.8.8.8 || echo 'no internet — good'"
+# Loopback only — rootless, isolated network namespace
+pelagos run --network loopback alpine /bin/sh -c "ping -c1 8.8.8.8 || echo 'no internet — good'"
 
-# Full internet via pasta (rootless-compatible, no kernel bridge)
-sudo pelagos run --network pasta alpine /bin/sh -c "wget -qO- https://example.com | head -5"
+# Full internet via pasta — rootless-compatible, no kernel bridge required
+pelagos run --network pasta alpine /bin/sh -c "wget -qO- https://example.com | head -5"
 
-# Bridge with NAT and a port mapping
+# Bridge with NAT and a port mapping — requires root (host bridge + nftables)
 sudo pelagos run --network bridge --nat --publish 8080:80 alpine \
   /bin/sh -c 'busybox httpd -p 80 -h /var/www & sleep 10'
 ```
+
+> **Rootless networking:** `none`, `loopback`, and `pasta` work without root.
+> `bridge`, `--nat`, and `--publish` require `sudo` because they create host
+> kernel objects (veth pairs, nftables rules) that need `CAP_NET_ADMIN`.
 
 ---
 

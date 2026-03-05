@@ -1861,12 +1861,18 @@ resolved IP matches A's bridge IP.
 Failure means the embedded DNS daemon isn't resolving container names correctly.
 
 ### `test_dns_upstream_forward`
-**Requires:** root, rootfs
+**Requires:** root, rootfs, host internet access to 8.8.8.8:53
 
 Registers a dummy DNS entry to start the daemon, then resolves `example.com`
-via the gateway DNS. Verifies upstream forwarding works.
+from inside a container via the gateway DNS. Verifies the daemon forwards
+unknown queries to upstream DNS and relays the response.
 
-Failure means the daemon can't forward queries to upstream DNS servers.
+The test first waits (up to 2s) for the daemon to bind to the gateway IP, then
+checks host reachability of 8.8.8.8:53 and skips if unreachable. nslookup
+inside the container is capped at 10s with `timeout` to prevent hanging.
+
+Failure means the daemon can't forward queries to upstream DNS servers, or
+the nslookup inside the container can't reach the gateway.
 
 ### `test_dns_network_isolation`
 **Requires:** root, rootfs
@@ -2742,3 +2748,15 @@ a serde serialization regression in the health-related state.json fields.
 Same as `test_healthcheck_healthy` but writes `health = "unhealthy"`. Asserts
 the value round-trips correctly through state.json. Failure indicates a serde
 regression in the unhealthy health state field.
+
+### `test_rootless_bridge_error`
+**Requires:** root (to invoke `sudo -u nobody`)
+
+Runs `pelagos run --network bridge alpine echo hi` as UID 65534 (nobody) via
+`sudo -u #65534`. Asserts that the process exits non-zero and that stderr contains
+"requires root".
+
+This validates the rootless-first guard in `src/cli/run.rs`: when a non-root user
+requests bridge networking, NAT, or port publishing, Pelagos should print a friendly
+error and exit immediately rather than failing deep in the network setup with a
+cryptic kernel error. Failure indicates the guard was removed or is not reached.

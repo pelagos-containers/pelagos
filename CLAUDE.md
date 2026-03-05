@@ -33,8 +33,42 @@ If a non-root pull fails with "Permission denied":
 1. The shell session may predate group membership → `newgrp pelagos` or new login
 2. Existing dirs may have been created by root before `setup.sh` → `sudo ./scripts/setup.sh` repairs them
 
-Operations that **do** require root: `run`, `exec`, `compose`, `stop`, `rm`
-(they create namespaces, configure network, mount filesystems).
+**Most operations work rootless.** Only a small set truly requires root:
+- `pelagos run --network bridge` / `--nat` / `--publish` — host bridge, nftables
+- `pelagos network create/rm` — host bridge + nftables manipulation
+- `pelagos exec` on a root-spawned container — joining root namespaces needs `CAP_SYS_PTRACE`
+- OCI lifecycle: `create`, `start`, `state`, `kill`, `delete`
+
+**Rootless without restriction:**
+- `pelagos run` (no network, `--network pasta`, `--network loopback`)
+- `pelagos build` — pasta for RUN networking; native or fuse overlay for layers
+- `pelagos compose` when no `(network ...)` declarations are used
+- `pelagos ps`, `pelagos logs`, `pelagos rm` — state file ops
+- `pelagos volume create/ls/rm`, `pelagos image pull/push/ls/rm/save/load/tag/login/logout`
+
+---
+
+### Rootless-First Design Philosophy
+Pelagos defaults to rootless and elevates to root only when the kernel truly requires it.
+
+**The overlay fallback chain (rootless containers):**
+1. Kernel overlayfs with `userxattr` — kernel ≥ 5.11, zero-copy, best performance
+2. `fuse-overlayfs` — any kernel, FUSE round-trip overhead per syscall (negligible for normal workloads)
+3. Error with clear instructions if neither is available
+
+**Performance trade-offs:**
+
+| Overlay backend | When used | Performance |
+|---|---|---|
+| Kernel overlayfs | root, or rootless + kernel ≥5.11 + `userxattr` | Best: zero-copy, kernel-native |
+| fuse-overlayfs | rootless, kernel < 5.11 or no `userxattr` | FUSE round-trip overhead; perceptible only for heavy random I/O |
+
+For typical `apk add`, `go build`, `npm install` workloads the difference is negligible.
+
+**Why bridge/NAT requires root:**
+Linux bridge and nftables operations require `CAP_NET_ADMIN` and root-owned kernel objects.
+`pasta` is the rootless alternative — it provides full internet access via user-mode networking
+with no kernel privileges.
 
 ---
 

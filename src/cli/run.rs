@@ -156,6 +156,24 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         unsafe { std::env::set_var("PELAGOS_DNS_BACKEND", backend) };
     }
 
+    // Parse network mode early (no filesystem access) so the rootless guard can fire
+    // before we touch the state directory.
+    let port_forwards = parse_port_forwards(&args.publish)?;
+    let primary_network_str = args.network.first().map(|s| s.as_str()).unwrap_or("none");
+    let network_mode = parse_network_mode(primary_network_str)?;
+    let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
+
+    // Early rootless + bridge guard — emit a friendly message before doing any filesystem work.
+    if let Some(msg) = super::check_rootless_bridge(
+        pelagos::paths::is_rootless(),
+        &network_mode,
+        args.nat,
+        !args.publish.is_empty(),
+    ) {
+        eprintln!("{}", msg);
+        std::process::exit(1);
+    }
+
     // Generate container name
     let name = match args.name {
         Some(ref n) => n.clone(),
@@ -172,11 +190,6 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Parse port forwards and network mode (shared by both paths).
-    let port_forwards = parse_port_forwards(&args.publish)?;
-    let primary_network_str = args.network.first().map(|s| s.as_str()).unwrap_or("none");
-    let network_mode = parse_network_mode(primary_network_str)?;
-    let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
     // Validate additional networks exist.
     for net_name in &additional_networks {
         let config = pelagos::paths::network_config_dir(net_name).join("config.json");

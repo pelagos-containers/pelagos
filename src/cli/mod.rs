@@ -81,6 +81,34 @@ pub fn rootfs_path(name: &str) -> std::io::Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Rootless bridge guard
+// ---------------------------------------------------------------------------
+
+/// Returns an error message if rootless mode is combined with bridge networking,
+/// NAT, or port publishing.  Returns `None` if the combination is valid.
+///
+/// This is a pure function so it can be tested without side effects.
+pub(crate) fn check_rootless_bridge(
+    is_rootless: bool,
+    network_mode: &pelagos::network::NetworkMode,
+    nat: bool,
+    has_ports: bool,
+) -> Option<String> {
+    if !is_rootless {
+        return None;
+    }
+    if network_mode.is_bridge() || nat || has_ports {
+        Some(
+            "pelagos: bridge networking requires root (CAP_NET_ADMIN / nftables).\n\
+             Use --network pasta for rootless internet access, or run with sudo."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Container state
 // ---------------------------------------------------------------------------
 
@@ -626,5 +654,54 @@ mod tests {
         let state: ContainerState = serde_json::from_str(json).unwrap();
         assert_eq!(state.health, None);
         assert!(state.health_config.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // check_rootless_bridge tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn rootless_bridge_errors() {
+        use pelagos::network::NetworkMode;
+        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, false, false).is_some());
+        assert!(
+            check_rootless_bridge(true, &NetworkMode::BridgeNamed("foo".into()), false, false)
+                .is_some()
+        );
+        assert!(
+            check_rootless_bridge(true, &NetworkMode::Bridge, false, false)
+                .unwrap()
+                .contains("requires root")
+        );
+    }
+
+    #[test]
+    fn rootless_nat_or_ports_errors() {
+        use pelagos::network::NetworkMode;
+        // nat=true with non-bridge mode
+        assert!(check_rootless_bridge(true, &NetworkMode::None, true, false).is_some());
+        // has_ports=true with non-bridge mode
+        assert!(check_rootless_bridge(true, &NetworkMode::None, false, true).is_some());
+        // bridge + nat + ports
+        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, true, true).is_some());
+    }
+
+    #[test]
+    fn rootless_pasta_and_loopback_ok() {
+        use pelagos::network::NetworkMode;
+        assert!(check_rootless_bridge(true, &NetworkMode::Pasta, false, false).is_none());
+        assert!(check_rootless_bridge(true, &NetworkMode::Loopback, false, false).is_none());
+        assert!(check_rootless_bridge(true, &NetworkMode::None, false, false).is_none());
+    }
+
+    #[test]
+    fn root_bridge_ok() {
+        use pelagos::network::NetworkMode;
+        // root (is_rootless=false) should never return an error regardless of mode
+        assert!(check_rootless_bridge(false, &NetworkMode::Bridge, true, true).is_none());
+        assert!(
+            check_rootless_bridge(false, &NetworkMode::BridgeNamed("net".into()), true, true)
+                .is_none()
+        );
     }
 }

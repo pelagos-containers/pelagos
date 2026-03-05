@@ -1287,8 +1287,14 @@ fsize, memlock, stack, core, rss, msgqueue, nice, rtprio.
 
 ## Rootless Mode
 
-Pelagos auto-detects rootless mode when run without sudo (`getuid() != 0`). No flag
-needed — just omit `sudo`.
+### Rootless-First Design Philosophy
+
+Pelagos is designed rootless-first: the default path never requires root, and
+root access is required only when the kernel genuinely demands it (host bridge
+manipulation, nftables, joining namespaces owned by root processes).
+
+Auto-detection is automatic: `getuid() != 0` → rootless mode. No flag needed —
+just omit `sudo`.
 
 ```bash
 # Pull and run — fully rootless
@@ -1299,18 +1305,42 @@ pelagos run alpine /bin/echo hello
 pelagos run -i --network pasta alpine /bin/sh
 ```
 
-**What works rootless:**
-- Image pull (`pelagos image pull`)
-- Image run with overlay filesystem (kernel 5.11+ native, or `fuse-overlayfs` fallback)
-- Named volumes (`-v mydata:/data`)
-- Loopback networking (`--network loopback`)
-- Pasta networking (`--network pasta`) -- full internet access
+**What works rootless (no sudo):**
+- `pelagos image pull/push/ls/rm/save/load/tag/login/logout`
+- `pelagos build` — pasta for RUN networking, native or fuse overlay for layers
+- `pelagos run` with no network, `--network pasta`, or `--network loopback`
+- `pelagos compose` when no `(network ...)` declarations are used
+- `pelagos ps`, `pelagos logs`, `pelagos rm` — state file operations
+- `pelagos volume create/ls/rm`
+- Named volumes (`-v mydata:/data`), tmpfs mounts
 - User namespace isolation (auto-configured: container UID 0 maps to your host UID)
 
-**What requires root:**
-- Bridge networking (`--network bridge`)
-- NAT and port mapping (`--nat`, `-p`)
-- Cgroups (skipped gracefully in rootless mode)
+**What requires root (`sudo`):**
+- Bridge networking (`--network bridge`) — host veth/bridge setup, `CAP_NET_ADMIN`
+- NAT and port mapping (`--nat`, `-p`) — nftables MASQUERADE, requires root
+- `pelagos network create/rm` — host bridge + nftables manipulation
+- `pelagos exec` on a root-spawned container — joining root namespaces needs `CAP_SYS_PTRACE`
+- OCI lifecycle commands: `create`, `start`, `state`, `kill`, `delete`
+- `pelagos stop` on a root-owned container — signalling a root process
+
+### Overlay Fallback Chain
+
+Pelagos automatically selects the best available overlay implementation:
+
+1. **Kernel overlayfs with `userxattr`** (kernel ≥ 5.11) — zero-copy, kernel-native, best performance
+2. **`fuse-overlayfs`** (any kernel) — FUSE round-trip overhead; perceptible only for heavy random I/O workloads
+3. **Error with instructions** if neither is available
+
+**Performance trade-offs:**
+
+| Backend | When used | Performance |
+|---------|-----------|-------------|
+| Kernel overlayfs | root, or rootless + kernel ≥5.11 + `userxattr` | Best: zero-copy, kernel-native |
+| fuse-overlayfs | rootless, kernel < 5.11 or no `userxattr` | FUSE overhead; negligible for typical `apk add`, `go build`, `npm install` |
+
+For typical workloads the difference between backends is not perceptible. For
+pathological cases (millions of small file ops in a single build step), kernel
+5.11+ or root mode will be faster.
 
 ### Rootless Overlay
 
