@@ -224,17 +224,19 @@ async fn pull_image(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use oci_client::{Client, Reference as OciRef};
 
-    // If the image is already in the local store with all layers present, skip
-    // the network entirely. Callers that need a guaranteed-fresh copy should
-    // remove the image first (`pelagos image rm`).
-    if let Ok(existing) = load_image(reference) {
-        let all_cached = existing
-            .layers
-            .iter()
-            .all(|d| layer_exists(d) && blob_exists(d));
-        if all_cached {
-            println!("Already present: {}", reference);
-            return Ok(());
+    // For pinned (immutable) tags, skip the network entirely if the image and
+    // all its layers are already in the local store. Mutable tags like `latest`
+    // must always fetch the manifest to detect upstream changes.
+    if !is_mutable_tag(reference) {
+        if let Ok(existing) = load_image(reference) {
+            let all_cached = existing
+                .layers
+                .iter()
+                .all(|d| layer_exists(d) && blob_exists(d));
+            if all_cached {
+                println!("Already present: {}", reference);
+                return Ok(());
+            }
         }
     }
 
@@ -405,6 +407,25 @@ fn add_default_tag(reference: &str) -> String {
     } else {
         format!("{}:latest", reference)
     }
+}
+
+/// Returns true if the tag is mutable (latest, absent, or a non-version word).
+///
+/// Mutable tags must always hit the registry to detect upstream changes.
+/// Pinned version tags (e.g. `3.21`, `1.2.3`) are immutable by convention
+/// and can be skipped if the image is already present locally.
+fn is_mutable_tag(reference: &str) -> bool {
+    let tag = if let Some(at) = reference.rfind('@') {
+        // digest-pinned reference — always immutable
+        let _ = at;
+        return false;
+    } else if let Some(colon) = reference.rfind(':') {
+        &reference[colon + 1..]
+    } else {
+        "latest"
+    };
+    // "latest" or any tag that doesn't start with a digit is treated as mutable.
+    tag == "latest" || !tag.chars().next().map_or(false, |c| c.is_ascii_digit())
 }
 
 /// Expand bare image names to fully qualified references.
