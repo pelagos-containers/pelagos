@@ -2077,6 +2077,30 @@ Failure indicates a regression in: parser reader macros (quote/quasiquote), `def
 `map`, the `service`/`network`/`compose`/`compose-up` builtins, list flattening in `compose`,
 or the `on-ready` hook registration pipeline.
 
+### `test_compose_declarative_through_evaluator`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+Regression test for the consolidation that dropped `.rem` compose files: all compose files
+now go through the Lisp evaluator, including those that use only static declarations (no
+`define`, `lambda`, or other dynamic features). Evaluates a `compose-up` form containing
+a plain 2-network, 1-volume, 3-service stack and asserts:
+- Correct network/volume/service counts
+- Topo order respects `depends-on`: db → api → proxy
+- API service has both networks, correct depends-on with port 5432
+- Proxy ports round-trip correctly
+
+Failure indicates that purely declarative compose files broke when routed through the
+evaluator — the most common user-facing regression from the .rem → .reml unification.
+
+### `test_compose_default_file_is_reml`
+**Requires:** nothing (runs `pelagos compose up --help`)
+
+Guards against the CLI default file regressing from `compose.reml` back to `compose.rem`.
+Runs `pelagos compose up --help` and asserts the help text shows `compose.reml` as the
+default and does not contain `compose.rem` as a default. Failure means users whose projects
+contain only `compose.reml` would get a "file not found" error when running `pelagos compose up`
+without `-f`.
+
 ### `test_lisp_evaluator_tco_and_higher_order`
 **Requires:** nothing (no root, no rootfs, no container spawning)
 

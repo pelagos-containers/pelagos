@@ -11083,6 +11083,96 @@ fn test_lisp_compose_basic() {
 }
 
 #[test]
+fn test_compose_declarative_through_evaluator() {
+    // Regression: purely declarative (compose ...) syntax — no Lisp features — must
+    // produce the correct ComposeFile when run through the Lisp evaluator.
+    //
+    // This is the core invariant of dropping .rem: all compose files go through
+    // the evaluator, and static declarations (the common case) must work identically.
+    // A failure here means plain compose files broke after the consolidation.
+    use pelagos::lisp::Interpreter;
+
+    let mut interp = Interpreter::new();
+    interp
+        .eval_str(
+            r#"
+(compose-up
+  (compose
+    (network "frontend" '(subnet "10.88.1.0/24"))
+    (network "backend"  '(subnet "10.88.2.0/24"))
+    (volume "data")
+    (service "db"
+      '(image "postgres:16")
+      '(network "backend")
+      '(memory "256m"))
+    (service "api"
+      '(image "myapi:latest")
+      '(network "frontend" "backend")
+      (list 'depends-on "db" 5432)
+      '(port 8080 8080))
+    (service "proxy"
+      '(image "nginx:stable")
+      '(network "frontend")
+      (list 'depends-on "api" 8080)
+      '(port 80 80))))
+"#,
+        )
+        .expect("declarative compose should evaluate without error");
+
+    let pending = interp
+        .take_pending()
+        .expect("compose-up should register a pending spec");
+    let spec = pending.spec.expect("spec must be present");
+
+    assert_eq!(spec.networks.len(), 2);
+    assert_eq!(spec.volumes, vec!["data"]);
+    assert_eq!(spec.services.len(), 3);
+
+    // Topo order must respect dependencies: db → api → proxy.
+    let order = pelagos::compose::topo_sort(&spec.services).unwrap();
+    let db_pos = order.iter().position(|n| n == "db").unwrap();
+    let api_pos = order.iter().position(|n| n == "api").unwrap();
+    let proxy_pos = order.iter().position(|n| n == "proxy").unwrap();
+    assert!(db_pos < api_pos, "db must start before api");
+    assert!(api_pos < proxy_pos, "api must start before proxy");
+
+    let api = spec.services.iter().find(|s| s.name == "api").unwrap();
+    assert_eq!(api.networks, vec!["frontend", "backend"]);
+    assert_eq!(api.depends_on[0].service, "db");
+    assert_eq!(
+        api.depends_on[0].health_check,
+        Some(pelagos::compose::HealthCheck::Port(5432))
+    );
+
+    let proxy = spec.services.iter().find(|s| s.name == "proxy").unwrap();
+    assert_eq!(proxy.ports[0].host, 80);
+    assert_eq!(proxy.ports[0].container, 80);
+}
+
+#[test]
+fn test_compose_default_file_is_reml() {
+    // Regression: the CLI default for -f/--file must be compose.reml, not compose.rem.
+    // If this reverts, users with compose.reml files lose default file discovery silently.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+        .args(["compose", "up", "--help"])
+        .output()
+        .expect("pelagos binary must be present");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("compose.reml"),
+        "compose up --help must show compose.reml as default, got:\n{}",
+        help
+    );
+    // Ensure the old .rem default does not appear (the trailing space/bracket
+    // disambiguates from the .reml substring).
+    assert!(
+        !help.contains("compose.rem ") && !help.contains("compose.rem]"),
+        "compose.rem must not appear as default in --help, got:\n{}",
+        help
+    );
+}
+
+#[test]
 fn test_lisp_evaluator_tco_and_higher_order() {
     // Purely evaluator-level test: no domain builtins needed.
     use pelagos::lisp::Interpreter;
