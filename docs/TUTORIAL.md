@@ -286,7 +286,7 @@ S-expression format that's more expressive than YAML.
     (image "myserver:latest")
     (network "frontend")
     (depends-on (redis :ready-port 6379))
-    (port "8080:80")
+    (port 8080 80)
     (environment
       (REDIS_HOST "redis")
       (APP_ENV "production"))))
