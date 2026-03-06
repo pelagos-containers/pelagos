@@ -132,8 +132,12 @@ This is a hard requirement, not optional cleanup.
 
 **"Engage!"** — Tag, release, and monitor:
 1. Create a git tag (ask user for version if unclear)
-2. Push the tag to trigger GitHub Actions release workflow
-3. Monitor the release with a background agent and report result
+2. Push the tag — this triggers the release workflow, which gates the build on
+   lint + unit-tests + integration-tests passing first (no release is cut if CI fails)
+3. Monitor the release workflow with a background agent; report pass/fail and release URL
+4. **If the release workflow fails**: diagnose immediately, fix, delete the tag locally
+   and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), push the
+   fix, re-tag, and re-push — do not leave a broken tag pointing at bad code
 
 ### Execution Style
 Execute quietly — no step-by-step narration of what you're about to do. Just do
