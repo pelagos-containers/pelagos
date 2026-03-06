@@ -39,10 +39,11 @@ the container), and a real Alpine environment — all without Docker.  Pass
 **Inspect what's running:**
 
 ```bash
-pelagos run --detach --name mybox alpine /bin/sleep 30
+pelagos run --detach --name mybox alpine /bin/sh -c "while true; do echo tick; sleep 1; done"
 
 pelagos ps
-pelagos logs mybox
+pelagos logs mybox        # shows tick lines collected so far
+pelagos logs -f mybox     # follow live output
 pelagos stop mybox
 ```
 
