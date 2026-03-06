@@ -39,10 +39,8 @@ the container), and a real Alpine environment — all without Docker.  Pass
 **Inspect what's running:**
 
 ```bash
-# In one terminal:
-pelagos run --name mybox alpine /bin/sleep 30 &
+pelagos run --detach --name mybox alpine /bin/sleep 30
 
-# In another:
 pelagos ps
 pelagos logs mybox
 sudo pelagos stop mybox   # stop sends a signal — requires root for root containers
@@ -103,7 +101,6 @@ echo "Hello from pelagos! PID=$$  Host=$(hostname)"
 `Remfile`:
 ```dockerfile
 FROM alpine
-RUN apk add --no-cache busybox-extras
 COPY server.sh /usr/local/bin/server.sh
 RUN chmod +x /usr/local/bin/server.sh
 CMD ["/usr/local/bin/server.sh"]
