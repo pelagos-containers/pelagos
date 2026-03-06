@@ -224,6 +224,20 @@ async fn pull_image(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use oci_client::{Client, Reference as OciRef};
 
+    // If the image is already in the local store with all layers present, skip
+    // the network entirely. Callers that need a guaranteed-fresh copy should
+    // remove the image first (`pelagos image rm`).
+    if let Ok(existing) = load_image(reference) {
+        let all_cached = existing
+            .layers
+            .iter()
+            .all(|d| layer_exists(d) && blob_exists(d));
+        if all_cached {
+            println!("Already present: {}", reference);
+            return Ok(());
+        }
+    }
+
     let oci_ref: OciRef = reference
         .parse()
         .map_err(|e| format!("invalid image reference '{}': {:?}", reference, e))?;
