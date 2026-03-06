@@ -6684,7 +6684,7 @@ mod images {
 
         // Pull the image using the pelagos binary (true E2E).
         let pull_status = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status()
             .expect("failed to run pelagos image pull");
         assert!(pull_status.success(), "pelagos image pull should succeed");
@@ -11806,7 +11806,7 @@ mod registry_auth {
 
         // Pull alpine so we have something to push (may already be cached).
         let _ = std::process::Command::new(bin)
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status();
 
         let dest_ref = format!("{}/library/alpine:latest", registry_addr);
@@ -11963,7 +11963,7 @@ mod registry_auth {
 
         // Ensure alpine is available to push.
         let _ = std::process::Command::new(bin)
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status();
 
         let dest_ref = format!("{}/library/alpine:latest", registry_addr);
@@ -13858,7 +13858,7 @@ mod tutorial_e2e_p1 {
     /// Ensures tests are self-contained when run in isolation.
     fn ensure_alpine() {
         let status = std::process::Command::new(bin())
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status()
             .expect("pelagos image pull alpine");
         assert!(status.success(), "pre-test alpine pull failed");
@@ -13874,7 +13874,7 @@ mod tutorial_e2e_p1 {
     fn test_tut_p1_echo() {
         ensure_alpine();
         let out = std::process::Command::new(bin())
-            .args(["run", "alpine", "/bin/echo", "hello from a container"])
+            .args(["run", "alpine:3.21", "/bin/echo", "hello from a container"])
             .output()
             .expect("pelagos run should not fail to spawn");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -13906,7 +13906,7 @@ mod tutorial_e2e_p1 {
         let out = std::process::Command::new(bin())
             .args([
                 "run",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 "hostname && whoami && cat /etc/os-release",
@@ -13959,7 +13959,7 @@ mod tutorial_e2e_p1 {
                 "--detach",
                 "--name",
                 name,
-                "alpine",
+                "alpine:3.21",
                 "/bin/sleep",
                 "30",
             ])
@@ -14026,7 +14026,7 @@ mod tutorial_e2e_p1 {
                 "--detach",
                 "--name",
                 name,
-                "alpine",
+                "alpine:3.21",
                 "/bin/sleep",
                 "60",
             ])
@@ -14084,7 +14084,7 @@ mod tutorial_e2e_p1 {
                 "--rm",
                 "--name",
                 name,
-                "alpine",
+                "alpine:3.21",
                 "/bin/echo",
                 "vanish",
             ])
@@ -14129,7 +14129,7 @@ mod tutorial_e2e_p2 {
 
     fn ensure_alpine() {
         let status = std::process::Command::new(bin())
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status()
             .expect("pelagos image pull alpine");
         assert!(status.success(), "pre-test alpine pull failed");
@@ -14360,7 +14360,7 @@ mod tutorial_e2e_p3 {
 
     fn ensure_alpine() {
         let status = std::process::Command::new(bin())
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status()
             .expect("pelagos image pull alpine");
         assert!(status.success(), "pre-test alpine pull failed");
@@ -14384,7 +14384,7 @@ mod tutorial_e2e_p3 {
             .args([
                 "run",
                 "--read-only",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 "echo test > /readonly.txt",
@@ -14419,7 +14419,7 @@ mod tutorial_e2e_p3 {
                 "64m",
                 "--tmpfs",
                 "/tmp",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 "dd if=/dev/zero of=/tmp/fill bs=1M count=200; echo done",
@@ -14456,7 +14456,7 @@ mod tutorial_e2e_p3 {
                 "loopback",
                 "--cap-drop",
                 "ALL",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 "ip link set lo mtu 1280 2>&1 || echo 'ip link set: denied'",
@@ -14494,7 +14494,7 @@ mod tutorial_e2e_p3 {
                 "run",
                 "--security-opt",
                 "seccomp=default",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 "unshare --user echo hi 2>&1 || echo 'blocked by seccomp'",
@@ -14527,7 +14527,7 @@ mod tutorial_e2e_p3 {
                 "run",
                 "--network",
                 "loopback",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 "ping -c1 -W2 8.8.8.8 2>&1 || echo 'no internet'",
@@ -14577,7 +14577,7 @@ mod tutorial_e2e_p3 {
                 "--nat",
                 "--publish",
                 "18080:80",
-                "alpine",
+                "alpine:3.21",
                 "/bin/sh",
                 "-c",
                 r#"while true; do { printf "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nHello from pelagos\n"; } | nc -l -p 80; done"#,
@@ -14641,7 +14641,7 @@ mod tutorial_e2e_p4 {
 
     fn ensure_alpine() {
         let status = std::process::Command::new(bin())
-            .args(["image", "pull", "alpine"])
+            .args(["image", "pull", "alpine:3.21"])
             .status()
             .expect("pelagos image pull alpine");
         assert!(status.success(), "pre-test alpine pull failed");

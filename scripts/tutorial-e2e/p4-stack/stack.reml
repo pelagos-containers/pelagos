@@ -12,12 +12,12 @@
     (network "tut-p4-net" '(subnet "10.91.0.0/24"))
 
     (service "db"
-      '(image "alpine")
+      '(image "alpine:3.21")
       '(network "tut-p4-net")
       '(command "/bin/sh" "-c" "while true; do echo pong | nc -l -p 6379; done"))
 
     (service "app"
-      '(image "alpine")
+      '(image "alpine:3.21")
       '(network "tut-p4-net")
       (list 'depends-on "db" 6379)
       '(command "/bin/sh" "-c" "sleep 300"))))

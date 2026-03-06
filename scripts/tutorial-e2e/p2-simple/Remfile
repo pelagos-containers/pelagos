@@ -1,4 +1,4 @@
-FROM alpine
+FROM alpine:3.21
 COPY server.sh /usr/local/bin/server.sh
 RUN chmod +x /usr/local/bin/server.sh
 CMD ["/usr/local/bin/server.sh"]

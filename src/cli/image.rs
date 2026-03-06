@@ -425,7 +425,7 @@ fn is_mutable_tag(reference: &str) -> bool {
         "latest"
     };
     // "latest" or any tag that doesn't start with a digit is treated as mutable.
-    tag == "latest" || !tag.chars().next().map_or(false, |c| c.is_ascii_digit())
+    tag == "latest" || !tag.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Expand bare image names to fully qualified references.
@@ -1010,6 +1010,29 @@ pub fn cmd_image_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify that `is_mutable_tag` correctly classifies tags.
+    ///
+    /// Mutable: `latest`, absent tag (implied latest), non-numeric tags.
+    /// Immutable: version tags starting with a digit (e.g. `3.21`, `1.2.3`),
+    ///            digest references (sha256:...).
+    #[test]
+    fn test_is_mutable_tag() {
+        // Mutable — must always hit the registry
+        assert!(is_mutable_tag("alpine"), "bare name implies latest");
+        assert!(is_mutable_tag("alpine:latest"), "explicit latest");
+        assert!(is_mutable_tag("ubuntu:rolling"), "non-numeric tag");
+        assert!(is_mutable_tag("nginx:stable"), "non-numeric tag");
+
+        // Immutable — safe to skip network if present locally
+        assert!(!is_mutable_tag("alpine:3.21"), "pinned version");
+        assert!(!is_mutable_tag("alpine:3.21.3"), "pinned patch version");
+        assert!(!is_mutable_tag("ubuntu:22.04"), "pinned version");
+        assert!(
+            !is_mutable_tag("alpine@sha256:abcdef1234"),
+            "digest reference"
+        );
+    }
 
     /// Verify that `build_oci_tar` produces a valid OCI Image Layout tar.
     ///
