@@ -14413,6 +14413,33 @@ mod tutorial_e2e_p1 {
             "uid:gid should be 1000:1000 with --user 1000:1000"
         );
 
+        // --user 1000 write: UID 1000 should be able to create and read back a
+        // file in /tmp (a tmpfs, world-writable).  This exercises a distinct
+        // failure mode from exec: without allow_other the fuse-overlayfs mount
+        // returns EACCES even for tmpfs writes that go through the overlay.
+        let write_out = std::process::Command::new(bin())
+            .args([
+                "exec",
+                "--user",
+                "1000",
+                name,
+                "/bin/sh",
+                "-c",
+                "echo uid1000_wrote > /tmp/exec_write_test && cat /tmp/exec_write_test",
+            ])
+            .output()
+            .expect("pelagos exec --user 1000 write");
+        assert!(
+            write_out.status.success(),
+            "exec --user 1000 write should exit 0; stderr={}",
+            String::from_utf8_lossy(&write_out.stderr).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&write_out.stdout).trim(),
+            "uid1000_wrote",
+            "UID 1000 should be able to write and read /tmp inside the container"
+        );
+
         cleanup(name);
     }
 
