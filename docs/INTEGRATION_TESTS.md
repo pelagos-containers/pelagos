@@ -2878,6 +2878,22 @@ pid==0 race fix in `cmd_stop` (stop must wait for the real PID before sending SI
 otherwise it races with the watcher overwriting state as Running+real_pid). Failure
 indicates the stop→exec race is back.
 
+### `test_rootless_exec_user_workdir`
+**Requires:** rootless (no root); also requires `user_allow_other` in `/etc/fuse.conf`
+
+Starts a detached container, then runs three exec sub-cases:
+- `--user 1000`: asserts `id -u` prints `1000`. Verifies fuse-overlayfs `allow_other`
+  is set — without it, the exec'd process (host UID 100999) cannot read the FUSE mount
+  and exec fails with EACCES.
+- `--workdir /tmp`: asserts `pwd` prints `/tmp`. Verifies chdir in the user_pre_exec
+  callback works.
+- `--user 1000:1000`: asserts `id -u && id -g` both print `1000`. Verifies GID
+  application via `with_gid()`.
+
+Failure indicates either: (a) fuse-overlayfs was not mounted with `allow_other` (setup.sh
+not run, or `user_allow_other` not in `/etc/fuse.conf`); or (b) `--user`/`--workdir`
+flag parsing in exec.rs is broken.
+
 ### `test_tut_p1_auto_rm`
 **Requires:** rootless
 

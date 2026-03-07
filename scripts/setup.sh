@@ -126,6 +126,32 @@ else
     fi
 fi
 
+# ── Enable user_allow_other in /etc/fuse.conf ────────────────────────────────
+#
+# fuse-overlayfs mounts with allow_other so that `pelagos exec --user UID`
+# works for non-root UIDs inside rootless containers.  The allow_other FUSE
+# mount option requires user_allow_other in /etc/fuse.conf when mounted by a
+# non-root user.
+
+info "Configuring /etc/fuse.conf..."
+if [[ -f /etc/fuse.conf ]]; then
+    if grep -q '^user_allow_other' /etc/fuse.conf; then
+        done_ "user_allow_other already enabled in /etc/fuse.conf"
+    else
+        # Uncomment if present as a comment, otherwise append.
+        if grep -q '#user_allow_other' /etc/fuse.conf; then
+            sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
+            ok "enabled user_allow_other in /etc/fuse.conf"
+        else
+            echo "user_allow_other" >> /etc/fuse.conf
+            ok "appended user_allow_other to /etc/fuse.conf"
+        fi
+    fi
+else
+    echo "user_allow_other" > /etc/fuse.conf
+    ok "created /etc/fuse.conf with user_allow_other"
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 echo ""

@@ -44,8 +44,7 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     // for up to 2 s so that `exec` called immediately after `run --detach`
     // doesn't spuriously fail.
     let state = {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut s = read_state(&args.name)
             .map_err(|e| format!("container '{}' not found: {}", args.name, e))?;
         while s.pid == 0
@@ -77,8 +76,7 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     // container (grandchild) has the correct environ.  Find it via the children
     // list, falling back to state.pid if no grandchild exists (non-PID-ns case).
     let environ_pid = {
-        let children_path =
-            format!("/proc/{}/task/{}/children", pid, pid);
+        let children_path = format!("/proc/{}/task/{}/children", pid, pid);
         std::fs::read_to_string(&children_path)
             .ok()
             .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok())

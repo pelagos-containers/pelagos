@@ -358,7 +358,7 @@ fn spawn_fuse_overlayfs(
     let host_uid = unsafe { libc::getuid() };
     let host_gid = unsafe { libc::getgid() };
     let opts = format!(
-        "lowerdir={},upperdir={},workdir={},squash_to_uid={},squash_to_gid={}",
+        "lowerdir={},upperdir={},workdir={},squash_to_uid={},squash_to_gid={},allow_other",
         lower,
         upper.display(),
         work.display(),

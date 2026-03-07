@@ -14220,9 +14220,7 @@ mod tutorial_e2e_p1 {
 
         // Inherited from container's /proc/{pid}/environ.
         let inherit_out = std::process::Command::new(bin())
-            .args([
-                "exec", name, "/bin/sh", "-c", "echo $MY_EXEC_VAR",
-            ])
+            .args(["exec", name, "/bin/sh", "-c", "echo $MY_EXEC_VAR"])
             .output()
             .expect("pelagos exec (inherit)");
         assert!(
@@ -14281,8 +14279,13 @@ mod tutorial_e2e_p1 {
         // Start then immediately stop.
         let status = std::process::Command::new(bin())
             .args([
-                "run", "--detach", "--name", name, "alpine:3.21",
-                "/bin/sleep", "60",
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine:3.21",
+                "/bin/sleep",
+                "60",
             ])
             .stdin(std::process::Stdio::null())
             .status()
@@ -14313,6 +14316,101 @@ mod tutorial_e2e_p1 {
             stderr.contains("not running"),
             "stderr should mention 'not running', got: {}",
             stderr.trim()
+        );
+
+        cleanup(name);
+    }
+
+    /// test_rootless_exec_user_workdir
+    ///
+    /// Rootless (no root required). Starts a detached container, then:
+    ///   - `pelagos exec --user 1000 ...` verifies UID 1000 is active inside the exec.
+    ///   - `pelagos exec --workdir /tmp ...` verifies the working directory is set.
+    ///   - `pelagos exec --user 1000:1000 ...` verifies both UID and GID are applied.
+    ///
+    /// Failure indicates that fuse-overlayfs `allow_other` is not set (UID != mount
+    /// owner gets EACCES), or that the `--user`/`--workdir` flags are broken in exec.rs.
+    #[test]
+    #[serial_test::serial]
+    fn test_rootless_exec_user_workdir() {
+        ensure_alpine();
+        let name = "rootless-exec-userwd-test";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine:3.21",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            name
+        );
+
+        // --user 1000: the exec'd process should run as UID 1000.
+        let uid_out = std::process::Command::new(bin())
+            .args(["exec", "--user", "1000", name, "/usr/bin/id", "-u"])
+            .output()
+            .expect("pelagos exec --user 1000");
+        assert!(
+            uid_out.status.success(),
+            "exec --user 1000 should exit 0; stderr={}",
+            String::from_utf8_lossy(&uid_out.stderr).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&uid_out.stdout).trim(),
+            "1000",
+            "id -u should report 1000 after --user 1000"
+        );
+
+        // --workdir /tmp: pwd should print /tmp.
+        let wd_out = std::process::Command::new(bin())
+            .args(["exec", "--workdir", "/tmp", name, "/bin/pwd"])
+            .output()
+            .expect("pelagos exec --workdir /tmp");
+        assert!(
+            wd_out.status.success(),
+            "exec --workdir /tmp should exit 0; stderr={}",
+            String::from_utf8_lossy(&wd_out.stderr).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&wd_out.stdout).trim(),
+            "/tmp",
+            "pwd should return /tmp with --workdir /tmp"
+        );
+
+        // --user 1000:1000: both UID and GID should be 1000.
+        let ug_out = std::process::Command::new(bin())
+            .args([
+                "exec",
+                "--user",
+                "1000:1000",
+                name,
+                "/bin/sh",
+                "-c",
+                "echo $(id -u):$(id -g)",
+            ])
+            .output()
+            .expect("pelagos exec --user 1000:1000");
+        assert!(
+            ug_out.status.success(),
+            "exec --user 1000:1000 should exit 0; stderr={}",
+            String::from_utf8_lossy(&ug_out.stderr).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&ug_out.stdout).trim(),
+            "1000:1000",
+            "uid:gid should be 1000:1000 with --user 1000:1000"
         );
 
         cleanup(name);
