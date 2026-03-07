@@ -14116,6 +14116,208 @@ mod tutorial_e2e_p1 {
         cleanup(name);
     }
 
+    /// test_rootless_exec_sees_container_filesystem
+    ///
+    /// Rootless (no root required). Starts a container that writes a marker to
+    /// /tmp/exec-marker and then sleeps. Runs `pelagos exec ... /bin/cat
+    /// /tmp/exec-marker` and asserts the output matches the marker string.
+    ///
+    /// Proves that the exec'd process joins the container's MOUNT namespace
+    /// (including its overlay-backed /tmp), not the host mount namespace.
+    /// Failure indicates MOUNT namespace join is broken in rootless exec.
+    #[test]
+    #[serial_test::serial]
+    fn test_rootless_exec_sees_container_filesystem() {
+        ensure_alpine();
+        let name = "rootless-exec-fs-test";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine:3.21",
+                "/bin/sh",
+                "-c",
+                "echo EXEC_MARKER_ROOTLESS > /tmp/exec-marker && sleep 60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached rootless run should exit 0");
+
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            name
+        );
+
+        // Give the shell time to write the marker file.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let exec_out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/cat", "/tmp/exec-marker"])
+            .output()
+            .expect("pelagos exec");
+        let stdout = String::from_utf8_lossy(&exec_out.stdout);
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+        assert!(
+            exec_out.status.success(),
+            "pelagos exec should exit 0; stderr={}",
+            stderr.trim()
+        );
+        assert_eq!(
+            stdout.trim(),
+            "EXEC_MARKER_ROOTLESS",
+            "exec should see the container's /tmp/exec-marker"
+        );
+
+        cleanup(name);
+    }
+
+    /// test_rootless_exec_environment
+    ///
+    /// Rootless (no root required). Starts a container with a custom env var
+    /// (`-e MY_EXEC_VAR=hello_rootless`), then runs `pelagos exec -e
+    /// MY_EXEC_VAR=overridden ... /bin/sh -c 'echo $MY_EXEC_VAR'` and asserts
+    /// the exec'd process sees the override.
+    ///
+    /// Also runs exec without the override and asserts the container's original
+    /// value is inherited from /proc/{pid}/environ.
+    ///
+    /// Failure indicates env var inheritance or -e override in exec is broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_rootless_exec_environment() {
+        ensure_alpine();
+        let name = "rootless-exec-env-test";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--env",
+                "MY_EXEC_VAR=hello_rootless",
+                "alpine:3.21",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached rootless run should exit 0");
+
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            name
+        );
+
+        // Inherited from container's /proc/{pid}/environ.
+        let inherit_out = std::process::Command::new(bin())
+            .args([
+                "exec", name, "/bin/sh", "-c", "echo $MY_EXEC_VAR",
+            ])
+            .output()
+            .expect("pelagos exec (inherit)");
+        assert!(
+            inherit_out.status.success(),
+            "exec (inherit) should exit 0; stderr={}",
+            String::from_utf8_lossy(&inherit_out.stderr).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&inherit_out.stdout).trim(),
+            "hello_rootless",
+            "exec should inherit MY_EXEC_VAR from container environ"
+        );
+
+        // Override via -e flag.
+        let override_out = std::process::Command::new(bin())
+            .args([
+                "exec",
+                "--env",
+                "MY_EXEC_VAR=overridden",
+                name,
+                "/bin/sh",
+                "-c",
+                "echo $MY_EXEC_VAR",
+            ])
+            .output()
+            .expect("pelagos exec (override)");
+        assert!(
+            override_out.status.success(),
+            "exec (override) should exit 0; stderr={}",
+            String::from_utf8_lossy(&override_out.stderr).trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&override_out.stdout).trim(),
+            "overridden",
+            "exec -e should override MY_EXEC_VAR"
+        );
+
+        cleanup(name);
+    }
+
+    /// test_rootless_exec_nonrunning_fails
+    ///
+    /// Rootless (no root required). Starts a container, stops it, then attempts
+    /// `pelagos exec` on the stopped container. Asserts that exec exits non-zero
+    /// and emits "not running" on stderr.
+    ///
+    /// Failure indicates the liveness check in cmd_exec is not rejecting exited
+    /// containers.
+    #[test]
+    #[serial_test::serial]
+    fn test_rootless_exec_nonrunning_fails() {
+        ensure_alpine();
+        let name = "rootless-exec-dead-test";
+        cleanup(name);
+
+        // Start then immediately stop.
+        let status = std::process::Command::new(bin())
+            .args([
+                "run", "--detach", "--name", name, "alpine:3.21",
+                "/bin/sleep", "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            name
+        );
+
+        let _ = std::process::Command::new(bin())
+            .args(["stop", name])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let exec_out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/echo", "should_not_run"])
+            .output()
+            .expect("pelagos exec on stopped container");
+        assert!(
+            !exec_out.status.success(),
+            "exec on stopped container should exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+        assert!(
+            stderr.contains("not running"),
+            "stderr should mention 'not running', got: {}",
+            stderr.trim()
+        );
+
+        cleanup(name);
+    }
+
     /// test_tut_p1_auto_rm
     ///
     /// Rootless. Runs `pelagos run --rm --name tut-p1-rm alpine /bin/echo "vanish"`

@@ -2849,6 +2849,35 @@ UTS/IPC/NET) and the pid==0 race window fix in `cmd_exec` (polling until the wat
 writes the real container PID before proceeding). Failure indicates a regression in
 either fix.
 
+### `test_rootless_exec_sees_container_filesystem`
+**Requires:** rootless (no root)
+
+Starts a detached container that writes `EXEC_MARKER_ROOTLESS` to `/tmp/exec-marker`,
+then runs `pelagos exec <name> /bin/cat /tmp/exec-marker` and asserts the output
+matches exactly. Failure indicates MOUNT namespace join is broken in rootless exec
+(exec'd process sees host /tmp instead of container's /tmp).
+
+### `test_rootless_exec_environment`
+**Requires:** rootless (no root)
+
+Starts a container with `--env MY_EXEC_VAR=hello_rootless`, then:
+1. Asserts `pelagos exec` inherits `MY_EXEC_VAR=hello_rootless` from the container's
+   `/proc/{grandchild_pid}/environ` (exercises the grandchild-environ fix — state.pid
+   is the intermediate that never exec'd, so we must read environ from its child).
+2. Asserts `pelagos exec --env MY_EXEC_VAR=overridden` overrides the inherited value.
+
+Failure indicates environ inheritance is reading from the wrong PID (intermediate
+instead of actual container), or -e override is broken.
+
+### `test_rootless_exec_nonrunning_fails`
+**Requires:** rootless (no root)
+
+Starts a detached container, stops it with `pelagos stop`, then attempts
+`pelagos exec` and asserts exit non-zero with "not running" on stderr. Exercises the
+pid==0 race fix in `cmd_stop` (stop must wait for the real PID before sending SIGTERM,
+otherwise it races with the watcher overwriting state as Running+real_pid). Failure
+indicates the stop→exec race is back.
+
 ### `test_tut_p1_auto_rm`
 **Requires:** rootless
 

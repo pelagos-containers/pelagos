@@ -69,8 +69,22 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 2. Discover which namespaces the container has
     let ns_entries = discover_namespaces(pid)?;
 
-    // 3. Read the container's environment
-    let container_env = read_proc_environ(pid);
+    // 3. Read the container's environment.
+    //
+    // For containers with a PID namespace, state.pid is the INTERMEDIATE process
+    // (it ran pre_exec but never called exec(), so its /proc/pid/environ reflects
+    // the fork-inherited host environment, not the --env vars).  The actual
+    // container (grandchild) has the correct environ.  Find it via the children
+    // list, falling back to state.pid if no grandchild exists (non-PID-ns case).
+    let environ_pid = {
+        let children_path =
+            format!("/proc/{}/task/{}/children", pid, pid);
+        std::fs::read_to_string(&children_path)
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok())
+            .unwrap_or(pid)
+    };
+    let container_env = read_proc_environ(environ_pid);
 
     // 4. Build Command
     let exe = &args.args[0];

@@ -13,6 +13,23 @@ pub fn cmd_stop(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    // In detached mode there is a brief window where pid==0: the watcher has
+    // written state.json but hasn't yet spawned the container process.  Poll
+    // until the real PID appears so we send SIGTERM to the right process.
+    if state.pid == 0 && check_liveness(state.watcher_pid) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while state.pid == 0
+            && state.status == ContainerStatus::Running
+            && check_liveness(state.watcher_pid)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(s) = read_state(name) {
+                state = s;
+            }
+        }
+    }
+
     if !check_liveness(state.pid) {
         // Already dead — update state and return.
         state.status = ContainerStatus::Exited;
