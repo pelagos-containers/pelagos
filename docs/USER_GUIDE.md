@@ -564,15 +564,53 @@ pelagos ps --all
 pelagos logs <name>
 pelagos logs --follow <name>
 
-# Stop a container (sends SIGTERM)
+# Stop a container (sends SIGTERM; watcher cleans up network resources)
 sudo pelagos stop <name>
 
-# Remove a stopped container
+# Remove a stopped container's state directory
 pelagos rm <name>
 
-# Force remove (SIGKILL + remove even if running)
+# Force remove: SIGTERM → 5 s grace period → SIGKILL (then remove state)
 pelagos rm --force <name>
 ```
+
+### Graceful Shutdown and Resource Cleanup
+
+When a detached container exits — whether naturally, via `pelagos stop`, or via
+`pelagos rm --force` — the watcher process runs full cleanup before exiting:
+
+- Deletes the **veth pair** connecting the container to the bridge
+- Removes the **named network namespace** (`/run/netns/rem-…`)
+- Decrements the **NAT/nftables refcount** and removes the table when the last
+  container on that network exits
+- Removes **iptables DNS rules** added for the container's bridge
+- Deregisters the container from the **DNS daemon**
+
+`pelagos rm --force` uses SIGTERM (not SIGKILL) so the watcher has time to run
+this teardown.  SIGKILL is only sent if the container doesn't exit within 5 s.
+
+> **Note:** If a watcher is killed with `kill -9` (SIGKILL) — for example by
+> the OS OOM killer or a script — teardown cannot run and the kernel resources
+> will leak.  Use `scripts/reset-test-env.sh` to clean up any such leftovers.
+
+### Resetting the Test Environment
+
+For development and testing, `scripts/reset-test-env.sh` performs a full
+teardown of all pelagos kernel resources:
+
+```bash
+sudo scripts/reset-test-env.sh
+```
+
+It handles:
+- Sending **SIGTERM** to running watcher and container processes (3 s grace),
+  then **SIGKILL** to any survivors
+- Deleting all **`vh-*`/`vp-*` veth interfaces** (including any leaked by
+  force-killed processes)
+- Removing all **`pelagos-*` nftables tables** (dynamically enumerated)
+- Flushing **iptables FORWARD/MASQUERADE/INPUT** rules added by pelagos
+- Stopping the **`pelagos-dns` daemon**
+- Removing `/run/pelagos` and any stale overlay mounts
 
 ---
 
