@@ -273,10 +273,48 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     // User
     if let Some(ref u) = args.user {
         let (uid, gid) = parse_user(u)?;
-        cmd = cmd.with_uid(uid);
+
+        // Validate UID against the container's user namespace uid_map before
+        // attempting to spawn.  setuid(uid) inside the user namespace fails
+        // with EINVAL when uid is not covered by any uid_map entry — e.g.
+        // when the container was started from a `newgrp`/`sg` shell where the
+        // effective GID ≠ primary GID, causing newuidmap to be skipped and the
+        // uid_map to collapse to a single entry `0 host_uid 1`.
+        let uid_map_path = format!("/proc/{}/uid_map", environ_pid);
+        if let Ok(uid_map) = std::fs::read_to_string(&uid_map_path) {
+            if !uid_in_ns_map(uid, &uid_map) {
+                return Err(format!(
+                    "UID {} is not mapped in container '{}' user namespace\n\
+                     uid_map: {}\n\
+                     Hint: restart the container from a login shell rather than a \
+                     'newgrp'/'sg' shell to enable subordinate UID mapping (newuidmap).",
+                    uid,
+                    args.name,
+                    uid_map.split_whitespace().collect::<Vec<_>>().join(" ")
+                )
+                .into());
+            }
+        }
+
         if let Some(g) = gid {
+            let gid_map_path = format!("/proc/{}/gid_map", environ_pid);
+            if let Ok(gid_map) = std::fs::read_to_string(&gid_map_path) {
+                if !uid_in_ns_map(g, &gid_map) {
+                    return Err(format!(
+                        "GID {} is not mapped in container '{}' user namespace\n\
+                         gid_map: {}\n\
+                         Hint: restart the container from a login shell rather than a \
+                         'newgrp'/'sg' shell to enable subordinate GID mapping (newgidmap).",
+                        g,
+                        args.name,
+                        gid_map.split_whitespace().collect::<Vec<_>>().join(" ")
+                    )
+                    .into());
+                }
+            }
             cmd = cmd.with_gid(g);
         }
+        cmd = cmd.with_uid(uid);
     }
 
     // 5. Spawn
@@ -588,4 +626,22 @@ fn read_proc_environ(pid: i32) -> Vec<(String, String)> {
             Some((k.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Return true if `uid` is covered by at least one entry in a `/proc/*/uid_map`
+/// file.  Each line is `container_start host_start count`; uid is valid inside
+/// the namespace when `container_start <= uid < container_start + count`.
+fn uid_in_ns_map(uid: u32, uid_map: &str) -> bool {
+    for line in uid_map.lines() {
+        let mut parts = line.split_whitespace();
+        let start: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+        let _host: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+        let count: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+        if let (Some(start), Some(count)) = (start, count) {
+            if uid >= start && uid < start.saturating_add(count) {
+                return true;
+            }
+        }
+    }
+    false
 }
