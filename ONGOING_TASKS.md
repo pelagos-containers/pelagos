@@ -13,9 +13,9 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #78 | feat: test_cgroup_resource_stats_pid_namespace (sub of #74) | test/CLOSED |
 | #77 | feat: test_cgroup_cpuset_pid_namespace (sub of #74) | test/CLOSED |
 | #76 | feat: test_cgroup_cpu_quota_pid_namespace (sub of #74) | test/CLOSED |
-| #52 | epic: AppArmor / SELinux profile support | epic |
-| #63 | feat(mac): AppArmor profile template (sub of #52) | feat |
-| #64 | feat(mac): SELinux process label support (sub of #52) | feat |
+| #52 | epic: AppArmor / SELinux profile support | epic/CLOSED |
+| #63 | feat(mac): AppArmor profile template (sub of #52) | feat/CLOSED |
+| #64 | feat(mac): SELinux process label support (sub of #52) | feat/CLOSED |
 | #60 | feat: io_uring opt-in seccomp profile | feat/low-pri |
 | #61 | feat: CRIU checkpoint/restore support | feat/low-pri |
 | #62 | feat: minimal --features build for embedded/IoT | feat/low-pri |
