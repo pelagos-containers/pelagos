@@ -1,0 +1,85 @@
+# AppArmor profile template for pelagos containers.
+#
+# This profile provides a restrictive-but-functional baseline suitable for
+# most Linux containers.  It mirrors Docker's docker-default profile in scope
+# while being tailored to pelagos's pivot_root + overlayfs setup.
+#
+# USAGE
+#   Load:    sudo apparmor_parser -r scripts/apparmor-profiles/pelagos-container
+#   Apply:   pelagos run --apparmor-profile pelagos-container <image> <cmd>
+#            or in compose: (apparmor-profile "pelagos-container")
+#   Unload:  sudo apparmor_parser -R scripts/apparmor-profiles/pelagos-container
+#
+# CUSTOMISATION
+#   Copy this file, rename the profile, and adjust the rules for your workload.
+#   Common additions:
+#     capability net_admin,      # for network tools
+#     capability sys_ptrace,     # for strace / gdb
+#     /path/to/data/** rw,       # for bind-mounted application data
+#
+# FLAGS
+#   attach_disconnected  — allow attaching to a disconnected path (overlayfs
+#                          merged dirs may appear disconnected to AppArmor)
+#   mediate_deleted      — mediate access to deleted files (pivot_root cleans
+#                          up old root; some file operations span the boundary)
+
+#include <tunables/global>
+
+profile pelagos-container flags=(attach_disconnected,mediate_deleted) {
+
+  #include <abstractions/base>
+
+  # ── Filesystem ────────────────────────────────────────────────────────────
+  # Read-only access to typical system paths.
+  / r,
+  /** r,
+
+  # Allow exec inside the container (ix = inherit profile on exec).
+  /** ix,
+
+  # Allow writes to typical container writable areas.
+  /dev/** rw,
+  /proc/** rw,
+  /sys/fs/cgroup/** rw,
+  /tmp/** rw,
+  /run/** rw,
+  /var/run/** rw,
+
+  # ── Mounts ────────────────────────────────────────────────────────────────
+  # Allow typical container mount operations (proc, sysfs, devtmpfs, overlay).
+  mount fstype=proc -> /proc/,
+  mount fstype=sysfs -> /sys/,
+  mount fstype=devtmpfs -> /dev/,
+  mount fstype=tmpfs,
+  umount,
+  pivot_root,
+
+  # ── Networking ────────────────────────────────────────────────────────────
+  network,
+
+  # ── Signals ───────────────────────────────────────────────────────────────
+  signal (send, receive),
+  signal (send, receive) peer=pelagos-container,
+
+  # ── Capabilities ──────────────────────────────────────────────────────────
+  # Match pelagos's DEFAULT_CAPS set (Podman 11-cap baseline):
+  capability chown,
+  capability dac_override,
+  capability fowner,
+  capability fsetid,
+  capability kill,
+  capability net_bind_service,
+  capability setgid,
+  capability setpcap,
+  capability setuid,
+  capability sys_chroot,
+
+  # ── Deny sensitive kernel interfaces ──────────────────────────────────────
+  deny /proc/sysrq-trigger rwklx,
+  deny /proc/mem rwklx,
+  deny /proc/kmem rwklx,
+  deny /proc/kcore rwklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+}

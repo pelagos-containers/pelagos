@@ -18,6 +18,7 @@ pub mod idmap;
 pub mod image;
 pub mod landlock;
 pub mod lisp;
+pub mod mac;
 pub mod network;
 pub mod notif;
 pub mod oci;

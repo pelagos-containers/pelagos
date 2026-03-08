@@ -565,6 +565,13 @@ fn spawn_service(
         .with_no_new_privileges(true)
         .with_masked_paths_default();
 
+    if let Some(ref profile) = svc.apparmor_profile {
+        cmd = cmd.with_apparmor_profile(profile);
+    }
+    if let Some(ref label) = svc.selinux_label {
+        cmd = cmd.with_selinux_label(label);
+    }
+
     // Spawn detached with log capture.
     std::fs::create_dir_all(containers_dir())?;
     let dir = container_dir(container_name);

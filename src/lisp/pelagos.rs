@@ -66,6 +66,8 @@ pub fn register_pelagos_builtins(
                     user: None,
                     cap_add: Vec::new(),
                     cap_drop: Vec::new(),
+                    apparmor_profile: None,
+                    selinux_label: None,
                 };
                 parse_service_opts(&mut spec, &args[1..])?;
                 if spec.image.is_empty() {

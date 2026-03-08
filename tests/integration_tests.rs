@@ -1116,6 +1116,164 @@ mod security {
     }
 }
 
+mod mac {
+    use super::*;
+
+    /// Smoke test: `.with_apparmor_profile("unconfined")` must not prevent the
+    /// container from starting.  Writing "unconfined" to the exec attr is
+    /// always safe — it explicitly requests no confinement.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    fn test_apparmor_profile_unconfined() {
+        if !is_root() {
+            eprintln!("Skipping test_apparmor_profile_unconfined: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_apparmor_profile_unconfined: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/echo")
+            .args(["ok"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_apparmor_profile("unconfined")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn with apparmor=unconfined should succeed");
+
+        let (status, out, _) = child.wait_with_output().expect("wait");
+        assert!(
+            status.success(),
+            "container with apparmor=unconfined should exit 0"
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("ok"),
+            "expected 'ok' in stdout"
+        );
+    }
+
+    /// Profile application: load the `pelagos-test` AppArmor profile, run a
+    /// container that prints `/proc/self/attr/current`, and assert the output
+    /// contains the profile name.  Unloads the profile afterwards.
+    ///
+    /// Skips when AppArmor is not enabled or `apparmor_parser` is not in PATH.
+    /// Requires root + rootfs.
+    #[test]
+    fn test_apparmor_profile_applied() {
+        if !is_root() {
+            eprintln!("Skipping test_apparmor_profile_applied: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_apparmor_profile_applied: alpine-rootfs not found");
+            return;
+        };
+        if !pelagos::mac::is_apparmor_enabled() {
+            eprintln!("Skipping test_apparmor_profile_applied: AppArmor not enabled");
+            return;
+        }
+        if std::process::Command::new("apparmor_parser")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("Skipping test_apparmor_profile_applied: apparmor_parser not in PATH");
+            return;
+        }
+
+        let profile_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/apparmor-profiles/pelagos-test"
+        );
+
+        // Load the test profile into the kernel.
+        let load = std::process::Command::new("apparmor_parser")
+            .args(["-r", profile_path])
+            .output()
+            .expect("apparmor_parser -r");
+        assert!(
+            load.status.success(),
+            "failed to load pelagos-test profile: {}",
+            String::from_utf8_lossy(&load.stderr)
+        );
+
+        // Run a container that reads its own AppArmor context.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat /proc/self/attr/current"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .with_apparmor_profile("pelagos-test")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn with apparmor=pelagos-test");
+
+        let (status, out, _) = child.wait_with_output().expect("wait");
+
+        // Unload the test profile regardless of result.
+        let _ = std::process::Command::new("apparmor_parser")
+            .args(["-R", profile_path])
+            .output();
+
+        assert!(status.success(), "container should exit 0");
+        let stdout = String::from_utf8_lossy(&out);
+        assert!(
+            stdout.contains("pelagos-test"),
+            "expected 'pelagos-test' in /proc/self/attr/current, got: {stdout:?}"
+        );
+    }
+
+    /// SELinux graceful skip: when SELinux is not running (common on most
+    /// hosts), `.with_selinux_label()` must be silently ignored and the
+    /// container must start normally.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    fn test_selinux_label_no_selinux() {
+        if !is_root() {
+            eprintln!("Skipping test_selinux_label_no_selinux: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_selinux_label_no_selinux: alpine-rootfs not found");
+            return;
+        };
+
+        // Regardless of whether SELinux is enabled, the container must start.
+        // When SELinux is absent the label is silently skipped (open returns
+        // ENOENT → fd = -1 → write_mac_attr is a no-op).
+        let mut child = Command::new("/bin/echo")
+            .args(["ok"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_selinux_label("system_u:system_r:container_t:s0")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect(
+                "spawn with selinux label should succeed (silently skipped when SELinux absent)",
+            );
+
+        let (status, out, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "container should exit 0");
+        assert!(
+            String::from_utf8_lossy(&out).contains("ok"),
+            "expected 'ok' in stdout"
+        );
+    }
+}
+
 mod user_notif {
     use super::*;
     use pelagos::notif::{SyscallHandler, SyscallNotif, SyscallResponse};

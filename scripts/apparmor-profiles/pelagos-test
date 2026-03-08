@@ -1,0 +1,20 @@
+# AppArmor profile for pelagos integration tests ONLY.
+# This profile is intentionally fully permissive — it is used solely to verify
+# that pelagos correctly applies a named AppArmor profile to a container.
+# Do NOT use this profile in production; use pelagos-container instead.
+
+#include <tunables/global>
+
+profile pelagos-test flags=(attach_disconnected,mediate_deleted) {
+  # Allow everything — enforcement testing is done by pelagos-container.
+  file,
+  network,
+  capability,
+  signal,
+  ptrace,
+  unix,
+  mount,
+  umount,
+  pivot_root,
+  dbus,
+}

@@ -142,6 +142,15 @@ pub struct RunArgs {
     #[clap(long = "security-opt")]
     pub security_opt: Vec<String>,
 
+    /// AppArmor profile to apply at container exec time (e.g. "pelagos-container")
+    #[clap(long = "apparmor-profile", value_name = "PROFILE")]
+    pub apparmor_profile: Option<String>,
+
+    /// SELinux process label to apply at container exec time
+    /// (e.g. "system_u:system_r:container_t:s0")
+    #[clap(long = "selinux-label", value_name = "LABEL")]
+    pub selinux_label: Option<String>,
+
     /// Link to another container for /etc/hosts name resolution (repeatable).
     /// Format: NAME or NAME:ALIAS
     #[clap(long = "link")]
@@ -662,6 +671,14 @@ fn apply_cli_options(
     if !args.masked_path.is_empty() {
         let paths: Vec<&str> = args.masked_path.iter().map(|s| s.as_str()).collect();
         cmd = cmd.with_masked_paths(&paths);
+    }
+
+    // MAC: AppArmor profile and SELinux label
+    if let Some(ref profile) = args.apparmor_profile {
+        cmd = cmd.with_apparmor_profile(profile);
+    }
+    if let Some(ref label) = args.selinux_label {
+        cmd = cmd.with_selinux_label(label);
     }
 
     Ok(cmd)

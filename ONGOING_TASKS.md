@@ -6,21 +6,26 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
-| #47 | track: runtime-tools pidfile.t kill-on-stopped bug (upstream) | upstream |
-| #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
-| #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
+| #86 | bug: postgres:alpine CAP_CHOWN/CAP_FOWNER denied in compose | bug/CLOSED |
+| #80 | bug: test_dns_upstream_forward fails (EAGAIN on 8.8.8.8 fwd socket) | bug/CLOSED |
+| #74 | epic: cgroup enforcement test coverage | epic/CLOSED |
+| #79 | feat: test_cgroup_pids_limit_pid_namespace (sub of #74) | test/CLOSED |
+| #78 | feat: test_cgroup_resource_stats_pid_namespace (sub of #74) | test/CLOSED |
+| #77 | feat: test_cgroup_cpuset_pid_namespace (sub of #74) | test/CLOSED |
+| #76 | feat: test_cgroup_cpu_quota_pid_namespace (sub of #74) | test/CLOSED |
 | #52 | epic: AppArmor / SELinux profile support | epic |
+| #63 | feat(mac): AppArmor profile template (sub of #52) | feat |
+| #64 | feat(mac): SELinux process label support (sub of #52) | feat |
 | #60 | feat: io_uring opt-in seccomp profile | feat/low-pri |
 | #61 | feat: CRIU checkpoint/restore support | feat/low-pri |
 | #62 | feat: minimal --features build for embedded/IoT | feat/low-pri |
-| #63 | feat(mac): AppArmor profile template (sub of #51) | feat |
-| #64 | feat(mac): SELinux process label support (sub of #51) | feat |
 | #67 | epic: deeper Wasm/WASI support | epic |
 | #70 | feat(wasm): mixed Linux+Wasm compose validation (P1) | feat |
 | #71 | feat(wasm): WASI preview 2 socket passthrough (P2) | feat |
-| #72 | feat(wasm): Component Model via embedded wasmtime (P3) | feat/CLOSED |
 | #73 | feat(wasm): persistent Wasm VM pool (P4) | feat/low-pri |
-| #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
+| #47 | track: runtime-tools pidfile.t kill-on-stopped bug (upstream) | upstream |
+| #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
+| #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
 ## Current Baseline (2026-03-07, SHA 201e4b4, v0.24.0)
 
@@ -262,11 +267,76 @@ dirty container state. Passes when run in isolation after
 
 ## Next Session: Start Here
 
-1. **#52 — AppArmor/SELinux profile support** (highest real-world security impact)
-   - Sub-issues: #63 (AppArmor template), #64 (SELinux process label)
-   - Design choice to resolve: generate profiles at build time vs ship canned profiles
+1. **#52 — AppArmor/SELinux profile support** — see plan below
 2. #60 (io_uring seccomp profile) — useful complement to existing seccomp work
 3. #61 (CRIU checkpoint/restore) — complex but differentiating feature
+
+---
+
+## Plan: AppArmor / SELinux Profile Support (#52, #63, #64)
+
+### Context
+
+- **AppArmor**: AVAILABLE on this host (`/proc/self/attr/apparmor/exec` writable).
+- **SELinux**: NOT available (`/sys/fs/selinux/` absent). Code is implemented; tests verify graceful skip.
+- **No existing MAC code** in the codebase. Clean slate.
+
+### Pre-exec hook placement
+
+The AppArmor exec-attr write must happen:
+- AFTER the PID-namespace double-fork (line ~3212) — so the grandchild (real container) writes its own attr, not the intermediate waiter
+- BEFORE chroot/pivot_root (line ~3282) — so `/proc/self/attr/apparmor/exec` is accessible via the host's /proc
+- WRITTEN late — after all security setup (caps, ambient, OOM adj, user callback, NNP) but BEFORE seccomp
+
+Technique: open the attr fd early (before chroot), write it late (before seccomp). Follows runc's pattern.
+
+### New steps in pre_exec
+
+**Step 3.9 (new)** — after double-fork, before overlay mount (~line 3240):
+```
+Open /proc/self/attr/apparmor/exec → apparmor_attr_fd (−1 if AppArmor not running)
+Open /proc/self/attr/exec          → selinux_attr_fd  (−1 if SELinux not running)
+```
+
+**Step 6.56 (new)** — after Landlock (step 6.55), before seccomp (step 7):
+```
+if apparmor_attr_fd >= 0: write(apparmor_attr_fd, profile); close(fd)
+if selinux_attr_fd  >= 0: write(selinux_attr_fd,  label);   close(fd)
+```
+
+### Files to create / modify
+
+| File | Change |
+|------|--------|
+| `src/mac.rs` (new) | `is_apparmor_enabled()`, `is_selinux_enabled()` (used from tests + CLI) |
+| `src/lib.rs` | `pub mod mac;` |
+| `src/container.rs` | New fields `apparmor_profile`, `selinux_label`; builder methods; two new pre_exec steps |
+| `src/cli/run.rs` | `--apparmor-profile` and `--selinux-label` CLI flags |
+| `src/compose.rs` | `apparmor_profile`, `selinux_label` fields on `ServiceSpec` + parser |
+| `src/cli/compose.rs` | Wire fields in `spawn_service()` |
+| `scripts/apparmor-profiles/pelagos-container` (new) | Minimal AppArmor profile template (permissive-ish baseline, commented) |
+| `scripts/apparmor-profiles/pelagos-test` (new) | Fully permissive profile for integration tests only |
+| `tests/integration_tests.rs` | 3 new tests (see below) |
+| `docs/INTEGRATION_TESTS.md` | Document the 3 new tests |
+
+### Tests
+
+| Test | Requires root | When run | Assertion |
+|------|--------------|----------|-----------|
+| `test_apparmor_profile_unconfined` | yes | AppArmor enabled OR not | `.with_apparmor_profile("unconfined")` — container exits 0 |
+| `test_apparmor_profile_applied` | yes | Skip if AppArmor disabled or `apparmor_parser` missing | Load `pelagos-test` profile; run container that prints `/proc/self/attr/current`; assert output contains `pelagos-test`; unload profile |
+| `test_selinux_label_no_selinux` | yes | Always | `.with_selinux_label("system_u:system_r:container_t:s0")` — container exits 0 (label silently ignored when SELinux not running) |
+
+### Graceful degradation rules
+
+- `open()` of attr path returns ENOENT / EACCES → LSM not running → fd = −1 → skip silently, container runs unconfined
+- `write()` fails (e.g., EINVAL — profile not found in kernel) → propagate as spawn error
+- "unconfined" is always a safe profile name on AppArmor-enabled systems
+
+### What #63 and #64 deliver
+
+- **#63**: `with_apparmor_profile()` API, `--apparmor-profile` CLI flag, `(apparmor-profile ...)` in compose, `scripts/apparmor-profiles/pelagos-container` template
+- **#64**: `with_selinux_label()` API, `--selinux-label` CLI flag, `(selinux-label ...)` in compose, graceful skip when SELinux absent
 
 ## Session Notes
 

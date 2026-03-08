@@ -942,6 +942,12 @@ pub struct Command {
     umask: Option<u32>,
     // Landlock filesystem access rules applied in pre_exec before seccomp.
     landlock_rules: Vec<crate::landlock::LandlockRule>,
+    // AppArmor profile name to apply at exec time via /proc/self/attr/apparmor/exec.
+    // Silently skipped when AppArmor is not running.
+    apparmor_profile: Option<String>,
+    // SELinux process label to apply at exec time via /proc/self/attr/exec.
+    // Silently skipped when SELinux is not running.
+    selinux_label: Option<String>,
     // Syscall numbers to intercept with SECCOMP_RET_USER_NOTIF.
     user_notif_syscalls: Vec<i64>,
     // Handler invoked by the supervisor thread for each intercepted syscall.
@@ -1008,6 +1014,8 @@ impl Command {
             additional_gids: Vec::new(),
             umask: None,
             landlock_rules: Vec::new(),
+            apparmor_profile: None,
+            selinux_label: None,
             user_notif_syscalls: Vec::new(),
             user_notif_handler: None,
             wasi_config: None,
@@ -1964,6 +1972,35 @@ impl Command {
         self
     }
 
+    /// Confine the container process under the named AppArmor profile.
+    ///
+    /// The profile name is written to `/proc/self/attr/apparmor/exec` before
+    /// chroot in the pre-exec hook, causing the kernel to transition the process
+    /// into the named profile when `exec(2)` replaces the process image.
+    ///
+    /// If AppArmor is not running (the attr path is absent) the write is silently
+    /// skipped and the container starts normally (unconfined).  If the profile
+    /// name is not loaded in the kernel, the write returns `EINVAL` and
+    /// `spawn()` propagates the error.
+    ///
+    /// Use `"unconfined"` to explicitly run the container without AppArmor
+    /// confinement regardless of any parent profile inheritance.
+    pub fn with_apparmor_profile(mut self, profile: &str) -> Self {
+        self.apparmor_profile = Some(profile.to_string());
+        self
+    }
+
+    /// Apply a SELinux process label to the container at exec time.
+    ///
+    /// The label (e.g. `"system_u:system_r:container_t:s0"`) is written to
+    /// `/proc/self/attr/exec` before chroot in the pre-exec hook.  If SELinux
+    /// is not loaded the write is silently skipped and the container starts
+    /// normally.
+    pub fn with_selinux_label(mut self, label: &str) -> Self {
+        self.selinux_label = Some(label.to_string());
+        self
+    }
+
     /// Intercept specific syscalls via `SECCOMP_RET_USER_NOTIF` (Linux ≥ 5.0).
     ///
     /// For each syscall number in `syscalls`, the container thread is suspended
@@ -2513,6 +2550,17 @@ impl Command {
         let additional_gids = self.additional_gids.clone();
         let umask_val = self.umask;
         let landlock_rules = self.landlock_rules.clone();
+        // MAC: only activate AppArmor / SELinux if the respective LSM is running.
+        // Checked in the parent so we can use is_apparmor_enabled() / is_selinux_enabled()
+        // (which allocate) rather than deferring the check to the async-signal-safe pre_exec.
+        let apparmor_profile: Option<String> = self
+            .apparmor_profile
+            .clone()
+            .filter(|_| crate::mac::is_apparmor_enabled());
+        let selinux_label: Option<String> = self
+            .selinux_label
+            .clone()
+            .filter(|_| crate::mac::is_selinux_enabled());
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
@@ -3232,6 +3280,23 @@ impl Command {
                         )));
                     }
                 }
+
+                // Step 3.9: Open MAC (AppArmor / SELinux) exec attr fds NOW — before
+                // chroot/pivot_root — so that /proc/self/attr/* is accessible via the
+                // host's procfs.  The fds remain valid after chroot (open file
+                // descriptors are not affected by chroot).  They are written late, at
+                // step 6.56, after all security setup but before seccomp.
+                // Returns -1 when the respective LSM is not running (silently skipped).
+                let apparmor_attr_fd: libc::c_int = if apparmor_profile.is_some() {
+                    crate::mac::open_apparmor_exec_attr()
+                } else {
+                    -1
+                };
+                let selinux_attr_fd: libc::c_int = if selinux_label.is_some() {
+                    crate::mac::open_selinux_exec_attr()
+                } else {
+                    -1
+                };
 
                 // Step 2: UID/GID mapping for root-created user namespaces.
                 // Maps are written by the parent process (via needs_parent_idmap pipe),
@@ -4187,6 +4252,18 @@ impl Command {
                     crate::landlock::apply_landlock(&landlock_rules)?;
                 }
 
+                // Step 6.56: Write MAC (AppArmor / SELinux) exec labels via the
+                // pre-opened attr fds (opened at step 3.9, before chroot).
+                // Must run after all privilege drops + NNP but BEFORE seccomp, so
+                // no seccomp filter can block the write(2) call.
+                // fd == -1 means the LSM is not running; write_mac_attr is a no-op.
+                if let Some(ref profile) = apparmor_profile {
+                    crate::mac::write_mac_attr(apparmor_attr_fd, profile)?;
+                }
+                if let Some(ref label) = selinux_label {
+                    crate::mac::write_mac_attr(selinux_attr_fd, label)?;
+                }
+
                 // Step 7: Apply seccomp filter (no_new_privileges=true path only).
                 // When no_new_privileges=true, NNP was already set at step 6.5, which
                 // grants permission to apply seccomp without CAP_SYS_ADMIN.
@@ -4756,6 +4833,14 @@ impl Command {
         let additional_gids = self.additional_gids.clone();
         let umask_val = self.umask;
         let landlock_rules = self.landlock_rules.clone();
+        let apparmor_profile: Option<String> = self
+            .apparmor_profile
+            .clone()
+            .filter(|_| crate::mac::is_apparmor_enabled());
+        let selinux_label: Option<String> = self
+            .selinux_label
+            .clone()
+            .filter(|_| crate::mac::is_selinux_enabled());
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
@@ -5377,6 +5462,18 @@ impl Command {
                         )));
                     }
                 }
+
+                // Step 3.9: Open MAC attr fds before chroot (mirrors spawn() step 3.9).
+                let apparmor_attr_fd: libc::c_int = if apparmor_profile.is_some() {
+                    crate::mac::open_apparmor_exec_attr()
+                } else {
+                    -1
+                };
+                let selinux_attr_fd: libc::c_int = if selinux_label.is_some() {
+                    crate::mac::open_selinux_exec_attr()
+                } else {
+                    -1
+                };
 
                 // Step 2: UID/GID mapping for root-created user namespaces.
                 // Maps are written by the parent (needs_parent_idmap pipe mechanism),
@@ -6194,6 +6291,14 @@ impl Command {
                 // Apply Landlock (NNP=true path, mirrors spawn() step 6.55).
                 if no_new_privileges && !landlock_rules.is_empty() {
                     crate::landlock::apply_landlock(&landlock_rules)?;
+                }
+
+                // Step 6.56: Write MAC labels (mirrors spawn() step 6.56).
+                if let Some(ref profile) = apparmor_profile {
+                    crate::mac::write_mac_attr(apparmor_attr_fd, profile)?;
+                }
+                if let Some(ref label) = selinux_label {
+                    crate::mac::write_mac_attr(selinux_attr_fd, label)?;
                 }
 
                 // Apply seccomp (no_new_privileges=true path only, mirrors spawn() step 7).

@@ -50,6 +50,10 @@ pub struct ServiceSpec {
     /// Capabilities to remove from the default set, or "ALL" to start from empty.
     /// Accepts bare names, prefixed names, or the special value "ALL".
     pub cap_drop: Vec<String>,
+    /// AppArmor profile to apply at exec time (e.g. "pelagos-container").
+    pub apparmor_profile: Option<String>,
+    /// SELinux process label to apply at exec time.
+    pub selinux_label: Option<String>,
 }
 
 /// A volume mount: `name:path` inside the container.
@@ -295,6 +299,8 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         user: None,
         cap_add: Vec::new(),
         cap_drop: Vec::new(),
+        apparmor_profile: None,
+        selinux_label: None,
     };
 
     for arg in &args[1..] {
@@ -426,6 +432,20 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
                     })?;
                     spec.cap_drop.push(cap.to_string());
                 }
+            }
+            "apparmor-profile" => {
+                spec.apparmor_profile = Some(require_atom(
+                    list,
+                    1,
+                    &format!("service '{}' apparmor-profile", name),
+                )?);
+            }
+            "selinux-label" => {
+                spec.selinux_label = Some(require_atom(
+                    list,
+                    1,
+                    &format!("service '{}' selinux-label", name),
+                )?);
             }
             other => {
                 return Err(ComposeError::SyntaxError(format!(

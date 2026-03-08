@@ -228,6 +228,40 @@ scoped to the declared subtrees, or `/tmp` is inadvertently inheriting access.
 
 ---
 
+## MAC (AppArmor / SELinux) Tests
+
+### `test_apparmor_profile_unconfined`
+**Requires:** root, rootfs
+
+Calls `.with_apparmor_profile("unconfined")`. When AppArmor is not running (detected via
+`is_apparmor_enabled()` in the parent) the profile field is silently cleared and the
+container starts normally.  When AppArmor IS running, "unconfined" is written to
+`/proc/self/attr/apparmor/exec` before chroot and the container runs unconfined.
+Asserts exit 0 and "ok" in stdout.  Failure indicates the MAC fd-open/write path
+broke container startup in either the AppArmor-on or AppArmor-off case.
+
+### `test_apparmor_profile_applied`
+**Requires:** root, rootfs, AppArmor enabled, `apparmor_parser` in PATH
+
+Loads `scripts/apparmor-profiles/pelagos-test` into the kernel via `apparmor_parser -r`,
+runs a container that prints `/proc/self/attr/current`, and asserts the output contains
+`"pelagos-test"`.  Unloads the profile afterwards.  Skips when AppArmor is not enabled or
+`apparmor_parser` is absent.  Failure indicates the exec-attr fd technique (open before
+chroot, write before seccomp) is not correctly transitioning the process into the named
+profile at exec time.
+
+### `test_selinux_label_no_selinux`
+**Requires:** root, rootfs
+
+Calls `.with_selinux_label("system_u:system_r:container_t:s0")`.  Because SELinux is not
+running, `is_selinux_enabled()` returns false in the parent, the label is cleared, and the
+container starts normally.  Asserts exit 0 and "ok" in stdout.  This test always runs
+(it does not skip on systems without SELinux) to confirm that the graceful-degradation path
+works: a misconfigured or production host without SELinux must not fail container startup
+simply because a label was specified.
+
+---
+
 ## `SECCOMP_RET_USER_NOTIF` Supervisor Tests
 
 ### `test_user_notif_handler_invoked`
