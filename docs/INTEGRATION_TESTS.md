@@ -144,6 +144,25 @@ the API-only section.
 Runs `echo` with no seccomp configuration at all. Confirms baseline operation is
 unaffected when seccomp is not used.
 
+### `test_seccomp_docker_blocks_io_uring`
+**Requires:** root, rootfs, C compiler (`cc`/`gcc`)
+
+Compiles `scripts/iouring-test-context/iouring_probe.c` as a static binary, bind-mounts
+it into the container, and runs it under the Docker default seccomp profile. The probe
+calls `io_uring_setup(0, NULL)` directly via `syscall(2)` and exits 1 if it receives
+`EPERM`. Test asserts exit code 1, confirming the three io_uring syscalls
+(`io_uring_setup`, `io_uring_enter`, `io_uring_register`) are blocked by the default
+profile. Skipped if no C compiler is available.
+
+### `test_seccomp_iouring_profile_allows_io_uring`
+**Requires:** root, rootfs, C compiler (`cc`/`gcc`)
+
+Same probe binary run under `SeccompProfile::DockerWithIoUring` (via
+`with_seccomp_allow_io_uring()`). Asserts exit code 0, meaning the syscall reached the
+kernel (returning `EINVAL`/`EFAULT` for invalid args) rather than being blocked with
+`EPERM`. Confirms the opt-in profile correctly removes the io_uring restriction. Skipped
+if no C compiler is available.
+
 ---
 
 ## Phase 1 Security Tests

@@ -691,6 +691,114 @@ mod security {
         assert!(status.success(), "Container should work without seccomp");
     }
 
+    /// Compile `scripts/iouring-test-context/iouring_probe.c` into the given path.
+    ///
+    /// Compiled as a static binary so it runs inside the Alpine (musl) rootfs
+    /// without glibc. Returns `None` if no C compiler is available (test skipped).
+    fn compile_iouring_probe(dest: &std::path::Path) -> Option<()> {
+        let src = std::env::current_dir()
+            .ok()?
+            .join("scripts/iouring-test-context/iouring_probe.c");
+        for compiler in &["cc", "gcc"] {
+            let status = std::process::Command::new(compiler)
+                .args([
+                    "-static",
+                    "-o",
+                    dest.to_str().unwrap(),
+                    src.to_str().unwrap(),
+                ])
+                .status()
+                .ok()?;
+            if status.success() {
+                return Some(());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_seccomp_docker_blocks_io_uring() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_docker_blocks_io_uring: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_seccomp_docker_blocks_io_uring: alpine-rootfs not found");
+            return;
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let probe = tmp.path().join("iouring_probe");
+        if compile_iouring_probe(&probe).is_none() {
+            eprintln!("Skipping test_seccomp_docker_blocks_io_uring: no C compiler found");
+            return;
+        }
+
+        // Bind-mount the tempdir to /tmp (which exists in Alpine) so the container
+        // can exec the statically-linked probe binary.
+        let mut child = Command::new("/tmp/iouring_probe")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(tmp.path(), "/tmp")
+            .with_seccomp_default()
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let status = child.wait().expect("Failed to wait");
+        // Exit 1 means EPERM — seccomp blocked the syscall as expected.
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "Docker default profile should block io_uring_setup (expected exit 1 = EPERM)"
+        );
+    }
+
+    #[test]
+    fn test_seccomp_iouring_profile_allows_io_uring() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_iouring_profile_allows_io_uring: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_seccomp_iouring_profile_allows_io_uring: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let probe = tmp.path().join("iouring_probe");
+        if compile_iouring_probe(&probe).is_none() {
+            eprintln!("Skipping test_seccomp_iouring_profile_allows_io_uring: no C compiler found");
+            return;
+        }
+
+        let mut child = Command::new("/tmp/iouring_probe")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(tmp.path(), "/tmp")
+            .with_seccomp_allow_io_uring()
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let status = child.wait().expect("Failed to wait");
+        // Exit 0 means the syscall reached the kernel (EINVAL/EFAULT with bogus args).
+        // Exit 1 would mean EPERM — seccomp is still blocking, which is a bug.
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "DockerWithIoUring profile should allow io_uring_setup to reach the kernel (expected exit 0)"
+        );
+    }
+
     #[test]
     fn test_no_new_privileges() {
         if !is_root() {

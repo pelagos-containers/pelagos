@@ -138,7 +138,7 @@ pub struct RunArgs {
     #[clap(long = "cap-add")]
     pub cap_add: Vec<String>,
 
-    /// Security options: seccomp=default|minimal|none, no-new-privileges
+    /// Security options: seccomp=default|minimal|iouring|none, no-new-privileges
     #[clap(long = "security-opt")]
     pub security_opt: Vec<String>,
 
@@ -644,10 +644,11 @@ fn apply_cli_options(
             "seccomp" => match val {
                 "default" | "" => cmd = cmd.with_seccomp_default(),
                 "minimal" => cmd = cmd.with_seccomp_minimal(),
+                "iouring" | "io-uring" => cmd = cmd.with_seccomp_allow_io_uring(),
                 "none" => {}
                 other => {
                     return Err(format!(
-                        "unknown seccomp profile '{}' (use: default, minimal, none)",
+                        "unknown seccomp profile '{}' (use: default, minimal, iouring, none)",
                         other
                     )
                     .into())

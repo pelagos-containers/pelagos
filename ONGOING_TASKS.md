@@ -27,10 +27,10 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-08, SHA d127a42, post-v0.24.0)
+## Current Baseline (2026-03-09, post-v0.24.0)
 
-- Unit tests: **296/296 pass**
-- Integration tests: **246/246 pass, 6 ignored**
+- Unit tests: **299/299 pass**
+- Integration tests: **248/248 pass, 6 ignored**
 - Tree: clean, up to date with origin/main
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
@@ -284,9 +284,74 @@ dirty container state. Passes when run in isolation after
 
 ## Next Session: Start Here
 
-1. #60 (io_uring seccomp profile) — useful complement to existing seccomp work
-2. #61 (CRIU checkpoint/restore) — complex but differentiating feature
-3. Wasm: #70 (mixed compose validation), #71 (WASI P2 sockets)
+1. #61 (CRIU checkpoint/restore) — complex but differentiating feature
+2. Wasm: #70 (mixed compose validation), #71 (WASI P2 sockets)
+
+## Completed This Session (2026-03-09)
+
+### io_uring opt-in seccomp profile (#60) — commit TBD
+
+- **Gap closed**: added `io_uring_setup`, `io_uring_enter`, `io_uring_register` to
+  `docker_default_filter()`'s blocked list, matching Docker's actual behaviour
+  (syscall numbers 425/426/427, same on x86_64 and aarch64)
+- **Opt-in**: `SeccompProfile::DockerWithIoUring` variant + `docker_iouring_filter()`
+  function (identical to Docker minus the three io_uring syscalls)
+- **Builder**: `Command::with_seccomp_allow_io_uring()`
+- **CLI**: `--security-opt seccomp=iouring` / `seccomp=io-uring`
+- **Test binary**: `scripts/iouring-test-context/iouring_probe.c` — static C probe,
+  exits 1 on EPERM (seccomp blocked), 0 on EINVAL/EFAULT (kernel reached)
+- **Integration tests**: `test_seccomp_docker_blocks_io_uring`,
+  `test_seccomp_iouring_profile_allows_io_uring` — both pass
+- Unit tests: 299/299 pass; integration tests: 248/248 pass
+- Issue #60 closed
+
+---
+
+## Plan: io_uring opt-in seccomp profile (#60)
+
+### Background
+
+Docker's real default seccomp profile blocks `io_uring_setup`, `io_uring_enter`,
+`io_uring_register` — these syscalls were blocked by Docker post-5.12 due to
+historical kernel exploits via io_uring. Pelagos's Docker-derived profile currently
+omits them from the blocked list (gap vs Docker reality). The feature:
+
+1. Closes the gap: add the three syscalls to `docker_default_filter()`'s blocked list.
+2. Provides opt-in: add `SeccompProfile::DockerWithIoUring` + `with_seccomp_allow_io_uring()`
+   builder + `--security-opt seccomp=iouring` CLI flag.
+
+### Syscall numbers (same on x86_64 and aarch64)
+
+| Syscall | x86_64 / aarch64 |
+|---------|-------------------|
+| `io_uring_setup` | 425 |
+| `io_uring_enter` | 426 |
+| `io_uring_register` | 427 |
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `src/seccomp.rs` | Add numbers to `syscall_number()`; add to `docker_default_filter()` blocked list; add `SeccompProfile::DockerWithIoUring`; add `docker_iouring_filter()` |
+| `src/container.rs` | Match arm for new variant; `with_seccomp_allow_io_uring()` builder |
+| `src/cli/run.rs` | `"iouring"\|"io-uring"` in seccomp CLI parser |
+| `scripts/iouring-test-context/iouring_probe.c` | C probe: calls `io_uring_setup(0,NULL)`; exits 1 on EPERM, 0 on anything else |
+| `tests/integration_tests.rs` | 2 new tests (see below) |
+| `docs/INTEGRATION_TESTS.md` | Document new tests |
+
+### `docker_iouring_filter()`
+
+Identical to `docker_default_filter()` but excludes the three io_uring names from
+`blocked_syscalls`. No other changes.
+
+### Tests
+
+| Test | Root | Assertion |
+|------|------|-----------|
+| `test_seccomp_docker_blocks_io_uring` | yes | Container with default Docker seccomp; runs `iouring_probe`; expects exit 1 (EPERM from seccomp) |
+| `test_seccomp_iouring_profile_allows_io_uring` | yes | Container with `DockerWithIoUring`; runs `iouring_probe`; expects exit 0 (EINVAL from kernel — syscall reached) |
+
+Both tests compile `iouring_probe.c` at test time with `cc`/`gcc`. Skip if compiler absent.
 
 ---
 

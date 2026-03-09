@@ -1894,6 +1894,17 @@ impl Command {
         self
     }
 
+    /// Apply Docker's default profile with io_uring syscalls permitted.
+    ///
+    /// Identical to [`Command::with_seccomp_default`] except that
+    /// `io_uring_setup`, `io_uring_enter`, and `io_uring_register` are allowed.
+    /// Use this for database or storage workloads that require high-throughput
+    /// async I/O via io_uring.
+    pub fn with_seccomp_allow_io_uring(mut self) -> Self {
+        self.seccomp_profile = Some(SeccompProfile::DockerWithIoUring);
+        self
+    }
+
     /// Set a specific seccomp profile.
     ///
     /// Allows choosing between different security profiles programmatically.
@@ -2389,6 +2400,9 @@ impl Command {
                 match profile {
                     SeccompProfile::Docker => {
                         Some(crate::seccomp::docker_default_filter().map_err(Error::Seccomp)?)
+                    }
+                    SeccompProfile::DockerWithIoUring => {
+                        Some(crate::seccomp::docker_iouring_filter().map_err(Error::Seccomp)?)
                     }
                     SeccompProfile::Minimal => {
                         Some(crate::seccomp::minimal_filter().map_err(Error::Seccomp)?)
@@ -4683,6 +4697,9 @@ impl Command {
                 match profile {
                     SeccompProfile::Docker => {
                         Some(crate::seccomp::docker_default_filter().map_err(Error::Seccomp)?)
+                    }
+                    SeccompProfile::DockerWithIoUring => {
+                        Some(crate::seccomp::docker_iouring_filter().map_err(Error::Seccomp)?)
                     }
                     SeccompProfile::Minimal => {
                         Some(crate::seccomp::minimal_filter().map_err(Error::Seccomp)?)
