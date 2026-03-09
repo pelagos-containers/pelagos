@@ -27,7 +27,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-09, post-v0.24.0)
+## Current Baseline (2026-03-09, SHA 42cb2c5)
 
 - Unit tests: **299/299 pass**
 - Integration tests: **249/249 pass, 6 ignored**
@@ -35,6 +35,33 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
 a possibly dirty environment.
+
+## Completed This Session (2026-03-09)
+
+### AppArmor CI fix — commit f011b44
+- `write_mac_attr` was writing bare profile name (e.g. `"unconfined"`) to
+  `/proc/self/attr/apparmor/exec`; kernel requires `"exec <profile>"` format (same as runc)
+- Local tests passed because AppArmor is disabled on dev machine (fd=-1 short-circuits write)
+- GH CI has AppArmor enabled → EINVAL on both AppArmor tests
+- Fixed both spawn paths in `container.rs` (lines ~4274, ~6315): `format!("exec {}", profile)`
+- SELinux writes unchanged (bare context string is correct for SELinux)
+
+### macOS Apple Silicon design analysis
+- Full architecture analysis written to `docs/MACOS_APPLE_SILICON.md`
+- 5 options evaluated: Lima/SSH, vfkit+Rust, Lima+gRPC, Homebrew, Apple Containerization
+- Security analysis added for each option
+- Key finding: `objc2-virtualization` crate exists (auto-generated, weekly Xcode SDK updates,
+  59k dependents) — pure-Rust AVF path is viable today, no Go required
+- Design principle added to `docs/DESIGN_PRINCIPLES.md` §7a: library deps vs. subsystem deps
+- Recommendation revised: pure-Rust AVF (pelagos-vz) is the target, not Lima
+
+### pelagos-mac repo created — commit 26137d7
+- New repo: https://github.com/skeptomai/pelagos-mac
+- Located at: /home/cb/Projects/pelagos-mac
+- Cargo workspace: pelagos-vz (AVF), pelagos-guest (vsock daemon), pelagos-mac (CLI)
+- CLAUDE.md, ONGOING_TASKS.md (6 pilot tasks), README.md, docs/DESIGN.md all written
+- Stubs with todo!() and protocol types in place; nothing implemented yet
+- Next work: start a session in /home/cb/Projects/pelagos-mac and begin pilot Task 0.1
 
 ## Completed This Session (2026-03-08)
 
