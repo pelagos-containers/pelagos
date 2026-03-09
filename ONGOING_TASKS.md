@@ -284,7 +284,7 @@ dirty container state. Passes when run in isolation after
 
 ## Apple Silicon Package — Design Options (researched 2026-03-09)
 
-See detailed notes below. Decision pending.
+See `docs/MACOS_APPLE_SILICON.md` for full analysis. Decision pending.
 
 ---
 
