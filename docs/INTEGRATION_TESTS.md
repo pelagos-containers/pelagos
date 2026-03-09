@@ -157,11 +157,22 @@ profile. Skipped if no C compiler is available.
 ### `test_seccomp_iouring_profile_allows_io_uring`
 **Requires:** root, rootfs, C compiler (`cc`/`gcc`)
 
-Same probe binary run under `SeccompProfile::DockerWithIoUring` (via
-`with_seccomp_allow_io_uring()`). Asserts exit code 0, meaning the syscall reached the
-kernel (returning `EINVAL`/`EFAULT` for invalid args) rather than being blocked with
-`EPERM`. Confirms the opt-in profile correctly removes the io_uring restriction. Skipped
-if no C compiler is available.
+Same workload binary run under `SeccompProfile::DockerWithIoUring` (via
+`with_seccomp_allow_io_uring()`). Asserts exit code 0, confirming the opt-in profile
+correctly removes the io_uring restriction and the kernel accepts the call. Skipped if
+no C compiler is available.
+
+### `test_seccomp_iouring_e2e`
+**Requires:** root, rootfs, C compiler (`cc`/`gcc`)
+
+Runs `scripts/iouring-test-context/iouring_workload.c` under `DockerWithIoUring`. The
+workload performs a complete io_uring round-trip: `io_uring_setup` to create the ring,
+mmap of the SQ/CQ rings and SQE array, submission of an `IORING_OP_NOP` SQE, and
+`io_uring_enter(IORING_ENTER_GETEVENTS)` to wait for its CQE. Asserts exit 0, meaning
+the NOP CQE was received with `result == 0`. This is the definitive proof that io_uring
+works end-to-end inside a pelagos container — not just that the syscall is unblocked,
+but that the kernel io_uring machinery is fully functional. Skipped if no C compiler is
+available.
 
 ---
 

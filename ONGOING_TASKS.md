@@ -30,7 +30,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 ## Current Baseline (2026-03-09, post-v0.24.0)
 
 - Unit tests: **299/299 pass**
-- Integration tests: **248/248 pass, 6 ignored**
+- Integration tests: **249/249 pass, 6 ignored**
 - Tree: clean, up to date with origin/main
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from

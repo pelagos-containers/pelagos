@@ -691,14 +691,15 @@ mod security {
         assert!(status.success(), "Container should work without seccomp");
     }
 
-    /// Compile `scripts/iouring-test-context/iouring_probe.c` into the given path.
+    /// Compile a C source file from `scripts/iouring-test-context/` into `dest`.
     ///
     /// Compiled as a static binary so it runs inside the Alpine (musl) rootfs
     /// without glibc. Returns `None` if no C compiler is available (test skipped).
-    fn compile_iouring_probe(dest: &std::path::Path) -> Option<()> {
+    fn compile_iouring_binary(src_name: &str, dest: &std::path::Path) -> Option<()> {
         let src = std::env::current_dir()
             .ok()?
-            .join("scripts/iouring-test-context/iouring_probe.c");
+            .join("scripts/iouring-test-context")
+            .join(src_name);
         for compiler in &["cc", "gcc"] {
             let status = std::process::Command::new(compiler)
                 .args([
@@ -728,15 +729,15 @@ mod security {
         };
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let probe = tmp.path().join("iouring_probe");
-        if compile_iouring_probe(&probe).is_none() {
+        let probe = tmp.path().join("iouring_workload");
+        if compile_iouring_binary("iouring_workload.c", &probe).is_none() {
             eprintln!("Skipping test_seccomp_docker_blocks_io_uring: no C compiler found");
             return;
         }
 
         // Bind-mount the tempdir to /tmp (which exists in Alpine) so the container
         // can exec the statically-linked probe binary.
-        let mut child = Command::new("/tmp/iouring_probe")
+        let mut child = Command::new("/tmp/iouring_workload")
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -771,13 +772,13 @@ mod security {
         };
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let probe = tmp.path().join("iouring_probe");
-        if compile_iouring_probe(&probe).is_none() {
+        let probe = tmp.path().join("iouring_workload");
+        if compile_iouring_binary("iouring_workload.c", &probe).is_none() {
             eprintln!("Skipping test_seccomp_iouring_profile_allows_io_uring: no C compiler found");
             return;
         }
 
-        let mut child = Command::new("/tmp/iouring_probe")
+        let mut child = Command::new("/tmp/iouring_workload")
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
@@ -796,6 +797,49 @@ mod security {
             status.code(),
             Some(0),
             "DockerWithIoUring profile should allow io_uring_setup to reach the kernel (expected exit 0)"
+        );
+    }
+
+    #[test]
+    fn test_seccomp_iouring_e2e() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_iouring_e2e: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_seccomp_iouring_e2e: alpine-rootfs not found");
+            return;
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workload = tmp.path().join("iouring_workload");
+        if compile_iouring_binary("iouring_workload.c", &workload).is_none() {
+            eprintln!("Skipping test_seccomp_iouring_e2e: no C compiler found");
+            return;
+        }
+
+        // Run a real io_uring workload inside a container using the opt-in profile:
+        // io_uring_setup → mmap rings → submit NOP SQE → io_uring_enter → read CQE.
+        // Exit 0 means the NOP completed with result == 0 (full round-trip success).
+        // Exit 1 would mean EPERM (seccomp still blocking — a bug in the profile).
+        // Exit 2 would mean an unexpected kernel or mmap error.
+        let mut child = Command::new("/tmp/iouring_workload")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(tmp.path(), "/tmp")
+            .with_seccomp_allow_io_uring()
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let status = child.wait().expect("Failed to wait");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "io_uring end-to-end: NOP should complete with result 0 (exit 2 = kernel/mmap error)"
         );
     }
 
