@@ -4272,7 +4272,9 @@ impl Command {
                 // no seccomp filter can block the write(2) call.
                 // fd == -1 means the LSM is not running; write_mac_attr is a no-op.
                 if let Some(ref profile) = apparmor_profile {
-                    crate::mac::write_mac_attr(apparmor_attr_fd, profile)?;
+                    // AppArmor exec attr requires "exec <profile>" format (same as runc).
+                    let aa_label = format!("exec {}", profile);
+                    crate::mac::write_mac_attr(apparmor_attr_fd, &aa_label)?;
                 }
                 if let Some(ref label) = selinux_label {
                     crate::mac::write_mac_attr(selinux_attr_fd, label)?;
@@ -6312,7 +6314,9 @@ impl Command {
 
                 // Step 6.56: Write MAC labels (mirrors spawn() step 6.56).
                 if let Some(ref profile) = apparmor_profile {
-                    crate::mac::write_mac_attr(apparmor_attr_fd, profile)?;
+                    // AppArmor exec attr requires "exec <profile>" format (same as runc).
+                    let aa_label = format!("exec {}", profile);
+                    crate::mac::write_mac_attr(apparmor_attr_fd, &aa_label)?;
                 }
                 if let Some(ref label) = selinux_label {
                     crate::mac::write_mac_attr(selinux_attr_fd, label)?;
