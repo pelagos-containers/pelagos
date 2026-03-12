@@ -2842,6 +2842,15 @@ impl Command {
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
         });
 
+        // Auto-bind-mount host /etc/resolv.conf when no DNS is already configured.
+        // Mirrors Docker/containerd behaviour: containers without an explicit DNS
+        // configuration still get working name resolution out of the box.
+        // Condition: no DNS mount planned (auto_dns empty) + MOUNT ns + chroot + host file present.
+        let auto_bind_resolv_conf = auto_dns.is_empty()
+            && self.chroot_dir.is_some()
+            && self.namespaces.contains(Namespace::MOUNT)
+            && std::path::Path::new("/etc/resolv.conf").exists();
+
         // Pasta containers need CA certs for HTTPS. Alpine base images don't include them.
         // Bind-mount the host's trust store read-only into the container so wget/curl/etc
         // can verify TLS certificates without any image changes.
@@ -3439,6 +3448,39 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "dns bind mount: {}",
+                                io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // Auto resolv.conf: when no DNS mount was configured above, bind-mount
+                    // the host's /etc/resolv.conf directly so plain containers get DNS.
+                    if auto_bind_resolv_conf {
+                        let etc_host = effective_root.join("etc");
+                        std::fs::create_dir_all(&etc_host)
+                            .map_err(|e| io::Error::other(format!("resolv mkdir /etc: {}", e)))?;
+                        let resolv_host = etc_host.join("resolv.conf");
+                        let src_c = std::ffi::CString::new("/etc/resolv.conf").unwrap();
+                        let tgt_c =
+                            std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "auto resolv.conf bind mount: {}",
                                 io::Error::last_os_error()
                             )));
                         }
@@ -5093,6 +5135,12 @@ impl Command {
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
         });
 
+        // Auto-bind-mount host /etc/resolv.conf when no DNS is already configured.
+        let auto_bind_resolv_conf = auto_dns.is_empty()
+            && self.chroot_dir.is_some()
+            && self.namespaces.contains(Namespace::MOUNT)
+            && std::path::Path::new("/etc/resolv.conf").exists();
+
         let pasta_ca_cert_cstring: Option<std::ffi::CString> = if is_pasta
             && self.namespaces.contains(Namespace::MOUNT)
             && self.chroot_dir.is_some()
@@ -5591,6 +5639,39 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "dns bind mount: {}",
+                                io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // Auto resolv.conf: when no DNS mount was configured above, bind-mount
+                    // the host's /etc/resolv.conf directly so plain containers get DNS.
+                    if auto_bind_resolv_conf {
+                        let etc_host = effective_root.join("etc");
+                        std::fs::create_dir_all(&etc_host)
+                            .map_err(|e| io::Error::other(format!("resolv mkdir /etc: {}", e)))?;
+                        let resolv_host = etc_host.join("resolv.conf");
+                        let src_c = std::ffi::CString::new("/etc/resolv.conf").unwrap();
+                        let tgt_c =
+                            std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "auto resolv.conf bind mount: {}",
                                 io::Error::last_os_error()
                             )));
                         }
