@@ -27,10 +27,10 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-09, SHA 42cb2c5)
+## Current Baseline (2026-03-12, SHA 0e37611)
 
 - Unit tests: **299/299 pass**
-- Integration tests: **249/249 pass, 6 ignored**
+- Integration tests: **252/252 pass, 6 ignored**
 - Tree: clean, up to date with origin/main
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
@@ -319,6 +319,108 @@ See `docs/MACOS_APPLE_SILICON.md` for full analysis. Decision pending.
 
 1. #61 (CRIU checkpoint/restore) — complex but differentiating feature
 2. Wasm: #70 (mixed compose validation), #71 (WASI P2 sockets)
+
+---
+
+## Plan: auto-bind-mount /etc/resolv.conf (#87)
+
+### Problem
+
+pelagos never auto-mounts the host's `/etc/resolv.conf` into containers.
+DNS works today only when bridge/pasta networking is active (those paths auto-inject
+a temp resolv.conf). Containers on loopback-only or no-network with an explicit
+`--network none` get no resolv.conf → DNS fails in glibc images (Ubuntu, Debian).
+
+The pelagos-mac guest daemon works around this with `-v /etc/resolv.conf:/etc/resolv.conf`,
+but the fix belongs in the runtime (pelagos #87, pelagos-mac #60).
+
+### Root cause
+
+`auto_dns` is only populated by bridge/pasta networking. When it's empty the entire
+DNS temp-file-write + pre-exec bind-mount block is skipped (line ~2813 in spawn()).
+
+### Fix strategy
+
+Add a new boolean `auto_bind_resolv_conf` computed in `spawn()` **after** the
+existing DNS logic. When true, bind-mount the **real** host `/etc/resolv.conf`
+directly into the container (no temp file needed).
+
+### Condition for auto-mount
+
+```
+auto_bind_resolv_conf = true  iff:
+  auto_dns.is_empty()                     // no DNS mount already planned
+  AND self.chroot_dir.is_some()           // chroot is set (we have an effective_root)
+  AND self.namespaces.contains(MOUNT)     // MOUNT ns is isolated → bind is safe
+  AND Path::new("/etc/resolv.conf").exists() // host file exists
+```
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `src/container.rs` | Add `auto_bind_resolv_conf: bool` computed in `spawn()` after DNS logic; bind-mount in pre_exec after existing DNS block; same in `spawn_oci()` |
+| `tests/integration_tests.rs` | 3 new tests (see below) |
+| `docs/INTEGRATION_TESTS.md` | Document new tests |
+
+### Pre-exec change (child process, before chroot)
+
+After the existing DNS bind-mount block (line ~3445), add:
+
+```rust
+if auto_bind_resolv_conf {
+    let etc_dir = effective_root.join("etc");
+    std::fs::create_dir_all(&etc_dir).ok();
+    let resolv_path = etc_dir.join("resolv.conf");
+    if !resolv_path.exists() {
+        std::fs::File::create(&resolv_path)?;
+    }
+    // bind-mount host /etc/resolv.conf → container /etc/resolv.conf
+    nix::mount::mount(
+        Some("/etc/resolv.conf"),
+        &resolv_path,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )?;
+}
+```
+
+No cleanup needed — mount lives in the container's private MOUNT namespace and
+disappears when the container exits.
+
+### spawn_oci() path
+
+Mirror the same `auto_bind_resolv_conf` logic in `spawn_oci()` (lines ~5063–5094
+for DNS logic, ~5730 for pre_exec bind-mount).
+
+### Tests
+
+| Test | Root | Assertion |
+|------|------|-----------|
+| `test_auto_resolv_conf_loopback` | yes | Container with MOUNT ns + chroot + loopback network reads `/etc/resolv.conf`; asserts non-empty file with at least one `nameserver` line |
+| `test_explicit_dns_skips_auto_resolv` | yes | Container with explicit `with_dns(&["1.1.1.1"])` uses the configured server (auto_dns non-empty → `auto_bind_resolv_conf = false`); no double-mount |
+| `test_no_mount_ns_no_auto_resolv` | yes | Container without MOUNT namespace: no bind-mount attempted, container exits 0 |
+
+### Interaction with existing DNS paths
+
+- Bridge network → `auto_dns` non-empty → `auto_bind_resolv_conf = false` → unchanged
+- Pasta network  → `auto_dns` non-empty → same
+- `with_dns()`   → `auto_dns` non-empty → same
+- Loopback / no network + no `with_dns()` → **NEW**: auto-mount host resolv.conf
+
+## Completed This Session (2026-03-12)
+
+### auto-bind-mount /etc/resolv.conf (#87) — commit faafb41
+
+- `auto_bind_resolv_conf` bool computed in `spawn()` and `spawn_oci()` after
+  existing DNS logic: true when `auto_dns.is_empty()` AND `Namespace::MOUNT` set
+  AND `chroot_dir.is_some()` AND `/etc/resolv.conf` exists on host
+- Pre-exec bind-mount of host `/etc/resolv.conf` → `{effective_root}/etc/resolv.conf`
+  in both spawn paths; no temp file, no cleanup (scoped to container's MOUNT ns)
+- Existing bridge/pasta/`with_dns()` paths unchanged
+- 3 new tests: loopback auto-mount, explicit DNS precedence, no-MOUNT-ns safety
+- PR #88 merged to main; pelagos-mac issue #60 closed
 
 ## Completed This Session (2026-03-09)
 
