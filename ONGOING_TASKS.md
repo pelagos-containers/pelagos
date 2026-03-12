@@ -27,7 +27,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-12, SHA 0e37611)
+## Current Baseline (2026-03-12, SHA 5f33721)
 
 - Unit tests: **299/299 pass**
 - Integration tests: **252/252 pass, 6 ignored**
@@ -411,16 +411,17 @@ for DNS logic, ~5730 for pre_exec bind-mount).
 
 ## Completed This Session (2026-03-12)
 
-### auto-bind-mount /etc/resolv.conf (#87) — commit faafb41
+### auto-inject host DNS via per-container temp file (#87) — commit 46edced
 
-- `auto_bind_resolv_conf` bool computed in `spawn()` and `spawn_oci()` after
-  existing DNS logic: true when `auto_dns.is_empty()` AND `Namespace::MOUNT` set
-  AND `chroot_dir.is_some()` AND `/etc/resolv.conf` exists on host
-- Pre-exec bind-mount of host `/etc/resolv.conf` → `{effective_root}/etc/resolv.conf`
-  in both spawn paths; no temp file, no cleanup (scoped to container's MOUNT ns)
-- Existing bridge/pasta/`with_dns()` paths unchanged
-- 3 new tests: loopback auto-mount, explicit DNS precedence, no-MOUNT-ns safety
-- PR #88 merged to main; pelagos-mac issue #60 closed
+- PR #88 (direct bind-mount of host `/etc/resolv.conf`) was insecure: write-through
+  to host, shared mutable state across containers, no loopback filtering
+- PR #89 fixes it: when `auto_dns` is empty and MOUNT ns + chroot are configured,
+  call `host_upstream_dns()` (filters loopback stubs like 127.0.0.53) to populate
+  `auto_dns`; the existing temp-file + bind-mount path handles the rest
+- Container writes go to per-container copy only; host file never shared
+- Matches Docker's copy-on-use behaviour
+- 3 tests pass; 252/252 suite passes
+- PR #88 and #89 merged; pelagos #87 and pelagos-mac #60 closed
 
 ## Completed This Session (2026-03-09)
 
