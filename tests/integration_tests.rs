@@ -15923,3 +15923,115 @@ fn test_cap_drop_individual_removes_only_that_cap() {
         "process must remain alive (other caps intact, not drop-all); stdout={stdout:?}"
     );
 }
+
+mod auto_resolv_conf {
+    use super::*;
+
+    /// Verify that a container with MOUNT namespace + chroot but no explicit DNS
+    /// configuration automatically receives a bind-mount of the host's
+    /// /etc/resolv.conf.  The container reads the file and we assert at least one
+    /// "nameserver" line is present.
+    ///
+    /// Requires: root, alpine-rootfs.
+    #[test]
+    fn test_auto_resolv_conf_loopback() {
+        if !is_root() {
+            eprintln!("SKIP: test_auto_resolv_conf_loopback requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_auto_resolv_conf_loopback requires alpine-rootfs");
+                return;
+            }
+        };
+        // No with_dns() call — auto-mount should kick in.
+        let (status, stdout_bytes, _) = Command::new("cat")
+            .args(["/etc/resolv.conf"])
+            .with_chroot(rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::IPC)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed")
+            .wait_with_output()
+            .expect("wait failed");
+        assert!(status.success(), "container exited non-zero: {:?}", status);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            stdout.contains("nameserver"),
+            "expected at least one 'nameserver' line in /etc/resolv.conf, got: {stdout:?}"
+        );
+    }
+
+    /// Verify that an explicit with_dns() call takes precedence and the auto-mount
+    /// is NOT applied (auto_dns is non-empty → auto_bind_resolv_conf = false).
+    /// The container should see the explicitly configured nameserver, not the host's.
+    ///
+    /// Requires: root, alpine-rootfs, Namespace::MOUNT.
+    #[test]
+    fn test_explicit_dns_skips_auto_resolv() {
+        if !is_root() {
+            eprintln!("SKIP: test_explicit_dns_skips_auto_resolv requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_explicit_dns_skips_auto_resolv requires alpine-rootfs");
+                return;
+            }
+        };
+        // Explicit DNS server — auto-mount must NOT double-mount.
+        let (status, stdout_bytes, _) = Command::new("cat")
+            .args(["/etc/resolv.conf"])
+            .with_chroot(rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::IPC)
+            .with_proc_mount()
+            .with_dns(&["1.2.3.4"])
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed")
+            .wait_with_output()
+            .expect("wait failed");
+        assert!(status.success(), "container exited non-zero: {:?}", status);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            stdout.contains("1.2.3.4"),
+            "expected explicitly configured nameserver 1.2.3.4 in resolv.conf, got: {stdout:?}"
+        );
+    }
+
+    /// Verify that without Namespace::MOUNT the auto-mount is not attempted and
+    /// the container still exits 0 (shared host mount namespace — no bind mount needed,
+    /// /etc/resolv.conf is inherited directly from the host).
+    ///
+    /// Requires: root, alpine-rootfs.
+    #[test]
+    fn test_no_mount_ns_no_auto_resolv() {
+        if !is_root() {
+            eprintln!("SKIP: test_no_mount_ns_no_auto_resolv requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_no_mount_ns_no_auto_resolv requires alpine-rootfs");
+                return;
+            }
+        };
+        // No MOUNT namespace → auto_bind_resolv_conf = false; container shares host mounts.
+        let status = Command::new("true")
+            .with_chroot(rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::IPC)
+            .env("PATH", ALPINE_PATH)
+            .spawn()
+            .expect("spawn failed")
+            .wait()
+            .expect("wait failed");
+        assert!(status.success(), "container must exit 0 without MOUNT ns: {:?}", status);
+    }
+}

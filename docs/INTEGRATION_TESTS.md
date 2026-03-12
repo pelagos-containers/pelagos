@@ -3163,3 +3163,38 @@ a single-cap drop removes only that capability without becoming drop-all.
 
 Failure in either direction: if `CHOWN=OK`, the cap-drop didn't apply; if
 `ALIVE` is missing, the implementation accidentally dropped all caps.
+
+---
+
+## `auto_resolv_conf` module
+
+### `test_auto_resolv_conf_loopback`
+**Requires:** root, alpine-rootfs
+
+Spawns a container with `Namespace::MOUNT` + chroot but **no** `with_dns()` call
+and reads `/etc/resolv.conf` inside the container.  Asserts the output contains
+at least one `nameserver` line.
+
+Failure indicates the auto-bind-mount of the host's `/etc/resolv.conf` is not
+being applied, so glibc containers (Ubuntu, Debian) would have no DNS resolution
+out of the box.
+
+### `test_explicit_dns_skips_auto_resolv`
+**Requires:** root, alpine-rootfs, `Namespace::MOUNT`
+
+Spawns a container with `with_dns(&["1.2.3.4"])` and reads `/etc/resolv.conf`.
+Asserts the content contains `1.2.3.4` (the explicitly configured server).
+
+Failure indicates either: the explicit DNS path is broken, or the auto-mount is
+running in addition to (and overwriting) the explicit DNS mount.
+
+### `test_no_mount_ns_no_auto_resolv`
+**Requires:** root, alpine-rootfs
+
+Spawns a container **without** `Namespace::MOUNT`.  Asserts the container exits
+0.  Without a private mount namespace, `auto_bind_resolv_conf` must be false —
+the container shares the host's mount namespace and sees the host's
+`/etc/resolv.conf` directly.  No bind-mount attempt is made.
+
+Failure indicates the auto-mount code is running unconditionally, which would
+corrupt the host mount namespace for non-isolated containers.
