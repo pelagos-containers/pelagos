@@ -3175,9 +3175,13 @@ Spawns a container with `Namespace::MOUNT` + chroot but **no** `with_dns()` call
 and reads `/etc/resolv.conf` inside the container.  Asserts the output contains
 at least one `nameserver` line.
 
-Failure indicates the auto-bind-mount of the host's `/etc/resolv.conf` is not
-being applied, so glibc containers (Ubuntu, Debian) would have no DNS resolution
-out of the box.
+The auto-inject path reads the host's nameservers via `host_upstream_dns()` (which
+filters loopback stub addresses like `127.0.0.53`) and writes them to a
+per-container temp file bind-mounted inside the container's private MOUNT namespace.
+The host file is never shared directly — container writes go to the temp copy only.
+
+Failure indicates the auto-injection is not populating `auto_dns`, so glibc
+containers (Ubuntu, Debian) would have no DNS resolution out of the box.
 
 ### `test_explicit_dns_skips_auto_resolv`
 **Requires:** root, alpine-rootfs, `Namespace::MOUNT`
@@ -3185,16 +3189,20 @@ out of the box.
 Spawns a container with `with_dns(&["1.2.3.4"])` and reads `/etc/resolv.conf`.
 Asserts the content contains `1.2.3.4` (the explicitly configured server).
 
-Failure indicates either: the explicit DNS path is broken, or the auto-mount is
-running in addition to (and overwriting) the explicit DNS mount.
+The auto-inject condition requires `auto_dns.is_empty() && dns_servers.is_empty()`,
+so an explicit `with_dns()` call bypasses it entirely.
+
+Failure indicates either: the explicit DNS path is broken, or the auto-inject
+is running in addition to and overwriting the explicit configuration.
 
 ### `test_no_mount_ns_no_auto_resolv`
 **Requires:** root, alpine-rootfs
 
-Spawns a container **without** `Namespace::MOUNT`.  Asserts the container exits
-0.  Without a private mount namespace, `auto_bind_resolv_conf` must be false —
-the container shares the host's mount namespace and sees the host's
-`/etc/resolv.conf` directly.  No bind-mount attempt is made.
+Spawns a container **without** `Namespace::MOUNT`.  Asserts the container exits 0.
+The auto-inject condition requires `Namespace::MOUNT` — without it no DNS injection
+is attempted, and the container shares the host's mount namespace where
+`/etc/resolv.conf` is already visible.
 
-Failure indicates the auto-mount code is running unconditionally, which would
-corrupt the host mount namespace for non-isolated containers.
+Failure indicates the auto-inject is running unconditionally, which would attempt
+to create a DNS temp file and bind-mount in a shared mount namespace, potentially
+corrupting the host's view of `/etc/resolv.conf`.
