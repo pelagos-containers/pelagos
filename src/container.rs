@@ -3873,9 +3873,7 @@ impl Command {
 
                     // pivot_root atomically makes new_root the mount namespace root
                     // and detaches the old root — stronger isolation than chroot(2).
-                    let put_old_name = pivot_put_old_name
-                        .as_deref()
-                        .unwrap_or(".pivot_root_old");
+                    let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
                     do_pivot_root(effective_root, put_old_name)?;
 
                     // Apply container working directory (defaults to /).
@@ -6009,9 +6007,7 @@ impl Command {
                         }
                     }
 
-                    let put_old_name = pivot_put_old_name
-                        .as_deref()
-                        .unwrap_or(".pivot_root_old");
+                    let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
                     do_pivot_root(effective_root, put_old_name)?;
                     let cwd = container_cwd
                         .as_deref()
