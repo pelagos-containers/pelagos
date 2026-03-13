@@ -28,24 +28,41 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-12, SHA TBD / pelagos-mac fac01b5)
+## Current Baseline (2026-03-13, SHA 5ba58ad / pelagos-mac fac01b5)
 
 - pelagos unit tests: **299/299 pass**
-- pelagos integration tests: **258/258 pass, 6 ignored**
-- pelagos-mac: compiles on macOS only (objc2-virtualization); no new test regressions
-- Trees: clean (pending commit for epic #96 pivot_root implementation)
+- pelagos integration tests: **258/258 pass, 6 ignored**, ~27s
+- pelagos v0.27.1 released: https://github.com/skeptomai/pelagos/releases/tag/v0.27.1
+- pelagos-mac: compiles on macOS only (objc2-virtualization); clean at fac01b5
+- Both trees: clean
 
-**Completed this session (2026-03-12):**
-- Epic #96 implemented: `with_chroot()` now uses `pivot_root(2)` internally
-- `do_pivot_root()` helper added to container.rs
-- `Namespace::MOUNT` guard enforced in `spawn()` and `spawn_interactive()`
-- Old explicit `pivot_root` field, initializer, and branch removed
-- `with_pivot_root()` marked `#[deprecated]` redirecting to `with_chroot()`
-- 2 new integration tests: `test_pivot_root_old_root_inaccessible`, updated `test_no_mount_ns_no_auto_resolv`
-- Version bumped to 0.27.0
+**Completed this session (2026-03-13):**
+- Fixed namespace capture ordering bug (c252337): `Namespace::MOUNT` auto-add was happening
+  after `let namespaces = self.namespaces` capture, so `unshare(CLONE_NEWNS)` was never
+  called — pivot_root returned EINVAL. Moved auto-add to before the capture.
+- Fixed parallel test race (b238a43): all containers sharing the same rootfs competed on
+  `.pivot_root_old`. Fixed by generating unique name (parent-PID + `PIVOT_ROOT_COUNTER`)
+  before fork, passing it as parameter to `do_pivot_root()`.
+- Confirmed no bind-mount leak: DNS bind-mounts always happen after `unshare(CLONE_NEWNS)`;
+  guard at spawn() prevents DNS setup without MOUNT namespace.
+- Bumped to v0.27.1, tagged, released. CI: all 5 jobs pass.
 
-**Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
-a possibly dirty environment.
+**Next session — pelagos-mac devcontainer (epic #67):**
+
+Pick up on `fix/volume-network-quiet-flag` branch in pelagos-mac. The pivot_root EINVAL
+blocking `pelagos start` / `docker start` is now fixed in v0.27.1. Remaining work:
+
+1. **Fix A** — Boot VM with `$HOME` as always-on virtiofs `share0`; add `subpath` field
+   to `GuestMount` so workspace paths resolve as subpaths of share0. Eliminates the
+   share-ordering mismatch that rejects `docker run` after `docker volume ls`.
+2. **Fix B** — Fast no-op path for `pelagos ps` / `pelagos volume ls` when daemon is not
+   running (don't boot VM for devcontainer pre-flight checks).
+3. **`docker build`** (sub-issue #68) — needed for devcontainer `features:` and custom
+   Dockerfile builds.
+4. **`docker cp`** — needed for some feature install scripts.
+5. VS Code end-to-end test — full extension flow, not just devcontainer CLI.
+
+Always `sudo scripts/reset-test-env.sh` before a full integration test run.
 
 ---
 
