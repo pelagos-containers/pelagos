@@ -2595,6 +2595,14 @@ impl Command {
             self.namespaces |= Namespace::NET;
         }
 
+        // pivot_root(2) requires a private mount namespace.  Auto-add it when a
+        // rootfs is configured — this matches runc's behavior (runc always creates
+        // a private mount namespace when rootfs is set, regardless of config.json).
+        // MUST come before the namespaces variable is captured below.
+        if self.chroot_dir.is_some() {
+            self.namespaces |= Namespace::MOUNT;
+        }
+
         // Collect configuration to move into pre_exec closure
         let namespaces = self.namespaces;
         let chroot_dir = self.chroot_dir.clone();
@@ -2698,15 +2706,6 @@ impl Command {
         if self.overlay.is_some() && self.chroot_dir.is_none() {
             return Err(Error::Io(io::Error::other(
                 "with_overlay requires with_chroot",
-            )));
-        }
-        // pivot_root(2) requires a private mount namespace.  Enforce this early
-        // so callers get a clear error instead of a confusing EINVAL from inside
-        // the pre_exec closure.
-        if self.chroot_dir.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
-            return Err(Error::Io(io::Error::other(
-                "a rootfs (with_chroot) requires Namespace::MOUNT; \
-                 add .with_namespaces(Namespace::MOUNT) to your Command",
             )));
         }
 
@@ -4878,6 +4877,11 @@ impl Command {
             }
             self.namespaces |= Namespace::NET;
         }
+        // pivot_root(2) requires a private mount namespace.  MUST come before
+        // namespaces is captured below.
+        if self.chroot_dir.is_some() {
+            self.namespaces |= Namespace::MOUNT;
+        }
 
         let namespaces = self.namespaces;
         let chroot_dir = self.chroot_dir.clone();
@@ -4972,12 +4976,6 @@ impl Command {
         if self.overlay.is_some() && self.chroot_dir.is_none() {
             return Err(Error::Io(io::Error::other(
                 "with_overlay requires with_chroot",
-            )));
-        }
-        if self.chroot_dir.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
-            return Err(Error::Io(io::Error::other(
-                "a rootfs (with_chroot) requires Namespace::MOUNT; \
-                 add .with_namespaces(Namespace::MOUNT) to your Command",
             )));
         }
 

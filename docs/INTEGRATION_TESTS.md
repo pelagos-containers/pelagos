@@ -3262,22 +3262,22 @@ is returned and it is the one with `tier=web`.
 Failure indicates the label filter in `cmd_ps` / `apply_filters` is broken — either
 the wrong containers are returned or the JSON output is malformed.
 
-## pivot_root enforcement (`with_chroot` requires `Namespace::MOUNT`)
+## pivot_root auto-mount-namespace (`with_chroot` auto-adds `Namespace::MOUNT`)
 
 ### `test_no_mount_ns_no_auto_resolv` (updated)
 **Requires:** root, alpine-rootfs
 
-Attempts to spawn a container with `with_chroot` but without `Namespace::MOUNT` and
-asserts that `spawn()` returns an error mentioning `Namespace::MOUNT`.
+Spawns a container with `with_chroot` but without explicitly requesting `Namespace::MOUNT`
+and asserts that the container succeeds and exits 0.
 
-Previously this test verified that auto-resolv-conf binding was skipped without a mount
-namespace.  Since `with_chroot` now uses `pivot_root(2)` internally, a private mount
-namespace is structurally required; the guard enforces this at `spawn()` time before
-any fork occurs.
+`with_chroot()` now automatically adds `Namespace::MOUNT` (matching runc behavior — runc
+always creates a private mount namespace when rootfs is configured, regardless of whether
+config.json requests one).  This means OCI bundles without a `"mount"` namespace entry in
+`linux.namespaces` still work correctly.
 
-Failure indicates the `Namespace::MOUNT` enforcement guard in `spawn()` /
-`spawn_interactive()` is missing or broken — containers without mount namespace isolation
-could silently use chroot instead of pivot_root, weakening security.
+Failure indicates the auto-add of `Namespace::MOUNT` in `spawn()` / `spawn_interactive()`
+is broken — containers with rootfs configured would fail to get a private mount namespace,
+causing pivot_root(2) to run in the host mount namespace.
 
 ### `test_pivot_root_old_root_inaccessible`
 **Requires:** root, alpine-rootfs

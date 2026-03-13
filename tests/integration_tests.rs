@@ -16022,21 +16022,21 @@ mod auto_resolv_conf {
                 return;
             }
         };
-        // Since pivot_root(2) requires a mount namespace, with_chroot without
-        // Namespace::MOUNT must now return an error at spawn() time.
-        let result = Command::new("true")
+        // with_chroot auto-adds Namespace::MOUNT (matching runc behavior) even
+        // when the caller does not explicitly request it.  The container must
+        // succeed and exit 0.
+        let status = Command::new("true")
             .with_chroot(rootfs)
             .with_namespaces(Namespace::UTS | Namespace::IPC)
             .env("PATH", ALPINE_PATH)
-            .spawn();
+            .spawn()
+            .expect("spawn must succeed — MOUNT ns is auto-added by with_chroot")
+            .wait()
+            .expect("wait failed");
         assert!(
-            result.is_err(),
-            "spawn with with_chroot but no Namespace::MOUNT must fail"
-        );
-        let err = result.err().unwrap().to_string();
-        assert!(
-            err.contains("Namespace::MOUNT"),
-            "error must mention Namespace::MOUNT: {err}"
+            status.success(),
+            "container must exit 0 with auto-added MOUNT ns: {:?}",
+            status
         );
     }
 
