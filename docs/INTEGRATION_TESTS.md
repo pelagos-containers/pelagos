@@ -3239,3 +3239,25 @@ asserts that `pelagos start` returns a non-zero exit code.
 
 Failure indicates the "already running" guard in `cmd_start` is broken and `pelagos start`
 incorrectly accepts or restarts a live container.
+
+## Native Container Labels (`pelagos run --label`)
+
+### `test_run_with_labels_appear_in_inspect`
+**Requires:** root, alpine-rootfs
+
+Starts a detached container with `--label env=staging --label managed=true`, waits until
+the container PID is recorded, then runs `pelagos container inspect` and asserts the
+JSON output contains `labels.env == "staging"` and `labels.managed == "true"`.
+
+Failure indicates: labels are not being parsed from CLI args, not written to `state.json`,
+or `container inspect` does not include them in its JSON output.
+
+### `test_ps_filter_label`
+**Requires:** root, alpine-rootfs
+
+Starts two containers with different `tier=web` and `tier=db` labels, then runs
+`pelagos ps --format json --filter label=tier=web` and asserts exactly one container
+is returned and it is the one with `tier=web`.
+
+Failure indicates the label filter in `cmd_ps` / `apply_filters` is broken — either
+the wrong containers are returned or the JSON output is malformed.

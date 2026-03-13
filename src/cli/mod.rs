@@ -196,6 +196,9 @@ pub struct SpawnConfig {
     /// Whether NAT (MASQUERADE) was enabled.
     #[serde(default)]
     pub nat: bool,
+    /// Container labels as KEY=VALUE strings (e.g. "env=staging").
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +235,9 @@ pub struct ContainerState {
     /// Saved spawn configuration for `pelagos start` restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_config: Option<SpawnConfig>,
+    /// Container labels as KEY=VALUE strings.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
 }
 
 pub fn now_iso8601() -> String {
@@ -685,6 +691,7 @@ mod tests {
             read_only: true,
             rm: false,
             nat: true,
+            labels: vec!["env=staging".to_string(), "managed=true".to_string()],
         };
         let json = serde_json::to_string(&sc).unwrap();
         let decoded: SpawnConfig = serde_json::from_str(&json).unwrap();
@@ -706,6 +713,137 @@ mod tests {
         assert!(decoded.read_only);
         assert!(!decoded.rm);
         assert!(decoded.nat);
+        assert_eq!(decoded.labels, sc.labels);
+    }
+
+    /// test_spawn_config_labels_roundtrip
+    ///
+    /// Verifies that SpawnConfig.labels serializes and deserializes correctly,
+    /// and that an older state JSON without labels field deserializes with empty vec.
+    #[test]
+    fn test_spawn_config_labels_roundtrip() {
+        let sc = SpawnConfig {
+            exe: "/bin/sh".to_string(),
+            labels: vec!["project=myapp".to_string(), "env=prod".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let decoded: SpawnConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.labels, vec!["project=myapp", "env=prod"]);
+
+        // Old state JSON without labels field → empty vec (default).
+        let old_json = r#"{"exe":"/bin/sh"}"#;
+        let old: SpawnConfig = serde_json::from_str(old_json).unwrap();
+        assert!(old.labels.is_empty());
+    }
+
+    /// test_label_filter
+    ///
+    /// Verifies that apply_filters correctly filters containers by label,
+    /// including key-only and key=value forms, and that unknown filters are ignored.
+    #[test]
+    fn test_label_filter() {
+        use super::ps::apply_filters;
+
+        fn make_state(name: &str, labels: &[(&str, &str)]) -> ContainerState {
+            ContainerState {
+                name: name.to_string(),
+                rootfs: "alpine".to_string(),
+                status: ContainerStatus::Running,
+                pid: 1,
+                watcher_pid: 0,
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                exit_code: None,
+                command: vec!["/bin/sh".to_string()],
+                stdout_log: None,
+                stderr_log: None,
+                bridge_ip: None,
+                network_ips: std::collections::HashMap::new(),
+                health: None,
+                health_config: None,
+                spawn_config: None,
+                labels: labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+
+        let mut states = vec![
+            make_state("web", &[("env", "staging"), ("managed", "true")]),
+            make_state("db", &[("env", "prod"), ("managed", "true")]),
+            make_state("cache", &[("tier", "infra")]),
+        ];
+
+        // Filter by key only.
+        let mut s = states.clone();
+        apply_filters(&mut s, &["label=managed".to_string()]);
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().any(|c| c.name == "web"));
+        assert!(s.iter().any(|c| c.name == "db"));
+
+        // Filter by key=value.
+        let mut s = states.clone();
+        apply_filters(&mut s, &["label=env=staging".to_string()]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].name, "web");
+
+        // No matches.
+        let mut s = states.clone();
+        apply_filters(&mut s, &["label=env=dev".to_string()]);
+        assert!(s.is_empty());
+
+        // Unknown filter is silently ignored.
+        apply_filters(&mut states, &["unknown=foo".to_string()]);
+        assert_eq!(states.len(), 3);
+    }
+
+    /// test_container_state_labels_serde
+    ///
+    /// Labels on ContainerState round-trip through JSON. Old state files without
+    /// `labels` field deserialize with an empty map.
+    #[test]
+    fn test_container_state_labels_serde() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+        labels.insert("managed".to_string(), "true".to_string());
+
+        let state = ContainerState {
+            name: "test".to_string(),
+            rootfs: "alpine".to_string(),
+            status: ContainerStatus::Running,
+            pid: 42,
+            watcher_pid: 0,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            exit_code: None,
+            command: vec!["/bin/sh".to_string()],
+            stdout_log: None,
+            stderr_log: None,
+            bridge_ip: None,
+            network_ips: std::collections::HashMap::new(),
+            health: None,
+            health_config: None,
+            spawn_config: None,
+            labels,
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let decoded: ContainerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.labels.get("env").map(|s| s.as_str()), Some("prod"));
+        assert_eq!(
+            decoded.labels.get("managed").map(|s| s.as_str()),
+            Some("true")
+        );
+
+        // Old state without labels → empty map.
+        let old_json = r#"{
+            "name": "old", "rootfs": "alpine", "status": "exited",
+            "pid": 0, "watcher_pid": 0, "started_at": "2026-01-01T00:00:00Z",
+            "exit_code": 0, "command": ["/bin/sh"],
+            "stdout_log": null, "stderr_log": null
+        }"#;
+        let old: ContainerState = serde_json::from_str(old_json).unwrap();
+        assert!(old.labels.is_empty());
     }
 
     /// test_spawn_config_missing_from_state
