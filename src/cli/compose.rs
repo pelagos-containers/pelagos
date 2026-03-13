@@ -610,6 +610,7 @@ fn spawn_service(
             .collect(),
         health: None,
         health_config: None,
+        spawn_config: None,
     };
     write_state(&cstate)?;
 
