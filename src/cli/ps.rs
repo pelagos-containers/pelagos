@@ -5,7 +5,35 @@ use super::{
     check_liveness, format_age, list_containers, read_state, write_state, ContainerStatus,
 };
 
-pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Filter a container state list by `--filter` expressions.
+///
+/// Supported filter formats:
+/// - `label=KEY` — container has this label (any value)
+/// - `label=KEY=VALUE` — container has this label with exactly this value
+/// - `name=PATTERN` — container name equals PATTERN (exact match for now)
+/// - `status=running|exited`
+pub fn apply_filters(states: &mut Vec<super::ContainerState>, filters: &[String]) {
+    for f in filters {
+        if let Some(rest) = f.strip_prefix("label=") {
+            // rest is either "KEY" or "KEY=VALUE"
+            let (key, val) = match rest.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (rest, None),
+            };
+            states.retain(|s| match val {
+                Some(v) => s.labels.get(key).map(|lv| lv == v).unwrap_or(false),
+                None => s.labels.contains_key(key),
+            });
+        } else if let Some(pattern) = f.strip_prefix("name=") {
+            states.retain(|s| s.name == pattern);
+        } else if let Some(status) = f.strip_prefix("status=") {
+            states.retain(|s| s.status.to_string() == status);
+        }
+        // Unknown filter types are silently ignored (Docker-compatible behaviour).
+    }
+}
+
+pub fn cmd_ps(all: bool, json: bool, filters: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut states = list_containers();
 
     // Sort by started_at (lexicographic on ISO 8601 string = chronological).
@@ -27,6 +55,8 @@ pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     if !all {
         states.retain(|s| s.status == ContainerStatus::Running);
     }
+
+    apply_filters(&mut states, filters);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&states)?);

@@ -100,5 +100,6 @@ fn spawn_config_to_run_args(
         dns_backend: None,
         rootfs: rootfs_field,
         args,
+        label: sc.labels,
     }
 }

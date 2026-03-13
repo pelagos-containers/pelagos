@@ -16336,4 +16336,192 @@ mod auto_resolv_conf {
             .args(["rm", "-f", name])
             .output();
     }
+
+    /// test_run_with_labels_appear_in_inspect
+    ///
+    /// Requires root + rootfs. Verifies that `--label KEY=VALUE` flags passed to
+    /// `pelagos run -d` are persisted in state.json and visible via
+    /// `pelagos container inspect`. Failure indicates label serialization is broken.
+    #[test]
+    fn test_run_with_labels_appear_in_inspect() {
+        if !is_root() {
+            eprintln!("SKIP: test_run_with_labels_appear_in_inspect requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_run_with_labels_appear_in_inspect requires alpine-rootfs");
+                return;
+            }
+        };
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "test-labels-inspect";
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--label",
+                "env=staging",
+                "--label",
+                "managed=true",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "30",
+            ])
+            .status()
+            .expect("pelagos run -d");
+        assert!(run_status.success(), "pelagos run -d with labels failed");
+
+        // Wait for container to be running.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["pid"].as_i64().unwrap_or(0) > 0 {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Inspect shows the labels.
+        let inspect_out = std::process::Command::new(bin)
+            .args(["container", "inspect", name])
+            .output()
+            .expect("pelagos container inspect");
+        assert!(inspect_out.status.success(), "inspect failed");
+        let json: serde_json::Value =
+            serde_json::from_slice(&inspect_out.stdout).expect("inspect output not JSON");
+        assert_eq!(
+            json["labels"]["env"].as_str(),
+            Some("staging"),
+            "label env=staging not found in inspect output"
+        );
+        assert_eq!(
+            json["labels"]["managed"].as_str(),
+            Some("true"),
+            "label managed=true not found in inspect output"
+        );
+
+        // Cleanup.
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// test_ps_filter_label
+    ///
+    /// Requires root + rootfs. Verifies that `pelagos ps --filter label=KEY=VALUE`
+    /// returns only containers with that label. Failure indicates filter logic is broken.
+    #[test]
+    fn test_ps_filter_label() {
+        if !is_root() {
+            eprintln!("SKIP: test_ps_filter_label requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_ps_filter_label requires alpine-rootfs");
+                return;
+            }
+        };
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name_a = "test-filter-label-a";
+        let name_b = "test-filter-label-b";
+        for n in [name_a, name_b] {
+            let _ = std::process::Command::new(bin)
+                .args(["rm", "-f", n])
+                .output();
+        }
+
+        // Run container A with label tier=web.
+        let run_a = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name_a,
+                "--label",
+                "tier=web",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "30",
+            ])
+            .status()
+            .expect("run A");
+        assert!(run_a.success());
+
+        // Run container B with label tier=db.
+        let run_b = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name_b,
+                "--label",
+                "tier=db",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "30",
+            ])
+            .status()
+            .expect("run B");
+        assert!(run_b.success());
+
+        // Wait for both containers to be running.
+        for n in [name_a, name_b] {
+            let state_path = format!("/run/pelagos/containers/{}/state.json", n);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if let Ok(data) = std::fs::read_to_string(&state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if v["pid"].as_i64().unwrap_or(0) > 0 {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        // Filter for tier=web — should return exactly name_a.
+        let ps_out = std::process::Command::new(bin)
+            .args(["ps", "--format", "json", "--filter", "label=tier=web"])
+            .output()
+            .expect("pelagos ps --filter");
+        assert!(ps_out.status.success(), "ps --filter failed");
+        let list: serde_json::Value =
+            serde_json::from_slice(&ps_out.stdout).expect("ps output not JSON");
+        let arr = list.as_array().expect("ps output is not a JSON array");
+        assert_eq!(arr.len(), 1, "expected exactly 1 container with tier=web");
+        assert_eq!(arr[0]["name"].as_str(), Some(name_a));
+
+        // Cleanup.
+        for n in [name_a, name_b] {
+            let _ = std::process::Command::new(bin).args(["stop", n]).output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for n in [name_a, name_b] {
+            let _ = std::process::Command::new(bin)
+                .args(["rm", "-f", n])
+                .output();
+        }
+    }
 }

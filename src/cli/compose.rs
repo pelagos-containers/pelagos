@@ -611,6 +611,7 @@ fn spawn_service(
         health: None,
         health_config: None,
         spawn_config: None,
+        labels: std::collections::HashMap::new(),
     };
     write_state(&cstate)?;
 

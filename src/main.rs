@@ -77,6 +77,9 @@ pub(crate) enum CliCommand {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Filter containers (e.g. label=env=staging, label=managed, status=running)
+        #[clap(long = "filter")]
+        filter: Vec<String>,
     },
 
     /// Send SIGTERM to a running container
@@ -200,6 +203,9 @@ pub(crate) enum ContainerCmd {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Filter containers (e.g. label=env=staging, label=managed, status=running)
+        #[clap(long = "filter")]
+        filter: Vec<String>,
     },
     /// Show detailed information about a container (JSON)
     Inspect {
@@ -405,14 +411,22 @@ fn main() {
         CliCommand::Build(args) => cli::build::cmd_build(args),
         CliCommand::Run(args) => cli::run::cmd_run(*args),
         CliCommand::Exec(args) => cli::exec::cmd_exec(args),
-        CliCommand::Ps { all, format } => cli::ps::cmd_ps(all, format == OutputFormat::Json),
+        CliCommand::Ps {
+            all,
+            format,
+            filter,
+        } => cli::ps::cmd_ps(all, format == OutputFormat::Json, &filter),
         CliCommand::Stop { name } => cli::stop::cmd_stop(&name),
         CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),
         CliCommand::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
 
         // Container (noun subcommand)
         CliCommand::Container { cmd } => match cmd {
-            ContainerCmd::Ls { all, format } => cli::ps::cmd_ps(all, format == OutputFormat::Json),
+            ContainerCmd::Ls {
+                all,
+                format,
+                filter,
+            } => cli::ps::cmd_ps(all, format == OutputFormat::Json, &filter),
             ContainerCmd::Inspect { name } => cli::ps::cmd_inspect(&name),
             ContainerCmd::Stop { name } => cli::stop::cmd_stop(&name),
             ContainerCmd::Rm { name, force } => cli::rm::cmd_rm(&name, force),

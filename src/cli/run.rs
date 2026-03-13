@@ -168,6 +168,10 @@ pub struct RunArgs {
     #[clap(long = "dns-backend", value_name = "BACKEND")]
     pub dns_backend: Option<String>,
 
+    /// Label KEY=VALUE (repeatable; stored in state.json and filterable via pelagos ps --filter)
+    #[clap(long = "label", short = 'l')]
+    pub label: Vec<String>,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -269,6 +273,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             )?
         };
 
+    let labels = parse_labels(&args.label);
     let spawn_config = build_spawn_config(&args, &rootfs_label, &exe_and_args);
 
     if args.detach {
@@ -279,6 +284,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             cmd,
             health_config,
             Some(spawn_config),
+            labels,
         )
     } else if args.interactive {
         run_interactive(cmd)
@@ -290,8 +296,20 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             cmd,
             args.rm,
             Some(spawn_config),
+            labels,
         )
     }
+}
+
+/// Parse "KEY=VALUE" label strings into a HashMap.
+fn parse_labels(label_args: &[String]) -> std::collections::HashMap<String, String> {
+    label_args
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Capture RunArgs fields into a SpawnConfig for container restart.
@@ -322,6 +340,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         read_only: args.read_only,
         rm: args.rm,
         nat: args.nat,
+        labels: args.label.clone(),
     }
 }
 
@@ -803,6 +822,7 @@ fn run_foreground(
     mut cmd: Command,
     auto_remove: bool,
     spawn_config: Option<SpawnConfig>,
+    labels: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cmd = cmd
         .stdin(Stdio::Inherit)
@@ -827,6 +847,7 @@ fn run_foreground(
         health: None,
         health_config: None,
         spawn_config,
+        labels,
     };
     write_state(&state)?;
 
@@ -896,6 +917,7 @@ fn run_detached(
     mut cmd: Command,
     health_config: Option<HealthConfig>,
     spawn_config: Option<SpawnConfig>,
+    labels: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
@@ -921,6 +943,7 @@ fn run_detached(
         health: None,
         health_config: None,
         spawn_config,
+        labels,
     };
     write_state(&state)?;
 
