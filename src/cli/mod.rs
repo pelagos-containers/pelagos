@@ -31,6 +31,7 @@ pub mod relay;
 pub mod rm;
 pub mod rootfs;
 pub mod run;
+pub mod start;
 pub mod stop;
 pub mod volume;
 
@@ -128,6 +129,75 @@ impl std::fmt::Display for ContainerStatus {
     }
 }
 
+/// Saved spawn configuration — enough to restart a container via `pelagos start`.
+///
+/// Populated by `cmd_run` at container creation and persisted in `state.json`.
+/// On restart, `cmd_start` converts this back into `RunArgs` and calls `cmd_run`.
+///
+/// Note: the overlay writable layer is NOT preserved between runs. A restarted
+/// container gets a fresh upper dir on top of the same image layers. Filesystem
+/// changes from the previous run are lost (future enhancement: overlay preservation).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SpawnConfig {
+    /// Image reference used to pull/locate layer dirs (e.g. "ubuntu:22.04").
+    /// None for rootfs-only containers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Executable path or name.
+    pub exe: String,
+    /// Arguments passed to the executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables as KEY=VALUE strings.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Read-write bind mounts as "host:container" strings.
+    #[serde(default)]
+    pub bind: Vec<String>,
+    /// Read-only bind mounts as "host:container" strings.
+    #[serde(default)]
+    pub bind_ro: Vec<String>,
+    /// Named volume mounts as "vol:container" strings.
+    #[serde(default)]
+    pub volume: Vec<String>,
+    /// Network modes (may include "pasta", "bridge", "bridge:name", "loopback").
+    #[serde(default)]
+    pub network: Vec<String>,
+    /// Port mappings as "HOST:CONTAINER" strings.
+    #[serde(default)]
+    pub publish: Vec<String>,
+    /// Explicit DNS servers.
+    #[serde(default)]
+    pub dns: Vec<String>,
+    /// Working directory inside the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// User as "uid" or "uid:gid" string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Container hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Capabilities to drop.
+    #[serde(default)]
+    pub cap_drop: Vec<String>,
+    /// Capabilities to add.
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+    /// Security options (e.g. "seccomp=unconfined", "apparmor=profile").
+    #[serde(default)]
+    pub security_opt: Vec<String>,
+    /// Whether the rootfs was mounted read-only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Whether the container should be removed on exit (--rm semantics).
+    #[serde(default)]
+    pub rm: bool,
+    /// Whether NAT (MASQUERADE) was enabled.
+    #[serde(default)]
+    pub nat: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
     pub name: String,
@@ -159,6 +229,9 @@ pub struct ContainerState {
     /// Health check configuration (from image HEALTHCHECK instruction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_config: Option<HealthConfig>,
+    /// Saved spawn configuration for `pelagos start` restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_config: Option<SpawnConfig>,
 }
 
 pub fn now_iso8601() -> String {
@@ -203,6 +276,12 @@ pub fn write_state(state: &ContainerState) -> std::io::Result<()> {
     let json =
         serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(state_path(&state.name), json)
+}
+
+/// Returns true if a pelagos container state file exists for `name`.
+/// Used to distinguish container-restart from OCI lifecycle in the `start` command.
+pub fn container_state_exists(name: &str) -> bool {
+    state_path(name).exists()
 }
 
 pub fn read_state(name: &str) -> std::io::Result<ContainerState> {
@@ -579,6 +658,78 @@ mod tests {
     /// rootfs_path should accept an existing filesystem directory path and
     /// return its canonicalized form, without requiring it to be registered
     /// in the rootfs store.
+    /// test_spawn_config_serde_roundtrip
+    ///
+    /// Verifies that SpawnConfig serializes to JSON and deserializes correctly,
+    /// including all optional fields.  Also verifies backward compatibility:
+    /// a ContainerState JSON without `spawn_config` deserializes with `spawn_config == None`.
+    #[test]
+    fn test_spawn_config_serde_roundtrip() {
+        let sc = SpawnConfig {
+            image: Some("docker.io/library/alpine:latest".to_string()),
+            exe: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "echo hello".to_string()],
+            env: vec!["FOO=bar".to_string()],
+            bind: vec!["/tmp:/tmp".to_string()],
+            bind_ro: vec!["/etc:/etc:ro".to_string()],
+            volume: vec!["mydata:/data".to_string()],
+            network: vec!["bridge".to_string()],
+            publish: vec!["8080:80".to_string()],
+            dns: vec!["1.1.1.1".to_string()],
+            working_dir: Some("/app".to_string()),
+            user: Some("1000:1000".to_string()),
+            hostname: Some("myhost".to_string()),
+            cap_drop: vec!["ALL".to_string()],
+            cap_add: vec!["NET_BIND_SERVICE".to_string()],
+            security_opt: vec!["no-new-privileges".to_string()],
+            read_only: true,
+            rm: false,
+            nat: true,
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let decoded: SpawnConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.image, sc.image);
+        assert_eq!(decoded.exe, sc.exe);
+        assert_eq!(decoded.args, sc.args);
+        assert_eq!(decoded.env, sc.env);
+        assert_eq!(decoded.bind, sc.bind);
+        assert_eq!(decoded.bind_ro, sc.bind_ro);
+        assert_eq!(decoded.network, sc.network);
+        assert_eq!(decoded.publish, sc.publish);
+        assert_eq!(decoded.dns, sc.dns);
+        assert_eq!(decoded.working_dir, sc.working_dir);
+        assert_eq!(decoded.user, sc.user);
+        assert_eq!(decoded.hostname, sc.hostname);
+        assert_eq!(decoded.cap_drop, sc.cap_drop);
+        assert_eq!(decoded.cap_add, sc.cap_add);
+        assert_eq!(decoded.security_opt, sc.security_opt);
+        assert!(decoded.read_only);
+        assert!(!decoded.rm);
+        assert!(decoded.nat);
+    }
+
+    /// test_spawn_config_missing_from_state
+    ///
+    /// Verifies that a ContainerState JSON without `spawn_config` deserializes
+    /// with `spawn_config == None` (backward-compatibility with older state files).
+    #[test]
+    fn test_spawn_config_missing_from_state() {
+        let json = r#"{
+            "name": "test",
+            "rootfs": "alpine",
+            "status": "exited",
+            "pid": 0,
+            "watcher_pid": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+            "exit_code": 0,
+            "command": ["/bin/sh"],
+            "stdout_log": null,
+            "stderr_log": null
+        }"#;
+        let state: ContainerState = serde_json::from_str(json).unwrap();
+        assert!(state.spawn_config.is_none());
+    }
+
     #[test]
     fn test_rootfs_path_accepts_filesystem_dir() {
         // /tmp always exists on Linux.

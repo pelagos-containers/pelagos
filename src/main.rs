@@ -511,7 +511,16 @@ fn main() {
             )
             .map_err(|e| e.to_string().into()),
         },
-        CliCommand::Start { id } => pelagos::oci::cmd_start(&id).map_err(|e| e.to_string().into()),
+        CliCommand::Start { id } => {
+            // Dispatch: pelagos container restart takes priority over OCI lifecycle.
+            // A pelagos container state lives at /run/pelagos/containers/<name>/state.json;
+            // an OCI container state lives at /run/pelagos/<id>/state.json (different dir).
+            if cli::container_state_exists(&id) {
+                cli::start::cmd_start(&id)
+            } else {
+                pelagos::oci::cmd_start(&id).map_err(|e| e.to_string().into())
+            }
+        }
         CliCommand::State { id } => pelagos::oci::cmd_state(&id).map_err(|e| e.to_string().into()),
         CliCommand::Kill { id, signal } => {
             pelagos::oci::cmd_kill(&id, &signal).map_err(|e| e.to_string().into())

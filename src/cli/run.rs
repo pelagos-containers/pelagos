@@ -26,7 +26,7 @@ extern "C" fn watcher_forward_signal(signum: libc::c_int) {
 use super::{
     check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
     parse_memory, parse_ulimit, parse_user, parse_user_in_layers, rootfs_path, write_state,
-    ContainerState, ContainerStatus, HealthConfig, HealthStatus,
+    ContainerState, ContainerStatus, HealthConfig, HealthStatus, SpawnConfig,
 };
 use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
 use pelagos::network::NetworkMode;
@@ -269,12 +269,59 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             )?
         };
 
+    let spawn_config = build_spawn_config(&args, &rootfs_label, &exe_and_args);
+
     if args.detach {
-        run_detached(name, rootfs_label, exe_and_args, cmd, health_config)
+        run_detached(
+            name,
+            rootfs_label,
+            exe_and_args,
+            cmd,
+            health_config,
+            Some(spawn_config),
+        )
     } else if args.interactive {
         run_interactive(cmd)
     } else {
-        run_foreground(name, rootfs_label, exe_and_args, cmd, args.rm)
+        run_foreground(
+            name,
+            rootfs_label,
+            exe_and_args,
+            cmd,
+            args.rm,
+            Some(spawn_config),
+        )
+    }
+}
+
+/// Capture RunArgs fields into a SpawnConfig for container restart.
+fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String]) -> SpawnConfig {
+    // image is None for --rootfs containers; otherwise it's the normalized image reference.
+    let image = if args.rootfs.is_none() && !args.args.is_empty() {
+        Some(rootfs_label.to_string())
+    } else {
+        None
+    };
+    SpawnConfig {
+        image,
+        exe: exe_and_args.first().cloned().unwrap_or_default(),
+        args: exe_and_args.get(1..).unwrap_or(&[]).to_vec(),
+        env: args.env.clone(),
+        bind: args.bind.clone(),
+        bind_ro: args.bind_ro.clone(),
+        volume: args.volume.clone(),
+        network: args.network.clone(),
+        publish: args.publish.clone(),
+        dns: args.dns.clone(),
+        working_dir: args.workdir.clone(),
+        user: args.user.clone(),
+        hostname: args.hostname.clone(),
+        cap_drop: args.cap_drop.clone(),
+        cap_add: args.cap_add.clone(),
+        security_opt: args.security_opt.clone(),
+        read_only: args.read_only,
+        rm: args.rm,
+        nat: args.nat,
     }
 }
 
@@ -755,6 +802,7 @@ fn run_foreground(
     command: Vec<String>,
     mut cmd: Command,
     auto_remove: bool,
+    spawn_config: Option<SpawnConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cmd = cmd
         .stdin(Stdio::Inherit)
@@ -778,6 +826,7 @@ fn run_foreground(
         network_ips: std::collections::HashMap::new(),
         health: None,
         health_config: None,
+        spawn_config,
     };
     write_state(&state)?;
 
@@ -846,6 +895,7 @@ fn run_detached(
     command: Vec<String>,
     mut cmd: Command,
     health_config: Option<HealthConfig>,
+    spawn_config: Option<SpawnConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
@@ -870,6 +920,7 @@ fn run_detached(
         network_ips: std::collections::HashMap::new(),
         health: None,
         health_config: None,
+        spawn_config,
     };
     write_state(&state)?;
 

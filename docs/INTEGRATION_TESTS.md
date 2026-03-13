@@ -3206,3 +3206,36 @@ is attempted, and the container shares the host's mount namespace where
 Failure indicates the auto-inject is running unconditionally, which would attempt
 to create a DNS temp file and bind-mount in a shared mount namespace, potentially
 corrupting the host's view of `/etc/resolv.conf`.
+
+---
+
+## Container Restart (`pelagos start`)
+
+### `test_container_restart_after_exit`
+**Requires:** root, alpine-rootfs
+
+Runs `/bin/true` in detached mode, waits for the container to reach `"exited"` status,
+verifies `spawn_config` was written to `state.json`, then calls `pelagos start` and
+waits for the restarted container to also exit.
+
+Failure indicates: `SpawnConfig` was not persisted on first run, `pelagos start` returns
+a non-zero exit code, or the restarted container fails to launch/exit cleanly.
+
+### `test_container_restart_runs_same_command`
+**Requires:** root, alpine-rootfs
+
+Runs `/bin/sh -c "echo run1 > /shared/marker.txt"` with a bind-mounted host directory.
+After the container exits, removes the marker file, calls `pelagos start`, and asserts
+the marker file is re-created by the restarted container.
+
+Failure indicates: `SpawnConfig` did not preserve the bind mount or the command arguments,
+so the restarted container ran a different command or without the correct mount.
+
+### `test_container_start_running_fails`
+**Requires:** root, alpine-rootfs
+
+Starts a long-lived container (`/bin/sleep 30`), waits until its PID is recorded, then
+asserts that `pelagos start` returns a non-zero exit code.
+
+Failure indicates the "already running" guard in `cmd_start` is broken and `pelagos start`
+incorrectly accepts or restarts a live container.
