@@ -3261,3 +3261,31 @@ is returned and it is the one with `tier=web`.
 
 Failure indicates the label filter in `cmd_ps` / `apply_filters` is broken — either
 the wrong containers are returned or the JSON output is malformed.
+
+## pivot_root enforcement (`with_chroot` requires `Namespace::MOUNT`)
+
+### `test_no_mount_ns_no_auto_resolv` (updated)
+**Requires:** root, alpine-rootfs
+
+Attempts to spawn a container with `with_chroot` but without `Namespace::MOUNT` and
+asserts that `spawn()` returns an error mentioning `Namespace::MOUNT`.
+
+Previously this test verified that auto-resolv-conf binding was skipped without a mount
+namespace.  Since `with_chroot` now uses `pivot_root(2)` internally, a private mount
+namespace is structurally required; the guard enforces this at `spawn()` time before
+any fork occurs.
+
+Failure indicates the `Namespace::MOUNT` enforcement guard in `spawn()` /
+`spawn_interactive()` is missing or broken — containers without mount namespace isolation
+could silently use chroot instead of pivot_root, weakening security.
+
+### `test_pivot_root_old_root_inaccessible`
+**Requires:** root, alpine-rootfs
+
+Starts a container with a chroot rootfs and asserts that `/.pivot_root_old` does not
+exist inside the container after startup.  `do_pivot_root()` creates this directory
+temporarily to pass to `pivot_root(2)` and immediately unmounts and removes it.  If it
+persists, the old root was not properly detached.
+
+Failure indicates `do_pivot_root()` is not cleaning up after itself — either the
+`umount2(MNT_DETACH)` or `rmdir` failed silently, leaving the old root accessible.

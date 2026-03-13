@@ -6,6 +6,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
+| #96 | epic: replace chroot with pivot_root as default root isolation | epic/COMPLETE |
 | #86 | bug: postgres:alpine CAP_CHOWN/CAP_FOWNER denied in compose | bug/CLOSED |
 | #80 | bug: test_dns_upstream_forward fails (EAGAIN on 8.8.8.8 fwd socket) | bug/CLOSED |
 | #74 | epic: cgroup enforcement test coverage | epic/CLOSED |
@@ -27,15 +28,265 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-12, SHA 0a8b57f / pelagos-mac fac01b5)
+## Current Baseline (2026-03-12, SHA TBD / pelagos-mac fac01b5)
 
-- pelagos unit tests: **299/299 + 43/43 bin pass** (new label tests in binary)
-- pelagos integration tests: **256/257 pass, 6 ignored** (1 pre-existing ordering flake)
+- pelagos unit tests: **299/299 pass**
+- pelagos integration tests: **258/258 pass, 6 ignored**
 - pelagos-mac: compiles on macOS only (objc2-virtualization); no new test regressions
-- Trees: clean, up to date with origin/main (both repos)
+- Trees: clean (pending commit for epic #96 pivot_root implementation)
+
+**Completed this session (2026-03-12):**
+- Epic #96 implemented: `with_chroot()` now uses `pivot_root(2)` internally
+- `do_pivot_root()` helper added to container.rs
+- `Namespace::MOUNT` guard enforced in `spawn()` and `spawn_interactive()`
+- Old explicit `pivot_root` field, initializer, and branch removed
+- `with_pivot_root()` marked `#[deprecated]` redirecting to `with_chroot()`
+- 2 new integration tests: `test_pivot_root_old_root_inaccessible`, updated `test_no_mount_ns_no_auto_resolv`
+- Version bumped to 0.27.0
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
 a possibly dirty environment.
+
+---
+
+## Epic #95 — Replace chroot with pivot_root as default root isolation
+
+### Background and motivation
+
+Pelagos currently uses `chroot(2)` as the default filesystem isolation mechanism.
+`with_chroot()` is what `pelagos run`, `pelagos build`, `pelagos compose`, and the OCI
+lifecycle all call. `with_pivot_root()` exists as an opt-in API but nothing in the CLI
+ever invokes it.
+
+`chroot` only changes what path `"/"` resolves to for the calling process — it does
+**not** modify the mount namespace root. A process with `CAP_SYS_ADMIN` or access to
+a setuid binary can escape a chroot jail. `pivot_root(2)` atomically makes the new
+rootfs the root of the mount namespace and detaches the old root; combined with a
+private mount namespace it is structurally unescapable.
+
+The chroot-default has caused several cascading problems:
+
+1. **exec complexity**: `pelagos exec` must locate the container root via
+   `/proc/{pid}/root` and use `fchdir(root_fd) + chroot(".")`. When PID namespaces
+   are active, `state.pid` is the intermediate process P which never called
+   pivot_root — hence `find_root_pid()` which traverses `/proc/P/task/P/children`
+   to find grandchild C.
+
+2. **Mount sequencing disorder**: The pre_exec code does all mounts host-side (using
+   `effective_root + in-container-path`) before calling chroot at the end. This is
+   inverted from the correct model. It also produces a duplicate /proc/sys/dev mount
+   sequence — once pre-chroot (lines 3549–3588, for OCI mount ordering) and once
+   post-chroot (lines 3833+, via the `mount_proc/sys/dev` flags).
+
+3. **No-MOUNT-namespace footgun**: Because chroot doesn't require a mount namespace,
+   the API allows containers without `Namespace::MOUNT`. This is silently broken — a
+   rootfs-isolated container without mount namespace isolation is not isolated.
+
+4. **OCI hooks limitation**: The OCI pre-start hooks can't join the container's mount
+   namespace because pivot_root/chroot has already run. runc invokes hooks *before*
+   pivot_root explicitly to avoid this.
+
+5. **Security**: chroot is a weaker guarantee than pivot_root. This is documented in
+   `with_pivot_root()`'s own doc comment but ignored by default.
+
+### What changes
+
+The goal is: **`with_chroot()` triggers pivot_root internally when MOUNT namespace is
+active** (which it always should be). The public `with_chroot()` API signature stays
+unchanged for library users; the implementation switches to pivot_root. The separate
+`with_pivot_root(new_root, put_old)` API is deprecated — put_old is now auto-managed.
+
+The exec path (`fchdir + chroot(".")`) is *correct* for joining an existing mount
+namespace and does not change. `find_root_pid()` stays because PID-namespace
+intermediate processes are real regardless of chroot vs pivot_root.
+
+### Exact file changes
+
+#### Phase 1 — Require `Namespace::MOUNT` when rootfs is configured
+
+**`src/container.rs`** — in `spawn()` pre_exec (early guard):
+```rust
+if chroot_dir.is_some() && !namespaces.contains(Namespace::MOUNT) {
+    return Err(io::Error::other(
+        "a rootfs (chroot/pivot_root) requires Namespace::MOUNT; \
+         add .with_namespaces(Namespace::MOUNT) to your Command"
+    ));
+}
+```
+Same guard in `spawn_interactive()`.
+
+This catches API misuse and is a prerequisite for Phase 2. Impacts: any test or
+example that calls `with_chroot()` without `Namespace::MOUNT` will get a clear error
+instead of silently running without isolation.
+
+#### Phase 2 — `do_pivot_root()` helper function
+
+Add to `src/container.rs` (near the pivot_root execution site, before spawn's
+pre_exec closure):
+
+```rust
+/// Perform pivot_root(new_root, new_root/.put_old), then detach and remove the
+/// old root.  Handles the case where new_root is not yet a mountpoint (plain
+/// rootfs dir) by bind-mounting it to itself first.
+///
+/// Requires: the calling process is inside a private mount namespace
+/// (CLONE_NEWNS + MS_PRIVATE|MS_REC already done).
+unsafe fn do_pivot_root(new_root: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // pivot_root(2) requires new_root to be a mountpoint.  overlayfs merged
+    // dirs already are.  Plain directories need a bind-mount to themselves.
+    let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
+    let bind_result = libc::mount(
+        new_root_c.as_ptr(),
+        new_root_c.as_ptr(),
+        ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        ptr::null(),
+    );
+    // EINVAL from MS_BIND usually means it's already a mountpoint — ignore.
+    if bind_result != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            return Err(io::Error::other(format!(
+                "bind-mount {} to itself: {}", new_root.display(), e
+            )));
+        }
+    }
+
+    // Create a put_old dir inside new_root.
+    let put_old = new_root.join(".pivot_root_old");
+    std::fs::create_dir_all(&put_old)?;
+    let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
+
+    #[cfg(target_arch = "x86_64")] const SYS_PIVOT_ROOT: i64 = 155;
+    #[cfg(target_arch = "aarch64")] const SYS_PIVOT_ROOT: i64 = 41;
+
+    let result = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
+    if result != 0 {
+        return Err(io::Error::other(format!(
+            "pivot_root({}, {}): {}",
+            new_root.display(), put_old.display(), io::Error::last_os_error()
+        )));
+    }
+
+    // We are now inside new_root.  old root is at /.pivot_root_old.
+    std::env::set_current_dir("/")?;
+
+    let put_old_rel = CString::new(".pivot_root_old").unwrap();
+    libc::umount2(put_old_rel.as_ptr(), libc::MNT_DETACH);
+    // Best-effort rmdir; ignore error (will be cleaned up at process exit anyway).
+    libc::rmdir(put_old_rel.as_ptr());
+
+    Ok(())
+}
+```
+
+#### Phase 3 — Replace chroot call with `do_pivot_root` in spawn()
+
+**`src/container.rs`** line 3822 — the chroot execution site:
+
+```rust
+// BEFORE:
+chroot(effective_root)
+    .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+
+// AFTER:
+unsafe { do_pivot_root(effective_root) }?;
+```
+
+The surrounding code (DNS bind-mounts, kernel mounts, bind mounts — all using
+`effective_root.join(...)` paths) is UNCHANGED. They already do the right thing:
+mount sources from the host into `effective_root/...` before pivot_root, which is
+exactly what runc does.
+
+Apply the same change in `spawn_interactive()` (line ~5700 in the parallel chroot
+execution block).
+
+#### Phase 4 — Remove the legacy explicit pivot_root branch
+
+The `if let Some((ref new_root, ref put_old)) = pivot_root` block at line 3383 and
+the corresponding block in `spawn_interactive()` are now dead code — everything goes
+through `do_pivot_root()`. Remove these blocks.
+
+Remove the `pivot_root: Option<(PathBuf, PathBuf)>` field from the `Command` struct
+(line 875).
+
+Deprecate `with_pivot_root()`:
+```rust
+#[deprecated(since = "0.27.0",
+    note = "pivot_root is now the default when Namespace::MOUNT is active; \
+            call with_chroot() instead")]
+pub fn with_pivot_root<P1, P2>(self, new_root: P1, _put_old: P2) -> Self
+where P1: Into<PathBuf>, P2: Into<PathBuf> {
+    self.with_chroot(new_root)
+}
+```
+
+#### Phase 5 — Enforce MOUNT namespace in CLI (belt-and-suspenders)
+
+**`src/cli/run.rs`** in `cmd_run()` — after rootfs is resolved, before spawning:
+```rust
+cmd = cmd.add_namespaces(Namespace::MOUNT);
+```
+(This is already done in most paths but should be explicit and unconditional.)
+
+Same in `src/cli/compose.rs` `spawn_service()` and `src/oci.rs` `build_command()`.
+
+#### Phase 6 — exec.rs: comment and minor cleanup
+
+`src/cli/exec.rs` lines 196–199: update the comment — the intermediate process P still
+doesn't call pivot_root (it never transitions to the container root; that's C), so
+`find_root_pid()` stays. But the comment should be accurate:
+
+```rust
+// IMPORTANT: with PID namespace enabled, state.pid = P (intermediate
+// process), which is not the same process that called pivot_root — only
+// the grandchild C (PID 1 inside the container) did.  P's /proc/P/root
+// is the HOST root.  Use find_root_pid() to find C.
+```
+
+The `fchdir(root_fd) + chroot(".")` exec pattern at lines 227–233 is CORRECT and
+unchanged — this is the standard nsenter pattern for entering an existing mount
+namespace.
+
+#### Phase 7 — Tests
+
+**Unit tests** (cargo test --lib):
+- `test_do_pivot_root_unmounts_old_root`: fork a child in a new mount namespace,
+  call `do_pivot_root()`, verify `/.pivot_root_old` doesn't exist after call.
+- `test_mount_ns_required_with_chroot`: verify `Command::new(...).with_chroot(...)
+  .spawn()` returns an error when MOUNT namespace is not set.
+
+**Integration tests** (`tests/integration_tests.rs`):
+- `test_pivot_root_old_root_inaccessible`: run a container that tries to read a
+  host-only path (e.g. `/etc/machine-id` which exists on host but not in alpine),
+  assert the read fails (ENOENT or EPERM) — proves old root is gone.
+- `test_chroot_without_mount_ns_rejected`: assert that `Command::new(...).with_chroot(dir)
+  .with_namespaces(Namespace::UTS)` (no MOUNT) returns Err before spawning.
+- Update `docs/INTEGRATION_TESTS.md` with entries for both.
+
+### Implementation order
+
+1. Phase 1 (MOUNT required) → cargo test → some existing tests may need MOUNT added
+2. Phase 2 (do_pivot_root helper) → unit test it
+3. Phase 3 (replace chroot call) → integration tests
+4. Phase 4 (remove legacy pivot_root branch + deprecate API) → check for uses
+5. Phase 5 (CLI enforcement) → regression test full suite
+6. Phase 6 (exec comments) → trivial
+7. Phase 7 (full test suite: lib + bin + integration)
+8. Bump to v0.27.0
+
+### Risks and mitigations
+
+| Risk | Mitigation |
+|------|-----------|
+| Plain rootfs dir not a mountpoint | `do_pivot_root()` bind-mounts to self first; EINVAL ignored (already mountpoint) |
+| Rootless pivot_root (user ns) | pivot_root works inside user-namespace-owned mount namespace (tested in runc/crun) |
+| OCI runtime-tools compatibility | pivot_root produces same visible result as chroot for `validatePosixMounts`; if not, OCI tests will catch it |
+| Library API breakage | `with_chroot()` signature unchanged; `with_pivot_root()` deprecated with 1-release grace period |
+| Tests without MOUNT namespace | Phase 1 gives clear errors; easy to fix by adding `Namespace::MOUNT` |
+| spawn_interactive() divergence | Both spawn paths updated in Phase 3 simultaneously |
 
 ## Completed This Session (2026-03-12)
 

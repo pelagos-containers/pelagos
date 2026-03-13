@@ -92,7 +92,6 @@
 
 use bitflags::bitflags;
 use nix::sched::{unshare, CloneFlags};
-use nix::unistd::chroot;
 
 /// Portable type for rlimit resource constants.
 /// glibc defines `__rlimit_resource_t` (c_uint), musl uses plain `c_int`.
@@ -872,7 +871,6 @@ pub struct Command {
     mount_proc: bool,
     mount_sys: bool,
     mount_dev: bool,
-    pivot_root: Option<(PathBuf, PathBuf)>, // (new_root, put_old)
     // Security configuration
     capabilities: Option<Capability>, // None = keep all, Some = keep only these
     seccomp_profile: Option<SeccompProfile>, // None = no seccomp, Some = apply profile
@@ -961,6 +959,75 @@ pub struct Command {
     stdio_err: Stdio,
 }
 
+/// Perform `pivot_root(new_root, new_root/.pivot_root_old)` and detach the old root.
+///
+/// `pivot_root(2)` requires `new_root` to be a mountpoint.  Overlay merged dirs
+/// already satisfy this.  Plain rootfs directories are self-bind-mounted first
+/// (EINVAL from that bind indicates the dir is already a mountpoint — treated as
+/// success).
+///
+/// # Safety
+/// Must be called from a child process that has already called
+/// `unshare(CLONE_NEWNS)` and made mounts private (`MS_PRIVATE|MS_REC`).
+unsafe fn do_pivot_root(new_root: &std::path::Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
+
+    // pivot_root(2) requires new_root to be a mountpoint.  Overlay merged dirs
+    // already are.  Plain directories need a bind-mount to themselves.
+    let bind_rc = libc::mount(
+        new_root_c.as_ptr(),
+        new_root_c.as_ptr(),
+        std::ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        std::ptr::null(),
+    );
+    // EINVAL usually means it is already a mountpoint — ignore.
+    if bind_rc != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            return Err(io::Error::other(format!(
+                "bind-mount {} to itself: {}",
+                new_root.display(),
+                e
+            )));
+        }
+    }
+
+    // Create .pivot_root_old inside new_root to receive the old root.
+    let put_old = new_root.join(".pivot_root_old");
+    std::fs::create_dir_all(&put_old)?;
+    let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
+
+    #[cfg(target_arch = "x86_64")]
+    const SYS_PIVOT_ROOT: i64 = 155;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_PIVOT_ROOT: i64 = 41;
+
+    let rc = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
+    if rc != 0 {
+        return Err(io::Error::other(format!(
+            "pivot_root({}, {}): {}",
+            new_root.display(),
+            put_old.display(),
+            io::Error::last_os_error()
+        )));
+    }
+
+    // We are now inside new_root.  Chdir to the new "/".
+    std::env::set_current_dir("/")?;
+
+    // Detach and remove the old root.
+    let put_old_rel = CString::new(".pivot_root_old").unwrap();
+    libc::umount2(put_old_rel.as_ptr(), libc::MNT_DETACH);
+    // Best-effort rmdir; ignored if non-empty or otherwise fails.
+    libc::rmdir(put_old_rel.as_ptr());
+
+    Ok(())
+}
+
 impl Command {
     /// Create a new command builder for the given program.
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
@@ -978,7 +1045,6 @@ impl Command {
             mount_proc: false,
             mount_sys: false,
             mount_dev: false,
-            pivot_root: None,
             capabilities: None,
             seccomp_profile: None,
             no_new_privileges: false,
@@ -1267,29 +1333,20 @@ impl Command {
         self
     }
 
-    /// Use pivot_root instead of chroot for filesystem isolation.
+    /// Deprecated: `with_chroot()` now uses `pivot_root(2)` internally.
     ///
-    /// pivot_root is more secure than chroot as it actually changes the root
-    /// of the mount namespace, preventing escape via chroot.
-    ///
-    /// # Arguments
-    ///
-    /// * `new_root` - Path to the new root filesystem
-    /// * `put_old` - Path (relative to new_root) where the old root will be mounted
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// cmd.with_namespaces(Namespace::MOUNT)
-    ///    .with_pivot_root("/path/to/rootfs", "/path/to/rootfs/old_root");
-    /// ```
+    /// The `put_old` argument is ignored — the old root is automatically detached
+    /// inside `.pivot_root_old/` and cleaned up.  Use `with_chroot(new_root)` instead.
+    #[deprecated(
+        since = "0.27.0",
+        note = "with_chroot() now uses pivot_root(2) internally; use with_chroot() and omit put_old"
+    )]
     pub fn with_pivot_root<P1: Into<PathBuf>, P2: Into<PathBuf>>(
-        mut self,
+        self,
         new_root: P1,
-        put_old: P2,
+        _put_old: P2,
     ) -> Self {
-        self.pivot_root = Some((new_root.into(), put_old.into()));
-        self
+        self.with_chroot(new_root)
     }
 
     /// Set which capabilities to keep (all others will be dropped).
@@ -2549,7 +2606,6 @@ impl Command {
         let mount_proc = self.mount_proc;
         let mount_sys = self.mount_sys;
         let mount_dev = self.mount_dev;
-        let pivot_root = self.pivot_root.clone();
         let capabilities = self.capabilities;
         let rlimits = self.rlimits.clone();
         let no_new_privileges = self.no_new_privileges;
@@ -2642,6 +2698,15 @@ impl Command {
         if self.overlay.is_some() && self.chroot_dir.is_none() {
             return Err(Error::Io(io::Error::other(
                 "with_overlay requires with_chroot",
+            )));
+        }
+        // pivot_root(2) requires a private mount namespace.  Enforce this early
+        // so callers get a clear error instead of a confusing EINVAL from inside
+        // the pre_exec closure.
+        if self.chroot_dir.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
+            return Err(Error::Io(io::Error::other(
+                "a rootfs (with_chroot) requires Namespace::MOUNT; \
+                 add .with_namespaces(Namespace::MOUNT) to your Command",
             )));
         }
 
@@ -3380,47 +3445,7 @@ impl Command {
                     };
 
                 // Step 4: Change root if specified
-                if let Some((ref new_root, ref put_old)) = pivot_root {
-                    // Use pivot_root for better security
-                    use std::os::unix::ffi::OsStrExt;
-
-                    // pivot_root syscall (not in nix crate, use libc directly)
-                    let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
-                    let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
-
-                    // pivot_root syscall number is 155 on x86_64
-                    #[cfg(target_arch = "x86_64")]
-                    const SYS_PIVOT_ROOT: i64 = 155;
-                    #[cfg(target_arch = "aarch64")]
-                    const SYS_PIVOT_ROOT: i64 = 41;
-
-                    let result =
-                        libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
-
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "pivot_root({}, {}): {}",
-                            new_root.display(),
-                            put_old.display(),
-                            io::Error::last_os_error()
-                        )));
-                    }
-
-                    // Change to new root
-                    std::env::set_current_dir("/")?;
-
-                    // Unmount old root
-                    let put_old_rel = put_old
-                        .strip_prefix(new_root)
-                        .map_err(|_| io::Error::other("put_old must be inside new_root"))?;
-                    let put_old_rel_c = CString::new(put_old_rel.as_os_str().as_bytes()).unwrap();
-
-                    let umount_result = libc::umount2(put_old_rel_c.as_ptr(), libc::MNT_DETACH);
-                    if umount_result != 0 {
-                        // Don't fail if unmount doesn't work - it's not critical
-                    }
-                } else if let Some(ref dir) = chroot_dir {
-                    // Fallback to chroot if pivot_root not specified
+                if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
                     // When overlay is active, the merged dir is the effective root.
@@ -3528,10 +3553,12 @@ impl Command {
                         }
                     }
 
-                    // If readonly rootfs is requested, bind-mount the effective root to itself
-                    // BEFORE chroot — this makes it a proper mount point so we can remount it
-                    // readonly later. When overlay is active, the overlay IS already a proper
-                    // mount point — skip the self-bind in that case.
+                    // If readonly rootfs is requested, bind-mount the root dir to itself
+                    // BEFORE pivot_root — this makes it a mount point so we can remount it
+                    // readonly after pivot_root (Step 4.85).  do_pivot_root() also does a
+                    // self-bind but only when the dir is not yet a mountpoint; doing it here
+                    // explicitly ensures the MS_REMOUNT|MS_RDONLY step always works.
+                    // When overlay is active, the overlay merged dir IS already a mount point.
                     if readonly_rootfs && overlay_merged.is_none() {
                         let dir_c = CString::new(dir.as_os_str().as_bytes()).unwrap();
                         let result = libc::mount(
@@ -3819,15 +3846,18 @@ impl Command {
                         }
                     }
 
-                    chroot(effective_root)
-                        .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    // pivot_root atomically makes new_root the mount namespace root
+                    // and detaches the old root — stronger isolation than chroot(2).
+                    do_pivot_root(effective_root)?;
 
-                    // Change working directory after chroot (defaults to /).
+                    // Apply container working directory (defaults to /).
                     let cwd = container_cwd
                         .as_deref()
                         .unwrap_or(std::path::Path::new("/"));
-                    std::env::set_current_dir(cwd)
-                        .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
+                    if cwd != std::path::Path::new("/") {
+                        std::env::set_current_dir(cwd)
+                            .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
+                    }
                 }
 
                 // Step 4.5: Perform automatic mounts if requested.
@@ -4056,9 +4086,10 @@ impl Command {
                     }
                 }
 
-                // Step 4.85: Make rootfs read-only if requested
-                // MUST come after all mounts (/proc, /sys, /dev, masked paths)
-                // Note: We already did bind mount before chroot, so just remount readonly now
+                // Step 4.85: Make rootfs read-only if requested.
+                // MUST come after all mounts (/proc, /sys, /dev, masked paths).
+                // The self-bind done before pivot_root made "/" a bind-mount,
+                // so MS_REMOUNT|MS_RDONLY succeeds here.
                 if readonly_rootfs {
                     let root = CString::new("/").unwrap();
                     let result = libc::mount(
@@ -4858,7 +4889,6 @@ impl Command {
         let mount_proc = self.mount_proc;
         let mount_sys = self.mount_sys;
         let mount_dev = self.mount_dev;
-        let pivot_root = self.pivot_root.clone();
         let capabilities = self.capabilities;
         let rlimits = self.rlimits.clone();
         let no_new_privileges = self.no_new_privileges;
@@ -4942,6 +4972,12 @@ impl Command {
         if self.overlay.is_some() && self.chroot_dir.is_none() {
             return Err(Error::Io(io::Error::other(
                 "with_overlay requires with_chroot",
+            )));
+        }
+        if self.chroot_dir.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
+            return Err(Error::Io(io::Error::other(
+                "a rootfs (with_chroot) requires Namespace::MOUNT; \
+                 add .with_namespaces(Namespace::MOUNT) to your Command",
             )));
         }
 
@@ -5565,31 +5601,7 @@ impl Command {
                         None
                     };
 
-                if let Some((ref new_root, ref put_old)) = pivot_root {
-                    use std::os::unix::ffi::OsStrExt;
-                    std::fs::create_dir_all(put_old).ok();
-
-                    let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
-                    let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
-
-                    #[cfg(target_arch = "x86_64")]
-                    const SYS_PIVOT_ROOT: i64 = 155;
-                    #[cfg(target_arch = "aarch64")]
-                    const SYS_PIVOT_ROOT: i64 = 41;
-
-                    let result =
-                        libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    std::env::set_current_dir("/")?;
-
-                    let put_old_rel = put_old
-                        .strip_prefix(new_root)
-                        .map_err(|_| io::Error::other("put_old must be inside new_root"))?;
-                    let put_old_rel_c = CString::new(put_old_rel.as_os_str().as_bytes()).unwrap();
-                    libc::umount2(put_old_rel_c.as_ptr(), libc::MNT_DETACH);
-                } else if let Some(ref dir) = chroot_dir {
+                if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
                     // When overlay is active, use the merged dir as the effective root.
@@ -5958,12 +5970,13 @@ impl Command {
                         }
                     }
 
-                    chroot(effective_root)
-                        .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    do_pivot_root(effective_root)?;
                     let cwd = container_cwd
                         .as_deref()
                         .unwrap_or(std::path::Path::new("/"));
-                    std::env::set_current_dir(cwd)?;
+                    if cwd != std::path::Path::new("/") {
+                        std::env::set_current_dir(cwd)?;
+                    }
                 }
 
                 if mount_proc {

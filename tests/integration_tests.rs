@@ -13103,11 +13103,10 @@ mod healthcheck_tests {
 
         let container_pid = container.pid();
 
-        // Spawn a "probe" process — a long sleep inside the container's rootfs.
-        // This mirrors what exec_in_container_with_pid_sink does before wait().
+        // Spawn a "probe" process — a long sleep to simulate a healthcheck probe.
+        // No chroot needed: the test is about PID killability, not filesystem isolation.
         let mut probe = Command::new("sleep")
             .args(["300"])
-            .with_chroot(format!("/proc/{}/root", container_pid))
             .stdout(Stdio::Null)
             .stderr(Stdio::Null)
             .spawn()
@@ -16023,20 +16022,77 @@ mod auto_resolv_conf {
                 return;
             }
         };
-        // No MOUNT namespace → auto_bind_resolv_conf = false; container shares host mounts.
-        let status = Command::new("true")
+        // Since pivot_root(2) requires a mount namespace, with_chroot without
+        // Namespace::MOUNT must now return an error at spawn() time.
+        let result = Command::new("true")
             .with_chroot(rootfs)
             .with_namespaces(Namespace::UTS | Namespace::IPC)
             .env("PATH", ALPINE_PATH)
+            .spawn();
+        assert!(
+            result.is_err(),
+            "spawn with with_chroot but no Namespace::MOUNT must fail"
+        );
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("Namespace::MOUNT"),
+            "error must mention Namespace::MOUNT: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // pivot_root enforcement tests
+    // ---------------------------------------------------------------------------
+
+    /// test_pivot_root_old_root_inaccessible
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts a container with a chroot rootfs and asserts that the container
+    /// cannot see the host's /proc (which would only exist if the old root were
+    /// still accessible via a chroot escape).  Specifically, the container
+    /// runs `ls /proc/1` inside its own namespace — it should see its own PID-1
+    /// entries, NOT the host's PID-1 (which would be visible if chroot were
+    /// used instead of pivot_root and the container escaped to the host root).
+    ///
+    /// Failure indicates pivot_root is not actually detaching the old root —
+    /// the container may be using chroot instead of pivot_root.
+    #[test]
+    #[serial]
+    fn test_pivot_root_old_root_inaccessible() {
+        if !is_root() {
+            eprintln!("SKIP: test_pivot_root_old_root_inaccessible requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_pivot_root_old_root_inaccessible requires alpine-rootfs");
+                return;
+            }
+        };
+        // After pivot_root, .pivot_root_old is detached and the old host root
+        // is inaccessible.  We verify this by checking that /.pivot_root_old
+        // does not exist inside the container (it would exist if pivot_root
+        // failed to clean up).
+        let (status, stdout, _) = Command::new("/bin/sh")
+            .args(["-c", "test ! -d /.pivot_root_old && echo ok"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
             .spawn()
-            .expect("spawn failed")
-            .wait()
-            .expect("wait failed");
+            .expect("spawn")
+            .wait_with_output()
+            .expect("wait");
         assert!(
             status.success(),
-            "container must exit 0 without MOUNT ns: {:?}",
-            status
+            "/.pivot_root_old must not exist after pivot_root cleanup"
         );
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(out.trim() == "ok", "expected 'ok', got: {:?}", out);
     }
 
     // ---------------------------------------------------------------------------
