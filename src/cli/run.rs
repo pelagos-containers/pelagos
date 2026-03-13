@@ -848,15 +848,17 @@ fn run_foreground(
         health_config: None,
         spawn_config,
         labels,
+        mnt_ns_inode: None,
     };
     write_state(&state)?;
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
     let pid = child.pid();
 
-    // Update state with real PID and network IPs (if bridge networking).
+    // Update state with real PID, mount-namespace inode, and network IPs.
     let mut state2 = state;
     state2.pid = pid;
+    state2.mnt_ns_inode = super::read_mnt_ns_inode(pid);
     state2.bridge_ip = child.container_ip();
     let all_ips: Vec<(String, String)> = child
         .container_ips()
@@ -944,6 +946,7 @@ fn run_detached(
         health_config: None,
         spawn_config,
         labels,
+        mnt_ns_inode: None,
     };
     write_state(&state)?;
 
@@ -1007,9 +1010,10 @@ fn run_detached(
                 );
             }
 
-            // Update state with real PIDs and network IPs.
+            // Update state with real PIDs, mount-namespace inode, and network IPs.
             let mut updated = state;
             updated.pid = pid;
+            updated.mnt_ns_inode = super::read_mnt_ns_inode(pid);
             updated.watcher_pid = watcher_pid;
             updated.bridge_ip = child.container_ip();
             let all_ips: Vec<(String, String)> = child

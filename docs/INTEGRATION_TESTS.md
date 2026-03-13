@@ -3289,3 +3289,31 @@ persists, the old root was not properly detached.
 
 Failure indicates `do_pivot_root()` is not cleaning up after itself — either the
 `umount2(MNT_DETACH)` or `rmdir` failed silently, leaving the old root accessible.
+
+### `test_exec_mnt_ns_inode_stored`
+**Requires:** root, alpine-rootfs
+
+Spawns a container in detached mode (`pelagos run -d --rootfs ...`) and reads the
+resulting `state.json`.  Asserts that `mnt_ns_inode` is present and non-zero.  Then
+calls `pelagos exec` into the running container and asserts it succeeds — the inode
+check must pass transparently for a live container (stored inode equals live inode).
+
+Failure indicates either:
+- `mnt_ns_inode` is not being written to `state.json` at spawn time (storage missing)
+- The inode check in `cmd_exec` is incorrectly rejecting a live container (false reject)
+
+### `test_exec_detects_pid_reuse`
+**Requires:** root, alpine-rootfs
+
+Spawns a container in detached mode, polls until `state.json` has a real PID, then
+tampers with `mnt_ns_inode` in `state.json` by setting it to the bogus value
+`999_999_999`.  Calls `pelagos exec` and asserts it fails with an error message
+containing "no longer running".
+
+Simulates the scenario where a short-lived container exits and its PID is recycled by
+an unrelated process: the mount-namespace inode of the recycled process will differ from
+the stored inode, so `verify_pid_not_recycled` must catch this before any `setns(2)`
+call is made.
+
+Failure indicates the inode check in `cmd_exec` is not firing — `pelagos exec` would
+silently enter the wrong process's namespaces.

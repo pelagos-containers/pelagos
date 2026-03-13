@@ -1,6 +1,6 @@
 //! `pelagos exec` — run a command inside a running container.
 
-use super::{check_liveness, parse_user, read_state, ContainerStatus};
+use super::{check_liveness, parse_user, read_state, verify_pid_not_recycled, ContainerStatus};
 use pelagos::container::{Command, Namespace, Stdio};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -65,7 +65,13 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let pid = state.pid;
 
-    // 2. Discover which namespaces the container has
+    // 2a. Verify PID identity before opening any namespace fds.
+    //     If the container exited and the OS recycled its PID, the mount-namespace
+    //     inode will differ from what was recorded at spawn time.  This catches the
+    //     race before we silently enter the wrong process's namespaces.
+    verify_pid_not_recycled(pid, &state).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // 2b. Discover which namespaces the container has
     let ns_entries = discover_namespaces(pid)?;
 
     // 3. Read the container's environment.
