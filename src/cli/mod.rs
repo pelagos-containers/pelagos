@@ -238,6 +238,12 @@ pub struct ContainerState {
     /// Container labels as KEY=VALUE strings.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub labels: std::collections::HashMap<String, String>,
+    /// Inode of the container's mount namespace (`/proc/<pid>/ns/mnt`) at creation
+    /// time.  Used by `pelagos exec` to detect PID reuse: if the current inode
+    /// doesn't match the stored one the original container has exited and the PID
+    /// has been recycled by an unrelated process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mnt_ns_inode: Option<u64>,
 }
 
 pub fn now_iso8601() -> String {
@@ -657,6 +663,49 @@ pub fn parse_capability_mask(names: &[String]) -> pelagos::container::Capability
     mask
 }
 
+/// Read the inode number of `/proc/<pid>/ns/mnt`.
+///
+/// Returns `None` if the file cannot be stat'd (process has exited or the caller
+/// lacks permission).
+pub fn read_mnt_ns_inode(pid: i32) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/proc/{}/ns/mnt", pid))
+        .ok()
+        .map(|m| m.ino())
+}
+
+/// Verify that `pid` still belongs to the expected container by comparing the
+/// live mount-namespace inode against the inode stored in `state.mnt_ns_inode`
+/// at container creation time.
+///
+/// Returns `Ok(())` when:
+/// - No stored inode exists (old state files — backwards compatible).
+/// - The stored inode matches the current one.
+///
+/// Returns `Err` with a user-facing message when the inode doesn't match
+/// (PID has been recycled by an unrelated process) or when the namespace file
+/// can no longer be read (process has exited).
+pub fn verify_pid_not_recycled(pid: i32, state: &ContainerState) -> Result<(), String> {
+    let expected = match state.mnt_ns_inode {
+        Some(inode) => inode,
+        None => return Ok(()), // old state file — skip check
+    };
+    match read_mnt_ns_inode(pid) {
+        Some(current) if current == expected => Ok(()),
+        Some(_) => Err(format!(
+            "container '{}' process (pid {}) is no longer running \
+             (PID was reused by another process) — \
+             use 'pelagos start {}' to restart it",
+            state.name, pid, state.name
+        )),
+        None => Err(format!(
+            "container '{}' process (pid {}) is no longer running — \
+             use 'pelagos start {}' to restart it",
+            state.name, pid, state.name
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +815,7 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                mnt_ns_inode: None,
             }
         }
 
@@ -825,6 +875,7 @@ mod tests {
             health_config: None,
             spawn_config: None,
             labels,
+            mnt_ns_inode: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();

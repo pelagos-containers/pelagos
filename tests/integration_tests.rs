@@ -7473,6 +7473,199 @@ mod exec {
             "exec output mismatch"
         );
     }
+
+    /// `mnt_ns_inode` is stored in state.json when a container is spawned.
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a container in detached mode (so state.json is written with a real PID)
+    /// and verifies that `mnt_ns_inode` is Some and matches the live inode of
+    /// `/proc/<pid>/ns/mnt`.  A missing or zero inode would mean the check in
+    /// `cmd_exec` would silently skip PID-reuse detection for all new containers.
+    #[test]
+    #[serial]
+    fn test_exec_mnt_ns_inode_stored() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_mnt_ns_inode_stored (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping (no rootfs)");
+                return;
+            }
+        };
+
+        let name = "test-mnt-inode";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Clean up any stale state.
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        // Start a detached sleeping container.
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "30",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run failed");
+        assert!(run_status.success(), "pelagos run -d failed");
+
+        // Poll for the watcher to write the real PID.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let state_json;
+        loop {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["pid"].as_i64().unwrap_or(0) > 0 {
+                        state_json = data;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "container did not start within 10s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let state: serde_json::Value = serde_json::from_str(&state_json).expect("parse state.json");
+        let stored_inode = state["mnt_ns_inode"]
+            .as_u64()
+            .expect("mnt_ns_inode must be present in state.json");
+        assert!(stored_inode > 0, "mnt_ns_inode must be non-zero");
+
+        // Verify exec succeeds while the container is running — the inode check
+        // must pass transparently for a live container (stored inode == live inode).
+        let exec_out = std::process::Command::new(bin)
+            .args(["exec", name, "/bin/true"])
+            .output()
+            .expect("pelagos exec");
+
+        // Clean up before asserting so the container is always stopped.
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        assert!(
+            exec_out.status.success(),
+            "exec into live container should succeed (inode check must not false-reject), stderr: {}",
+            String::from_utf8_lossy(&exec_out.stderr)
+        );
+    }
+
+    /// `pelagos exec` rejects a PID whose mount-namespace inode doesn't match
+    /// the stored value (simulating PID reuse after container exit).
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a container, tampers with `mnt_ns_inode` in state.json to a
+    /// deliberately wrong value, then calls `pelagos exec`.  The exec must fail
+    /// with an error mentioning "no longer running" — not silently enter the wrong
+    /// process's namespaces.  A pass confirms the inode check fires before any
+    /// `setns(2)` call.
+    #[test]
+    #[serial]
+    fn test_exec_detects_pid_reuse() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_detects_pid_reuse (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping (no rootfs)");
+                return;
+            }
+        };
+
+        let name = "test-pid-reuse";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Clean up stale state.
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        // Start a detached sleeping container.
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "30",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run failed");
+        assert!(run_status.success(), "pelagos run -d failed");
+
+        // Poll for the watcher to write the real PID.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["pid"].as_i64().unwrap_or(0) > 0 {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "container did not start within 10s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Tamper with state.json — overwrite mnt_ns_inode with a bogus value.
+        let json = std::fs::read_to_string(&state_path).expect("read state.json");
+        let mut state: serde_json::Value = serde_json::from_str(&json).expect("parse state.json");
+        state["mnt_ns_inode"] = serde_json::Value::Number(serde_json::Number::from(999_999_999u64));
+        std::fs::write(&state_path, serde_json::to_string(&state).unwrap())
+            .expect("write tampered state.json");
+
+        // Attempt exec — must fail with a clear "no longer running" / PID-reuse error.
+        let exec_out = std::process::Command::new(bin)
+            .args(["exec", name, "/bin/true"])
+            .output()
+            .expect("pelagos exec invocation failed");
+
+        // Clean up before asserting so the container is always stopped.
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        assert!(
+            !exec_out.status.success(),
+            "exec should have failed on tampered inode but exited 0"
+        );
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+        assert!(
+            stderr.contains("no longer running"),
+            "error should mention 'no longer running', got: {}",
+            stderr
+        );
+    }
 }
 
 mod watcher {
