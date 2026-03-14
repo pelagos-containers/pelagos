@@ -3361,3 +3361,32 @@ the underlying bind-mount mechanism itself is broken.
 
 Failure indicates the DNS bind-mount mechanism isn't working for image-layer containers
 with pasta networking.
+
+### `test_copy_dot_src`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Regression test for issue #103: `COPY . /dest/` (bare dot, no trailing slash) failed with ENOENT.
+
+`Path::new(".").file_name()` returns `None`; the fallback `unwrap_or(".")` produced a resolved
+destination of `/dest/.` instead of `/dest/`, and `create_dir_all` on the non-existent parent
+then raised ENOENT.  The fix treats `src == "."` as contents mode, identical to `src.ends_with('/')`.
+
+Builds a Remfile with `COPY . /tmp/ctx/`, runs the resulting image, and asserts that a sentinel
+file written to the build context appears at `/tmp/ctx/sentinelfile` inside the container.
+
+Failure indicates `execute_copy()` does not handle the bare-dot case and the ENOENT regression
+has returned.
+
+### `test_from_local_tag`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Regression test for issue #104: `FROM <local-tag>` failed because `normalise_image_reference()`
+unconditionally prepended `docker.io/library/`, producing a ref that does not match the on-disk
+path written by `pelagos build -t <local-tag>`.
+
+Builds a base image tagged `pelagos-test-local-base:latest` (with a sentinel file `/marker`),
+then builds a derived image whose Remfile begins with `FROM pelagos-test-local-base`.  Asserts the
+second build succeeds and the sentinel from the base image is visible inside the derived container.
+
+Failure indicates the local-ref lookup is missing and `FROM <local>` unconditionally hits the
+registry normalisation path, which does not know about locally built images.

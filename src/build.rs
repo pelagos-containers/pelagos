@@ -650,8 +650,16 @@ fn execute_stage(
         if base_ref == "scratch" {
             (Vec::new(), ImageConfig::default())
         } else {
+            // Try local reference first (bare name with :latest if no tag),
+            // then fall back to the normalised registry reference.
+            let local_ref = if !base_ref.contains(':') && !base_ref.contains('@') {
+                format!("{}:latest", base_ref)
+            } else {
+                base_ref.clone()
+            };
             let normalised = normalise_image_reference(&base_ref);
-            let base_manifest = image::load_image(&normalised)
+            let base_manifest = image::load_image(&local_ref)
+                .or_else(|_| image::load_image(&normalised))
                 .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
             (base_manifest.layers.clone(), base_manifest.config.clone())
         }
@@ -1289,8 +1297,8 @@ fn execute_copy(
     // this directory into dest", not "copy the directory itself".
     //   COPY mygoapp/ .  →  /app/main.go   (contents, no extra nesting)
     //   COPY mygoapp .   →  /app/mygoapp/main.go  (directory itself)
-    let src_basename = if src.ends_with('/') {
-        // Trailing slash → contents mode; don't append the dir name.
+    let src_basename = if src.ends_with('/') || src == "." {
+        // Trailing slash or bare "." → contents mode; don't append the dir name.
         ""
     } else {
         Path::new(src)

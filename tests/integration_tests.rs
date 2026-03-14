@@ -14277,6 +14277,177 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
         result.unwrap();
     }
 
+    /// test_copy_dot_src
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for issue #103: `COPY . /dest/` fails with ENOENT.
+    ///
+    /// The bare `"."` source was not treated as contents mode (equivalent to `"./"`).
+    /// `Path::new(".").file_name()` returns `None`, causing `unwrap_or(".")` to fall
+    /// through, producing a resolved destination of `/dest/.` instead of `/dest/`,
+    /// and the subsequent `create_dir_all` call failed with ENOENT.
+    ///
+    /// Failure indicates: `execute_copy` does not handle `src == "."` as contents
+    /// mode and the ENOENT regression has returned.
+    #[test]
+    fn test_copy_dot_src() {
+        if !is_root() {
+            eprintln!("SKIP test_copy_dot_src: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!("SKIP test_copy_dot_src: alpine not pulled (run: pelagos image pull alpine)");
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("sentinelfile"), b"hello-dot-copy\n").unwrap();
+
+        let remfile = "\
+FROM alpine\n\
+COPY . /tmp/ctx/\n\
+CMD [\"cat\", \"/tmp/ctx/sentinelfile\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-copy-dot:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build with COPY . /dest/ should succeed (issue #103)");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("cat")
+                .args(["/tmp/ctx/sentinelfile"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("should spawn container from built image");
+
+            let (status, stdout, _stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(
+                status.success(),
+                "container exited non-zero; sentinel not found at /tmp/ctx/sentinelfile"
+            );
+            assert_eq!(
+                out.trim(),
+                "hello-dot-copy",
+                "unexpected sentinel content — COPY . did not copy file into /tmp/ctx/"
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
+    /// test_from_local_tag
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for issue #104: `FROM <local-tag>` cannot find locally-built images.
+    ///
+    /// `normalise_image_reference()` unconditionally prepends `docker.io/library/` to bare
+    /// names, so `FROM mylocaltag` resolved to `docker.io/library/mylocaltag:latest` which
+    /// does not match the on-disk path written by `pelagos build -t mylocaltag`.
+    ///
+    /// The fix tries the bare `<tag>:latest` ref first, falling back to the normalised form.
+    /// This test builds a base image, tags it, then builds a second image whose FROM refers
+    /// to the local tag and asserts the second build succeeds and can read content from the
+    /// first image's layers.
+    ///
+    /// Failure indicates: the local-ref lookup is missing and the `FROM <local>` path
+    /// unconditionally hits the registry fallback, which does not know about local builds.
+    #[test]
+    fn test_from_local_tag() {
+        if !is_root() {
+            eprintln!("SKIP test_from_local_tag: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_from_local_tag: alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let base_tag = "pelagos-test-local-base:latest";
+        let derived_tag = "pelagos-test-local-derived:latest";
+
+        // Build the base image with a sentinel file.
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("marker"), b"from-local-base\n").unwrap();
+
+        let base_remfile = "\
+FROM alpine\n\
+COPY marker /marker\n";
+        let base_instructions = build::parse_remfile(base_remfile).unwrap();
+        build::execute_build(
+            &base_instructions,
+            ctx.path(),
+            base_tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("base image build should succeed");
+
+        // Build derived image FROM the local tag (no trailing registry prefix).
+        let derived_remfile = "\
+FROM pelagos-test-local-base\n\
+CMD [\"cat\", \"/marker\"]\n";
+        let derived_instructions = build::parse_remfile(derived_remfile).unwrap();
+        let derived_manifest = build::execute_build(
+            &derived_instructions,
+            ctx.path(),
+            derived_tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("derived image build FROM local tag should succeed (issue #104)");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&derived_manifest);
+            let mut child = Command::new("cat")
+                .args(["/marker"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn container from derived image");
+
+            let (status, stdout, _stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(
+                status.success(),
+                "container from derived image exited non-zero"
+            );
+            assert_eq!(
+                out.trim(),
+                "from-local-base",
+                "marker from base image not visible in derived image"
+            );
+        });
+
+        cleanup_image(base_tag);
+        cleanup_image(derived_tag);
+        result.unwrap();
+    }
+
     /// Verify that the rootless bridge guard fires when `pelagos run --network bridge` is invoked
     /// as a non-root user.  Uses `sudo -u nobody` to execute the installed binary without root.
     ///

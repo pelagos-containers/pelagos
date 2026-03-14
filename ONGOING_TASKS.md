@@ -6,6 +6,8 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
+| #103 | bug: COPY . /dest/ fails with ENOENT (bare dot not treated as contents mode) | bug/FIXED |
+| #104 | bug: FROM <local-tag> cannot find locally-built images (normalise_image_reference) | bug/FIXED |
 | #96 | epic: replace chroot with pivot_root as default root isolation | epic/COMPLETE |
 | #86 | bug: postgres:alpine CAP_CHOWN/CAP_FOWNER denied in compose | bug/CLOSED |
 | #80 | bug: test_dns_upstream_forward fails (EAGAIN on 8.8.8.8 fwd socket) | bug/CLOSED |
