@@ -345,12 +345,21 @@ fn kernel_supports_overlayfs() -> bool {
     use std::sync::OnceLock;
     static RESULT: OnceLock<bool> = OnceLock::new();
     *RESULT.get_or_init(|| {
-        std::fs::read_to_string("/proc/filesystems")
+        let supported = std::fs::read_to_string("/proc/filesystems")
             .map(|s| {
                 s.lines()
                     .any(|l| l.split_whitespace().any(|w| w == "overlay"))
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if supported {
+            log::debug!("overlay: kernel supports overlayfs (found in /proc/filesystems)");
+        } else {
+            log::warn!(
+                "overlay: kernel does not support overlayfs (not in /proc/filesystems); \
+                 CONFIG_OVERLAY_FS may not be compiled in — container image runs will fail"
+            );
+        }
+        supported
     })
 }
 
@@ -2895,6 +2904,9 @@ impl Command {
                      or run as a rootless user with fuse-overlayfs installed",
                 )));
             }
+            if self.overlay.is_some() {
+                log::debug!("overlay: root mode — using native kernel overlayfs");
+            }
             use_fuse_overlay = false;
         }
 
@@ -5169,6 +5181,9 @@ impl Command {
                      container images require overlayfs — use a kernel with overlay support \
                      or run as a rootless user with fuse-overlayfs installed",
                 )));
+            }
+            if self.overlay.is_some() {
+                log::debug!("overlay: root mode — using native kernel overlayfs");
             }
             use_fuse_overlay = false;
         }
