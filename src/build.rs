@@ -1161,10 +1161,24 @@ fn execute_run(
 
     // Apply network mode for package installs etc.
     // Bridge mode needs NAT (MASQUERADE) for outbound internet and DNS for
-    // hostname resolution.  Pasta provides both natively.
+    // hostname resolution.
+    // Pasta provides outbound routing natively but does NOT write /etc/resolv.conf.
+    // We inject DNS explicitly for both modes so that package managers can always
+    // resolve hostnames.  For pasta we include the host's real upstream DNS first
+    // (may be fastest if reachable from pasta's netns) and append well-known public
+    // DNS as a reliable fallback for environments where private DNS isn't routable
+    // through pasta's isolated network namespace.
     cmd = cmd.with_network(network_mode.clone());
     if network_mode.is_bridge() {
         cmd = cmd.with_nat().with_dns(&["8.8.8.8", "1.1.1.1"]);
+    } else if matches!(&network_mode, NetworkMode::Pasta) {
+        let mut dns_list = crate::container::host_upstream_dns();
+        for public in &["8.8.8.8", "1.1.1.1"] {
+            if !dns_list.iter().any(|s| s.as_str() == *public) {
+                dns_list.push(public.to_string());
+            }
+        }
+        cmd = cmd.with_dns(&dns_list);
     }
 
     let mut child = cmd.spawn()?;

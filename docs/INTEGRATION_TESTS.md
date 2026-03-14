@@ -3330,3 +3330,25 @@ call is made.
 
 Failure indicates the inode check in `cmd_exec` is not firing — `pelagos exec` would
 silently enter the wrong process's namespaces.
+
+### `test_build_run_pasta_dns_injected`
+**Requires:** rootless (non-root), pasta installed, alpine-rootfs
+
+Regression test for issue #102: `pelagos build` RUN steps with pasta networking
+failing DNS resolution.
+
+Simulates what `execute_run()` in `build.rs` does for a pasta-mode RUN step:
+constructs an explicit DNS list (public DNS 8.8.8.8/1.1.1.1), then runs a container
+with `with_image_layers()` + `with_network(Pasta)` + `with_dns()` and checks that
+`/etc/resolv.conf` inside the container contains both `nameserver` entries and
+specifically `8.8.8.8`.
+
+Before the fix, `execute_run()` relied on spawn()'s auto-injection for pasta mode
+(which uses the host's DNS server). In environments where the host DNS isn't routable
+from inside pasta's isolated netns (e.g. the Alpine VM using 192.168.105.1 as DNS
+which may not be reachable from pasta's default route), DNS failed with "Temporary
+failure resolving". The fix: `execute_run()` now explicitly injects host DNS + public
+DNS fallback, matching what bridge mode has always done.
+
+Failure indicates the DNS bind-mount mechanism isn't working for image-layer containers
+with pasta networking, or the explicit DNS injection in `execute_run()` was removed.

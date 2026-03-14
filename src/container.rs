@@ -417,7 +417,7 @@ const HOST_CA_CERT: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// at 127.0.0.53) which is unreachable from a container with its own network namespace.
 /// We prefer `/run/systemd/resolve/resolv.conf`, which lists actual upstream servers.
 /// Loopback addresses (127.x, ::1) are always filtered out.
-fn host_upstream_dns() -> Vec<String> {
+pub(crate) fn host_upstream_dns() -> Vec<String> {
     // Candidate resolv.conf files, in preference order.
     let candidates = ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"];
     for path in &candidates {

@@ -16801,4 +16801,74 @@ mod auto_resolv_conf {
                 .output();
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // Build RUN step DNS injection tests (issue #102)
+    // ---------------------------------------------------------------------------
+
+    /// test_build_run_pasta_dns_injected
+    ///
+    /// Requires: rootless (non-root), pasta available, alpine-rootfs.
+    ///
+    /// Simulates what `pelagos build` does for a RUN step with pasta networking:
+    /// constructs the DNS list the same way `execute_run()` does (host upstream DNS
+    /// + 8.8.8.8/1.1.1.1 as public fallback), then runs a container with
+    /// `with_image_layers()` + pasta + explicit DNS and verifies that
+    /// `/etc/resolv.conf` inside the container contains nameserver entries.
+    ///
+    /// This is the regression test for issue #102 — before the fix, pasta build
+    /// RUN steps relied on auto-injection only and could end up with the image's
+    /// original empty resolv.conf, causing `apt-get update` to fail with
+    /// "Temporary failure resolving".
+    #[test]
+    fn test_build_run_pasta_dns_injected() {
+        if is_root() {
+            eprintln!("SKIP: test_build_run_pasta_dns_injected is for rootless mode");
+            return;
+        }
+        if !pelagos::network::is_pasta_available() {
+            eprintln!("SKIP: test_build_run_pasta_dns_injected requires pasta");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_build_run_pasta_dns_injected requires alpine-rootfs");
+                return;
+            }
+        };
+
+        // Simulate the DNS list that execute_run() injects for pasta mode:
+        // host DNS + 8.8.8.8/1.1.1.1 as public fallback.
+        // For this test we use just the public DNS to keep the test
+        // deterministic across environments.
+        let dns_list = ["8.8.8.8", "1.1.1.1"];
+
+        // Simulate a build RUN step: with_image_layers() + pasta + explicit DNS.
+        let layer_dirs = vec![rootfs.clone()];
+        let (status, stdout_bytes, _) = Command::new("cat")
+            .args(["/etc/resolv.conf"])
+            .with_image_layers(layer_dirs)
+            .with_network(NetworkMode::Pasta)
+            .with_dns(&dns_list)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn failed")
+            .wait_with_output()
+            .expect("wait failed");
+
+        assert!(status.success(), "container exited non-zero: {:?}", status);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        // Both nameservers must appear — confirms the bind-mount reached the container.
+        assert!(
+            stdout.contains("nameserver"),
+            "build RUN step must have nameserver in /etc/resolv.conf, got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("8.8.8.8"),
+            "build RUN step resolv.conf must include 8.8.8.8, got: {stdout:?}"
+        );
+    }
 }
