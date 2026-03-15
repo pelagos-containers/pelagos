@@ -6,6 +6,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
+| #110 | bug: pelagos log output aliases container stdin during pasta build RUN | bug/FIXED v0.41.0 |
 | #107 | bug: pasta stderr discarded; TAP setup failures opaque | bug/FIXED |
 | #106 | bug: COPY --chown flag parsed as source path | bug/FIXED |
 | #105 | bug: FROM ${VAR} not substituted + FROM <stage-alias> not found in completed_stages | bug/FIXED |
@@ -33,11 +34,14 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-15, SHA 0e43705 / pelagos-mac fac01b5)
+## Current Baseline (2026-03-15, SHA pre-v0.41.0)
 
 - pelagos unit tests: **305/305 pass**
-- pelagos integration tests: CI green (v0.35.0 release workflow passed)
-- pelagos v0.35.0 released: https://github.com/skeptomai/pelagos/releases/tag/v0.35.0
+- v0.41.0 in progress: fix issue #110 (pelagos log output aliases container stdin)
+  - Two-guard fix: pre_exec null-stdin re-assert + execute_run stderr Piped isolation
+  - Updated test: sets RUST_LOG=debug to reproduce exact failure mode
+- pelagos v0.40.0 released (issue #110 first attempt, insufficient)
+- pelagos v0.39.0 released: https://github.com/skeptomai/pelagos/releases/tag/v0.39.0
 - pelagos-mac: compiles on macOS only (objc2-virtualization); clean at fac01b5
 - Both trees: clean
 

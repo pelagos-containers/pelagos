@@ -2684,6 +2684,13 @@ impl Command {
         let additional_gids = self.additional_gids.clone();
         let umask_val = self.umask;
         let landlock_rules = self.landlock_rules.clone();
+        // Capture whether stdin should be /dev/null so pre_exec can re-assert
+        // it explicitly.  In some host environments (e.g. vsock-invoked builds
+        // on pelagos-mac) pelagos's own stderr fd 2 can alias the container's
+        // stdin fd through a dup2 ordering quirk in Command setup.  Explicitly
+        // opening /dev/null and dup2-ing it to fd 0 at the start of pre_exec
+        // (from the HOST filesystem, before pivot_root) closes this window.
+        let null_stdin = matches!(self.stdio_in, Stdio::Null);
         // MAC: only activate AppArmor / SELinux if the respective LSM is running.
         // Checked in the parent so we can use is_apparmor_enabled() / is_selinux_enabled()
         // (which allocate) rather than deferring the check to the async-signal-safe pre_exec.
@@ -3134,6 +3141,33 @@ impl Command {
             self.inner.pre_exec(move || {
                 use std::ffi::CString;
                 use std::ptr;
+
+                // Step -1: Belt-and-suspenders stdin isolation.
+                //
+                // When stdin is configured as Null, explicitly open /dev/null from
+                // the HOST filesystem (before pivot_root / chroot) and dup2 it to
+                // fd 0.  This is redundant when Rust's Command setup works correctly,
+                // but guards against an fd aliasing edge case in certain host
+                // environments (e.g. vsock-invoked builds in pelagos-mac) where
+                // pelagos's own stderr (fd 2) can alias the container's stdin fd
+                // number due to a dup2 ordering quirk during Command setup.
+                //
+                // We use O_RDONLY | O_CLOEXEC: O_RDONLY is correct for stdin;
+                // O_CLOEXEC ensures the temp fd is closed across any nested exec
+                // that might occur during pre_exec (e.g. newuidmap).
+                if null_stdin {
+                    let dev_null_path = b"/dev/null\0";
+                    let dev_null_fd = libc::open(
+                        dev_null_path.as_ptr() as *const libc::c_char,
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    );
+                    if dev_null_fd >= 0 {
+                        libc::dup2(dev_null_fd, 0);
+                        if dev_null_fd != 0 {
+                            libc::close(dev_null_fd);
+                        }
+                    }
+                }
 
                 // Step 0: For non-PID-namespace containers (single fork), add ourselves
                 // to the pre-created cgroup immediately so all subsequent memory

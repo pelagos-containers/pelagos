@@ -3542,20 +3542,24 @@ Failure indicates: `load_image` no longer falls back to `<ref>:latest` for bare 
 ### `test_pasta_stdin_not_contaminated`
 **Requires:** root, pasta installed, `docker.io/library/alpine:latest` pre-pulled
 
-Regression test for issue #110. During build RUN steps using `NetworkMode::Pasta`, pasta's
-stdout pipe was leaking into the container's stdin fd in some environments (e.g. devcontainer
-builds via vsock), causing `curl | bash`-style scripts to execute pasta log messages as
-shell commands (exit code 127).
+Regression test for issue #110 (v0.41.0 fix). During build RUN steps using `NetworkMode::Pasta`,
+pelagos's own RUST_LOG debug output (written to pelagos's stderr fd 2 via env_logger) was aliasing
+the container's stdin fd in certain host environments (vsock-invoked builds on pelagos-mac), causing
+`curl | bash` RUN steps to fail with exit 127 as bash tried to execute the log line as a command.
 
-The fix replaces the two separate `Stdio::piped()` calls for pasta's stdout and stderr with a
-single pipe created via `pipe2()` + `dup()`. Both pasta's stdout and stderr are directed to the
-same pipe write-end, and the output_thread reads from the single read-end. This eliminates the
-separate stdout pipe that was being confused with the container's stdin fd, and removes the
-nested stderr-draining thread.
+The v0.40.0 fix (combining pasta's stdout+stderr into a single pipe) was insufficient because the
+contaminating source was pelagos's own log output, not pasta's stdout.
 
-This test builds with `NetworkMode::Pasta`, running `cat /dev/stdin | wc -c` in a RUN step and
-asserting the byte count is 0. A non-zero count indicates bytes leaked from pasta's output into
-the container's stdin.
+The v0.41.0 fix applies two guards:
+1. `container.rs` pre_exec: explicitly opens `/dev/null` from the host filesystem and dup2s it
+   to fd 0 at the start of pre_exec (before namespace setup), overriding any incorrect fd
+   inherited due to fd aliasing during Command setup.
+2. `build.rs` execute_run: uses `Stdio::Piped` (not `Inherit`) for container stderr, so the
+   container's fd 2 is a fresh write-only pipe isolated from pelagos's own fd 2. A relay thread
+   forwards the pipe to pelagos's stderr so build output remains visible.
 
-Failure indicates: the combined-pipe fix (pipe2+dup) has been reverted or pasta's stdout is
-once again routed through a separate pipe that can alias the container's stdin.
+The test sets `RUST_LOG=debug` before building to maximise log output (reproducing the failure
+mode), runs `cat /dev/stdin | wc -c` in a RUN step, and asserts the byte count is 0. A non-zero
+count indicates pelagos's log output or pasta's pipes leaked into the container's stdin.
+
+Failure indicates the stdin isolation fix (pre_exec null redirect or stderr Piped) was reverted.

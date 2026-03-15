@@ -17859,22 +17859,23 @@ mod issue_110_pasta_stdin_isolation {
     ///
     /// Requires: root, pasta installed, docker.io/library/alpine:latest pre-pulled
     ///
-    /// Regression test for issue #110: pasta's stdout pipe was leaking into the
-    /// container's stdin during build RUN steps, causing `curl | bash`-style
-    /// scripts to execute pasta's log output as shell commands (exit code 127).
+    /// Regression test for issue #110 (v0.41.0 fix): during `pelagos build` with
+    /// pasta networking, pelagos's own RUST_LOG debug output (written to pelagos's
+    /// stderr fd 2) was aliasing the container's stdin fd in certain host
+    /// environments (vsock-invoked builds on pelagos-mac).  `curl | bash` RUN steps
+    /// failed with exit 127 because bash executed the log line as a shell command.
     ///
-    /// The fix combines pasta's stdout and stderr into a single pipe using
-    /// `pipe2()` + `dup()`, eliminating separate stdout/stderr pipes that
-    /// could be confused with the container's stdin fd.
+    /// The v0.40.0 fix (combining pasta's pipes) was insufficient; the real fix
+    /// requires two guards:
+    ///   1. container.rs pre_exec: explicitly open /dev/null + dup2 to fd 0 when
+    ///      stdin=Null, before any namespace setup (belt-and-suspenders).
+    ///   2. build.rs execute_run: use Stdio::Piped for container stderr (not Inherit)
+    ///      so the container's fd 2 is a fresh pipe isolated from pelagos's fd 2.
     ///
-    /// This test builds an image with a RUN step that explicitly reads from stdin
-    /// (`/bin/sh -c "read line; [ -z \"$line\" ]"`), asserts it exits 0 (stdin was
-    /// /dev/null → EOF → `read` returns non-zero... actually read returns 1 on EOF).
-    /// Instead we use `cat /dev/stdin | wc -c` and assert the byte count is 0,
-    /// which proves the container's stdin contained no bytes from pasta.
+    /// This test builds with RUST_LOG=debug (maximising log output) and asserts
+    /// stdin byte count is 0, which proves no log bytes leaked into the container.
     ///
-    /// Failure indicates: pasta's combined output pipe is leaking into the container's
-    /// stdin fd (i.e. the pipe2+dup fix was reverted or is broken).
+    /// Failure indicates the stdin isolation fix was reverted.
     #[test]
     fn test_pasta_stdin_not_contaminated() {
         if !is_root() {
@@ -17897,23 +17898,35 @@ mod issue_110_pasta_stdin_isolation {
         let _ = image::remove_image(tag);
         let _ = image::remove_image(&format!("{}:latest", tag));
 
+        // Enable maximum log output to reproduce the exact failure mode:
+        // pelagos's debug log (env_logger → stderr fd 2) was the contaminating source.
+        let old_rust_log = std::env::var("RUST_LOG").ok();
+        std::env::set_var("RUST_LOG", "debug");
+
         // The RUN step reads all bytes from stdin and writes the count to a file.
-        // If pasta's pipe contaminated stdin, the byte count will be > 0.
+        // If pelagos's log output or pasta's pipes contaminated stdin, count > 0.
         let remfile = "FROM alpine\nRUN cat /dev/stdin | wc -c > /stdin-bytes.txt\n";
         let instructions = build::parse_remfile(remfile).expect("parse_remfile");
         let tmpdir = tempfile::tempdir().expect("tempdir");
 
-        let manifest = build::execute_build(
+        let result = build::execute_build(
             &instructions,
             tmpdir.path(),
             tag,
             pelagos::network::NetworkMode::Pasta,
             false,
             &HashMap::new(),
-        )
-        .expect("execute_build should succeed (pasta stdin isolation)");
+        );
 
-        // Verify the built image runs correctly and /stdin-bytes.txt contains "0".
+        // Restore RUST_LOG regardless of success/failure.
+        match old_rust_log {
+            Some(val) => std::env::set_var("RUST_LOG", val),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+
+        let manifest = result.expect("execute_build should succeed (pasta stdin isolation)");
+
+        // Verify /stdin-bytes.txt contains "0" (stdin was truly empty during build).
         let layer_dirs = image::layer_dirs(&manifest);
         let cmd = pelagos::container::Command::new("/bin/cat")
             .args(["/stdin-bytes.txt"])
@@ -17928,7 +17941,7 @@ mod issue_110_pasta_stdin_isolation {
         let bytes: u64 = out.trim().parse().unwrap_or(u64::MAX);
         assert_eq!(
             bytes, 0,
-            "stdin was not empty during the RUN step: {} bytes leaked (pasta stdout contamination)",
+            "stdin was not empty during the RUN step: {} bytes leaked (pelagos log / pasta fd aliasing)",
             bytes
         );
 

@@ -1224,7 +1224,15 @@ fn execute_run(
         .with_image_layers(layer_dirs)
         .stdin(Stdio::Null)
         .stdout(Stdio::Inherit)
-        .stderr(Stdio::Inherit);
+        // Use Piped (not Inherit) for stderr so the container gets a fresh pipe as
+        // fd 2, completely isolated from pelagos's own stderr.  If we used Inherit,
+        // the container's fd 2 would be the same underlying file description as
+        // pelagos's fd 2 (where log::debug! writes RUST_LOG output).  In certain
+        // host environments (vsock-invoked builds in pelagos-mac) this causes
+        // pelagos's log lines to appear on the container's stdin via fd aliasing.
+        // The relay thread below forwards container stderr to pelagos's stderr so
+        // build output remains visible.
+        .stderr(Stdio::Piped);
 
     // Apply accumulated environment.
     for env_str in &config.env {
@@ -1261,7 +1269,28 @@ fn execute_run(
     }
 
     let mut child = cmd.spawn()?;
+
+    // Relay container stderr → pelagos's stderr in a background thread.
+    // This prevents a full pipe buffer from blocking wait_preserve_overlay()
+    // and ensures build output (apt-get, curl, npm, etc.) is visible in real time.
+    // The relay also ensures the container's stderr pipe is drained before we join.
+    let stderr_relay = child.take_stderr().map(|stderr_pipe| {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let reader = BufReader::new(stderr_pipe);
+            let mut out = std::io::stderr();
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = writeln!(out, "{}", line);
+            }
+        })
+    });
+
     let (status, overlay_base) = child.wait_preserve_overlay()?;
+
+    // Wait for the relay thread to flush any remaining buffered output.
+    if let Some(t) = stderr_relay {
+        let _ = t.join();
+    }
 
     if !status.success() {
         // Clean up overlay base if present.
