@@ -17481,10 +17481,13 @@ mod pasta_diagnostic_tests {
             return;
         }
         // Skip if ip(8) is not available (needed to create/delete named netns).
-        if Command::new("ip").arg("netns").arg("list")
+        if Command::new("ip")
+            .arg("netns")
+            .arg("list")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status().is_err()
+            .status()
+            .is_err()
         {
             eprintln!("SKIP: ip not in PATH");
             return;
@@ -17503,9 +17506,7 @@ mod pasta_diagnostic_tests {
         struct Cleanup(String);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = Command::new("ip")
-                    .args(["netns", "del", &self.0])
-                    .status();
+                let _ = Command::new("ip").args(["netns", "del", &self.0]).status();
             }
         }
         let _cleanup = Cleanup(ns_name.clone());
