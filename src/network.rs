@@ -1672,17 +1672,28 @@ pub fn setup_pasta_network(
 ) -> io::Result<PastaSetup> {
     let mut args: Vec<String> = vec![];
 
-    // Use the PID form: `pasta [OPTIONS] PID`.
+    // Invocation form depends on whether we are running as root or not.
     //
-    // When pasta receives a PID it joins that process's *existing* user namespace
-    // (via /proc/{pid}/ns/user) rather than creating a new one to drop privileges.
-    // In root mode the container's user namespace is the host/initial namespace —
-    // joining it is a no-op, so pasta retains full capabilities and can open the
-    // container's /proc/{pid}/ns/net without "Permission denied".
+    // ROOT mode — use `pasta --netns /proc/{pid}/ns/net --runas 0 [OPTIONS]`:
+    //   When pasta receives a PID it always opens /proc/{pid}/ns/user to enter the
+    //   container's user namespace before entering the network namespace.  On kernels
+    //   that restrict user namespace operations (e.g. Alpine linux-lts with
+    //   CONFIG_USER_NS restrictions, or sysctl kernel.unprivileged_userns_clone=0),
+    //   this open fails with EPERM and pasta exits with status 1 before creating the
+    //   TAP interface.
     //
-    // The --netns PATH form triggers a different code path where pasta *creates* a
-    // new user namespace for the drop-to-nobody dance, and then lacks access to the
-    // target netns file from within that new user namespace.
+    //   The `--netns PATH` form avoids the user namespace entirely: because no
+    //   `--userns` is given, pasta uses `--netns-only` semantics and joins the
+    //   network namespace directly without touching the user namespace file.
+    //   `--runas 0` keeps pasta running as root so no privilege-drop dance occurs.
+    //
+    // ROOTLESS mode — use `pasta [OPTIONS] PID`:
+    //   The container runs in a user namespace created by pelagos.  pasta must enter
+    //   that user namespace (via the PID form) before it can enter the owned network
+    //   namespace.  The --netns form would require a separate --userns argument and
+    //   is unnecessarily complex; the PID form handles this automatically.
+    // SAFETY: geteuid() is always safe to call.
+    let running_as_root = unsafe { libc::geteuid() } == 0;
 
     for &(host, container, proto) in port_forwards {
         if matches!(proto, PortProto::Tcp | PortProto::Both) {
@@ -1714,10 +1725,20 @@ pub fn setup_pasta_network(
     // correctly collects output when pasta exits for any reason.
     args.push("--foreground".to_string());
     // NOTE: do NOT pass --quiet here. pasta writes error messages to either stdout
-    // or stderr depending on the error path and its version; suppressing stdout with
-    // --quiet or Stdio::null() silently discards the actual failure message.
-    // PID must come last (positional argument).
-    args.push(child_pid.to_string());
+    // or stderr depending on the error path and version; suppressing either channel
+    // silently discards the actual failure message.
+    if running_as_root {
+        // Root mode: join netns directly, stay as root — avoids the user namespace.
+        args.push("--netns".to_string());
+        args.push(format!("/proc/{}/ns/net", child_pid));
+        args.push("--runas".to_string());
+        args.push("0".to_string());
+    } else {
+        // Rootless mode: PID form — pasta joins the container's user namespace
+        // before the network namespace (required when the container has a user ns).
+        // PID must come last (positional argument).
+        args.push(child_pid.to_string());
+    }
 
     let mut process = SysCmd::new("pasta")
         .args(&args)

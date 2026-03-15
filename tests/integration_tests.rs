@@ -17437,4 +17437,146 @@ mod pasta_diagnostic_tests {
             output
         );
     }
+
+    /// test_pasta_root_netns_setup
+    ///
+    /// Requires: root, pasta in PATH, tun module loaded, /dev/net/tun exists
+    ///
+    /// Regression test for issue #107 (root mode): when pelagos runs as root
+    /// and spawns pasta with the PID form, pasta tries to open the container's
+    /// user namespace (/proc/<pid>/ns/user) for the privilege-drop dance.  On
+    /// kernels that restrict user namespace access (Alpine linux-lts, or any
+    /// host with sysctl kernel.unprivileged_userns_clone=0), this open fails
+    /// with EPERM and pasta exits status 1 before creating the TAP interface.
+    ///
+    /// The fix: when running as root, use `pasta --netns /proc/<pid>/ns/net
+    /// --runas 0` which joins the network namespace directly without ever
+    /// touching the user namespace file.
+    ///
+    /// This test creates a named network namespace via `ip netns add`, runs
+    /// pasta with the fixed flags, and asserts that a non-loopback TAP
+    /// interface appeared in the namespace.
+    ///
+    /// Failure indicates the root-mode pasta invocation is still using the PID
+    /// form (which triggers the user namespace open) or --runas 0 is missing.
+    #[test]
+    fn test_pasta_root_netns_setup() {
+        use std::process::Command;
+
+        // Skip if not root.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: not root");
+            return;
+        }
+        // Skip if pasta is not available.
+        if !Command::new("pasta")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("SKIP: pasta not in PATH");
+            return;
+        }
+        // Skip if ip(8) is not available (needed to create/delete named netns).
+        if Command::new("ip").arg("netns").arg("list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status().is_err()
+        {
+            eprintln!("SKIP: ip not in PATH");
+            return;
+        }
+
+        let ns_name = format!("pelagos-test-{}", std::process::id());
+
+        // Create a named network namespace (appears at /run/netns/<ns_name>).
+        let create_status = Command::new("ip")
+            .args(["netns", "add", &ns_name])
+            .status()
+            .expect("ip netns add");
+        assert!(create_status.success(), "ip netns add failed");
+
+        // Ensure cleanup even if the test panics.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("ip")
+                    .args(["netns", "del", &self.0])
+                    .status();
+            }
+        }
+        let _cleanup = Cleanup(ns_name.clone());
+
+        // Run pasta the same way pelagos does for root containers:
+        //   pasta --foreground --config-net --netns /run/netns/<ns> --runas 0
+        // pasta will create a TAP interface and configure it, then keep running.
+        // We send SIGTERM after a brief poll to let it finish setup.
+        let mut pasta = Command::new("pasta")
+            .args([
+                "--foreground",
+                "--config-net",
+                "--netns",
+                &format!("/run/netns/{}", ns_name),
+                "--runas",
+                "0",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("pasta spawn");
+
+        // Poll for a non-loopback interface in the namespace (max 5s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut tap_found = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(status)) = pasta.try_wait() {
+                // pasta exited early — collect output and fail.
+                let mut stdout_out = String::new();
+                let mut stderr_out = String::new();
+                if let Some(mut out) = pasta.stdout.take() {
+                    let _ = std::io::Read::read_to_string(&mut out, &mut stdout_out);
+                }
+                if let Some(mut err) = pasta.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut err, &mut stderr_out);
+                }
+                panic!(
+                    "pasta exited early (status: {}) before TAP appeared\n\
+                     stdout: {}\nstderr: {}",
+                    status, stdout_out, stderr_out
+                );
+            }
+            // Check for a non-loopback interface in the netns.
+            let ifout = Command::new("ip")
+                .args(["netns", "exec", &ns_name, "ip", "link", "show"])
+                .output();
+            if let Ok(out) = ifout {
+                let text = String::from_utf8_lossy(&out.stdout);
+                // ip link show lists lines like "2: wlan0: <...>"
+                // Any interface other than lo means pasta created the TAP.
+                if text.lines().any(|l| {
+                    let name = l.split(':').nth(1).unwrap_or("").trim();
+                    !name.is_empty() && name != "lo" && !name.starts_with('@')
+                }) {
+                    tap_found = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Kill pasta (it's a relay; we don't need it running for the assertion).
+        let _ = pasta.kill();
+        let _ = pasta.wait();
+
+        assert!(
+            tap_found,
+            "pasta did not create a TAP interface in netns '{}' within 5s — \
+             root-mode pasta invocation is broken (user namespace EPERM regression)",
+            ns_name
+        );
+    }
 }
