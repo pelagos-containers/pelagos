@@ -18033,3 +18033,116 @@ mod issue_110_pasta_stdin_isolation {
         let _ = image::remove_image(&manifest.reference);
     }
 }
+
+#[cfg(test)]
+mod issue_110_path_fallback {
+    use super::*;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    /// test_build_run_path_fallback_when_config_env_empty
+    ///
+    /// Requires: root, alpine:latest pre-pulled
+    ///
+    /// Regression test for issue #110 (v0.43.0): when a base image has an
+    /// empty config.env (e.g. ubuntu:22.04 from ECR mirrors where
+    /// parse_image_config returns an empty Vec), execute_run must still inject
+    /// the OCI default PATH so that standard shell utilities are findable.
+    ///
+    /// Failure indicates execute_run does not inject the PATH fallback, leaving
+    /// the container with no PATH and causing exit 127 for any RUN step.
+    #[test]
+    fn test_build_run_path_fallback_when_config_env_empty() {
+        if !is_root() {
+            eprintln!("SKIP test_build_run_path_fallback_when_config_env_empty: requires root");
+            return;
+        }
+
+        let base_tag = "docker.io/library/alpine:latest";
+        let test_tag = "pelagos-issue-110-empty-env-test:latest";
+        let out_tag = "pelagos-issue-110-empty-env-output";
+
+        let base_manifest = match image::load_image(base_tag) {
+            Err(_) => {
+                eprintln!(
+                    "SKIP test_build_run_path_fallback_when_config_env_empty: \
+                     alpine not pulled (run: pelagos image pull alpine)"
+                );
+                return;
+            }
+            Ok(m) => m,
+        };
+
+        // Create a fake image manifest using alpine's layers but with
+        // an empty config.env — simulating a registry image (e.g. ubuntu
+        // from ECR) whose OCI config JSON has null/absent Env field.
+        let empty_env_manifest = image::ImageManifest {
+            reference: test_tag.to_string(),
+            digest: base_manifest.digest.clone(),
+            layers: base_manifest.layers.clone(),
+            layer_types: base_manifest.layer_types.clone(),
+            config: image::ImageConfig {
+                env: Vec::new(), // empty: simulates missing Env in OCI config
+                cmd: vec!["/bin/sh".to_string()],
+                entrypoint: Vec::new(),
+                working_dir: String::new(),
+                user: String::new(),
+                labels: HashMap::new(),
+                healthcheck: None,
+            },
+        };
+        image::save_image(&empty_env_manifest).expect("save_image with empty env");
+
+        // Build FROM the no-PATH image.  RUN must succeed even though
+        // config.env is empty — execute_run should inject the OCI default PATH.
+        //
+        // Note: use $$PATH (escaped) so substitute_vars passes a literal "$PATH"
+        // to /bin/sh rather than expanding it to empty (unknown variable → "").
+        // The shell inside the container then expands $PATH from its own environment,
+        // which should be the OCI default PATH injected by execute_run.
+        let remfile = format!(
+            "FROM {test_tag}\nRUN chmod 644 /etc/hostname && printenv PATH > /out.txt\n",
+        );
+        let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        );
+
+        let _ = image::remove_image(test_tag);
+
+        let manifest = result.expect(
+            "execute_build failed — PATH fallback missing when config.env is empty \
+             (chmod not found, exit 127)",
+        );
+
+        // Verify /out.txt contains a non-empty PATH (the OCI default was injected).
+        let layer_dirs = image::layer_dirs(&manifest);
+        let cmd = pelagos::container::Command::new("/bin/cat")
+            .args(["/out.txt"])
+            .with_image_layers(layer_dirs)
+            .stdin(pelagos::container::Stdio::Null)
+            .stdout(pelagos::container::Stdio::Piped)
+            .stderr(pelagos::container::Stdio::Null);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "cat /out.txt failed");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains('/'),
+            "PATH was empty or missing in container; execute_run fallback injection \
+             did not work when config.env was empty. Output: {:?}",
+            out
+        );
+
+        let _ = image::remove_image(&manifest.reference);
+    }
+}

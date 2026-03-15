@@ -3586,3 +3586,18 @@ the container's `PATH` comes from the Alpine image config (`/usr/local/sbin:/usr
 
 Failure indicates `env_clear()` was removed from `execute_run` in `build.rs`.
 
+### `test_build_run_path_fallback_when_config_env_empty`
+**Requires:** root, `docker.io/library/alpine:latest` pre-pulled
+
+Regression test for issue #110 (v0.43.0 fix). When a base image has an empty `config.env`
+(e.g. ubuntu:22.04 from ECR mirrors where `parse_image_config` returns an empty `Vec` because
+the OCI config JSON has a null or absent `Env` field), `execute_run` must still inject the
+OCI-standard default `PATH` so that shell utilities are findable.
+
+The test creates a fake `ImageManifest` using Alpine's layers but with `config.env = []`, then
+builds a two-step image: `chmod 644 /etc/hostname && printenv PATH > /out.txt`. It asserts:
+1. The build succeeds — `chmod` was found, meaning PATH was set in the container's environment.
+2. `/out.txt` contains a `/`-prefixed path — `printenv PATH` printed the injected fallback PATH.
+
+Failure (build exit 127) indicates `execute_run` does not inject the PATH fallback when
+`config.env` is empty, causing every standard utility to be unfindable in the container.

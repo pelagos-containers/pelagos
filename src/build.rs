@@ -1255,6 +1255,29 @@ fn execute_run(
         }
     }
 
+    // Guarantee PATH is always set — even when the image config omits it.
+    //
+    // Some images stored from ECR mirrors or custom registries may have an empty
+    // or absent Env list in their OCI config JSON (e.g. parse_image_config returns
+    // an empty Vec when the "Env" field is null or the "config" key is absent).
+    // Combined with env_clear() above, this leaves the container with no PATH at
+    // all, which causes every shell utility (chmod, bash, apt-get, ...) to fail
+    // with "not found" (exit 127), even though the binaries are present in the image.
+    //
+    // We inject the OCI/Docker-standard fallback PATH when the image config does
+    // not supply one.  This exactly matches Docker's behaviour: if the image config
+    // lacks a PATH entry, Docker inserts the platform default before exec.
+    if !config.env.iter().any(|e| e == "PATH" || e.starts_with("PATH=")) {
+        log::warn!(
+            "build: image config has no PATH; injecting OCI default \
+             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        cmd = cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+    }
+
     // Apply accumulated workdir.
     if !config.working_dir.is_empty() {
         cmd = cmd.with_cwd(&config.working_dir);
