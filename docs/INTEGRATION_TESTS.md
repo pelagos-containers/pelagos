@@ -3520,3 +3520,21 @@ Failure indicates: `--json` is not wired up on `NetworkCmd::Ls`.
 Verifies that `pelagos volume ls --json` produces a valid JSON array.
 
 Failure indicates: `--json` is not wired up on `VolumeCmd::Ls`.
+
+### `test_run_finds_image_built_with_bare_tag`
+**Requires:** root, `docker.io/library/alpine:latest` pre-pulled
+
+Regression test for issue #109. `pelagos build -t myapp` stores the manifest as
+`myapp:latest` (execute_build appends `:latest` to bare tags). Previously `pelagos run myapp`
+tried only the raw ref `myapp` and the normalised registry form — never `myapp:latest` — so
+the run failed immediately after a successful build.
+
+The fix moves the `:latest` fallback into `image::load_image` itself: when a bare ref (no `:`
+or `@`) is not found, `load_image` automatically retries with `<ref>:latest`.
+
+This test calls `execute_build` with a bare tag, then asserts:
+1. `manifest.reference == "myapp:latest"` — build stored the canonical form
+2. `load_image("myapp")` succeeds — bare-tag lookup works
+3. `load_image("myapp:latest")` succeeds — canonical form still works
+
+Failure indicates: `load_image` no longer falls back to `<ref>:latest` for bare refs.

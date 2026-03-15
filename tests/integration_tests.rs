@@ -17756,3 +17756,92 @@ mod json_flag_tests {
             .unwrap_or_else(|e| panic!("not valid JSON: {}\noutput: {}", e, stdout));
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #109 — pelagos run cannot find locally-built image after pelagos build
+// ---------------------------------------------------------------------------
+
+mod issue_109_run_finds_built_image {
+    use crate::is_root;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    /// test_run_finds_image_built_with_bare_tag
+    ///
+    /// Requires: root, docker.io/library/alpine:latest pre-pulled
+    ///
+    /// Regression test for issue #109: `pelagos build -t myapp` stores the
+    /// manifest under "myapp:latest" (execute_build appends :latest when no
+    /// tag separator is present), but `pelagos run myapp` previously tried
+    /// only the raw ref "myapp" and the normalised registry ref, never
+    /// "myapp:latest".  The result was a "not found" error immediately after
+    /// a successful build.
+    ///
+    /// This test verifies the full round-trip:
+    ///   1. Build with a bare tag (no colon) via execute_build
+    ///   2. Assert load_image(<bare-tag>) succeeds (the fix in run.rs)
+    ///   3. Assert load_image(<bare-tag>:latest) also succeeds (canonical form)
+    ///   4. Assert the manifest reference is "<bare-tag>:latest"
+    ///
+    /// Failure indicates: build_image_run in run.rs does not try
+    /// "<ref>:latest" before falling through to the normalised registry form.
+    #[test]
+    fn test_run_finds_image_built_with_bare_tag() {
+        if !is_root() {
+            eprintln!("SKIP test_run_finds_image_built_with_bare_tag: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_run_finds_image_built_with_bare_tag: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let tag = "pelagos-issue-109-test";
+        let _ = image::remove_image(tag);
+        let _ = image::remove_image(&format!("{}:latest", tag));
+
+        let remfile = "FROM alpine\nRUN echo issue109 > /issue109.txt\n";
+        let instructions = build::parse_remfile(remfile).expect("parse_remfile");
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let manifest = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            tag, // bare tag — no colon
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build");
+
+        // The stored reference must have :latest appended.
+        assert_eq!(
+            manifest.reference,
+            format!("{}:latest", tag),
+            "execute_build should append :latest to a bare tag"
+        );
+
+        // load_image with the bare tag must succeed (the fix).
+        let found_bare = image::load_image(tag);
+        assert!(
+            found_bare.is_ok(),
+            "load_image('{}') failed — run.rs fix is missing or broken: {:?}",
+            tag,
+            found_bare.err()
+        );
+
+        // load_image with the canonical :latest form must also succeed.
+        let found_latest = image::load_image(&format!("{}:latest", tag));
+        assert!(
+            found_latest.is_ok(),
+            "load_image('{}:latest') failed unexpectedly",
+            tag
+        );
+
+        // Cleanup.
+        let _ = image::remove_image(&manifest.reference);
+    }
+}

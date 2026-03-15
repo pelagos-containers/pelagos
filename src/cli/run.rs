@@ -359,7 +359,8 @@ fn build_image_run(
 ) -> Result<ImageRunResult, Box<dyn std::error::Error>> {
     use pelagos::image;
 
-    // Try loading the raw reference first (locally-built images), then normalised.
+    // Resolve the image reference: load_image already tries <ref>:latest for
+    // bare refs, so fall back directly to the normalised registry form.
     let (full_ref, manifest) = if let Ok(m) = image::load_image(image_ref) {
         (image_ref.to_string(), m)
     } else {

@@ -497,10 +497,25 @@ pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
 }
 
 /// Load an image manifest from disk.
+///
+/// If `reference` is a bare name (no `:` or `@`), also tries `<reference>:latest`
+/// so that `pelagos run myapp` finds an image built with `pelagos build -t myapp`.
 pub fn load_image(reference: &str) -> io::Result<ImageManifest> {
     let path = image_dir(reference).join("manifest.json");
-    let data = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&data).map_err(|e| io::Error::other(e.to_string()))
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).map_err(|e| io::Error::other(e.to_string())),
+        Err(e) if !reference.contains(':') && !reference.contains('@') => {
+            let with_latest = format!("{}:latest", reference);
+            let path2 = image_dir(&with_latest).join("manifest.json");
+            match std::fs::read_to_string(&path2) {
+                Ok(data) => {
+                    serde_json::from_str(&data).map_err(|e| io::Error::other(e.to_string()))
+                }
+                Err(_) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// List all stored images.
