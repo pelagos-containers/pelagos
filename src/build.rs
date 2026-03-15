@@ -145,22 +145,38 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 instructions.push(Instruction::Run(rest.to_string()));
             }
             "COPY" => {
-                // Detect optional --from=<stage> prefix.
-                let (from_stage, remaining) = if let Some(after_flag) = rest.strip_prefix("--from=")
-                {
-                    if let Some((stage, r)) = after_flag.split_once(char::is_whitespace) {
-                        (Some(stage.to_string()), r.trim())
+                // Strip zero or more --key=value flags before <src> <dest>.
+                // Recognised flags: --from=<stage> (consumed), --chown=<spec>
+                // and --chmod=<mode> (accepted and silently ignored — ownership
+                // and permission changes are not yet applied, but the flag must
+                // not be mis-parsed as a source path).
+                let mut from_stage: Option<String> = None;
+                let mut cursor = rest;
+                loop {
+                    let tok = cursor.trim_start();
+                    if let Some(after) = tok.strip_prefix("--from=") {
+                        let (val, tail) =
+                            after.split_once(char::is_whitespace).unwrap_or((after, ""));
+                        from_stage = Some(val.to_string());
+                        cursor = tail.trim_start();
+                    } else if let Some(after) = tok.strip_prefix("--chown=") {
+                        // Silently accepted; ownership changes not yet applied.
+                        let (_val, tail) =
+                            after.split_once(char::is_whitespace).unwrap_or((after, ""));
+                        log::debug!("build: COPY --chown ignored (not yet implemented)");
+                        cursor = tail.trim_start();
+                    } else if let Some(after) = tok.strip_prefix("--chmod=") {
+                        // Silently accepted; permission changes not yet applied.
+                        let (_val, tail) =
+                            after.split_once(char::is_whitespace).unwrap_or((after, ""));
+                        log::debug!("build: COPY --chmod ignored (not yet implemented)");
+                        cursor = tail.trim_start();
                     } else {
-                        return Err(BuildError::Parse {
-                            line: line_num,
-                            message: "COPY --from=<stage> requires <src> <dest>".to_string(),
-                        });
+                        break;
                     }
-                } else {
-                    (None, rest)
-                };
-                let parts: Vec<&str> = remaining.splitn(2, char::is_whitespace).collect();
-                if parts.len() < 2 {
+                }
+                let parts: Vec<&str> = cursor.splitn(2, char::is_whitespace).collect();
+                if parts.len() < 2 || parts[0].is_empty() {
                     return Err(BuildError::Parse {
                         line: line_num,
                         message: "COPY requires <src> <dest>".to_string(),
@@ -2365,6 +2381,69 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
             Instruction::From {
                 image: "alpine".into(),
                 alias: Some("builder".into())
+            }
+        );
+    }
+
+    // -- issue #106: COPY flag parsing --
+
+    /// `--chown=user:group` before `<src> <dest>` must not be consumed as a
+    /// source path; it should be silently accepted and stripped.
+    #[test]
+    fn test_parse_copy_chown_ignored() {
+        let content = "FROM alpine\nCOPY --chown=root:root src.txt /dest.txt";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "src.txt".into(),
+                dest: "/dest.txt".into(),
+                from_stage: None,
+            }
+        );
+    }
+
+    /// `--chown=` before `--from=` — both flags must be consumed regardless of order.
+    #[test]
+    fn test_parse_copy_chown_then_from() {
+        let content = "FROM alpine\nCOPY --chown=root:root --from=builder /app/bin /usr/bin/app";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "/app/bin".into(),
+                dest: "/usr/bin/app".into(),
+                from_stage: Some("builder".into()),
+            }
+        );
+    }
+
+    /// `--from=` before `--chown=` — order must not matter.
+    #[test]
+    fn test_parse_copy_from_then_chown() {
+        let content = "FROM alpine\nCOPY --from=builder --chown=root:root /app/bin /usr/bin/app";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "/app/bin".into(),
+                dest: "/usr/bin/app".into(),
+                from_stage: Some("builder".into()),
+            }
+        );
+    }
+
+    /// `--chmod=` must also be silently accepted.
+    #[test]
+    fn test_parse_copy_chmod_ignored() {
+        let content = "FROM alpine\nCOPY --chmod=755 src.txt /dest.txt";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "src.txt".into(),
+                dest: "/dest.txt".into(),
+                from_stage: None,
             }
         );
     }

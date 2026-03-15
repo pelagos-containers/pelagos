@@ -14615,6 +14615,82 @@ CMD [\"cat\", \"/marker2\"]\n";
         result.unwrap();
     }
 
+    /// test_copy_chown_flag_parsed
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for issue #106: `COPY --chown=root:root --from=<stage> <src> <dest>`
+    /// failed with "COPY source not found: --chown=root:root" because the parser consumed
+    /// the `--chown=` flag as the source path instead of stripping it as a flag.
+    ///
+    /// Builds the exact two-stage pattern from the issue: stage0 writes a file, stage1
+    /// copies it with `--chown=root:root --from=stage0`.  Asserts the build succeeds and
+    /// the copied file is visible in the resulting container.
+    ///
+    /// Failure indicates: the COPY flag-stripping loop does not handle `--chown=`, or
+    /// multiple flags in any order still break the `<src> <dest>` extraction.
+    #[test]
+    fn test_copy_chown_flag_parsed() {
+        if !is_root() {
+            eprintln!("SKIP test_copy_chown_flag_parsed: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_copy_chown_flag_parsed: alpine not pulled \
+                 (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+
+        let remfile = "\
+FROM alpine AS stage0\n\
+RUN echo chown-test > /chown-marker\n\
+FROM alpine\n\
+COPY --chown=root:root --from=stage0 /chown-marker /chown-marker\n\
+CMD [\"cat\", \"/chown-marker\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-copy-chown:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build with COPY --chown= --from= should succeed (issue #106)");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("cat")
+                .args(["/chown-marker"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn");
+
+            let (status, stdout, _stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(status.success(), "container exited non-zero");
+            assert!(
+                out.trim().contains("chown-test"),
+                "expected 'chown-test' in output, got: {:?}",
+                out.trim()
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
     /// Verify that the rootless bridge guard fires when `pelagos run --network bridge` is invoked
     /// as a non-root user.  Uses `sudo -u nobody` to execute the installed binary without root.
     ///

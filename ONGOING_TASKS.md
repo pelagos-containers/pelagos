@@ -6,6 +6,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
+| #106 | bug: COPY --chown flag parsed as source path | bug/FIXED |
 | #105 | bug: FROM ${VAR} not substituted + FROM <stage-alias> not found in completed_stages | bug/FIXED |
 | #103 | bug: COPY . /dest/ fails with ENOENT (bare dot not treated as contents mode) | bug/FIXED |
 | #104 | bug: FROM <local-tag> cannot find locally-built images (normalise_image_reference) | bug/FIXED |

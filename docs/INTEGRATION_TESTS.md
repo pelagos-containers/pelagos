@@ -3421,3 +3421,21 @@ Asserts the build succeeds and the file from stage 0 is visible in the resulting
 
 Failure indicates: `sub_vars` is not updated by ARG processing inside a stage's body, so
 inter-stage FROM substitution fails when the caller provides no `--build-arg` override.
+
+### `test_copy_chown_flag_parsed`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Regression test for issue #106: `COPY --chown=root:root --from=<stage> <src> <dest>` failed
+with "COPY source not found: --chown=root:root" because the parser consumed `--chown=` as the
+source path.
+
+The COPY parser previously handled only a single leading `--from=` flag via `strip_prefix`.
+Any other flag (or flags in a different order) bypassed the check and fell through as `<src>`.
+The fix replaces the single check with a loop that strips all `--key=value` flags (`--from=`,
+`--chown=`, `--chmod=`) before extracting `<src> <dest>`.
+
+Builds a two-stage Remfile where stage1 does `COPY --chown=root:root --from=stage0 /file /file`
+and asserts the build succeeds and the copied file is readable in the resulting container.
+
+Failure indicates: the flag-stripping loop is missing or does not handle `--chown=`, causing
+it to be mis-parsed as the source path.
