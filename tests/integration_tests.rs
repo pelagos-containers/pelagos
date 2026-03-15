@@ -17362,59 +17362,79 @@ mod auto_resolv_conf {
 // ---------------------------------------------------------------------------
 
 mod pasta_diagnostic_tests {
-    /// test_pasta_teardown_logs_stderr
+    /// test_pasta_teardown_logs_output
     ///
     /// Requires: nothing (no root, no pasta, no alpine)
     ///
-    /// Regression test for issue #107: pasta stderr was silently discarded
-    /// (Stdio::null()), making TAP setup failures completely opaque.
+    /// Regression test for issue #107: pasta stdout and stderr were silently
+    /// discarded (Stdio::null()), making TAP setup failures completely opaque.
+    /// pasta may write error messages to stdout, stderr, or both depending on
+    /// the error path and the pasta version, so both must be captured.
     ///
-    /// This test exercises the stderr-capture infrastructure directly: it
-    /// spawns a real child process that writes a known string to stderr and
-    /// exits, then verifies that teardown_pasta_network correctly joins the
-    /// reader thread and surfaces the output.  No actual pasta binary or
-    /// container netns is required.
+    /// This test exercises the output-capture infrastructure directly: it
+    /// spawns a real child process that writes known strings to both stdout
+    /// and stderr and exits, then verifies that the reader thread collects
+    /// both.  No actual pasta binary or container netns is required.
     ///
-    /// Failure indicates: the stderr reader thread is not being started,
-    /// the JoinHandle is not being stored in PastaSetup, or teardown does
-    /// not join the thread and collect the output.
+    /// Failure indicates: either pipe is not being captured (Stdio::null()),
+    /// one of the reader sub-threads is not being started, or the output is
+    /// not being merged correctly before being returned.
     #[test]
-    fn test_pasta_teardown_logs_stderr() {
+    fn test_pasta_teardown_logs_output() {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
-        // Spawn a surrogate process that writes a known string to stderr
-        // and then exits — simulating pasta writing an error and dying.
+        // Spawn a surrogate process that writes known strings to both stdout
+        // and stderr — simulating pasta writing an error on either channel.
         let mut child = Command::new("sh")
-            .args(["-c", "echo 'pasta-diagnostic-sentinel' >&2"])
+            .args([
+                "-c",
+                "echo 'pasta-stdout-sentinel'; echo 'pasta-stderr-sentinel' >&2",
+            ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("sh should be available");
 
-        // Replicate the reader-thread pattern from setup_pasta_network.
-        let mut stderr_handle = child.stderr.take().expect("stderr pipe");
-        let stderr_thread: std::thread::JoinHandle<String> = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = stderr_handle.read_to_string(&mut s);
-            s
+        // Replicate the merged reader-thread pattern from setup_pasta_network.
+        let mut stdout_pipe = child.stdout.take().expect("stdout pipe");
+        let mut stderr_pipe = child.stderr.take().expect("stderr pipe");
+        let output_thread: std::thread::JoinHandle<String> = std::thread::spawn(move || {
+            let stderr_thread = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = stderr_pipe.read_to_string(&mut s);
+                s
+            });
+            let mut stdout_out = String::new();
+            let _ = stdout_pipe.read_to_string(&mut stdout_out);
+            let stderr_out = stderr_thread.join().unwrap_or_default();
+            let mut combined = stdout_out;
+            if !stderr_out.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr_out);
+            }
+            combined
         });
 
         // Replicate teardown_pasta_network's join logic.
-        // Wait for natural exit first so the child's write end of the pipe is
-        // closed before the reader thread tries to collect output.  kill() is
-        // called after (no-op here) to match the teardown path exactly.
         let _ = child.wait();
         let _ = child.kill();
-        let stderr = stderr_thread
+        let output = output_thread
             .join()
-            .expect("stderr thread should not panic");
+            .expect("output thread should not panic");
 
         assert!(
-            stderr.contains("pasta-diagnostic-sentinel"),
-            "stderr reader thread should collect child output; got: {:?}",
-            stderr
+            output.contains("pasta-stdout-sentinel"),
+            "stdout capture missing from combined output; got: {:?}",
+            output
+        );
+        assert!(
+            output.contains("pasta-stderr-sentinel"),
+            "stderr capture missing from combined output; got: {:?}",
+            output
         );
     }
 }

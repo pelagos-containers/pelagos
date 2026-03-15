@@ -436,13 +436,13 @@ impl std::fmt::Debug for NetworkSetup {
 
 /// Runtime state for a pasta-backed container; holds the pasta process for teardown.
 ///
-/// `stderr_thread` drains pasta's stderr asynchronously so the pipe buffer never
-/// fills and blocks pasta.  The collected output is logged at teardown (or sooner
-/// when pasta exits unexpectedly before the TAP appears).
+/// `output_thread` drains pasta's stdout **and** stderr asynchronously so neither
+/// pipe buffer fills and blocks pasta.  The collected output is logged at teardown
+/// (or sooner when pasta exits unexpectedly before the TAP appears).
 pub struct PastaSetup {
     process: std::process::Child,
-    /// Background thread draining pasta's stderr pipe.  Joined in teardown.
-    stderr_thread: Option<std::thread::JoinHandle<String>>,
+    /// Background thread draining pasta's stdout+stderr pipes.  Joined in teardown.
+    output_thread: Option<std::thread::JoinHandle<String>>,
 }
 
 // ── Name generation ───────────────────────────────────────────────────────────
@@ -1713,29 +1713,50 @@ pub fn setup_pasta_network(
     // accurate, kill() in teardown reaches the relay, and the stderr thread
     // correctly collects output when pasta exits for any reason.
     args.push("--foreground".to_string());
-    args.push("--quiet".to_string());
+    // NOTE: do NOT pass --quiet here. pasta writes error messages to either stdout
+    // or stderr depending on the error path and its version; suppressing stdout with
+    // --quiet or Stdio::null() silently discards the actual failure message.
     // PID must come last (positional argument).
     args.push(child_pid.to_string());
 
     let mut process = SysCmd::new("pasta")
         .args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()) // captured for diagnostics
         .stderr(std::process::Stdio::piped()) // captured for diagnostics
         .spawn()
         .map_err(|e| {
             io::Error::other(format!("failed to start pasta (is it installed?): {}", e))
         })?;
 
-    // Drain pasta's stderr asynchronously to prevent the pipe buffer from filling
-    // and stalling pasta.  The thread exits when pasta closes its end of the pipe
+    // Drain pasta's stdout and stderr asynchronously on a single thread to prevent
+    // either pipe buffer from filling and stalling pasta.  pasta may write its error
+    // messages to stdout, stderr, or both depending on the error path and version,
+    // so we must capture both.  The thread exits when pasta closes both pipes
     // (i.e. when pasta exits).  We join it in teardown to collect the output.
-    let stderr_thread = {
-        let mut stderr = process.stderr.take().expect("stderr pipe");
+    let output_thread = {
+        use std::io::Read;
+        let mut stdout_pipe = process.stdout.take().expect("stdout pipe");
+        let mut stderr_pipe = process.stderr.take().expect("stderr pipe");
         Some(std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = stderr.read_to_string(&mut s);
-            s
+            // Spawn a sub-thread for stderr so both pipes drain concurrently.
+            let stderr_thread = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = stderr_pipe.read_to_string(&mut s);
+                s
+            });
+            let mut stdout_out = String::new();
+            let _ = stdout_pipe.read_to_string(&mut stdout_out);
+            let stderr_out = stderr_thread.join().unwrap_or_default();
+            // Merge stdout+stderr into a single string for unified logging.
+            let mut combined = stdout_out;
+            if !stderr_out.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr_out);
+            }
+            combined
         }))
     };
 
@@ -1749,7 +1770,7 @@ pub fn setup_pasta_network(
 
     Ok(PastaSetup {
         process,
-        stderr_thread,
+        output_thread,
     })
 }
 
@@ -1774,8 +1795,8 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
         if let Ok(Some(status)) = process.try_wait() {
             log::warn!(
                 "pasta exited (status: {}) before TAP interface appeared in \
-                 /proc/{}/net/dev — network setup failed; stderr output will be \
-                 logged at teardown",
+                 /proc/{}/net/dev — network setup failed; stdout/stderr output \
+                 will be logged at teardown",
                 status,
                 child_pid
             );
@@ -1813,25 +1834,25 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
     }
 }
 
-/// Kill the pasta relay process and collect its stderr output for diagnostics.
+/// Kill the pasta relay process and collect its stdout+stderr output for diagnostics.
 ///
-/// Kills pasta (best-effort), reaps the process, then joins the stderr reader
-/// thread.  Any output pasta wrote to stderr is logged at `warn!` level so
-/// operators can diagnose setup failures without needing `RUST_LOG=debug`.
+/// Kills pasta (best-effort), reaps the process, then joins the output reader
+/// thread.  Any output pasta wrote to stdout or stderr is logged at `warn!` level
+/// so operators can diagnose setup failures without needing `RUST_LOG=debug`.
 pub fn teardown_pasta_network(setup: &mut PastaSetup) {
     let _ = setup.process.kill();
     let _ = setup.process.wait();
-    // Join the stderr reader thread now that pasta's pipe is closed.
-    if let Some(thread) = setup.stderr_thread.take() {
+    // Join the output reader thread now that pasta's pipes are closed.
+    if let Some(thread) = setup.output_thread.take() {
         match thread.join() {
-            Ok(stderr) if !stderr.trim().is_empty() => {
-                log::warn!("pasta stderr output:\n{}", stderr.trim());
+            Ok(out) if !out.trim().is_empty() => {
+                log::warn!("pasta output:\n{}", out.trim());
             }
             Ok(_) => {
-                log::debug!("pasta stderr: (empty)");
+                log::debug!("pasta output: (empty)");
             }
             Err(_) => {
-                log::debug!("pasta stderr reader thread panicked");
+                log::debug!("pasta output reader thread panicked");
             }
         }
     }

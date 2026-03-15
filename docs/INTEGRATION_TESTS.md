@@ -3440,19 +3440,19 @@ and asserts the build succeeds and the copied file is readable in the resulting 
 Failure indicates: the flag-stripping loop is missing or does not handle `--chown=`, causing
 it to be mis-parsed as the source path.
 
-### `test_pasta_teardown_logs_stderr`
+### `test_pasta_teardown_logs_output`
 **Requires:** nothing (no root, no pasta, no alpine)
 
-Regression test for issue #107: pasta's stderr was unconditionally discarded via
-`Stdio::null()`, making TAP setup failures completely opaque.
+Regression test for issue #107: pasta's stdout and stderr were unconditionally discarded via
+`Stdio::null()`, making TAP setup failures completely opaque.  pasta may write error messages
+to stdout, stderr, or both depending on the error path and version, so both must be captured.
 
-Exercises the stderr-capture infrastructure introduced in the fix: spawns a real child
-process that writes a known sentinel string to stderr and exits (simulating pasta writing
-an error and dying), then verifies that the reader thread correctly collects and surfaces
-the output.
+Exercises the merged output-capture infrastructure: spawns a real child process that writes
+known sentinel strings to both stdout and stderr (simulating pasta writing an error on either
+channel), then verifies that the merged reader thread collects both.
 
 Does not require a pasta binary or container network namespace — it tests only the
-pipe/thread mechanics that `setup_pasta_network` and `teardown_pasta_network` now use.
+pipe/thread mechanics that `setup_pasta_network` and `teardown_pasta_network` use.
 
-Failure indicates: the `JoinHandle<String>` is not being stored in `PastaSetup`, the
-reader thread is not being spawned, or teardown does not join the thread to collect output.
+Failure indicates: one or both pipes are still `Stdio::null()`, the merged reader thread is
+not spawned correctly, or teardown does not join the thread to collect output.
