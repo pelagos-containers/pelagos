@@ -3601,3 +3601,29 @@ builds a two-step image: `chmod 644 /etc/hostname && printenv PATH > /out.txt`. 
 
 Failure (build exit 127) indicates `execute_run` does not inject the PATH fallback when
 `config.env` is empty, causing every standard utility to be unfindable in the container.
+
+### `test_env_path_expands_base_image_value`
+**Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+
+Root-cause regression test for issue #110 (v0.44.0). The `substitute_vars` function was
+expanding `${PATH}` (and other base-image env vars) to the empty string because `sub_vars`
+only contained ARG/ENV values declared in the Remfile — not the base image's inherited env.
+
+The devcontainer node feature (and many other tools) use the pattern:
+```
+ENV PATH="${NVM_DIR}/versions/node/v18/bin:${PATH}"
+```
+Before the fix, `${PATH}` → `""`, so `config.env.PATH` became `"/nvm/bin:"` with no standard
+system directories. The next `RUN chmod ...` then fails with "not found" (exit 127) because
+`/bin` is not in PATH.
+
+After the fix, `sub_vars` is pre-populated with base image env vars after `FROM` is processed,
+so `${PATH}` expands to the ubuntu base image's `PATH=/usr/local/sbin:...`.
+
+The test builds a Remfile that has `ENV PATH="${NVM_DIR}/versions/node/v18/bin:${PATH}"` and
+a subsequent `RUN chmod`. It asserts:
+1. The build succeeds (chmod found because PATH includes `/bin`).
+2. `/out.txt` contains a standard system directory like `/usr/bin` or `/bin`.
+
+Failure indicates `sub_vars` is not seeded with base image env vars, causing `${PATH}` to
+expand to empty string and breaking any `ENV PATH=...${PATH}` pattern.

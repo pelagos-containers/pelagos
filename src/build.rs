@@ -462,19 +462,28 @@ fn parse_label_value(rest: &str) -> Option<(String, String)> {
     Some((k.to_string(), v.to_string()))
 }
 
-/// Parse ENV: supports `KEY=VALUE` or `KEY VALUE`.
+/// Parse ENV: supports `KEY=VALUE`, `KEY="VALUE"`, or `KEY VALUE`.
+/// Outer single or double quotes are stripped from the value (matching Docker).
 fn parse_env_value(rest: &str) -> Option<(String, String)> {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Some((k, v)) = trimmed.split_once('=') {
-        Some((k.to_string(), v.to_string()))
+    let (k, v) = if let Some(pair) = trimmed.split_once('=') {
+        pair
     } else if let Some((k, v)) = trimmed.split_once(char::is_whitespace) {
-        Some((k.to_string(), v.trim().to_string()))
+        (k, v.trim())
     } else {
-        None
-    }
+        return None;
+    };
+    let v = v.trim();
+    let v =
+        if (v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')) {
+            &v[1..v.len() - 1]
+        } else {
+            v
+        };
+    Some((k.to_string(), v.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +713,22 @@ fn execute_stage(
         // Stage without FROM (pre-FROM ARGs only).
         (Vec::new(), ImageConfig::default())
     };
+
+    // Seed sub_vars with the base image's environment variables so that
+    // ${PATH} and other base-image vars expand correctly in subsequent ENV
+    // instructions.  This matches Docker's behaviour: `ENV PATH=new:${PATH}`
+    // in a Dockerfile expands ${PATH} to the value inherited from the base
+    // image, not to the empty string.
+    //
+    // Use entry().or_insert_with() so that values already in sub_vars (from
+    // ARG instructions or a prior stage) take precedence over base-image vars.
+    for env_str in &config.env {
+        if let Some((k, v)) = env_str.split_once('=') {
+            sub_vars
+                .entry(k.to_string())
+                .or_insert_with(|| v.to_string());
+        }
+    }
 
     let total = instructions.len();
     let mut cache_active = use_cache;

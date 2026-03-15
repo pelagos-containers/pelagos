@@ -18145,3 +18145,100 @@ mod issue_110_path_fallback {
         let _ = image::remove_image(&manifest.reference);
     }
 }
+
+#[cfg(test)]
+mod issue_110_env_path_substitution {
+    use super::*;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    /// test_env_path_expands_base_image_value
+    ///
+    /// Requires: root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+    ///
+    /// Root cause of issue #110: `ENV PATH="${NVM_DIR}/bin:${PATH}"` in a Remfile
+    /// expands `${PATH}` to the empty string because the base image's env vars
+    /// (including PATH=/usr/local/sbin:...) were not seeded into sub_vars.
+    ///
+    /// After the fix, sub_vars is pre-populated with the base image's env vars
+    /// after processing FROM, so `${PATH}` correctly expands to the inherited value.
+    ///
+    /// Failure (before fix): PATH in the container ends up as "/nvm/bin:" with no
+    /// standard directories, causing `chmod: not found` (exit 127) in any subsequent
+    /// RUN step.
+    #[test]
+    fn test_env_path_expands_base_image_value() {
+        if !is_root() {
+            eprintln!("SKIP test_env_path_expands_base_image_value: requires root");
+            return;
+        }
+
+        let ecr_ubuntu = "public.ecr.aws/docker/library/ubuntu:22.04";
+        if image::load_image(ecr_ubuntu).is_err() {
+            eprintln!(
+                "SKIP test_env_path_expands_base_image_value: \
+                 ECR ubuntu not pulled (run: pelagos image pull {})",
+                ecr_ubuntu
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-110-env-path-test";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        // This pattern is used by devcontainer features (e.g. the Node.js feature):
+        //   ENV NVM_DIR="/usr/local/share/nvm"
+        //   ENV PATH="${NVM_DIR}/versions/node/v18/bin:${PATH}"
+        //
+        // Before the fix: ${PATH} → "" → container PATH = "/nvm/bin:" (no /bin)
+        // After the fix:  ${PATH} → ubuntu's PATH → container PATH = "/nvm/bin:/usr/..."
+        let remfile = format!(
+            "FROM {ecr_ubuntu}\n\
+             ENV NVM_DIR=\"/usr/local/share/nvm\"\n\
+             ENV PATH=\"${{NVM_DIR}}/versions/node/v18/bin:${{PATH}}\"\n\
+             RUN chmod 644 /etc/hostname && printenv PATH > /out.txt\n"
+        );
+
+        let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        );
+
+        let manifest = result.expect(
+            "execute_build failed — ENV PATH expansion broke PATH \
+             (chmod not found, exit 127). ${PATH} in ENV may not expand \
+             to the base image value.",
+        );
+
+        // Verify the PATH in the container includes standard system directories.
+        let layer_dirs = image::layer_dirs(&manifest);
+        let cmd = pelagos::container::Command::new("/bin/cat")
+            .args(["/out.txt"])
+            .with_image_layers(layer_dirs)
+            .stdin(pelagos::container::Stdio::Null)
+            .stdout(pelagos::container::Stdio::Piped)
+            .stderr(pelagos::container::Stdio::Null);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "cat /out.txt failed");
+        let out = String::from_utf8_lossy(&stdout);
+        // After the fix, PATH must include both the NVM prefix and the ubuntu default.
+        assert!(
+            out.contains("/usr/bin") || out.contains("/bin"),
+            "PATH does not contain standard system dirs after ENV PATH expansion. \
+             ${{PATH}} in ENV may not be expanding to the base image value. \
+             Got: {:?}",
+            out
+        );
+
+        let _ = image::remove_image(&manifest.reference);
+    }
+}
