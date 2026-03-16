@@ -1247,6 +1247,12 @@ fn execute_run(
         .args(["-c", cmd_text])
         .with_namespaces(Namespace::UTS | Namespace::IPC | Namespace::PID)
         .with_image_layers(layer_dirs)
+        // Mount a fresh tmpfs on /tmp (mode=1777, sticky bit) matching Docker's
+        // behaviour.  Without this, /tmp is a plain overlayfs directory whose
+        // permissions depend on whatever the base image or prior RUN steps left
+        // there.  Tools like apt-key require /tmp to be world-writable with the
+        // sticky bit set; if it isn't, they fail to create temp files (exit 100).
+        .with_tmpfs("/tmp", "mode=1777")
         .stdin(Stdio::Null)
         .stdout(Stdio::Inherit)
         // Use Piped (not Inherit) for stderr so the container gets a fresh pipe as

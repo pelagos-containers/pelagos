@@ -3627,3 +3627,19 @@ a subsequent `RUN chmod`. It asserts:
 
 Failure indicates `sub_vars` is not seeded with base image env vars, causing `${PATH}` to
 expand to empty string and breaking any `ENV PATH=...${PATH}` pattern.
+
+### `test_build_run_tmp_is_world_writable`
+**Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+
+Regression test for issue #111 (v0.45.0). Without a fresh tmpfs on `/tmp` in each RUN step
+container, `/tmp` is a plain overlayfs directory whose permissions depend on whatever the
+base image or prior steps left there. Tools like `apt-key` (invoked by `apt-get update`)
+require `/tmp` to be world-writable with the sticky bit (`mode=1777`); if it isn't, they
+fail with "Couldn't create temporary file /tmp/apt.conf.*" (exit 100).
+
+The test builds a Remfile that runs `stat -c '%a' /tmp` and `touch /tmp/canary.txt`.
+It asserts:
+1. The build succeeds (file creation in `/tmp` did not fail).
+2. `/tmp-mode.txt` contains `1777` — the sticky + world-writable mode Docker sets.
+
+Failure indicates `with_tmpfs("/tmp","mode=1777")` was removed from `execute_run` in `build.rs`.

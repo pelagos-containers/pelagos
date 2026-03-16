@@ -18242,3 +18242,98 @@ mod issue_110_env_path_substitution {
         let _ = image::remove_image(&manifest.reference);
     }
 }
+
+#[cfg(test)]
+mod issue_111_tmp_writable {
+    use super::*;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    /// test_build_run_tmp_is_world_writable
+    ///
+    /// Requires: root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+    ///
+    /// Regression test for issue #111: /tmp inside a RUN step container must be
+    /// a fresh tmpfs with mode 1777 (world-writable + sticky bit).  Without this,
+    /// tools like apt-key that create temp files in /tmp fail with
+    /// "Couldn't create temporary file /tmp/apt.conf.*" (exit 100).
+    ///
+    /// Failure would indicate with_tmpfs("/tmp","mode=1777") was removed from
+    /// execute_run in build.rs.
+    #[test]
+    fn test_build_run_tmp_is_world_writable() {
+        if !is_root() {
+            eprintln!("SKIP test_build_run_tmp_is_world_writable: requires root");
+            return;
+        }
+
+        let ecr_ubuntu = "public.ecr.aws/docker/library/ubuntu:22.04";
+        if image::load_image(ecr_ubuntu).is_err() {
+            eprintln!(
+                "SKIP test_build_run_tmp_is_world_writable: \
+                 ECR ubuntu not pulled (run: pelagos image pull {})",
+                ecr_ubuntu
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-111-tmp-test";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        // Verify /tmp is world-writable (mode 1777) and that we can create files
+        // in it — the same operations that apt-key performs.
+        let remfile = format!(
+            "FROM {ecr_ubuntu}\n\
+             RUN stat -c '%a' /tmp > /tmp-mode.txt \
+             && touch /tmp/canary.txt \
+             && echo OK >> /tmp-mode.txt\n"
+        );
+
+        let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        );
+
+        let manifest = result.expect(
+            "execute_build failed — /tmp may not be writable inside RUN step. \
+             with_tmpfs(\"/tmp\",\"mode=1777\") may be missing from execute_run.",
+        );
+
+        // Read /tmp-mode.txt from the built image to verify the mode.
+        let layer_dirs = image::layer_dirs(&manifest);
+        let cmd = pelagos::container::Command::new("/bin/cat")
+            .args(["/tmp-mode.txt"])
+            .with_image_layers(layer_dirs)
+            .stdin(pelagos::container::Stdio::Null)
+            .stdout(pelagos::container::Stdio::Piped)
+            .stderr(pelagos::container::Stdio::Null);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "cat /tmp-mode.txt failed");
+        let out = String::from_utf8_lossy(&stdout);
+        // stat -c '%a' outputs the octal mode; 1777 = sticky + rwxrwxrwx.
+        assert!(
+            out.contains("1777"),
+            "/tmp mode was not 1777 inside RUN step container. \
+             apt-key and similar tools require sticky + world-writable /tmp. \
+             Got: {:?}",
+            out
+        );
+        assert!(
+            out.contains("OK"),
+            "Failed to create a file in /tmp inside RUN step container. \
+             Got: {:?}",
+            out
+        );
+
+        let _ = image::remove_image(&manifest.reference);
+    }
+}
