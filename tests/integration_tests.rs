@@ -13011,25 +13011,30 @@ mod healthcheck_tests {
             .expect("pelagos run");
         assert!(run_status.success(), "pelagos run -d failed");
 
-        // Poll until state.json appears (watcher child writes it after container starts).
+        // Poll until state.json exists AND contains valid, complete JSON with a
+        // non-zero pid.  The watcher writes the file after the container starts;
+        // there is a brief window where the file exists but is empty or partially
+        // written — checking only for existence causes a parse panic on EOF.
         let state_path = format!("/run/pelagos/containers/{}/state.json", name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if std::path::Path::new(&state_path).exists() {
-                break;
+        let state_data = loop {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0) > 0 {
+                        break data;
+                    }
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            std::path::Path::new(&state_path).exists(),
-            "state.json not created within 10s"
-        );
+            if std::time::Instant::now() >= deadline {
+                panic!("state.json not ready with valid JSON + pid within 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
 
         // Patch state.json to inject health_config so the watcher's health monitor
         // picks it up on next state poll. Note: this test patches after-the-fact so
         // we rely on the monitor being started externally (e.g. pelagos run --health-cmd).
         // For now this test exercises the state.json format and polling logic.
-        let state_data = std::fs::read_to_string(&state_path).expect("read state.json");
         let mut state: serde_json::Value = serde_json::from_str(&state_data).unwrap();
         state["health_config"] = serde_json::json!({
             "cmd": ["/bin/true"],
