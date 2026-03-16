@@ -3631,15 +3631,36 @@ expand to empty string and breaking any `ENV PATH=...${PATH}` pattern.
 ### `test_build_run_tmp_is_world_writable`
 **Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
 
-Regression test for issue #111 (v0.45.0). Without a fresh tmpfs on `/tmp` in each RUN step
-container, `/tmp` is a plain overlayfs directory whose permissions depend on whatever the
-base image or prior steps left there. Tools like `apt-key` (invoked by `apt-get update`)
-require `/tmp` to be world-writable with the sticky bit (`mode=1777`); if it isn't, they
-fail with "Couldn't create temporary file /tmp/apt.conf.*" (exit 100).
+Regression test for issue #111 (v0.46.0). `/tmp` inside a RUN step container must have
+mode 1777 (world-writable + sticky bit). Tools like `apt-key` (invoked by `apt-get update`)
+require this; if `/tmp` is mode 755, they fail with "Couldn't create temporary file
+/tmp/apt.conf.*" (exit 100).
+
+The root cause: `COPY src /tmp/dest` calls `create_dir_all` which creates the staging `/tmp`
+with the process umask (755). This layer entry shadows the base image's `/tmp` (1777). Fixed
+in v0.46.0 by `fix_staging_dir_perms()` in `build.rs`, which sets mode 0o1777 on the staging
+`/tmp` before packaging the layer.
 
 The test builds a Remfile that runs `stat -c '%a' /tmp` and `touch /tmp/canary.txt`.
 It asserts:
 1. The build succeeds (file creation in `/tmp` did not fail).
-2. `/tmp-mode.txt` contains `1777` — the sticky + world-writable mode Docker sets.
+2. `/tmp-mode.txt` contains `1777` — the sticky + world-writable mode.
 
-Failure indicates `with_tmpfs("/tmp","mode=1777")` was removed from `execute_run` in `build.rs`.
+Failure indicates `fix_staging_dir_perms` is not setting `/tmp` to 0o1777 in `build.rs`.
+
+### `test_build_copy_to_tmp_visible_in_run`
+**Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+
+Regression test for issue #111 v0.45.0 regression: files COPY'd into `/tmp` must be visible
+to subsequent RUN steps.
+
+v0.45.0 fixed `/tmp` writability by mounting a fresh tmpfs over `/tmp` in `execute_run`. This
+shadowed all overlayfs content in `/tmp`, making COPY'd files invisible to the next RUN step.
+
+The correct fix (v0.46.0) removes the tmpfs mount and instead fixes permissions via
+`fix_staging_dir_perms()` — the COPY layer's `/tmp` gets mode 1777, so the base image's `/tmp`
+is not shadowed by a 755 entry, and RUN steps see both the correct permissions and the COPY'd content.
+
+The test builds a Remfile that COPYs a sentinel file to `/tmp/sentinel.txt` then RUNs
+`cat /tmp/sentinel.txt`. Failure would indicate a tmpfs is mounted on `/tmp` in `execute_run`,
+hiding overlay content.

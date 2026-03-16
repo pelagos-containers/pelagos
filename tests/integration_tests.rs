@@ -18254,12 +18254,17 @@ mod issue_111_tmp_writable {
     /// Requires: root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
     ///
     /// Regression test for issue #111: /tmp inside a RUN step container must be
-    /// a fresh tmpfs with mode 1777 (world-writable + sticky bit).  Without this,
-    /// tools like apt-key that create temp files in /tmp fail with
-    /// "Couldn't create temporary file /tmp/apt.conf.*" (exit 100).
+    /// world-writable with the sticky bit set (mode 1777).  Without this, tools
+    /// like apt-key that create temp files in /tmp fail with "Couldn't create
+    /// temporary file /tmp/apt.conf.*" (exit 100).
     ///
-    /// Failure would indicate with_tmpfs("/tmp","mode=1777") was removed from
-    /// execute_run in build.rs.
+    /// The fix is in fix_staging_dir_perms() in build.rs: when COPY creates a
+    /// layer entry for /tmp, its permissions are corrected to 0o1777 before
+    /// the layer is packaged, preventing the base image's /tmp (1777) from being
+    /// shadowed by a 755 entry.
+    ///
+    /// Failure would indicate that /tmp permissions are being broken by a COPY
+    /// layer or that fix_staging_dir_perms is not applying 1777 to /tmp.
     #[test]
     fn test_build_run_tmp_is_world_writable() {
         if !is_root() {
@@ -18304,7 +18309,7 @@ mod issue_111_tmp_writable {
 
         let manifest = result.expect(
             "execute_build failed — /tmp may not be writable inside RUN step. \
-             with_tmpfs(\"/tmp\",\"mode=1777\") may be missing from execute_run.",
+             fix_staging_dir_perms may not be setting /tmp to 0o1777 in build.rs.",
         );
 
         // Read /tmp-mode.txt from the built image to verify the mode.
@@ -18335,5 +18340,75 @@ mod issue_111_tmp_writable {
         );
 
         let _ = image::remove_image(&manifest.reference);
+    }
+
+    /// test_build_copy_to_tmp_visible_in_run
+    ///
+    /// Requires: root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+    ///
+    /// Regression test for issue #111 v0.45.0 regression: COPY'd files placed
+    /// inside /tmp must be visible to subsequent RUN steps.
+    ///
+    /// v0.45.0 fixed /tmp writability by mounting a fresh tmpfs on /tmp in
+    /// execute_run.  This introduced a regression: the tmpfs shadowed all
+    /// overlayfs content in /tmp, so files COPY'd into /tmp were invisible in
+    /// subsequent RUN steps.
+    ///
+    /// The correct fix (v0.46.0) is to set mode 1777 on the staging /tmp entry
+    /// in fix_staging_dir_perms() so the base image's /tmp is NOT shadowed with
+    /// wrong permissions, and remove the tmpfs mount from execute_run.
+    ///
+    /// Failure would indicate the tmpfs mount is still present in execute_run,
+    /// hiding COPY'd content in /tmp from subsequent RUN steps.
+    #[test]
+    fn test_build_copy_to_tmp_visible_in_run() {
+        if !is_root() {
+            eprintln!("SKIP test_build_copy_to_tmp_visible_in_run: requires root");
+            return;
+        }
+
+        let ecr_ubuntu = "public.ecr.aws/docker/library/ubuntu:22.04";
+        if image::load_image(ecr_ubuntu).is_err() {
+            eprintln!(
+                "SKIP test_build_copy_to_tmp_visible_in_run: \
+                 ECR ubuntu not pulled (run: pelagos image pull {})",
+                ecr_ubuntu
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-111-copy-tmp-test";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        // Create a sentinel file in the build context to COPY into /tmp.
+        std::fs::write(tmpdir.path().join("sentinel.txt"), "copy-in-tmp-ok\n")
+            .expect("write sentinel");
+
+        let remfile = format!(
+            "FROM {ecr_ubuntu}\n\
+             COPY sentinel.txt /tmp/sentinel.txt\n\
+             RUN cat /tmp/sentinel.txt && echo COPY_VISIBLE\n"
+        );
+
+        let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        );
+
+        result.expect(
+            "execute_build failed — COPY'd file in /tmp was not visible to RUN. \
+             A tmpfs mount on /tmp in execute_run would shadow overlay content. \
+             Check that with_tmpfs(\"/tmp\",...) is absent from execute_run in build.rs.",
+        );
+
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
     }
 }

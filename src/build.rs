@@ -1247,12 +1247,6 @@ fn execute_run(
         .args(["-c", cmd_text])
         .with_namespaces(Namespace::UTS | Namespace::IPC | Namespace::PID)
         .with_image_layers(layer_dirs)
-        // Mount a fresh tmpfs on /tmp (mode=1777, sticky bit) matching Docker's
-        // behaviour.  Without this, /tmp is a plain overlayfs directory whose
-        // permissions depend on whatever the base image or prior RUN steps left
-        // there.  Tools like apt-key require /tmp to be world-writable with the
-        // sticky bit set; if it isn't, they fail to create temp files (exit 100).
-        .with_tmpfs("/tmp", "mode=1777")
         .stdin(Stdio::Null)
         .stdout(Stdio::Inherit)
         // Use Piped (not Inherit) for stderr so the container gets a fresh pipe as
@@ -1431,6 +1425,27 @@ fn resolve_copy_dest(dest: &str, src_basename: &str, working_dir: &str) -> Strin
     }
 }
 
+/// Restore correct permissions on well-known world-writable root directories
+/// inside a layer staging area.
+///
+/// `create_dir_all` applies the process umask (typically 022) to any directory
+/// it creates, yielding mode 0755 even for directories like `/tmp` that must be
+/// 0o1777 (sticky bit).  A COPY whose destination is inside `/tmp` therefore
+/// produces a layer entry `/tmp` with mode 0755.  When overlayfs stacks this
+/// layer on the base image, the new entry shadows the base image's `/tmp`
+/// (0o1777), making it non-writable by non-root in subsequent RUN steps.
+///
+/// This helper is called after all file content has been placed in the staging
+/// directory and before `create_layer_from_dir` packages it into a tarball.
+fn fix_staging_dir_perms(staging_root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // /tmp must be world-writable + sticky (0o1777, matching Linux default).
+    let staging_tmp = staging_root.join("tmp");
+    if staging_tmp.is_dir() {
+        let _ = std::fs::set_permissions(&staging_tmp, std::fs::Permissions::from_mode(0o1777));
+    }
+}
+
 /// Execute a COPY instruction: create a layer from context files.
 /// When `remignore` is `Some`, directory copies skip matched entries.
 fn execute_copy(
@@ -1506,6 +1521,17 @@ fn execute_copy(
         std::fs::copy(&src_path, &dest_in_tmp)?;
     }
 
+    // create_dir_all uses the process umask (typically 022 → mode 755) for any
+    // directories it creates.  If the COPY destination is inside /tmp (or any
+    // other world-writable root directory), the staging /tmp entry ends up with
+    // mode 755.  When this layer is stacked on the base image via overlayfs, the
+    // new /tmp entry shadows the base image's /tmp (mode 1777, sticky bit),
+    // making /tmp non-writable by non-root in subsequent RUN steps.
+    //
+    // Fix: after creating all content, walk known world-writable root dirs and
+    // restore the sticky-bit permissions before packaging the layer.
+    fix_staging_dir_perms(tmp.path());
+
     let digest = create_layer_from_dir(tmp.path())?;
     Ok(digest)
 }
@@ -1569,6 +1595,7 @@ fn execute_add_url(url: &str, dest: &str, working_dir: &str) -> Result<String, B
     let mut file = std::fs::File::create(&dest_in_tmp)?;
     io::copy(&mut reader, &mut file)?;
 
+    fix_staging_dir_perms(tmp.path());
     let digest = create_layer_from_dir(tmp.path())?;
     Ok(digest)
 }
@@ -1636,6 +1663,7 @@ fn execute_add_archive(
         tar::Archive::new(file).unpack(&dest_in_tmp)?;
     }
 
+    fix_staging_dir_perms(tmp.path());
     let digest = create_layer_from_dir(tmp.path())?;
     Ok(digest)
 }
