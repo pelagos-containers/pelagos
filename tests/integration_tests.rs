@@ -15453,6 +15453,7 @@ mod tutorial_e2e_p2 {
     ///
     /// Failure indicates the build engine (COPY, RUN chmod, CMD) or image run is broken.
     #[test]
+    #[serial_test::serial]
     fn test_tut_p2_simple_build() {
         let ctx = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -15507,6 +15508,7 @@ mod tutorial_e2e_p2 {
     /// Failure indicates the save/load round-trip is broken — either the OCI
     /// archive format is corrupt or the image store is not updated correctly on load.
     #[test]
+    #[serial_test::serial]
     fn test_tut_p2_image_save_load() {
         let ctx = concat!(
             env!("CARGO_MANIFEST_DIR"),
