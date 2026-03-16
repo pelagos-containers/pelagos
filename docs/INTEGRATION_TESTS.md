@@ -3734,3 +3734,21 @@ Also verifies that `manifest.config.env` records the sentinel path after the bui
 confirms the build engine stores ENV correctly. Failure indicates the unconditional PATH
 override has been re-introduced in `apply_cli_options`, or the image-config env application
 order has been broken.
+
+### `test_exec_applies_image_env_path`
+**Requires:** root, `docker.io/library/alpine:latest` pre-pulled
+
+Regression test for issue #115: `pelagos exec` must apply the image's OCI config `Env`
+(Dockerfile `ENV` instructions) to the exec'd process environment, not rely solely on
+reading the running container's `/proc/<pid>/environ`.
+
+Previously, `cmd_exec` read the container's live `/proc/<pid>/environ` as the base env.
+This is unreliable: containers started before issue #114 was fixed had the wrong PATH in
+their environ, and in general the running container's environ may diverge from the image
+config. The fix loads `manifest.config.env` from `state.spawn_config.image` and uses that
+as the authoritative base (matching Docker's `exec` semantics). For rootfs-based containers
+with no image manifest, the fallback to `/proc/<pid>/environ` is retained.
+
+Flow: builds an alpine image with `ENV PATH=/issue-115-sentinel:...`, starts it in detached
+mode, runs `pelagos exec <name> /bin/sh -c 'echo $PATH'`, asserts the sentinel appears.
+Failure indicates `cmd_exec` no longer loads the image manifest config env.

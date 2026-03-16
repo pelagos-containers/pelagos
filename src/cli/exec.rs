@@ -2,6 +2,7 @@
 
 use super::{check_liveness, parse_user, read_state, verify_pid_not_recycled, ContainerStatus};
 use pelagos::container::{Command, Namespace, Stdio};
+use pelagos::image;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
@@ -74,8 +75,39 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 2b. Discover which namespaces the container has
     let ns_entries = discover_namespaces(pid)?;
 
-    // 3. Read the container's environment.
+    // 3. Build the base environment for the exec'd process.
     //
+    // Priority (lowest → highest):
+    //   a) Image config Env (Dockerfile ENV instructions) — authoritative base
+    //   b) Container's live /proc/<pid>/environ — used only for rootfs containers
+    //      (no image manifest) and to pick up any runtime vars not in the image
+    //   c) CLI -e overrides — always win
+    //
+    // For image-based containers we load the image manifest and use its config.env
+    // as the base.  This matches Docker's `exec` semantics: the exec'd process
+    // inherits the OCI image config env regardless of what the running init process
+    // currently has in /proc/environ (which may reflect a pre-#114 spawn where PATH
+    // was incorrectly overwritten).
+    //
+    // For rootfs-based containers (no spawn_config.image), we fall back to the
+    // live /proc/environ of the container's actual process (grandchild in PID-ns).
+    let image_env: Vec<(String, String)> = state
+        .spawn_config
+        .as_ref()
+        .and_then(|sc| sc.image.as_deref())
+        .and_then(|img| image::load_image(img).ok())
+        .map(|m| {
+            m.config
+                .env
+                .iter()
+                .filter_map(|e| {
+                    let (k, v) = e.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // For containers with a PID namespace, state.pid is the INTERMEDIATE process
     // (it ran pre_exec but never called exec(), so its /proc/pid/environ reflects
     // the fork-inherited host environment, not the --env vars).  The actual
@@ -88,7 +120,12 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok())
             .unwrap_or(pid)
     };
-    let container_env = read_proc_environ(environ_pid);
+    // Only read /proc/environ when no image manifest is available (rootfs containers).
+    let container_env: Vec<(String, String)> = if image_env.is_empty() {
+        read_proc_environ(environ_pid)
+    } else {
+        Vec::new()
+    };
 
     // 4. Build Command
     let exe = &args.args[0];
@@ -262,8 +299,9 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Apply container environment as base
-    for (k, v) in &container_env {
+    // Apply base environment: image config env (image-based containers) or
+    // live /proc/environ (rootfs containers).  Exactly one of these is non-empty.
+    for (k, v) in image_env.iter().chain(container_env.iter()) {
         cmd = cmd.env(k, v);
     }
 

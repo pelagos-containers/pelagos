@@ -18784,3 +18784,147 @@ mod issue_114_image_env_applied_on_run {
         let _ = image::remove_image(&format!("{}:latest", out_tag));
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #115 — pelagos exec does not apply image-config ENV to exec'd process
+// ---------------------------------------------------------------------------
+
+mod issue_115_exec_applies_image_env {
+    use crate::is_root;
+    use pelagos::build;
+    use pelagos::image;
+    use std::collections::HashMap;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn cleanup(name: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["stop", name])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(bin())
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    fn wait_for_container(name: &str, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            let out = std::process::Command::new(bin())
+                .args(["ps", "--all"])
+                .output()
+                .ok();
+            if let Some(o) = out {
+                let s = String::from_utf8_lossy(&o.stdout);
+                if s.lines().any(|l| l.split_whitespace().next() == Some(name)) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Regression test for issue #115: `pelagos exec` must apply the image's
+    /// OCI config Env (Dockerfile `ENV` instructions) to the exec'd process,
+    /// not rely solely on reading the running container's `/proc/<pid>/environ`.
+    ///
+    /// Requires: root, `docker.io/library/alpine:latest` pre-pulled.
+    ///
+    /// Flow:
+    ///   1. Build an alpine image with `ENV PATH=/issue-115-sentinel:$PATH`
+    ///   2. Start the container in detached mode (`sleep 300`)
+    ///   3. `pelagos exec <name> /bin/sh -c 'echo $PATH'` and capture output
+    ///   4. Assert the sentinel appears in the PATH
+    ///   5. Stop and remove the container
+    ///
+    /// Failure indicates `cmd_exec` in exec.rs does not load the image manifest
+    /// config env and the sentinel path is absent (exec inherits a default PATH
+    /// that does not include non-standard directories added by devcontainer features).
+    #[test]
+    #[serial_test::serial]
+    fn test_exec_applies_image_env_path() {
+        if !is_root() {
+            eprintln!("SKIP test_exec_applies_image_env_path: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_exec_applies_image_env_path: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-115-test";
+        let ctr_name = "pelagos-issue-115-ctr";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+        cleanup(ctr_name);
+
+        // 1. Build the image with a sentinel PATH prefix.
+        let remfile =
+            "FROM alpine\nENV PATH=/issue-115-sentinel:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n";
+        let instructions = build::parse_remfile(remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build");
+
+        // 2. Start the container in detached mode.
+        let run_status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                ctr_name,
+                &format!("{}:latest", out_tag),
+                "/bin/sleep",
+                "300",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(run_status.success(), "detached run should exit 0");
+
+        assert!(
+            wait_for_container(ctr_name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            ctr_name
+        );
+
+        // 3. Exec `echo $PATH` inside the running container.
+        let exec_out = std::process::Command::new(bin())
+            .args(["exec", ctr_name, "/bin/sh", "-c", "echo $PATH"])
+            .output()
+            .expect("pelagos exec");
+        let stdout = String::from_utf8_lossy(&exec_out.stdout);
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+
+        // 4. Assert the sentinel is present.
+        assert!(
+            exec_out.status.success(),
+            "pelagos exec should exit 0; stderr={}",
+            stderr.trim()
+        );
+        assert!(
+            stdout.contains("/issue-115-sentinel"),
+            "exec'd PATH does not contain /issue-115-sentinel; got: {:?}\n\
+             This means cmd_exec does not load the image manifest config env.\n\
+             Check issue_115 fix in src/cli/exec.rs.",
+            stdout.trim()
+        );
+
+        // 5. Cleanup.
+        cleanup(ctr_name);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+    }
+}
