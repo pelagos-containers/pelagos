@@ -2797,6 +2797,17 @@ impl Command {
                 let _ = std::fs::set_permissions(&merged, std::fs::Permissions::from_mode(0o755));
                 ov.upper_dir = upper;
                 ov.work_dir = work;
+                // For pasta containers: pre-seed the overlay upper dir with the host CA cert
+                // as a plain file.  A bind-mount (the non-overlay fallback) would cause EBUSY
+                // when apt's post-install hook runs `update-ca-certificates`, which renames a
+                // .crt.new file onto the bind-mount target.  A plain file in the upper dir can
+                // be freely renamed over by the container.
+                if is_pasta && std::path::Path::new(HOST_CA_CERT).exists() {
+                    let cert_dir = ov.upper_dir.join("etc/ssl/certs");
+                    if std::fs::create_dir_all(&cert_dir).is_ok() {
+                        let _ = std::fs::copy(HOST_CA_CERT, cert_dir.join("ca-certificates.crt"));
+                    }
+                }
             }
             Some(merged)
         } else {
@@ -3601,33 +3612,43 @@ impl Command {
                     }
 
                     // CA certs: bind-mount host trust store read-only for pasta containers.
-                    // Alpine base images lack ca-certificates; this lets wget/curl verify TLS.
+                    // Alpine/scratch images lack ca-certificates; this lets wget/curl verify TLS.
+                    //
+                    // Overlay case: the cert was pre-seeded in the upper dir as a plain file
+                    // by the parent before fork — skip the bind-mount.  A bind-mount target
+                    // causes EBUSY when `update-ca-certificates` renames .crt.new over it,
+                    // breaking `apt-get install ca-certificates`.
+                    //
+                    // Non-overlay case (static rootfs): bind-mount as before.
                     if let Some(ref ca_src) = pasta_ca_cert_cstring {
-                        let ssl_dir = effective_root.join("etc/ssl/certs");
-                        std::fs::create_dir_all(&ssl_dir)
-                            .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
-                        let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
-                        let tgt_c = std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
-                        let fd = libc::open(
-                            tgt_c.as_ptr(),
-                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-                            0o644u32,
-                        );
-                        if fd >= 0 {
-                            libc::close(fd);
-                        }
-                        let r = libc::mount(
-                            ca_src.as_ptr(),
-                            tgt_c.as_ptr(),
-                            ptr::null(),
-                            libc::MS_BIND | libc::MS_RDONLY,
-                            ptr::null(),
-                        );
-                        if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "ca cert bind mount: {}",
-                                io::Error::last_os_error()
-                            )));
+                        if overlay_merged.is_none() {
+                            let ssl_dir = effective_root.join("etc/ssl/certs");
+                            let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
+                            std::fs::create_dir_all(&ssl_dir)
+                                .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
+                            let tgt_c =
+                                std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
+                            let fd = libc::open(
+                                tgt_c.as_ptr(),
+                                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                0o644u32,
+                            );
+                            if fd >= 0 {
+                                libc::close(fd);
+                            }
+                            let r = libc::mount(
+                                ca_src.as_ptr(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                            if r != 0 {
+                                return Err(io::Error::other(format!(
+                                    "ca cert bind mount: {}",
+                                    io::Error::last_os_error()
+                                )));
+                            }
                         }
                     }
 
@@ -5118,6 +5139,17 @@ impl Command {
                 std::fs::create_dir_all(&work).map_err(Error::Io)?;
                 ov.upper_dir = upper;
                 ov.work_dir = work;
+                // For pasta containers: pre-seed the overlay upper dir with the host CA cert
+                // as a plain file.  A bind-mount (the non-overlay fallback) would cause EBUSY
+                // when apt's post-install hook runs `update-ca-certificates`, which renames a
+                // .crt.new file onto the bind-mount target.  A plain file in the upper dir can
+                // be freely renamed over by the container.
+                if is_pasta && std::path::Path::new(HOST_CA_CERT).exists() {
+                    let cert_dir = ov.upper_dir.join("etc/ssl/certs");
+                    if std::fs::create_dir_all(&cert_dir).is_ok() {
+                        let _ = std::fs::copy(HOST_CA_CERT, cert_dir.join("ca-certificates.crt"));
+                    }
+                }
             }
             Some(merged)
         } else {
@@ -5776,32 +5808,37 @@ impl Command {
                     }
 
                     // CA certs: bind-mount host trust store read-only for pasta containers.
+                    // Overlay case: cert was pre-seeded in upper dir as a plain file — skip.
+                    // Non-overlay case (static rootfs): bind-mount as before.
                     if let Some(ref ca_src) = pasta_ca_cert_cstring {
-                        let ssl_dir = effective_root.join("etc/ssl/certs");
-                        std::fs::create_dir_all(&ssl_dir)
-                            .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
-                        let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
-                        let tgt_c = std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
-                        let fd = libc::open(
-                            tgt_c.as_ptr(),
-                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
-                            0o644u32,
-                        );
-                        if fd >= 0 {
-                            libc::close(fd);
-                        }
-                        let r = libc::mount(
-                            ca_src.as_ptr(),
-                            tgt_c.as_ptr(),
-                            ptr::null(),
-                            libc::MS_BIND | libc::MS_RDONLY,
-                            ptr::null(),
-                        );
-                        if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "ca cert bind mount: {}",
-                                io::Error::last_os_error()
-                            )));
+                        if overlay_merged.is_none() {
+                            let ssl_dir = effective_root.join("etc/ssl/certs");
+                            let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
+                            std::fs::create_dir_all(&ssl_dir)
+                                .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
+                            let tgt_c =
+                                std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
+                            let fd = libc::open(
+                                tgt_c.as_ptr(),
+                                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                0o644u32,
+                            );
+                            if fd >= 0 {
+                                libc::close(fd);
+                            }
+                            let r = libc::mount(
+                                ca_src.as_ptr(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                            if r != 0 {
+                                return Err(io::Error::other(format!(
+                                    "ca cert bind mount: {}",
+                                    io::Error::last_os_error()
+                                )));
+                            }
                         }
                     }
 

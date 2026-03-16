@@ -3700,3 +3700,22 @@ Two-stage Remfile: stage 0 (`FROM scratch`) places a file at `/tmp/build-feature
 stage 1 (`FROM ubuntu`) uses `COPY --from=0` to pull it out, then `stat -c '%a' /tmp`.
 Asserts `/tmp-mode.txt` contains `1777`. Failure indicates `fix_staging_dir_perms` is absent
 from `execute_copy_from_stage` in `build.rs`.
+
+### `test_build_apt_install_ca_certificates`
+**Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled, `pasta` installed
+
+Regression test for issue #112: `apt-get install ca-certificates` failed with EBUSY during
+`update-ca-certificates`. The root cause: pelagos unconditionally bind-mounted the host's
+`/etc/ssl/certs/ca-certificates.crt` into pasta overlay containers. The bind-mount target
+cannot be renamed over — `update-ca-certificates` renames a `.crt.new` file onto it, which
+fails with EBUSY.
+
+Fix (v0.51.0): for overlay-based pasta containers (all build-engine RUN steps), the parent
+process pre-seeds the overlay upper dir with a plain-file copy of the host CA cert before
+fork. A plain file in the upper dir can be freely renamed over. The bind-mount is now only
+performed for non-overlay (static rootfs) pasta containers where `update-ca-certificates`
+would not be called.
+
+Remfile: `FROM ubuntu:22.04 RUN apt-get update && apt-get install -y ca-certificates`.
+Asserts exit code 0 and that the output contains "done." (the final `update-ca-certificates`
+success message). Failure indicates the bind-mount-over-overlay EBUSY regression has returned.

@@ -18599,3 +18599,74 @@ mod issue_111_tmp_writable {
         let _ = image::remove_image(&manifest.reference);
     }
 }
+
+#[cfg(test)]
+mod issue_112_ca_cert_bind_mount {
+    use super::*;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    /// test_build_apt_install_ca_certificates
+    ///
+    /// Requires: root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+    ///
+    /// Regression test for issue #112: `apt-get install ca-certificates` failed
+    /// with EBUSY because pelagos unconditionally bind-mounted the host CA bundle
+    /// over `/etc/ssl/certs/ca-certificates.crt` in every pasta RUN step, even
+    /// when the base image already had a CA bundle.  The post-install script calls
+    /// `mv /etc/ssl/certs/ca-certificates.crt.new /etc/ssl/certs/ca-certificates.crt`
+    /// (a rename) which fails with EBUSY on a bind-mount target.
+    ///
+    /// Fix (v0.50.0): check if the container's merged overlay already has a
+    /// non-empty CA bundle; if so, skip the bind-mount entirely.
+    ///
+    /// Failure would indicate the `already_has_certs` guard was removed from the
+    /// CA cert bind-mount code in container.rs.
+    #[test]
+    fn test_build_apt_install_ca_certificates() {
+        if !is_root() {
+            eprintln!("SKIP test_build_apt_install_ca_certificates: requires root");
+            return;
+        }
+
+        let ecr_ubuntu = "public.ecr.aws/docker/library/ubuntu:22.04";
+        if image::load_image(ecr_ubuntu).is_err() {
+            eprintln!(
+                "SKIP test_build_apt_install_ca_certificates: \
+                 ECR ubuntu not pulled (run: pelagos image pull {})",
+                ecr_ubuntu
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-112-ca-certs-test";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        let remfile = format!(
+            "FROM {ecr_ubuntu}\n\
+             RUN apt-get update && apt-get install -y ca-certificates\n"
+        );
+
+        let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Pasta,
+            false,
+            &HashMap::new(),
+        );
+
+        result.expect(
+            "execute_build failed — apt-get install ca-certificates returned an error. \
+             The host CA bundle may be unconditionally bind-mounted over the container's \
+             ca-certificates.crt, causing EBUSY on rename. \
+             Check the already_has_certs guard in container.rs.",
+        );
+
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+    }
+}
