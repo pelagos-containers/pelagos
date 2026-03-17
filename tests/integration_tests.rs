@@ -19502,3 +19502,99 @@ mod issue_118_start_returns_promptly {
         cleanup(name);
     }
 }
+
+mod issue_120_etc_hosts {
+    use crate::{get_test_rootfs, is_root, ALPINE_PATH};
+    use pelagos::container::{Command, Namespace, Stdio};
+
+    /// Verifies that /etc/hosts is always created in containers, containing at minimum
+    /// `127.0.0.1 localhost` and the IPv6 localhost aliases.
+    ///
+    /// Requires root + alpine rootfs. Failure indicates that getaddrinfo("localhost")
+    /// would fail inside containers, breaking any software that connects to localhost
+    /// (e.g. VS Code Remote server's Node.js listener).
+    #[test]
+    fn test_etc_hosts_localhost_present() {
+        if !is_root() {
+            eprintln!("SKIP: test_etc_hosts_localhost_present requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_etc_hosts_localhost_present: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/etc/hosts"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(status.success(), "container exited non-zero");
+        assert!(
+            stdout.contains("127.0.0.1") && stdout.contains("localhost"),
+            "/etc/hosts missing 127.0.0.1 localhost entry, got:\n{}",
+            stdout
+        );
+        assert!(
+            stdout.contains("::1") && stdout.contains("ip6-localhost"),
+            "/etc/hosts missing ::1 ip6-localhost entry, got:\n{}",
+            stdout
+        );
+    }
+
+    /// Verifies that /etc/hosts includes a 127.0.1.1 alias for the container hostname
+    /// when with_hostname() is set, matching Docker's behaviour.
+    ///
+    /// Requires root + alpine rootfs. Failure indicates hostname resolution via
+    /// `getaddrinfo(hostname)` would fail inside the container.
+    #[test]
+    fn test_etc_hosts_hostname_alias() {
+        if !is_root() {
+            eprintln!("SKIP: test_etc_hosts_hostname_alias requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIP: test_etc_hosts_hostname_alias: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/etc/hosts"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .with_hostname("mycontainer")
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(status.success(), "container exited non-zero");
+        assert!(
+            stdout.contains("127.0.1.1") && stdout.contains("mycontainer"),
+            "/etc/hosts missing 127.0.1.1 mycontainer entry, got:\n{}",
+            stdout
+        );
+    }
+}

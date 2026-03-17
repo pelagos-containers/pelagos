@@ -3061,28 +3061,42 @@ impl Command {
             }
             nets
         };
-        let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
-            let pid = unsafe { libc::getpid() };
-            let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = crate::paths::hosts_dir(pid, n);
-            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
-            let mut content = String::from("127.0.0.1\tlocalhost\n");
-            for (container_name, alias) in &self.links {
-                // Try to resolve on a shared network first, fall back to any IP.
-                let ip = resolve_container_ip_on_shared_network(container_name, &my_networks)
-                    .or_else(|_| resolve_container_ip(container_name))
-                    .map_err(Error::Io)?;
-                if alias == container_name {
-                    content.push_str(&format!("{}\t{}\n", ip, alias));
-                } else {
-                    content.push_str(&format!("{}\t{}\t{}\n", ip, alias, container_name));
+        // Always create /etc/hosts when MOUNT namespace + chroot is active.
+        // Docker always provides this file so that getaddrinfo("localhost") works
+        // without mDNS or any other resolver being present in the container.
+        // Links (container-name → IP) are appended after the localhost block.
+        let hosts_temp_dir: Option<PathBuf> =
+            if self.namespaces.contains(Namespace::MOUNT) && self.chroot_dir.is_some() {
+                let pid = unsafe { libc::getpid() };
+                let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let dir = crate::paths::hosts_dir(pid, n);
+                std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+                // Docker-compatible localhost block.
+                let mut content = String::from(
+                    "127.0.0.1\tlocalhost\n\
+                     ::1\t\tlocalhost ip6-localhost ip6-loopback\n\
+                     fe00::0\tip6-localnet\n",
+                );
+                // If a hostname is set, add a 127.0.1.1 alias (mirrors Docker).
+                if let Some(ref h) = hostname {
+                    content.push_str(&format!("127.0.1.1\t{}\n", h));
                 }
-            }
-            std::fs::write(dir.join("hosts"), content).map_err(Error::Io)?;
-            Some(dir)
-        } else {
-            None
-        };
+                for (container_name, alias) in &self.links {
+                    // Try to resolve on a shared network first, fall back to any IP.
+                    let ip = resolve_container_ip_on_shared_network(container_name, &my_networks)
+                        .or_else(|_| resolve_container_ip(container_name))
+                        .map_err(Error::Io)?;
+                    if alias == container_name {
+                        content.push_str(&format!("{}\t{}\n", ip, alias));
+                    } else {
+                        content.push_str(&format!("{}\t{}\t{}\n", ip, alias, container_name));
+                    }
+                }
+                std::fs::write(dir.join("hosts"), content).map_err(Error::Io)?;
+                Some(dir)
+            } else {
+                None
+            };
         let hosts_temp_file_cstring: Option<std::ffi::CString> =
             hosts_temp_dir.as_ref().map(|dir| {
                 use std::os::unix::ffi::OsStrExt as _;
@@ -5366,28 +5380,42 @@ impl Command {
             }
             nets
         };
-        let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
-            let pid = unsafe { libc::getpid() };
-            let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = crate::paths::hosts_dir(pid, n);
-            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
-            let mut content = String::from("127.0.0.1\tlocalhost\n");
-            for (container_name, alias) in &self.links {
-                // Try to resolve on a shared network first, fall back to any IP.
-                let ip = resolve_container_ip_on_shared_network(container_name, &my_networks)
-                    .or_else(|_| resolve_container_ip(container_name))
-                    .map_err(Error::Io)?;
-                if alias == container_name {
-                    content.push_str(&format!("{}\t{}\n", ip, alias));
-                } else {
-                    content.push_str(&format!("{}\t{}\t{}\n", ip, alias, container_name));
+        // Always create /etc/hosts when MOUNT namespace + chroot is active.
+        // Docker always provides this file so that getaddrinfo("localhost") works
+        // without mDNS or any other resolver being present in the container.
+        // Links (container-name → IP) are appended after the localhost block.
+        let hosts_temp_dir: Option<PathBuf> =
+            if self.namespaces.contains(Namespace::MOUNT) && self.chroot_dir.is_some() {
+                let pid = unsafe { libc::getpid() };
+                let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let dir = crate::paths::hosts_dir(pid, n);
+                std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+                // Docker-compatible localhost block.
+                let mut content = String::from(
+                    "127.0.0.1\tlocalhost\n\
+                     ::1\t\tlocalhost ip6-localhost ip6-loopback\n\
+                     fe00::0\tip6-localnet\n",
+                );
+                // If a hostname is set, add a 127.0.1.1 alias (mirrors Docker).
+                if let Some(ref h) = hostname {
+                    content.push_str(&format!("127.0.1.1\t{}\n", h));
                 }
-            }
-            std::fs::write(dir.join("hosts"), content).map_err(Error::Io)?;
-            Some(dir)
-        } else {
-            None
-        };
+                for (container_name, alias) in &self.links {
+                    // Try to resolve on a shared network first, fall back to any IP.
+                    let ip = resolve_container_ip_on_shared_network(container_name, &my_networks)
+                        .or_else(|_| resolve_container_ip(container_name))
+                        .map_err(Error::Io)?;
+                    if alias == container_name {
+                        content.push_str(&format!("{}\t{}\n", ip, alias));
+                    } else {
+                        content.push_str(&format!("{}\t{}\t{}\n", ip, alias, container_name));
+                    }
+                }
+                std::fs::write(dir.join("hosts"), content).map_err(Error::Io)?;
+                Some(dir)
+            } else {
+                None
+            };
         let hosts_temp_file_cstring: Option<std::ffi::CString> =
             hosts_temp_dir.as_ref().map(|dir| {
                 use std::os::unix::ffi::OsStrExt as _;

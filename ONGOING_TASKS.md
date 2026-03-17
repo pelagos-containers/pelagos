@@ -2,6 +2,26 @@
 
 All work is tracked in GitHub Issues. This file is a brief index.
 
+## Session in progress: 2026-03-17
+
+### Issues closed this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| #120 | fix: always create /etc/hosts with localhost entries in containers | v0.57.0 |
+
+### Key implementation details
+
+**#120 (/etc/hosts missing — localhost unresolvable):**
+- Both spawn paths (`spawn()` and `spawn_interactive()`/OCI) updated
+- Condition changed from `!self.links.is_empty()` → `MOUNT namespace + chroot is active`
+- Always writes Docker-compatible localhost block: `127.0.0.1 localhost`, `::1 localhost ip6-localhost ip6-loopback`, `fe00::0 ip6-localnet`
+- If hostname is set, also adds `127.0.1.1 <hostname>` (mirrors Docker)
+- Links still appended after the localhost block (no behaviour change for existing users of `with_link`)
+- Two integration tests: `test_etc_hosts_localhost_present`, `test_etc_hosts_hostname_alias`
+
+---
+
 ## Session completed: 2026-03-17 (SHA 5eee65c, v0.56.0)
 
 ### Issues closed this session

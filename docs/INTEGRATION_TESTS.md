@@ -3824,3 +3824,26 @@ itself exited.  With the fix the watcher redirects its inherited stdio to `/dev/
 Failure indicates either: (a) the watcher still inherits and holds the stdout pipe open
 (reintroduction of issue #118), or (b) `spawn_config` is not being saved so `pelagos
 start` cannot reconstruct the RunArgs.
+
+### `test_etc_hosts_localhost_present`
+**Requires:** root, alpine rootfs
+**Module:** `issue_120_etc_hosts`
+
+Spawns a container that runs `cat /etc/hosts` and asserts the output contains
+`127.0.0.1 localhost` and `::1 ip6-localhost`.
+
+Failure indicates that `/etc/hosts` is not being created (or is empty) in containers
+with a MOUNT namespace + chroot, which causes `getaddrinfo("localhost")` to fail with
+`ENOTFOUND` — breaking any software (e.g. VS Code Remote server's Node.js listener)
+that resolves `localhost` at startup.
+
+### `test_etc_hosts_hostname_alias`
+**Requires:** root, alpine rootfs
+**Module:** `issue_120_etc_hosts`
+
+Spawns a container with `with_hostname("mycontainer")` that runs `cat /etc/hosts` and
+asserts the output contains `127.0.1.1 mycontainer`.
+
+Failure indicates that the hostname alias is missing from `/etc/hosts`, which would cause
+`getaddrinfo(hostname)` to fail inside the container — matching Docker's behaviour of
+always providing a `127.0.1.1` alias for the container's hostname.
