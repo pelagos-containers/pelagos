@@ -1028,6 +1028,25 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             // Detach from parent's session so we're adopted by init when parent exits.
             unsafe { libc::setsid() };
 
+            // Daemon step: redirect the watcher's own stdin/stdout/stderr to /dev/null.
+            // This releases the write-end of any pipe or socket the caller holds on those
+            // FDs (SSH session, vsock relay, Stdio::piped()), so the caller sees EOF and
+            // unblocks as soon as the parent process exits.  All container I/O is already
+            // handled through the relay thread writing to log files; the watcher itself
+            // does not need its inherited stdio after this point.
+            let devnull =
+                unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR) };
+            if devnull >= 0 {
+                unsafe {
+                    libc::dup2(devnull, libc::STDIN_FILENO);
+                    libc::dup2(devnull, libc::STDOUT_FILENO);
+                    libc::dup2(devnull, libc::STDERR_FILENO);
+                    if devnull > libc::STDERR_FILENO {
+                        libc::close(devnull);
+                    }
+                }
+            }
+
             // Become a subreaper: any orphaned descendant is re-parented to us
             // instead of host init.  This ensures that if the watcher is killed
             // (e.g. OOM), the container process (C) is re-parented to us rather

@@ -3805,3 +3805,22 @@ and asserts the command is accepted and "Container started" appears in stdout.
 This exercises the Docker CLI compatibility pattern used by the VS Code devcontainer CLI.
 Failure indicates that `--sig-proxy` is not accepted (clap parse error) or that the
 combination of `-a STDOUT -a STDERR --sig-proxy=false` breaks the attach relay.
+
+### `test_start_returns_promptly`
+**Requires:** root, alpine image (pulled from registry)
+**Module:** `issue_118_start_returns_promptly`
+
+Runs `pelagos run --detach`, stops the container, then calls `pelagos start` with
+`stdout(Stdio::piped())` and asserts that the process exits within 2 seconds.  After
+the process exits, polls `state.json` to confirm the container reaches `status: running`
+with a real PID within 5 seconds.
+
+This test reproduces the exact mechanism of the hang described in issue #118: before the
+fix the watcher child inherited the write-end of the stdout pipe and never closed it, so
+the caller (SSH session, vsock relay, `Command::output()`) would block until the container
+itself exited.  With the fix the watcher redirects its inherited stdio to `/dev/null` after
+`setsid()`, releasing the pipe immediately when the parent exits.
+
+Failure indicates either: (a) the watcher still inherits and holds the stdout pipe open
+(reintroduction of issue #118), or (b) `spawn_config` is not being saved so `pelagos
+start` cannot reconstruct the RunArgs.

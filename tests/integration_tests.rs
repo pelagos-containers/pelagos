@@ -19352,3 +19352,138 @@ mod issue_117_attach_streams {
         cleanup(name);
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #118 — pelagos start must exit promptly when stdout is a pipe
+// ---------------------------------------------------------------------------
+
+mod issue_118_start_returns_promptly {
+    use crate::is_root;
+    use std::time::{Duration, Instant};
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn cleanup(name: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["stop", name])
+            .output();
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::process::Command::new(bin())
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// Verify that `pelagos start` exits promptly (< 2 s) even when its
+    /// stdout is a pipe.
+    ///
+    /// Before the fix the watcher child inherited the write-end of the pipe
+    /// and never closed it, so SSH sessions, vsock relays, and any caller
+    /// using `Stdio::piped()` would block until the container exited.
+    /// The fix redirects the watcher's stdin/stdout/stderr to /dev/null
+    /// after setsid(), releasing the caller's pipe immediately.
+    ///
+    /// This test uses `Stdio::piped()` to reproduce the exact scenario that
+    /// caused the hang in pelagos-mac's Docker shim (issue #118).
+    #[test]
+    fn test_start_returns_promptly() {
+        use std::process::Stdio;
+
+        if !is_root() {
+            eprintln!("SKIP: test_start_returns_promptly requires root");
+            return;
+        }
+
+        let name = "start-prompt-test";
+        cleanup(name);
+
+        // 1. Start a long-running container detached.
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "public.ecr.aws/docker/library/alpine:latest",
+                "/bin/sh",
+                "-c",
+                "sleep 60",
+            ])
+            .output()
+            .expect("pelagos run --detach");
+        assert!(
+            out.status.success(),
+            "pelagos run --detach failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // 2. Stop it so it reaches Exited state.
+        let _ = std::process::Command::new(bin())
+            .args(["stop", name])
+            .output();
+
+        // Brief pause so the watcher has time to write Exited state.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // 3. Restart via `pelagos start` with stdout PIPED.
+        //    Before the fix the watcher held the pipe open and this hung.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut child = std::process::Command::new(bin())
+            .args(["start", name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pelagos start spawn");
+
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(s) => break s,
+                None => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        panic!(
+                            "pelagos start did not exit within 2 s — \
+                             watcher is leaking the stdout pipe (issue #118)"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+
+        assert!(
+            status.success(),
+            "pelagos start exited with non-zero status: {}",
+            status
+        );
+
+        // 4. Container should be running again within a short window.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let running = {
+            let deadline2 = Instant::now() + Duration::from_secs(5);
+            let mut found = false;
+            while Instant::now() < deadline2 {
+                if let Ok(raw) = std::fs::read_to_string(&state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let status = v["status"].as_str().unwrap_or("");
+                        let pid = v["pid"].as_i64().unwrap_or(0);
+                        if status == "running" && pid > 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            found
+        };
+        assert!(
+            running,
+            "container '{}' did not reach running state after pelagos start",
+            name
+        );
+
+        cleanup(name);
+    }
+}
