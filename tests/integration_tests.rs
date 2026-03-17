@@ -19400,7 +19400,11 @@ mod issue_118_start_returns_promptly {
 
         // Pull alpine if not already present.
         let pull = std::process::Command::new(bin())
-            .args(["image", "pull", "public.ecr.aws/docker/library/alpine:latest"])
+            .args([
+                "image",
+                "pull",
+                "public.ecr.aws/docker/library/alpine:latest",
+            ])
             .output()
             .expect("pelagos image pull");
         assert!(
