@@ -19150,3 +19150,205 @@ mod issue_115_exec_applies_image_env {
         let _ = image::remove_image(&format!("{}:latest", out_tag));
     }
 }
+
+mod issue_117_attach_streams {
+    use crate::{get_test_rootfs, is_root};
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn cleanup(name: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// test_detach_attach_stdout_streams_output
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Runs `pelagos run -d -a STDOUT --name <n> ... /bin/sh -c 'echo sentinel'` and
+    /// asserts that "sentinel" appears in the process's captured stdout.
+    ///
+    /// Failure indicates that `-a STDOUT` does not tee container stdout to the caller,
+    /// or that the attach pipe is not being wired up in run_detached / relay.rs.
+    #[test]
+    fn test_detach_attach_stdout_streams_output() {
+        if !is_root() {
+            eprintln!("SKIP: test_detach_attach_stdout_streams_output requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_detach_attach_stdout_streams_output requires alpine-rootfs");
+                return;
+            }
+        };
+
+        let name = "attach-stdout-test";
+        cleanup(name);
+
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "-d",
+                "-a",
+                "STDOUT",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                "echo sentinel-stdout",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        // Container name goes to stderr; "sentinel-stdout" goes to stdout.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "pelagos run -d -a STDOUT failed: stderr={:?}",
+            stderr
+        );
+        assert!(
+            stdout.contains("sentinel-stdout"),
+            "stdout should contain 'sentinel-stdout'; got stdout={:?} stderr={:?}",
+            stdout,
+            stderr
+        );
+        // The container name should NOT appear in stdout (it goes to stderr).
+        assert!(
+            !stdout.contains(name),
+            "container name should not appear in stdout (attach mode); got stdout={:?}",
+            stdout
+        );
+
+        cleanup(name);
+    }
+
+    /// test_detach_attach_stderr_streams_output
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Runs `pelagos run -d -a STDERR ... /bin/sh -c 'echo sentinel >&2'` and asserts
+    /// that "sentinel-stderr" appears in the process's captured stderr (not stdout).
+    ///
+    /// Failure indicates that `-a STDERR` is not teeing container stderr to the caller.
+    #[test]
+    fn test_detach_attach_stderr_streams_output() {
+        if !is_root() {
+            eprintln!("SKIP: test_detach_attach_stderr_streams_output requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_detach_attach_stderr_streams_output requires alpine-rootfs");
+                return;
+            }
+        };
+
+        let name = "attach-stderr-test";
+        cleanup(name);
+
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "-d",
+                "-a",
+                "STDERR",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                "echo sentinel-stderr >&2",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "pelagos run -d -a STDERR failed: stderr={:?}",
+            stderr
+        );
+        assert!(
+            stderr.contains("sentinel-stderr"),
+            "stderr should contain 'sentinel-stderr'; got stderr={:?}",
+            stderr
+        );
+
+        cleanup(name);
+    }
+
+    /// test_detach_attach_sig_proxy_compat
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Runs `pelagos run -d -a STDOUT -a STDERR --sig-proxy=false ...` and asserts
+    /// the command is accepted and output is streamed.  This exercises the Docker
+    /// CLI compatibility flag `--sig-proxy` that devcontainer passes.
+    ///
+    /// Failure indicates that `--sig-proxy` is not accepted (clap parse error), or
+    /// that the combination of flags breaks the attach relay.
+    #[test]
+    fn test_detach_attach_sig_proxy_compat() {
+        if !is_root() {
+            eprintln!("SKIP: test_detach_attach_sig_proxy_compat requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_detach_attach_sig_proxy_compat requires alpine-rootfs");
+                return;
+            }
+        };
+
+        let name = "attach-sigproxy-test";
+        cleanup(name);
+
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "-d",
+                "-a",
+                "STDOUT",
+                "-a",
+                "STDERR",
+                "--sig-proxy=false",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                "echo Container started",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "pelagos run with --sig-proxy=false failed: stderr={:?}",
+            stderr
+        );
+        assert!(
+            stdout.contains("Container started"),
+            "stdout should contain 'Container started'; got stdout={:?} stderr={:?}",
+            stdout,
+            stderr
+        );
+
+        cleanup(name);
+    }
+}

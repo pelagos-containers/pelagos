@@ -3773,3 +3773,35 @@ with no image manifest, the fallback to `/proc/<pid>/environ` is retained.
 Flow: builds an alpine image with `ENV PATH=/issue-115-sentinel:...`, starts it in detached
 mode, runs `pelagos exec <name> /bin/sh -c 'echo $PATH'`, asserts the sentinel appears.
 Failure indicates `cmd_exec` no longer loads the image manifest config env.
+
+## `-a`/`--attach` with `--detach` (issue #117)
+
+### `test_detach_attach_stdout_streams_output`
+**Requires:** root, alpine-rootfs
+
+Runs `pelagos run -d -a STDOUT --name <n> ... /bin/sh -c 'echo sentinel-stdout'` and
+asserts that "sentinel-stdout" appears in the caller's captured stdout, and that the
+container name does NOT appear in stdout (it goes to stderr in attach mode).
+
+Failure indicates: `-a STDOUT` is not setting up the attach pipe in `run_detached`, or the
+tee relay in `relay.rs` is not writing to the pipe write-end, or the parent relay thread is
+not reading from the pipe read-end.
+
+### `test_detach_attach_stderr_streams_output`
+**Requires:** root, alpine-rootfs
+
+Runs `pelagos run -d -a STDERR ... /bin/sh -c 'echo sentinel-stderr >&2'` and asserts that
+"sentinel-stderr" appears in the caller's captured stderr.
+
+Failure indicates that `-a STDERR` is not teeing container stderr to the caller's stderr,
+or the stderr attach pipe is not wired up in the relay.
+
+### `test_detach_attach_sig_proxy_compat`
+**Requires:** root, alpine-rootfs
+
+Runs `pelagos run -d -a STDOUT -a STDERR --sig-proxy=false ... /bin/sh -c 'echo Container started'`
+and asserts the command is accepted and "Container started" appears in stdout.
+
+This exercises the Docker CLI compatibility pattern used by the VS Code devcontainer CLI.
+Failure indicates that `--sig-proxy` is not accepted (clap parse error) or that the
+combination of `-a STDOUT -a STDERR --sig-proxy=false` breaks the attach relay.

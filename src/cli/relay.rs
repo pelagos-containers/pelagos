@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::{ChildStderr, ChildStdout};
 
@@ -22,7 +22,23 @@ pub fn start_log_relay(
     stdout_path: PathBuf,
     stderr_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || relay_loop(stdout, stderr, stdout_path, stderr_path))
+    std::thread::spawn(move || relay_loop(stdout, stderr, stdout_path, stderr_path, [None, None]))
+}
+
+/// Like `start_log_relay` but also "tees" each stream to optional extra fds.
+///
+/// Used for `--detach -a STDOUT [-a STDERR]`: writes to both log files and the
+/// write-end of an attach pipe so the parent can stream container output to the
+/// caller's stdout/stderr.  The fds are closed by the thread once both pipes
+/// reach EOF.
+pub fn start_tee_relay(
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    attach_fds: [Option<RawFd>; 2],
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || relay_loop(stdout, stderr, stdout_path, stderr_path, attach_fds))
 }
 
 fn relay_loop(
@@ -30,6 +46,7 @@ fn relay_loop(
     stderr: Option<ChildStderr>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    attach_fds: [Option<RawFd>; 2],
 ) {
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -96,8 +113,26 @@ fn relay_loop(
             };
 
             if nread > 0 {
+                let data = &buf[..nread as usize];
                 if let Some(ref mut f) = files[idx] {
-                    let _ = f.write_all(&buf[..nread as usize]);
+                    let _ = f.write_all(data);
+                }
+                // Tee to attach pipe write-end (if present).
+                if let Some(afd) = attach_fds[idx] {
+                    let mut written = 0usize;
+                    while written < data.len() {
+                        let r = unsafe {
+                            libc::write(
+                                afd,
+                                data[written..].as_ptr() as *const libc::c_void,
+                                data.len() - written,
+                            )
+                        };
+                        if r <= 0 {
+                            break;
+                        }
+                        written += r as usize;
+                    }
                 }
             } else {
                 // EOF (0) or non-EINTR error (-1): deregister and mark done.
@@ -108,6 +143,10 @@ fn relay_loop(
     }
 
     unsafe { libc::close(epfd) };
+    // Close attach pipe write-ends so the parent's relay threads see EOF.
+    for afd in attach_fds.into_iter().flatten() {
+        unsafe { libc::close(afd) };
+    }
     // stdout / stderr are dropped here, closing the pipe read-ends.
 }
 

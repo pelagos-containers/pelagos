@@ -108,5 +108,7 @@ fn spawn_config_to_run_args(
         rootfs: rootfs_field,
         args,
         label: sc.labels,
+        attach: vec![],
+        sig_proxy: None,
     }
 }

@@ -172,6 +172,16 @@ pub struct RunArgs {
     #[clap(long = "label", short = 'l')]
     pub label: Vec<String>,
 
+    /// Attach to a container stream (STDOUT or STDERR; repeatable).
+    /// When combined with --detach, streams the container's output to the caller
+    /// while the container runs in the background.
+    #[clap(long = "attach", short = 'a', value_name = "STREAM")]
+    pub attach: Vec<String>,
+
+    /// Forward signals to the container process (accepted for Docker CLI compatibility; ignored)
+    #[clap(long = "sig-proxy", value_name = "BOOL", hide = true)]
+    pub sig_proxy: Option<String>,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -275,17 +285,21 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let labels = parse_labels(&args.label);
     let spawn_config = build_spawn_config(&args, &rootfs_label, &exe_and_args);
+    let attach_stdout = args.attach.iter().any(|s| s.eq_ignore_ascii_case("stdout"));
+    let attach_stderr = args.attach.iter().any(|s| s.eq_ignore_ascii_case("stderr"));
 
     if args.detach {
-        run_detached(
+        run_detached(DetachedArgs {
             name,
-            rootfs_label,
-            exe_and_args,
+            rootfs: rootfs_label,
+            command: exe_and_args,
             cmd,
             health_config,
-            Some(spawn_config),
+            spawn_config: Some(spawn_config),
             labels,
-        )
+            attach_stdout,
+            attach_stderr,
+        })
     } else if args.interactive {
         run_interactive(cmd)
     } else {
@@ -934,15 +948,30 @@ fn run_interactive(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
 // Detached mode
 // ---------------------------------------------------------------------------
 
-fn run_detached(
+struct DetachedArgs {
     name: String,
     rootfs: String,
     command: Vec<String>,
-    mut cmd: Command,
+    cmd: Command,
     health_config: Option<HealthConfig>,
     spawn_config: Option<SpawnConfig>,
     labels: std::collections::HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    attach_stdout: bool,
+    attach_stderr: bool,
+}
+
+fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let DetachedArgs {
+        name,
+        rootfs,
+        command,
+        mut cmd,
+        health_config,
+        spawn_config,
+        labels,
+        attach_stdout,
+        attach_stderr,
+    } = a;
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
     let dir = container_dir(&name);
@@ -972,7 +1001,21 @@ fn run_detached(
     };
     write_state(&state)?;
 
-    // Fork a watcher child; parent prints name and exits.
+    // Create attach pipes before fork (O_CLOEXEC so the container grandchild's exec() closes them).
+    // Slot 0 = stdout pipe, slot 1 = stderr pipe.  Each: [read_fd, write_fd].
+    let mut attach_pipes: [[i32; 2]; 2] = [[-1, -1], [-1, -1]];
+    if attach_stdout
+        && unsafe { libc::pipe2(attach_pipes[0].as_mut_ptr(), libc::O_CLOEXEC) } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    if attach_stderr
+        && unsafe { libc::pipe2(attach_pipes[1].as_mut_ptr(), libc::O_CLOEXEC) } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+
+    // Fork a watcher child; parent either streams output (attach mode) or prints name and exits.
     let fork_result = unsafe { libc::fork() };
     match fork_result {
         -1 => {
@@ -980,6 +1023,12 @@ fn run_detached(
         }
         0 => {
             // We are the watcher child.
+            // Close the read ends of attach pipes — only the parent needs those.
+            for slot in &attach_pipes {
+                if slot[0] >= 0 {
+                    unsafe { libc::close(slot[0]) };
+                }
+            }
             // Detach from parent's session so we're adopted by init when parent exits.
             unsafe { libc::setsid() };
 
@@ -1061,12 +1110,26 @@ fn run_detached(
                 std::thread::spawn(move || super::health::run_health_monitor(name2, pid, hc, stop))
             });
 
-            // Single epoll relay thread: multiplexes stdout and stderr into log files.
-            let t_relay = super::relay::start_log_relay(
+            // Single epoll relay thread: multiplexes stdout and stderr into log files,
+            // and optionally tees to the attach pipe write-ends (if -a was specified).
+            let attach_fds = [
+                if attach_pipes[0][1] >= 0 {
+                    Some(attach_pipes[0][1])
+                } else {
+                    None
+                },
+                if attach_pipes[1][1] >= 0 {
+                    Some(attach_pipes[1][1])
+                } else {
+                    None
+                },
+            ];
+            let t_relay = super::relay::start_tee_relay(
                 child.take_stdout(),
                 child.take_stderr(),
                 stdout_log.clone(),
                 stderr_log.clone(),
+                attach_fds,
             );
 
             // Wait for the container to exit.
@@ -1095,8 +1158,68 @@ fn run_detached(
             unsafe { libc::_exit(0) };
         }
         _child_pid => {
-            // We are the parent: print the container name and exit immediately.
-            println!("{}", name);
+            // We are the parent.
+            // Close the write ends of attach pipes — only the watcher child needs those.
+            for slot in &attach_pipes {
+                if slot[1] >= 0 {
+                    unsafe { libc::close(slot[1]) };
+                }
+            }
+
+            if attach_stdout || attach_stderr {
+                // Attach mode: stream container output to our own stdout/stderr.
+                // Container name goes to stderr so callers capturing stdout still get clean output.
+                eprintln!("{}", name);
+
+                // Relay each pipe in its own thread so stdout and stderr don't block each other.
+                let stdout_thread = if attach_pipes[0][0] >= 0 {
+                    let rfd = attach_pipes[0][0];
+                    Some(std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = unsafe {
+                                libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                            };
+                            if n <= 0 {
+                                break;
+                            }
+                            let _ = io::stdout().write_all(&buf[..n as usize]);
+                            let _ = io::stdout().flush();
+                        }
+                        unsafe { libc::close(rfd) };
+                    }))
+                } else {
+                    None
+                };
+                let stderr_thread = if attach_pipes[1][0] >= 0 {
+                    let rfd = attach_pipes[1][0];
+                    Some(std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = unsafe {
+                                libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                            };
+                            if n <= 0 {
+                                break;
+                            }
+                            let _ = io::stderr().write_all(&buf[..n as usize]);
+                            let _ = io::stderr().flush();
+                        }
+                        unsafe { libc::close(rfd) };
+                    }))
+                } else {
+                    None
+                };
+                if let Some(t) = stdout_thread {
+                    let _ = t.join();
+                }
+                if let Some(t) = stderr_thread {
+                    let _ = t.join();
+                }
+            } else {
+                // Normal detach: print the container name to stdout and exit immediately.
+                println!("{}", name);
+            }
         }
     }
     Ok(())
