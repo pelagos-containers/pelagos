@@ -11,11 +11,18 @@
 use super::run::{cmd_run, RunArgs};
 use super::{read_state, ContainerStatus};
 
-/// Restart an exited pelagos container by name.
+/// Restart one or more exited pelagos containers by name.
 ///
-/// Returns `Ok(())` after printing the container name to stdout (matching the
-/// behaviour of `pelagos run --detach`).
-pub fn cmd_start(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Returns `Ok(())` after all named containers have been started.  If any
+/// name fails the error is returned immediately (remaining names are not started).
+pub fn cmd_start(names: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    for name in names {
+        start_one(name)?;
+    }
+    Ok(())
+}
+
+fn start_one(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let state = read_state(name).map_err(|_| format!("container '{}' not found", name))?;
 
     match state.status {
@@ -77,7 +84,7 @@ fn spawn_config_to_run_args(
         volume: sc.volume,
         bind: sc.bind,
         bind_ro: sc.bind_ro,
-        tmpfs: vec![],
+        tmpfs: sc.tmpfs,
         read_only: sc.read_only,
         env: sc.env,
         env_file: None,

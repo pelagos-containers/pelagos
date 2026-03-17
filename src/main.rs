@@ -177,8 +177,12 @@ pub(crate) enum CliCommand {
         #[clap(hide = true)]
         bundle_positional: Option<std::path::PathBuf>,
     },
-    /// OCI lifecycle: start a created container
-    Start { id: String },
+    /// Start one or more stopped containers (or OCI lifecycle start for a single container)
+    Start {
+        /// Container name(s) to start
+        #[clap(required = true)]
+        id: Vec<String>,
+    },
     /// OCI lifecycle: print container state as JSON
     State { id: String },
     /// OCI lifecycle: send a signal to a container
@@ -549,13 +553,31 @@ fn main() {
             .map_err(|e| e.to_string().into()),
         },
         CliCommand::Start { id } => {
-            // Dispatch: pelagos container restart takes priority over OCI lifecycle.
+            // Multi-name pelagos restart: if all names are known pelagos containers, use
+            // cmd_start (which handles multiple names).  If the single argument is an OCI
+            // container ID, fall through to the OCI lifecycle handler.
             // A pelagos container state lives at /run/pelagos/containers/<name>/state.json;
             // an OCI container state lives at /run/pelagos/<id>/state.json (different dir).
-            if cli::container_state_exists(&id) {
+            let all_pelagos = id.iter().all(|n| cli::container_state_exists(n));
+            if all_pelagos {
                 cli::start::cmd_start(&id)
+            } else if id.len() == 1 {
+                pelagos::oci::cmd_start(&id[0]).map_err(|e| e.to_string().into())
             } else {
-                pelagos::oci::cmd_start(&id).map_err(|e| e.to_string().into())
+                // Mix of known and unknown names — report as an error.
+                let unknown: Vec<_> = id
+                    .iter()
+                    .filter(|n| !cli::container_state_exists(n))
+                    .collect();
+                Err(format!(
+                    "container(s) not found: {}",
+                    unknown
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into())
             }
         }
         CliCommand::State { id } => pelagos::oci::cmd_state(&id).map_err(|e| e.to_string().into()),

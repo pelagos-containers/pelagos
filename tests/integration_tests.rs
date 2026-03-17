@@ -17035,6 +17035,226 @@ mod auto_resolv_conf {
             .output();
     }
 
+    /// test_container_restart_preserves_tmpfs
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Runs a container with `--tmpfs /tmp` in detached mode, lets it exit, then
+    /// restarts it and verifies the restart succeeds.  Also checks that state.json
+    /// contains `tmpfs` in `spawn_config` after the first run.
+    ///
+    /// Failure indicates that `SpawnConfig.tmpfs` is not being saved by `build_spawn_config`
+    /// or not being restored by `spawn_config_to_run_args`.
+    #[test]
+    #[serial]
+    fn test_container_restart_preserves_tmpfs() {
+        if !is_root() {
+            eprintln!("SKIP: test_container_restart_preserves_tmpfs requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_container_restart_preserves_tmpfs requires alpine-rootfs");
+                return;
+            }
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-restart-tmpfs-test";
+
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        // Run with a tmpfs mount and write a file into it.
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--tmpfs",
+                "/tmp",
+                "/bin/sh",
+                "-c",
+                "echo hello > /tmp/test.txt",
+            ])
+            .status()
+            .expect("pelagos run -d");
+        assert!(run_status.success(), "pelagos run -d with --tmpfs failed");
+
+        // Wait for "exited".
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["status"].as_str() == Some("exited") {
+                        exited = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(exited, "container did not exit within 5s");
+
+        // Verify spawn_config.tmpfs was persisted.
+        let data = std::fs::read_to_string(&state_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let tmpfs_arr = v["spawn_config"]["tmpfs"].as_array();
+        assert!(
+            tmpfs_arr.is_some() && !tmpfs_arr.unwrap().is_empty(),
+            "state.json spawn_config.tmpfs should contain /tmp; got: {:?}",
+            v["spawn_config"]["tmpfs"]
+        );
+        assert_eq!(
+            tmpfs_arr.unwrap()[0].as_str(),
+            Some("/tmp"),
+            "spawn_config.tmpfs[0] should be '/tmp'"
+        );
+
+        // Restart — should succeed (tmpfs is re-applied from SpawnConfig).
+        let start_status = std::process::Command::new(bin)
+            .args(["start", name])
+            .status()
+            .expect("pelagos start");
+        assert!(start_status.success(), "pelagos start with tmpfs failed");
+
+        // Wait for restart to exit.
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exited2 = false;
+        while std::time::Instant::now() < deadline2 {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["status"].as_str() == Some("exited") {
+                        exited2 = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            exited2,
+            "restarted container (with tmpfs) did not exit within 5s"
+        );
+
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// test_container_start_multiple_names
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Runs two short-lived containers in detached mode, waits for both to exit,
+    /// then calls `pelagos start name1 name2` and verifies both reach "exited"
+    /// again.
+    ///
+    /// Failure indicates the multi-name dispatch in main.rs or cmd_start is broken.
+    #[test]
+    #[serial]
+    fn test_container_start_multiple_names() {
+        if !is_root() {
+            eprintln!("SKIP: test_container_start_multiple_names requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP: test_container_start_multiple_names requires alpine-rootfs");
+                return;
+            }
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let names = ["pelagos-multi-start-1", "pelagos-multi-start-2"];
+
+        for &name in &names {
+            let _ = std::process::Command::new(bin)
+                .args(["rm", "-f", name])
+                .output();
+        }
+
+        // Start both containers.
+        for &name in &names {
+            let status = std::process::Command::new(bin)
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    name,
+                    "--rootfs",
+                    rootfs.to_str().unwrap(),
+                    "/bin/true",
+                ])
+                .status()
+                .expect("pelagos run -d");
+            assert!(status.success(), "pelagos run -d failed for {name}");
+        }
+
+        // Wait for both to exit.
+        for &name in &names {
+            let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut exited = false;
+            while std::time::Instant::now() < deadline {
+                if let Ok(data) = std::fs::read_to_string(&state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if v["status"].as_str() == Some("exited") {
+                            exited = true;
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(exited, "container {name} did not exit within 5s");
+        }
+
+        // Restart both in one command.
+        let start_status = std::process::Command::new(bin)
+            .args(["start", names[0], names[1]])
+            .status()
+            .expect("pelagos start multi");
+        assert!(
+            start_status.success(),
+            "pelagos start with two names failed"
+        );
+
+        // Verify both reach "exited" again.
+        for &name in &names {
+            let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut exited = false;
+            while std::time::Instant::now() < deadline {
+                if let Ok(data) = std::fs::read_to_string(&state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if v["status"].as_str() == Some("exited") {
+                            exited = true;
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(exited, "restarted container {name} did not exit within 5s");
+        }
+
+        // Cleanup.
+        for &name in &names {
+            let _ = std::process::Command::new(bin)
+                .args(["rm", "-f", name])
+                .output();
+        }
+    }
+
     /// test_run_with_labels_appear_in_inspect
     ///
     /// Requires root + rootfs. Verifies that `--label KEY=VALUE` flags passed to

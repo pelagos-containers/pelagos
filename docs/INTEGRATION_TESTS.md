@@ -3240,6 +3240,27 @@ asserts that `pelagos start` returns a non-zero exit code.
 Failure indicates the "already running" guard in `cmd_start` is broken and `pelagos start`
 incorrectly accepts or restarts a live container.
 
+### `test_container_restart_preserves_tmpfs`
+**Requires:** root, alpine-rootfs
+
+Runs a container with `--tmpfs /tmp` in detached mode, lets it exit, then checks that
+`state.json` contains `spawn_config.tmpfs = ["/tmp"]`.  Restarts the container via
+`pelagos start` and waits for it to exit again.
+
+Failure indicates: `SpawnConfig.tmpfs` was not saved by `build_spawn_config` (field was
+missing from the struct or not populated), or was not passed through by
+`spawn_config_to_run_args`, causing the restarted container to fail to mount tmpfs.
+
+### `test_container_start_multiple_names`
+**Requires:** root, alpine-rootfs
+
+Runs two containers (`/bin/true`) in detached mode, waits for both to exit, then calls
+`pelagos start name1 name2` and verifies both containers reach `"exited"` status again.
+
+Failure indicates the multi-name dispatch in `main.rs` (the `Start { id: Vec<String> }` arm)
+or the loop in `cmd_start` is broken — only one container would restart, both would fail,
+or `pelagos start` would reject the second argument.
+
 ## Native Container Labels (`pelagos run --label`)
 
 ### `test_run_with_labels_appear_in_inspect`

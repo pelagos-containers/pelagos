@@ -341,6 +341,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         rm: args.rm,
         nat: args.nat,
         labels: args.label.clone(),
+        tmpfs: args.tmpfs.clone(),
     }
 }
 

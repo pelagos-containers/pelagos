@@ -199,6 +199,9 @@ pub struct SpawnConfig {
     /// Container labels as KEY=VALUE strings (e.g. "env=staging").
     #[serde(default)]
     pub labels: Vec<String>,
+    /// tmpfs mounts as "path" or "path:options" strings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
 }
 
 /// Persisted state for a running or exited container.
@@ -752,6 +755,7 @@ mod tests {
             rm: false,
             nat: true,
             labels: vec!["env=staging".to_string(), "managed=true".to_string()],
+            tmpfs: vec!["/run".to_string(), "/tmp:size=64m".to_string()],
         };
         let json = serde_json::to_string(&sc).unwrap();
         let decoded: SpawnConfig = serde_json::from_str(&json).unwrap();
@@ -774,6 +778,7 @@ mod tests {
         assert!(!decoded.rm);
         assert!(decoded.nat);
         assert_eq!(decoded.labels, sc.labels);
+        assert_eq!(decoded.tmpfs, sc.tmpfs);
     }
 
     /// test_spawn_config_labels_roundtrip
