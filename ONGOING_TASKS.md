@@ -2,6 +2,24 @@
 
 All work is tracked in GitHub Issues. This file is a brief index.
 
+## Session completed: 2026-03-17 (SHA 5eee65c, v0.56.0)
+
+### Issues closed this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| #118 | fix(start): redirect watcher stdio to /dev/null; pelagos start returns promptly | v0.56.0 |
+
+### Key implementation details
+
+**#118 (watcher stdio / pelagos start hangs):**
+- Root cause: watcher child inherited pipe write-end; caller (SSH/vsock/Stdio::piped) blocked waiting for EOF
+- Fix: after `setsid()` in watcher child, `open("/dev/null") + dup2` on stdin/stdout/stderr
+- Releases all inherited pipe FDs; parent exits → caller sees EOF immediately
+- Integration test `test_start_returns_promptly` reproduces via `Stdio::piped()`, asserts exit ≤ 2s
+
+---
+
 ## Session completed: 2026-03-17 (SHA afb1b7f, v0.55.0)
 
 ### Issues closed this session
