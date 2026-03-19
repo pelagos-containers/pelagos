@@ -2,12 +2,12 @@
 
 All work is tracked in GitHub Issues. This file is a brief index.
 
-## Session in progress: v0.59.0 (branch fix/run-state-ordering-issue-124)
+## Session completed: 2026-03-19 (SHA 1e488ba, v0.59.0)
 
-### Issues in progress
+### Issues closed this session
 
-| # | Title | Fix |
-|---|-------|-----|
+| # | Title | Fixed in |
+|---|-------|---------|
 | #124 | fix(run): write state with real PID before relaying stdout | v0.59.0 |
 
 ### Key implementation details
