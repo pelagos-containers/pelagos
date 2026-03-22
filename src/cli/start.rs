@@ -44,7 +44,9 @@ fn start_one(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    let run_args = spawn_config_to_run_args(name, sc, &state.rootfs);
+    let mut run_args = spawn_config_to_run_args(name, sc, &state.rootfs);
+    // Reuse the persisted writable layer if it still exists on disk.
+    run_args.upper_dir = state.upper_dir.filter(|p| p.is_dir());
     cmd_run(run_args)
 }
 

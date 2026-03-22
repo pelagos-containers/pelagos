@@ -189,6 +189,12 @@ pub struct RunArgs {
     /// Image reference (or command when using --rootfs): IMAGE [COMMAND [ARGS...]]
     #[clap(multiple_values = true)]
     pub args: Vec<String>,
+
+    /// Pre-existing overlay upper dir from a previous container run.
+    /// Not a CLI flag — set programmatically by `pelagos start` to reuse the
+    /// persisted writable layer.
+    #[clap(skip)]
+    pub upper_dir: Option<PathBuf>,
 }
 
 pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -288,6 +294,15 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let attach_stdout = args.attach.iter().any(|s| s.eq_ignore_ascii_case("stdout"));
     let attach_stderr = args.attach.iter().any(|s| s.eq_ignore_ascii_case("stderr"));
 
+    // For non-ephemeral containers, set up a persistent overlay upper dir in the
+    // container state directory so the writable layer survives stop/start cycles.
+    // --rm containers stay ephemeral (auto-created in runtime_dir as before).
+    let (cmd, persistent_upper) = if args.rm {
+        (cmd, None)
+    } else {
+        prepare_persistent_upper(&name, cmd, args.upper_dir.as_deref())?
+    };
+
     if args.detach {
         run_detached(DetachedArgs {
             name,
@@ -299,6 +314,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             labels,
             attach_stdout,
             attach_stderr,
+            upper_dir: persistent_upper,
         })
     } else if args.interactive {
         run_interactive(
@@ -309,6 +325,7 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.rm,
             Some(spawn_config),
             labels,
+            persistent_upper,
         )
     } else {
         run_foreground(
@@ -319,8 +336,46 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.rm,
             Some(spawn_config),
             labels,
+            persistent_upper,
         )
     }
+}
+
+/// Set up the persistent overlay upper dir for a non-ephemeral container.
+///
+/// On first run: creates a fresh `upper/` and `work/` under `container_dir(name)`.
+/// On restart: reuses the existing `upper/` (if `existing_upper` is provided and
+/// the directory exists); always recreates `work/` (must be empty at mount time).
+///
+/// Returns `(cmd_with_upper_dir_injected, upper_dir_path)`.
+fn prepare_persistent_upper(
+    name: &str,
+    cmd: Command,
+    existing_upper: Option<&std::path::Path>,
+) -> Result<(Command, Option<PathBuf>), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let container_d = container_dir(name);
+    std::fs::create_dir_all(&container_d)?;
+
+    let upper = match existing_upper {
+        Some(p) if p.is_dir() => p.to_path_buf(),
+        _ => {
+            let u = container_d.join("upper");
+            std::fs::create_dir_all(&u)?;
+            let _ = std::fs::set_permissions(&u, std::fs::Permissions::from_mode(0o755));
+            u
+        }
+    };
+
+    // Work dir must be empty at mount time — recreate it every run.
+    let work = container_d.join("work");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755));
+
+    let cmd = cmd.with_upper_dir(&upper, &work);
+    Ok((cmd, Some(upper)))
 }
 
 /// Parse "KEY=VALUE" label strings into a HashMap.
@@ -867,6 +922,7 @@ fn run_foreground(
     auto_remove: bool,
     spawn_config: Option<SpawnConfig>,
     labels: std::collections::HashMap<String, String>,
+    upper_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Use Piped for stdout/stderr so we can write state with the real PID
     // before any container output reaches the caller (issue #124).
@@ -912,6 +968,7 @@ fn run_foreground(
         spawn_config,
         labels,
         mnt_ns_inode,
+        upper_dir,
     };
     write_state(&state)?;
 
@@ -986,6 +1043,7 @@ fn run_interactive(
     auto_remove: bool,
     spawn_config: Option<SpawnConfig>,
     labels: std::collections::HashMap<String, String>,
+    upper_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = cmd
         .spawn_interactive()
@@ -1025,6 +1083,7 @@ fn run_interactive(
         spawn_config,
         labels,
         mnt_ns_inode,
+        upper_dir,
     };
     write_state(&state)?;
     register_dns(&name, &all_ips);
@@ -1067,6 +1126,7 @@ struct DetachedArgs {
     labels: std::collections::HashMap<String, String>,
     attach_stdout: bool,
     attach_stderr: bool,
+    upper_dir: Option<PathBuf>,
 }
 
 fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1080,6 +1140,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         labels,
         attach_stdout,
         attach_stderr,
+        upper_dir,
     } = a;
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
@@ -1107,6 +1168,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         spawn_config,
         labels,
         mnt_ns_inode: None,
+        upper_dir,
     };
     write_state(&state)?;
 
