@@ -194,9 +194,10 @@ pub(crate) enum CliCommand {
         /// Run with an interactive PTY (foreground instead of detached)
         #[clap(long, short = 'i')]
         interactive: bool,
-        /// Override the command for this run only (does not update the saved SpawnConfig)
-        #[clap(long, multiple_values = true, value_name = "CMD")]
-        cmd: Option<Vec<String>>,
+        /// Override the command for this run only; pass after -- (does not update SpawnConfig).
+        /// Example: pelagos start -i myapp -- /bin/sh
+        #[clap(last = true, value_name = "CMD")]
+        cmd: Vec<String>,
     },
     /// OCI lifecycle: print container state as JSON
     State { id: String },
@@ -576,7 +577,7 @@ fn main() {
             // an OCI container state lives at /run/pelagos/<id>/state.json (different dir).
             let all_pelagos = id.iter().all(|n| cli::container_state_exists(n));
             if all_pelagos {
-                cli::start::cmd_start(&id, interactive, cmd)
+                cli::start::cmd_start(&id, interactive, if cmd.is_empty() { None } else { Some(cmd) })
             } else if id.len() == 1 {
                 pelagos::oci::cmd_start(&id[0]).map_err(|e| e.to_string().into())
             } else {
