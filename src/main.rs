@@ -195,7 +195,7 @@ pub(crate) enum CliCommand {
         #[clap(long, short = 'i')]
         interactive: bool,
         /// Override the command for this run only (does not update the saved SpawnConfig)
-        #[clap(long, num_args = 1.., value_name = "CMD")]
+        #[clap(long, multiple_values = true, value_name = "CMD")]
         cmd: Option<Vec<String>>,
     },
     /// OCI lifecycle: print container state as JSON
