@@ -401,6 +401,7 @@ fn base64_decode(b64: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_base64_roundtrip() {
@@ -428,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_parse_docker_config_synthetic() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let docker_dir = tmp.path().join(".docker");
@@ -458,6 +460,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_auth_env() {
         std::env::set_var("PELAGOS_REGISTRY_USER", "envuser");
         std::env::set_var("PELAGOS_REGISTRY_PASS", "envpass");
@@ -474,6 +477,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_auth_cli_priority() {
         std::env::set_var("PELAGOS_REGISTRY_USER", "envuser");
         std::env::set_var("PELAGOS_REGISTRY_PASS", "envpass");
@@ -490,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_auth_anonymous() {
         std::env::remove_var("PELAGOS_REGISTRY_USER");
         std::env::remove_var("PELAGOS_REGISTRY_PASS");
@@ -550,6 +555,7 @@ mod tests {
     /// Writes a small shell script that emits the expected JSON on stdout,
     /// adds the temp dir to PATH, then calls the helper.
     #[test]
+    #[serial]
     fn test_call_credential_helper_get() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let helper_path = tmp.path().join("docker-credential-fake-pelagos-test");
@@ -578,6 +584,7 @@ mod tests {
 
     /// Verify that `parse_docker_config` uses a configured helper over static auths.
     #[test]
+    #[serial]
     fn test_parse_docker_config_uses_helper() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
