@@ -914,7 +914,6 @@ fn prepare_persistent_upper(
     Ok((cmd, Some(upper)))
 }
 
-
 fn run_foreground(
     name: String,
     rootfs: String,
@@ -1062,8 +1061,7 @@ fn run_interactive(
         .into_iter()
         .map(|(n, ip)| (n.to_string(), ip))
         .collect();
-    let network_ips: std::collections::HashMap<String, String> =
-        all_ips.iter().cloned().collect();
+    let network_ips: std::collections::HashMap<String, String> = all_ips.iter().cloned().collect();
 
     std::fs::create_dir_all(containers_dir())?;
     let mut state = ContainerState {

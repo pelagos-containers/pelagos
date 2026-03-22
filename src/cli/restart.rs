@@ -20,8 +20,7 @@ pub fn cmd_restart(name: &str, time: u64) -> Result<(), Box<dyn std::error::Erro
         cmd_stop(name)?;
 
         // Wait for the process to actually vacate its PID.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(time.max(1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(time.max(1));
         while check_liveness(pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -29,8 +28,7 @@ pub fn cmd_restart(name: &str, time: u64) -> Result<(), Box<dyn std::error::Erro
         // If still alive after the grace period, escalate to SIGKILL.
         if check_liveness(pid) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            let kill_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while check_liveness(pid) && std::time::Instant::now() < kill_deadline {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }

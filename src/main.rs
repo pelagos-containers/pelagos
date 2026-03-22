@@ -569,7 +569,11 @@ fn main() {
             )
             .map_err(|e| e.to_string().into()),
         },
-        CliCommand::Start { id, interactive, cmd } => {
+        CliCommand::Start {
+            id,
+            interactive,
+            cmd,
+        } => {
             // Multi-name pelagos restart: if all names are known pelagos containers, use
             // cmd_start (which handles multiple names).  If the single argument is an OCI
             // container ID, fall through to the OCI lifecycle handler.
@@ -577,7 +581,11 @@ fn main() {
             // an OCI container state lives at /run/pelagos/<id>/state.json (different dir).
             let all_pelagos = id.iter().all(|n| cli::container_state_exists(n));
             if all_pelagos {
-                cli::start::cmd_start(&id, interactive, if cmd.is_empty() { None } else { Some(cmd) })
+                cli::start::cmd_start(
+                    &id,
+                    interactive,
+                    if cmd.is_empty() { None } else { Some(cmd) },
+                )
             } else if id.len() == 1 {
                 pelagos::oci::cmd_start(&id[0]).map_err(|e| e.to_string().into())
             } else {
