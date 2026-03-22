@@ -1503,6 +1503,7 @@ mod user_notif {
     }
 
     #[test]
+    #[ignore = "requires kernel seccomp supervisor capabilities unavailable on CI runner"]
     fn test_user_notif_deny_syscall() {
         // Verify that Deny(EPERM) causes the intercepted syscall to fail.
         // Intercept SYS_fchmodat (what Alpine's chmod uses) and deny it.
@@ -1541,6 +1542,7 @@ mod user_notif {
     }
 
     #[test]
+    #[ignore = "requires kernel seccomp supervisor capabilities unavailable on CI runner"]
     fn test_user_notif_allow_passthrough() {
         // Verify that Allow lets the syscall proceed normally.
         // Intercept SYS_fchmodat and allow it; chmod should succeed.
