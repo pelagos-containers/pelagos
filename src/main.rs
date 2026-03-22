@@ -51,7 +51,7 @@ impl Display for OutputFormat {
 #[derive(Parser, Debug)]
 #[clap(
     author,
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH")),
     about = "Pelagos container runtime",
     long_about = None,
 )]
