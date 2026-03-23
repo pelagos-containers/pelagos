@@ -594,9 +594,18 @@ mod tests {
 
     #[test]
     fn test_normalise_reference_bare() {
-        assert_eq!(normalise_reference("alpine"), "docker.io/library/alpine:latest");
-        assert_eq!(normalise_reference("alpine:3.19"), "docker.io/library/alpine:3.19");
-        assert_eq!(normalise_reference("ubuntu@sha256:abc"), "docker.io/library/ubuntu@sha256:abc");
+        assert_eq!(
+            normalise_reference("alpine"),
+            "docker.io/library/alpine:latest"
+        );
+        assert_eq!(
+            normalise_reference("alpine:3.19"),
+            "docker.io/library/alpine:3.19"
+        );
+        assert_eq!(
+            normalise_reference("ubuntu@sha256:abc"),
+            "docker.io/library/ubuntu@sha256:abc"
+        );
     }
 
     #[test]
@@ -609,7 +618,10 @@ mod tests {
             normalise_reference("public.ecr.aws/docker/library/alpine:latest"),
             "public.ecr.aws/docker/library/alpine:latest"
         );
-        assert_eq!(normalise_reference("ghcr.io/myorg/myapp"), "ghcr.io/myorg/myapp:latest");
+        assert_eq!(
+            normalise_reference("ghcr.io/myorg/myapp"),
+            "ghcr.io/myorg/myapp:latest"
+        );
     }
 
     #[test]
