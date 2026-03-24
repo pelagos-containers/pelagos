@@ -211,8 +211,18 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Parse network mode early (no filesystem access) so the rootless guard can fire
     // before we touch the state directory.
     let port_forwards = parse_port_forwards(&args.publish)?;
-    let primary_network_str = args.network.first().map(|s| s.as_str()).unwrap_or("none");
-    let network_mode = parse_network_mode(primary_network_str)?;
+    let network_mode = if args.network.is_empty() {
+        // No explicit --network: choose a safe, isolated default.
+        // -p requires per-container IP (bridge); otherwise loopback gives
+        // isolation without requiring the bridge to be pre-configured.
+        if !port_forwards.is_empty() {
+            NetworkMode::Bridge
+        } else {
+            NetworkMode::Loopback
+        }
+    } else {
+        parse_network_mode(args.network.first().unwrap())?
+    };
     let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
 
     // Early rootless + bridge guard — emit a friendly message before doing any filesystem work.
@@ -489,7 +499,7 @@ fn build_image_run(
         // Add UTS (hostname isolation) + PID namespace.  Use add_namespaces so
         // we OR into the flags already set by with_image_layers (MOUNT) rather
         // than replacing them.
-        .add_namespaces(Namespace::UTS | Namespace::PID);
+        .add_namespaces(Namespace::UTS | Namespace::PID | Namespace::IPC | Namespace::CGROUP);
 
     // Apply image config environment.  This includes any PATH set by Dockerfile
     // ENV instructions.  apply_cli_options no longer injects a fallback PATH
@@ -559,7 +569,7 @@ fn build_command(
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_chroot(rootfs_dir)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID | Namespace::IPC | Namespace::CGROUP)
         .with_proc_mount()
         .with_dev_mount()
         // Rootfs-based runs have no image config; inject the OCI default PATH
