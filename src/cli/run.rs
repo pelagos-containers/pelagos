@@ -569,7 +569,9 @@ fn build_command(
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_chroot(rootfs_dir)
-        .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID | Namespace::IPC | Namespace::CGROUP)
+        .with_namespaces(
+            Namespace::UTS | Namespace::MOUNT | Namespace::PID | Namespace::IPC | Namespace::CGROUP,
+        )
         .with_proc_mount()
         .with_dev_mount()
         // Rootfs-based runs have no image config; inject the OCI default PATH

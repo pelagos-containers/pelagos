@@ -3728,9 +3728,7 @@ mod networking {
         }
 
         let Some(rootfs) = get_test_rootfs() else {
-            eprintln!(
-                "Skipping test_ip_forward_enabled_on_port_forward: alpine-rootfs not found"
-            );
+            eprintln!("Skipping test_ip_forward_enabled_on_port_forward: alpine-rootfs not found");
             return;
         };
 
@@ -3753,8 +3751,7 @@ mod networking {
 
         // enable_port_forwards() runs in the parent during spawn(); by the
         // time spawn() returns the sysctl must already be 1.
-        let val =
-            std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default();
+        let val = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default();
 
         child.wait().expect("wait for port-forward container");
 
