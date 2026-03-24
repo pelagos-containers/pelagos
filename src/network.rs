@@ -963,9 +963,11 @@ fn netns_exists(ns_name: &str) -> bool {
         return false;
     };
     // NS_GET_NSTYPE = _IO(0xb7, 0x1) — returns namespace type if fd is a live nsfs.
-    const NS_GET_NSTYPE: libc::c_ulong = 0xb701;
+    // Cast to `_` so the compiler selects the right ioctl request type per target
+    // (c_ulong on glibc x86_64/aarch64, c_int on musl aarch64).
+    const NS_GET_NSTYPE: u32 = 0xb701;
     // SAFETY: ioctl with a read-only query on a file fd; no memory aliasing.
-    unsafe { libc::ioctl(file.as_raw_fd(), NS_GET_NSTYPE) >= 0 }
+    unsafe { libc::ioctl(file.as_raw_fd(), NS_GET_NSTYPE as _) >= 0 }
 }
 
 /// Increment the NAT active set; install nftables rules when the set goes from empty → 1.
