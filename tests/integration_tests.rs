@@ -19469,11 +19469,7 @@ mod issue_118_start_returns_promptly {
 
         // Pull alpine if not already present.
         let pull = std::process::Command::new(bin())
-            .args([
-                "image",
-                "pull",
-                "docker.io/library/alpine:latest",
-            ])
+            .args(["image", "pull", "docker.io/library/alpine:latest"])
             .output()
             .expect("pelagos image pull");
         assert!(
@@ -19688,11 +19684,7 @@ mod issue_124_run_state_ordering {
 
     fn pull_alpine() {
         let _ = std::process::Command::new(bin())
-            .args([
-                "image",
-                "pull",
-                "docker.io/library/alpine:latest",
-            ])
+            .args(["image", "pull", "docker.io/library/alpine:latest"])
             .output();
     }
 
