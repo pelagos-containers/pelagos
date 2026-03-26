@@ -4800,74 +4800,25 @@ impl Command {
         prog_path: std::path::PathBuf,
         wasi: crate::wasm::WasiConfig,
     ) -> Result<Child, Error> {
-        // ── Embedded path: available when feature is on and all stdio is Inherit ──
+        // ── Embedded path: in-process wasmtime (no subprocess) ──
+        //
+        // wasmtime inherits the process stdio directly via inherit_stdout()/
+        // inherit_stderr() in the WasiCtxBuilder.  Output flows to the pelagos
+        // process's fd 1/2, which is correct: the test shell's $(...) or the
+        // terminal sees it without any relay thread.  take_stdout()/take_stderr()
+        // return None; relay threads in cli/run.rs gracefully no-op on None.
         #[cfg(feature = "embedded-wasm")]
         {
-            use std::os::unix::io::{FromRawFd, OwnedFd};
-
-            // Create OS pipes for any Piped stdio channel so the relay threads
-            // in cli/run.rs can stream output from the embedded Wasm thread.
-            // The write-ends are dup2'd into the thread before wasmtime runs;
-            // the read-ends are returned as ChildStdout/ChildStderr.
-            //
-            // Safety: pipe2() returns valid fds; we immediately wrap them in
-            // OwnedFd / ChildStdout so they are closed on drop. dup2() in the
-            // thread is safe here because each `pelagos run` invocation is a
-            // separate process, so no concurrent threads are writing to fd 1/2.
-            let (stdout_read, stdout_write) = if matches!(self.stdio_out, Stdio::Piped) {
-                let mut fds = [-1i32; 2];
-                // SAFETY: fds is a valid 2-element array.
-                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
-                    let r =
-                        unsafe { std::process::ChildStdout::from(OwnedFd::from_raw_fd(fds[0])) };
-                    (Some(r), Some(fds[1]))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
-
-            let (stderr_read, stderr_write) = if matches!(self.stdio_err, Stdio::Piped) {
-                let mut fds = [-1i32; 2];
-                // SAFETY: fds is a valid 2-element array.
-                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
-                    let r =
-                        unsafe { std::process::ChildStderr::from(OwnedFd::from_raw_fd(fds[0])) };
-                    (Some(r), Some(fds[1]))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
-
             let extra_args: Vec<std::ffi::OsString> =
                 self.inner.get_args().map(|a| a.to_owned()).collect();
             let handle = std::thread::spawn(move || {
-                // Redirect stdout/stderr to the pipe write-ends so the relay
-                // threads in cli/run.rs receive output from the Wasm module.
-                if let Some(wfd) = stdout_write {
-                    // SAFETY: wfd is a valid open fd; dup2 and close are always safe.
-                    unsafe {
-                        libc::dup2(wfd, libc::STDOUT_FILENO);
-                        libc::close(wfd);
-                    }
-                }
-                if let Some(wfd) = stderr_write {
-                    // SAFETY: same as above.
-                    unsafe {
-                        libc::dup2(wfd, libc::STDERR_FILENO);
-                        libc::close(wfd);
-                    }
-                }
                 crate::wasm::run_wasm_embedded(&prog_path, &extra_args, &wasi)
             });
             return Ok(Child {
                 inner: ChildInner::Embedded {
                     handle: Some(handle),
-                    stdout: stdout_read,
-                    stderr: stderr_read,
+                    stdout: None,
+                    stderr: None,
                 },
                 cgroup: None,
                 network: None,
