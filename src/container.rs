@@ -4800,71 +4800,81 @@ impl Command {
         prog_path: std::path::PathBuf,
         wasi: crate::wasm::WasiConfig,
     ) -> Result<Child, Error> {
-        // ── Embedded path: available when feature is on and all stdio is Inherit ──
+        // ── Embedded path: in-process wasmtime (no subprocess) ──
+        //
+        // wasmtime inherits the process stdio directly via inherit_stdout()/
+        // inherit_stderr() in the WasiCtxBuilder.  Output flows to the pelagos
+        // process's fd 1/2, which is correct: the test shell's $(...) or the
+        // terminal sees it without any relay thread.  take_stdout()/take_stderr()
+        // return None; relay threads in cli/run.rs gracefully no-op on None.
         #[cfg(feature = "embedded-wasm")]
         {
-            let use_embedded = matches!(
-                (&self.stdio_in, &self.stdio_out, &self.stdio_err),
-                (Stdio::Inherit, Stdio::Inherit, Stdio::Inherit)
-            );
-            if use_embedded {
-                let extra_args: Vec<std::ffi::OsString> =
-                    self.inner.get_args().map(|a| a.to_owned()).collect();
-                let handle = std::thread::spawn(move || {
-                    crate::wasm::run_wasm_embedded(&prog_path, &extra_args, &wasi)
-                });
-                return Ok(Child {
-                    inner: ChildInner::Embedded(Some(handle)),
-                    cgroup: None,
-                    network: None,
-                    secondary_networks: Vec::new(),
-                    pasta: None,
-                    overlay_merged_dir: None,
-                    dns_temp_dir: None,
-                    hosts_temp_dir: None,
-                    fuse_overlay_child: None,
-                    fuse_overlay_merged: None,
-                    supervisor_thread: None,
-                });
-            }
+            let extra_args: Vec<std::ffi::OsString> =
+                self.inner.get_args().map(|a| a.to_owned()).collect();
+            let handle = std::thread::spawn(move || {
+                crate::wasm::run_wasm_embedded(&prog_path, &extra_args, &wasi)
+            });
+            return Ok(Child {
+                inner: ChildInner::Embedded {
+                    handle: Some(handle),
+                    stdout: None,
+                    stderr: None,
+                },
+                cgroup: None,
+                network: None,
+                secondary_networks: Vec::new(),
+                pasta: None,
+                overlay_merged_dir: None,
+                dns_temp_dir: None,
+                hosts_temp_dir: None,
+                fuse_overlay_child: None,
+                fuse_overlay_merged: None,
+                supervisor_thread: None,
+            });
         }
 
-        // ── Subprocess path: fallback (piped stdio, feature off, or non-Inherit stdio) ──
-        let extra_args: Vec<std::ffi::OsString> =
-            self.inner.get_args().map(|a| a.to_owned()).collect();
+        // ── Subprocess path: used when embedded-wasm feature is off ──
+        // When embedded-wasm is on the block above always returns; this code is
+        // unreachable in that configuration but must remain for type-checking.
+        #[allow(unreachable_code)]
+        {
+            let extra_args: Vec<std::ffi::OsString> =
+                self.inner.get_args().map(|a| a.to_owned()).collect();
 
-        let stdin = match self.stdio_in {
-            Stdio::Inherit => std::process::Stdio::inherit(),
-            Stdio::Null => std::process::Stdio::null(),
-            Stdio::Piped => std::process::Stdio::piped(),
-        };
-        let stdout = match self.stdio_out {
-            Stdio::Inherit => std::process::Stdio::inherit(),
-            Stdio::Null => std::process::Stdio::null(),
-            Stdio::Piped => std::process::Stdio::piped(),
-        };
-        let stderr = match self.stdio_err {
-            Stdio::Inherit => std::process::Stdio::inherit(),
-            Stdio::Null => std::process::Stdio::null(),
-            Stdio::Piped => std::process::Stdio::piped(),
-        };
+            let stdin = match self.stdio_in {
+                Stdio::Inherit => std::process::Stdio::inherit(),
+                Stdio::Null => std::process::Stdio::null(),
+                Stdio::Piped => std::process::Stdio::piped(),
+            };
+            let stdout = match self.stdio_out {
+                Stdio::Inherit => std::process::Stdio::inherit(),
+                Stdio::Null => std::process::Stdio::null(),
+                Stdio::Piped => std::process::Stdio::piped(),
+            };
+            let stderr = match self.stdio_err {
+                Stdio::Inherit => std::process::Stdio::inherit(),
+                Stdio::Null => std::process::Stdio::null(),
+                Stdio::Piped => std::process::Stdio::piped(),
+            };
 
-        let inner = crate::wasm::spawn_wasm(&prog_path, &extra_args, &wasi, stdin, stdout, stderr)
-            .map_err(Error::Io)?;
+            let inner =
+                crate::wasm::spawn_wasm(&prog_path, &extra_args, &wasi, stdin, stdout, stderr)
+                    .map_err(Error::Io)?;
 
-        Ok(Child {
-            inner: ChildInner::Process(inner),
-            cgroup: None,
-            network: None,
-            secondary_networks: Vec::new(),
-            pasta: None,
-            overlay_merged_dir: None,
-            dns_temp_dir: None,
-            hosts_temp_dir: None,
-            fuse_overlay_child: None,
-            fuse_overlay_merged: None,
-            supervisor_thread: None,
-        })
+            Ok(Child {
+                inner: ChildInner::Process(inner),
+                cgroup: None,
+                network: None,
+                secondary_networks: Vec::new(),
+                pasta: None,
+                overlay_merged_dir: None,
+                dns_temp_dir: None,
+                hosts_temp_dir: None,
+                fuse_overlay_child: None,
+                fuse_overlay_merged: None,
+                supervisor_thread: None,
+            })
+        }
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -6870,8 +6880,14 @@ pub(crate) enum ChildInner {
     ///
     /// The thread returns the WASI exit code as `i32`.
     /// Wrapped in `Option` so it can be taken by value in `wait()`.
+    /// stdout/stderr are the read-ends of OS pipes when Stdio::Piped was
+    /// requested; the write-ends are dup2'd into the thread before wasmtime runs.
     #[cfg(feature = "embedded-wasm")]
-    Embedded(Option<std::thread::JoinHandle<i32>>),
+    Embedded {
+        handle: Option<std::thread::JoinHandle<i32>>,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
+    },
 }
 
 pub struct Child {
@@ -6926,7 +6942,7 @@ impl Child {
         match &self.inner {
             ChildInner::Process(c) => c.id() as i32,
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => 0,
+            ChildInner::Embedded { .. } => 0,
         }
     }
 
@@ -6996,7 +7012,7 @@ impl Child {
         match &mut self.inner {
             ChildInner::Process(c) => c.stdout.take(),
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => None,
+            ChildInner::Embedded { stdout, .. } => stdout.take(),
         }
     }
 
@@ -7008,7 +7024,7 @@ impl Child {
         match &mut self.inner {
             ChildInner::Process(c) => c.stderr.take(),
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => None,
+            ChildInner::Embedded { stderr, .. } => stderr.take(),
         }
     }
 
@@ -7019,7 +7035,7 @@ impl Child {
         match &mut self.inner {
             ChildInner::Process(c) => c.wait().map_err(Error::Wait),
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(h) => {
+            ChildInner::Embedded { handle: h, .. } => {
                 let code = h
                     .take()
                     .expect("wait_inner() called twice on embedded child")
@@ -7080,8 +7096,13 @@ impl Child {
                 }
             }
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => {
-                // Embedded P3a: inherit stdio only; no piped buffers.
+            ChildInner::Embedded { stdout, stderr, .. } => {
+                if let Some(mut out) = stdout.take() {
+                    let _ = out.read_to_end(&mut stdout_buf);
+                }
+                if let Some(mut err) = stderr.take() {
+                    let _ = err.read_to_end(&mut stderr_buf);
+                }
             }
         }
         let status = self.wait_inner()?;
@@ -7211,7 +7232,7 @@ impl Drop for Child {
                 let _ = c.wait();
             }
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(h) => {
+            ChildInner::Embedded { handle: h, .. } => {
                 // Detach: thread completes on its own (cannot kill a thread safely).
                 drop(h.take());
             }
