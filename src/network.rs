@@ -2012,12 +2012,10 @@ pub fn teardown_pasta_network(setup: &mut PastaSetup) {
                 let cleaned = cleaned.trim();
                 // Log at warn only if pasta printed something that looks like an
                 // error; its normal startup summary is purely informational.
-                let looks_like_error = cleaned
-                    .lines()
-                    .any(|l| {
-                        let l = l.to_ascii_lowercase();
-                        l.contains("error") || l.contains("fatal") || l.contains("failed")
-                    });
+                let looks_like_error = cleaned.lines().any(|l| {
+                    let l = l.to_ascii_lowercase();
+                    l.contains("error") || l.contains("fatal") || l.contains("failed")
+                });
                 if looks_like_error {
                     log::warn!("pasta output:\n{}", cleaned);
                 } else {
