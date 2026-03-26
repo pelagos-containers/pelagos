@@ -591,8 +591,10 @@ pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_normalise_reference_bare() {
         assert_eq!(
             normalise_reference("alpine"),
@@ -625,6 +627,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_normalise_reference_default_registry_env() {
         std::env::set_var("PELAGOS_DEFAULT_REGISTRY", "public.ecr.aws/docker/library");
         let result = normalise_reference("alpine");
