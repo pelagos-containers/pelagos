@@ -633,5 +633,60 @@ $BINARY rm -f e2e-fglog 2>/dev/null || true
 
 # ===================================================================
 echo ""
+echo "=== Section 13: Subscribe Command ==="
+echo ""
+
+SUBSCRIBE_FIFO=$(mktemp -u /tmp/e2e-subscribe.XXXXXX)
+mkfifo "$SUBSCRIBE_FIFO"
+SUBSCRIBE_PID=""
+
+cleanup_subscribe() {
+    [ -n "$SUBSCRIBE_PID" ] && kill "$SUBSCRIBE_PID" 2>/dev/null || true
+    rm -f "$SUBSCRIBE_FIFO"
+}
+trap 'cleanup_subscribe; cleanup' EXIT
+
+# Start subscribe in background, writing to FIFO.
+$BINARY subscribe > "$SUBSCRIBE_FIFO" 2>/dev/null &
+SUBSCRIBE_PID=$!
+
+echo "--- Test: initial snapshot ---"
+SNAP_LINE=$(timeout 5 head -n1 "$SUBSCRIBE_FIFO" 2>/dev/null || true)
+if echo "$SNAP_LINE" | grep -q '"type":"snapshot"' && echo "$SNAP_LINE" | grep -q '"vm_running":true'; then
+    pass "subscribe: initial snapshot with vm_running=true"
+else
+    fail "subscribe: initial snapshot (got: $SNAP_LINE)"
+fi
+
+echo "--- Test: ContainerStarted event ---"
+run_detach run --detach --name e2e-sub-test alpine /bin/sleep 30 >/dev/null
+CONTAINERS_TO_CLEAN+=(e2e-sub-test)
+STARTED_LINE=$(timeout 5 head -n1 "$SUBSCRIBE_FIFO" 2>/dev/null || true)
+if echo "$STARTED_LINE" | grep -q '"type":"container_started"' && echo "$STARTED_LINE" | grep -q 'e2e-sub-test'; then
+    pass "subscribe: container_started event for e2e-sub-test"
+else
+    fail "subscribe: container_started event (got: $STARTED_LINE)"
+fi
+
+echo "--- Test: ContainerExited event ---"
+$BINARY stop e2e-sub-test 2>/dev/null || true
+EXITED_LINE=$(timeout 5 head -n1 "$SUBSCRIBE_FIFO" 2>/dev/null || true)
+if echo "$EXITED_LINE" | grep -q '"type":"container_exited"'; then
+    pass "subscribe: container_exited event"
+else
+    fail "subscribe: container_exited event (got: $EXITED_LINE)"
+fi
+
+# Kill subscribe process and clean up FIFO.
+[ -n "$SUBSCRIBE_PID" ] && kill "$SUBSCRIBE_PID" 2>/dev/null || true
+SUBSCRIBE_PID=""
+rm -f "$SUBSCRIBE_FIFO"
+$BINARY rm -f e2e-sub-test 2>/dev/null || true
+
+# Restore plain cleanup trap.
+trap cleanup EXIT
+
+# ===================================================================
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

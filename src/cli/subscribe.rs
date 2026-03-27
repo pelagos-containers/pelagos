@@ -56,8 +56,11 @@ enum Event {
 // ---------------------------------------------------------------------------
 
 fn read_snapshots() -> Vec<ContainerSnapshot> {
-    let dir = containers_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    read_snapshots_from(&containers_dir())
+}
+
+fn read_snapshots_from(containers_dir: &std::path::Path) -> Vec<ContainerSnapshot> {
+    let Ok(entries) = std::fs::read_dir(containers_dir) else {
         return Vec::new();
     };
 
@@ -254,4 +257,155 @@ pub fn cmd_subscribe() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_snapshot(name: &str, status: &str, pid: i32, rootfs: &str) -> ContainerSnapshot {
+        ContainerSnapshot {
+            name: name.to_string(),
+            status: status.to_string(),
+            pid,
+            rootfs: rootfs.to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            exit_code: None,
+            ports: vec![],
+        }
+    }
+
+    fn event_json(e: &Event) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(e).unwrap()).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // read_snapshots_from tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_snapshots_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = read_snapshots_from(tmp.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_read_snapshots_reads_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctr_dir = tmp.path().join("mycontainer");
+        std::fs::create_dir_all(&ctr_dir).unwrap();
+        let state = serde_json::json!({
+            "name": "mycontainer",
+            "status": "running",
+            "pid": 1234,
+            "rootfs": "/var/lib/pelagos/rootfs/alpine",
+            "started_at": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(ctr_dir.join("state.json"), state.to_string()).unwrap();
+
+        let result = read_snapshots_from(tmp.path());
+        assert_eq!(result.len(), 1);
+        let s = &result[0];
+        assert_eq!(s.name, "mycontainer");
+        assert_eq!(s.status, "running");
+        assert_eq!(s.pid, 1234);
+        assert_eq!(s.rootfs, "/var/lib/pelagos/rootfs/alpine");
+    }
+
+    #[test]
+    fn test_read_snapshots_skips_bad_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctr_dir = tmp.path().join("broken");
+        std::fs::create_dir_all(&ctr_dir).unwrap();
+        std::fs::write(ctr_dir.join("state.json"), "not json at all {{{{").unwrap();
+
+        let result = read_snapshots_from(tmp.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_read_snapshots_ports_from_spawn_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctr_dir = tmp.path().join("webserver");
+        std::fs::create_dir_all(&ctr_dir).unwrap();
+        let state = serde_json::json!({
+            "name": "webserver",
+            "status": "running",
+            "pid": 42,
+            "rootfs": "/rootfs",
+            "started_at": "2026-01-01T00:00:00Z",
+            "spawn_config": {
+                "publish": ["8080:80", "9090:90"]
+            }
+        });
+        std::fs::write(ctr_dir.join("state.json"), state.to_string()).unwrap();
+
+        let result = read_snapshots_from(tmp.path());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].ports, vec!["8080:80", "9090:90"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // diff tests (via JSON serialization since Event is not pub)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_empty() {
+        let events = diff(&[], &[]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_diff_new_running_container() {
+        let current = vec![make_snapshot("alpha", "running", 100, "/rootfs")];
+        let events = diff(&[], &current);
+        assert_eq!(events.len(), 1);
+        let v = event_json(&events[0]);
+        assert_eq!(v["type"], "container_started");
+        assert_eq!(v["container"]["name"], "alpha");
+    }
+
+    #[test]
+    fn test_diff_container_exited() {
+        let prev = vec![make_snapshot("beta", "running", 200, "/rootfs")];
+        let current = vec![make_snapshot("beta", "exited", 200, "/rootfs")];
+        let events = diff(&prev, &current);
+        assert_eq!(events.len(), 1);
+        let v = event_json(&events[0]);
+        assert_eq!(v["type"], "container_exited");
+        assert_eq!(v["name"], "beta");
+    }
+
+    #[test]
+    fn test_diff_new_exited_container() {
+        // A container that appears already exited → started then immediately exited.
+        let current = vec![make_snapshot("gamma", "exited", 0, "/rootfs")];
+        let events = diff(&[], &current);
+        assert_eq!(events.len(), 2);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|e| event_json(e)["type"].as_str().unwrap().to_string())
+            .collect::<Vec<String>>()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert!(types.contains(&"container_started"));
+        assert!(types.contains(&"container_exited"));
+    }
+
+    #[test]
+    fn test_diff_container_removed() {
+        // Container disappears from the running state.
+        let prev = vec![make_snapshot("delta", "running", 300, "/rootfs")];
+        let events = diff(&prev, &[]);
+        assert_eq!(events.len(), 1);
+        let v = event_json(&events[0]);
+        assert_eq!(v["type"], "container_exited");
+        assert_eq!(v["name"], "delta");
+    }
 }
