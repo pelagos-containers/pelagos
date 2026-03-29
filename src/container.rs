@@ -4496,28 +4496,6 @@ impl Command {
                     crate::mac::write_mac_attr(selinux_attr_fd, label)?;
                 }
 
-                // Step 7: Apply seccomp filter (no_new_privileges=true path only).
-                // When no_new_privileges=true, NNP was already set at step 6.5, which
-                // grants permission to apply seccomp without CAP_SYS_ADMIN.
-                // When no_new_privileges=false, seccomp was applied at step 4.849 using
-                // CAP_SYS_ADMIN (before capability drops), so no action needed here.
-                if no_new_privileges {
-                    if let Some(ref filter) = seccomp_filter {
-                        crate::seccomp::apply_filter(filter)?;
-                    }
-                }
-
-                // Step 7.1: Install user_notif filter (NNP=true path).
-                //
-                // NNP was set at step 6.5, so CAP_SYS_ADMIN is no longer required.
-                // Installed after regular seccomp (LIFO → evaluated first by kernel).
-                if no_new_privileges && !user_notif_bpf.is_empty() {
-                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf)?;
-                    crate::notif::send_notif_fd(notif_child_sock, notif_fd)?;
-                    libc::close(notif_fd);
-                    libc::close(notif_child_sock);
-                }
-
                 // Step 8: OCI create/start synchronization.
                 // Signals the parent that setup is complete (writes PID to ready_write_fd),
                 // then blocks on accept(listen_fd) until "pelagos start" connects.
@@ -4588,6 +4566,32 @@ impl Command {
                             io::Error::last_os_error()
                         )));
                     }
+                }
+
+                // Step 7: Apply seccomp filter (no_new_privileges=true path only).
+                // Placed here — after setuid/setgid/setgroups — so that the process can
+                // complete all credential transitions before the filter activates.
+                // Seccomp blocks setuid/setgid to prevent SUID-binary privilege escalation
+                // after exec; calling them here (before exec) is the intentional setup path.
+                // When no_new_privileges=true, NNP was set at step 6.5, which grants
+                // permission to apply seccomp without CAP_SYS_ADMIN.
+                // When no_new_privileges=false, seccomp was applied at step 4.849 (before
+                // capability drops), so no action is needed here.
+                if no_new_privileges {
+                    if let Some(ref filter) = seccomp_filter {
+                        crate::seccomp::apply_filter(filter)?;
+                    }
+                }
+
+                // Step 7.1: Install user_notif filter (NNP=true path).
+                //
+                // NNP was set at step 6.5, so CAP_SYS_ADMIN is no longer required.
+                // Installed after regular seccomp (LIFO → evaluated first by kernel).
+                if no_new_privileges && !user_notif_bpf.is_empty() {
+                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf)?;
+                    crate::notif::send_notif_fd(notif_child_sock, notif_fd)?;
+                    libc::close(notif_fd);
+                    libc::close(notif_child_sock);
                 }
 
                 // Re-raise ambient capabilities after setuid.
@@ -6596,21 +6600,6 @@ impl Command {
                     crate::mac::write_mac_attr(selinux_attr_fd, label)?;
                 }
 
-                // Apply seccomp (no_new_privileges=true path only, mirrors spawn() step 7).
-                if no_new_privileges {
-                    if let Some(ref filter) = seccomp_filter {
-                        crate::seccomp::apply_filter(filter)?;
-                    }
-                }
-
-                // Install user_notif filter (NNP=true path, mirrors spawn() step 7.1).
-                if no_new_privileges && !user_notif_bpf_i.is_empty() {
-                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf_i)?;
-                    crate::notif::send_notif_fd(notif_child_sock_i, notif_fd)?;
-                    libc::close(notif_fd);
-                    libc::close(notif_child_sock_i);
-                }
-
                 // Step 8: OCI sync (same as spawn()).
                 if let Some((ready_w, listen_fd)) = oci_sync {
                     let pid: i32 = libc::getpid();
@@ -6664,6 +6653,23 @@ impl Command {
                             io::Error::last_os_error()
                         )));
                     }
+                }
+
+                // Apply seccomp after setuid/setgid (NNP=true path, mirrors spawn() step 7).
+                // Seccomp must come after all credential transitions so that setuid/setgid
+                // are not blocked before the process drops to its target UID/GID.
+                if no_new_privileges {
+                    if let Some(ref filter) = seccomp_filter {
+                        crate::seccomp::apply_filter(filter)?;
+                    }
+                }
+
+                // Install user_notif filter (NNP=true path, mirrors spawn() step 7.1).
+                if no_new_privileges && !user_notif_bpf_i.is_empty() {
+                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf_i)?;
+                    crate::notif::send_notif_fd(notif_child_sock_i, notif_fd)?;
+                    libc::close(notif_fd);
+                    libc::close(notif_child_sock_i);
                 }
 
                 // Re-raise ambient capabilities after setuid (mirrors spawn()).
