@@ -1011,6 +1011,133 @@ mod tests {
         assert!(hooks.contains_key("loki"), "no on-ready hook for loki");
     }
 
+    // ── Compose fixture: monitoring stack (inline-let variant, issue #159) ──
+
+    #[test]
+    fn test_lisp_eval_file_monitoring_inline_let_fixture() {
+        // Evaluate the inline-let variant of the monitoring compose.reml.
+        //
+        // This fixture is the real-world pattern that was impossible before
+        // issue #159: secrets and tunables are read from the host environment
+        // with a fallback default, expressed entirely inline as dotted-pair
+        // cdr values:
+        //
+        //   :env ("GF_SECURITY_ADMIN_PASSWORD" . (let ((p (env "GRAFANA_PASSWORD")))
+        //                                          (if (null? p) "admin" p)))
+        //
+        // Before the fix, (list? sub) returned true for any dotted pair whose
+        // cdr was a proper list, so the ,@sub splice branch would flatten
+        // (let ...) into bare tokens → "unbound variable: let".
+        //
+        // Assertions mirror test_lisp_eval_file_monitoring_fixture but also
+        // verify the inline-let expressions produce the correct default values,
+        // and that overriding via environment variables works correctly.
+
+        // ── default behaviour (env vars unset) ────────────────────────────
+        // Ensure the vars are absent so defaults apply.
+        std::env::remove_var("GRAFANA_PASSWORD");
+        std::env::remove_var("GRAFANA_LOG_LEVEL");
+        std::env::remove_var("PROM_RETENTION");
+
+        let src = include_str!(
+            "../../examples/compose/monitoring-inline-let/compose.reml"
+        );
+        let mut i = interp();
+        i.eval_str(src)
+            .expect("monitoring-inline-let compose.reml failed to eval");
+
+        let pending = i
+            .take_pending()
+            .expect("no pending compose from compose-up");
+        let spec = pending.spec.expect("compose-up produced no spec");
+
+        assert_eq!(spec.services.len(), 3, "expected 3 services");
+        assert_eq!(spec.services[0].name, "prometheus");
+        assert_eq!(spec.services[1].name, "loki");
+        assert_eq!(spec.services[2].name, "grafana");
+
+        // Network and volumes unchanged from top-level-define variant.
+        assert_eq!(spec.networks.len(), 1);
+        assert_eq!(spec.networks[0].name, "monitoring-net");
+        assert_eq!(spec.networks[0].subnet.as_deref(), Some("10.89.1.0/24"));
+        assert_eq!(spec.volumes.len(), 2);
+
+        // Grafana depends on prometheus:9090 and loki:3100.
+        let grafana = &spec.services[2];
+        assert_eq!(grafana.depends_on.len(), 2);
+        let dep_names: Vec<&str> = grafana
+            .depends_on
+            .iter()
+            .map(|d| d.service.as_str())
+            .collect();
+        assert!(dep_names.contains(&"prometheus"));
+        assert!(dep_names.contains(&"loki"));
+
+        // ── inline-let defaults ───────────────────────────────────────────
+        // GRAFANA_PASSWORD unset → "admin"
+        assert_eq!(
+            grafana.env.get("GF_SECURITY_ADMIN_PASSWORD").map(String::as_str),
+            Some("admin"),
+            "inline let should default GF_SECURITY_ADMIN_PASSWORD to 'admin'"
+        );
+        // GRAFANA_LOG_LEVEL unset → "warn"
+        assert_eq!(
+            grafana.env.get("GF_LOG_LEVEL").map(String::as_str),
+            Some("warn"),
+            "inline let should default GF_LOG_LEVEL to 'warn'"
+        );
+        // GF_SERVER_HTTP_PORT comes from a variable expression, not env.
+        assert_eq!(
+            grafana.env.get("GF_SERVER_HTTP_PORT").map(String::as_str),
+            Some("3000"),
+            "port variable expression should produce '3000'"
+        );
+        // Static env entries still work alongside inline-let entries.
+        assert_eq!(
+            grafana.env.get("GF_USERS_ALLOW_SIGN_UP").map(String::as_str),
+            Some("false")
+        );
+
+        // Ports
+        assert_eq!(spec.services[0].ports[0].host, 9090);
+        assert_eq!(spec.services[1].ports[0].host, 3100);
+        assert_eq!(spec.services[2].ports[0].host, 3000);
+
+        // on-ready hooks
+        let hooks = i.take_hooks();
+        assert!(hooks.contains_key("prometheus"));
+        assert!(hooks.contains_key("loki"));
+
+        // ── overridden via environment variables ──────────────────────────
+        std::env::set_var("GRAFANA_PASSWORD", "s3cr3t");
+        std::env::set_var("GRAFANA_LOG_LEVEL", "debug");
+
+        let mut i2 = interp();
+        i2.eval_str(src)
+            .expect("monitoring-inline-let compose.reml failed to eval (overridden)");
+        let spec2 = i2
+            .take_pending()
+            .expect("no pending compose (overridden)")
+            .spec
+            .expect("no spec (overridden)");
+        let grafana2 = spec2.services.iter().find(|s| s.name == "grafana").unwrap();
+
+        assert_eq!(
+            grafana2.env.get("GF_SECURITY_ADMIN_PASSWORD").map(String::as_str),
+            Some("s3cr3t"),
+            "GRAFANA_PASSWORD env var should override the inline-let default"
+        );
+        assert_eq!(
+            grafana2.env.get("GF_LOG_LEVEL").map(String::as_str),
+            Some("debug"),
+            "GRAFANA_LOG_LEVEL env var should override the inline-let default"
+        );
+
+        // Clean up so we don't bleed state into other tests.
+        std::env::remove_var("GRAFANA_PASSWORD");
+        std::env::remove_var("GRAFANA_LOG_LEVEL");
+    }
+
     // ── Compose fixture: rust-builder stack ───────────────────────────────
 
     #[test]
