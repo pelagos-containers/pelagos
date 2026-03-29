@@ -754,6 +754,126 @@ mod tests {
         }
     }
 
+    // ── define-service: dotted-pair env values with complex expressions (issue #159) ──
+
+    #[test]
+    fn test_define_service_env_dotted_pair_with_let() {
+        // Regression test for issue #159: a `let` expression as the cdr of a
+        // dotted-pair env value was treated as an unbound variable because the
+        // S-expression `("K" . (let ...))` is indistinguishable from `("K" let ...)`
+        // at the Value level (both are proper-list Pair chains).  The fix checks
+        // `(= (length sub) 2)` before taking the `,@sub` splice branch so that
+        // a list-valued cdr is kept together as a single expression rather than
+        // being spliced apart.
+        let mut i = interp();
+        eval_ok(&mut i, r#"(define base-val "hello")"#);
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("MY_VAR" . (let ((v base-val)) (if (null? v) "default" v))))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(
+                    s.env.get("MY_VAR").map(String::as_str),
+                    Some("hello"),
+                    "let expression in dotted-pair env value must be evaluated"
+                );
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_env_dotted_pair_with_if() {
+        // Guards against regression for other special forms used as dotted-pair
+        // cdr values.  `if` is a special form; before the fix it would have
+        // triggered "unbound variable: if" for the same reason as `let`.
+        let mut i = interp();
+        eval_ok(&mut i, r#"(define flag #t)"#);
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("MODE" . (if flag "production" "development")))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(
+                    s.env.get("MODE").map(String::as_str),
+                    Some("production"),
+                    "if expression in dotted-pair env value must be evaluated"
+                );
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_env_2element_list_unchanged() {
+        // The 2-element proper-list form ("K" "v") must continue to work after
+        // the length-check fix.  This is the primary documented syntax for
+        // env key-value pairs.
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("FOO" "bar") ("BAZ" "qux"))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.env.get("FOO").map(String::as_str), Some("bar"));
+                assert_eq!(s.env.get("BAZ").map(String::as_str), Some("qux"));
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_env_3element_sublist_errors() {
+        // A 3-element list `("K" "a" "b")` is ambiguous: the writer may have
+        // intended a dotted pair `("K" . "a")` with an extra stray token, or a
+        // multi-value form that has no documented meaning.
+        //
+        // OLD behaviour (`,@sub` for all proper lists): silently set K="a" and
+        // dropped "b" — a data-loss bug with no error.
+        //
+        // NEW behaviour (length-2 check): the `,(car sub) ,(cdr sub)` branch
+        // fires, producing `(list 'env "K" ("a" "b"))`.  The cdr `("a" "b")`
+        // is unquoted as a code form and evaluated as a function call, where
+        // `"a"` is not a procedure → "not a procedure: string".  This is still
+        // an error (good — the input is wrong), just earlier in the pipeline.
+        // Surfacing any error is strictly better than silent data loss.
+        let mut i = interp();
+        let err = eval_err(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("MY_VAR" "a" "b"))"#,
+        );
+        assert!(
+            !err.is_empty(),
+            "3-element env sublist must produce an error, not silently drop data"
+        );
+        // The exact message depends on evaluation order but must not be empty.
+        // Document the current message so future changes don't silently revert
+        // to the old silent-data-loss behaviour.
+        assert!(
+            err.contains("not a procedure") || err.contains("expected string"),
+            "unexpected error message for 3-element env sublist: {}",
+            err
+        );
+    }
+
     #[test]
     fn test_on_ready_hook_registered() {
         let mut i = interp();
@@ -889,6 +1009,140 @@ mod tests {
             "no on-ready hook for prometheus"
         );
         assert!(hooks.contains_key("loki"), "no on-ready hook for loki");
+    }
+
+    // ── Compose fixture: monitoring stack (inline-let variant, issue #159) ──
+
+    #[test]
+    fn test_lisp_eval_file_monitoring_inline_let_fixture() {
+        // Evaluate the inline-let variant of the monitoring compose.reml.
+        //
+        // This fixture is the real-world pattern that was impossible before
+        // issue #159: secrets and tunables are read from the host environment
+        // with a fallback default, expressed entirely inline as dotted-pair
+        // cdr values:
+        //
+        //   :env ("GF_SECURITY_ADMIN_PASSWORD" . (let ((p (env "GRAFANA_PASSWORD")))
+        //                                          (if (null? p) "admin" p)))
+        //
+        // Before the fix, (list? sub) returned true for any dotted pair whose
+        // cdr was a proper list, so the ,@sub splice branch would flatten
+        // (let ...) into bare tokens → "unbound variable: let".
+        //
+        // Assertions mirror test_lisp_eval_file_monitoring_fixture but also
+        // verify the inline-let expressions produce the correct default values,
+        // and that overriding via environment variables works correctly.
+
+        // ── default behaviour (env vars unset) ────────────────────────────
+        // Ensure the vars are absent so defaults apply.
+        std::env::remove_var("GRAFANA_PASSWORD");
+        std::env::remove_var("GRAFANA_LOG_LEVEL");
+        std::env::remove_var("PROM_RETENTION");
+
+        let src = include_str!("../../examples/compose/monitoring-inline-let/compose.reml");
+        let mut i = interp();
+        i.eval_str(src)
+            .expect("monitoring-inline-let compose.reml failed to eval");
+
+        let pending = i
+            .take_pending()
+            .expect("no pending compose from compose-up");
+        let spec = pending.spec.expect("compose-up produced no spec");
+
+        assert_eq!(spec.services.len(), 3, "expected 3 services");
+        assert_eq!(spec.services[0].name, "prometheus");
+        assert_eq!(spec.services[1].name, "loki");
+        assert_eq!(spec.services[2].name, "grafana");
+
+        // Network and volumes unchanged from top-level-define variant.
+        assert_eq!(spec.networks.len(), 1);
+        assert_eq!(spec.networks[0].name, "monitoring-net");
+        assert_eq!(spec.networks[0].subnet.as_deref(), Some("10.89.1.0/24"));
+        assert_eq!(spec.volumes.len(), 2);
+
+        // Grafana depends on prometheus:9090 and loki:3100.
+        let grafana = &spec.services[2];
+        assert_eq!(grafana.depends_on.len(), 2);
+        let dep_names: Vec<&str> = grafana
+            .depends_on
+            .iter()
+            .map(|d| d.service.as_str())
+            .collect();
+        assert!(dep_names.contains(&"prometheus"));
+        assert!(dep_names.contains(&"loki"));
+
+        // ── inline-let defaults ───────────────────────────────────────────
+        // GRAFANA_PASSWORD unset → "admin"
+        assert_eq!(
+            grafana
+                .env
+                .get("GF_SECURITY_ADMIN_PASSWORD")
+                .map(String::as_str),
+            Some("admin"),
+            "inline let should default GF_SECURITY_ADMIN_PASSWORD to 'admin'"
+        );
+        // GRAFANA_LOG_LEVEL unset → "warn"
+        assert_eq!(
+            grafana.env.get("GF_LOG_LEVEL").map(String::as_str),
+            Some("warn"),
+            "inline let should default GF_LOG_LEVEL to 'warn'"
+        );
+        // GF_SERVER_HTTP_PORT comes from a variable expression, not env.
+        assert_eq!(
+            grafana.env.get("GF_SERVER_HTTP_PORT").map(String::as_str),
+            Some("3000"),
+            "port variable expression should produce '3000'"
+        );
+        // Static env entries still work alongside inline-let entries.
+        assert_eq!(
+            grafana
+                .env
+                .get("GF_USERS_ALLOW_SIGN_UP")
+                .map(String::as_str),
+            Some("false")
+        );
+
+        // Ports
+        assert_eq!(spec.services[0].ports[0].host, 9090);
+        assert_eq!(spec.services[1].ports[0].host, 3100);
+        assert_eq!(spec.services[2].ports[0].host, 3000);
+
+        // on-ready hooks
+        let hooks = i.take_hooks();
+        assert!(hooks.contains_key("prometheus"));
+        assert!(hooks.contains_key("loki"));
+
+        // ── overridden via environment variables ──────────────────────────
+        std::env::set_var("GRAFANA_PASSWORD", "s3cr3t");
+        std::env::set_var("GRAFANA_LOG_LEVEL", "debug");
+
+        let mut i2 = interp();
+        i2.eval_str(src)
+            .expect("monitoring-inline-let compose.reml failed to eval (overridden)");
+        let spec2 = i2
+            .take_pending()
+            .expect("no pending compose (overridden)")
+            .spec
+            .expect("no spec (overridden)");
+        let grafana2 = spec2.services.iter().find(|s| s.name == "grafana").unwrap();
+
+        assert_eq!(
+            grafana2
+                .env
+                .get("GF_SECURITY_ADMIN_PASSWORD")
+                .map(String::as_str),
+            Some("s3cr3t"),
+            "GRAFANA_PASSWORD env var should override the inline-let default"
+        );
+        assert_eq!(
+            grafana2.env.get("GF_LOG_LEVEL").map(String::as_str),
+            Some("debug"),
+            "GRAFANA_LOG_LEVEL env var should override the inline-let default"
+        );
+
+        // Clean up so we don't bleed state into other tests.
+        std::env::remove_var("GRAFANA_PASSWORD");
+        std::env::remove_var("GRAFANA_LOG_LEVEL");
     }
 
     // ── Compose fixture: rust-builder stack ───────────────────────────────

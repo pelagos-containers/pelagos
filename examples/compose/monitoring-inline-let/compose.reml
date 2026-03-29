@@ -1,0 +1,108 @@
+; Pelagos Monitoring Stack — inline-let variant
+;
+; This file is structurally equivalent to examples/compose/monitoring/compose.reml
+; but demonstrates inline `let` expressions as dotted-pair :env values.
+;
+; The top-level variant writes:
+;
+;   (define grafana-password
+;     (let ((p (env "GRAFANA_PASSWORD")))
+;       (if (null? p) "admin" p)))
+;   ...
+;   :env ("GF_SECURITY_ADMIN_PASSWORD" . grafana-password)
+;
+; This variant eliminates the top-level defines and buries the let inline:
+;
+;   :env ("GF_SECURITY_ADMIN_PASSWORD" . (let ((p (env "GRAFANA_PASSWORD")))
+;                                          (if (null? p) "admin" p)))
+;
+; Both are equivalent.  The inline form was broken before issue #159 was fixed;
+; the macro's (list? sub) check treated the dotted-pair cdr as a splice target,
+; flattening (let ...) into bare tokens and failing with "unbound variable: let".
+;
+; Architecture:
+;
+;   monitoring-net (10.89.1.0/24):  prometheus ←→ grafana
+;                                   loki       ←→ grafana
+;
+; Env vars (optional — safe defaults apply when unset):
+;   GRAFANA_PASSWORD   — Grafana admin password    (default: "admin")
+;   GRAFANA_LOG_LEVEL  — Grafana log verbosity      (default: "warn")
+;   PROM_RETENTION     — Prometheus retention period (default: "30d")
+;
+; Usage:
+;   GRAFANA_PASSWORD=secret sudo pelagos compose up -f compose.reml -p monitoring
+
+(define port-prometheus 9090)
+(define port-grafana    3000)
+(define port-loki       3100)
+
+(define mem-prometheus "256m")
+(define mem-grafana    "256m")
+(define mem-loki       "128m")
+
+;; ── Network ───────────────────────────────────────────────────────
+
+(define net-monitoring (network "monitoring-net" '(subnet "10.89.1.0/24")))
+
+;; ── Lifecycle hooks ───────────────────────────────────────────────
+
+(on-ready "prometheus"
+  (lambda ()
+    (log "prometheus: metrics backend ready — Grafana can scrape")))
+
+(on-ready "loki"
+  (lambda ()
+    (log "loki: log aggregation ready — Grafana can query")))
+
+;; ── Services ──────────────────────────────────────────────────────
+;;
+;; Secrets and tunables are read from the host environment inline.
+;; Each dotted-pair :env value is a (let ...) expression evaluated at
+;; compose-up time — no top-level (define ...) boilerplate required.
+
+(define-service svc-prometheus "prometheus"
+  :image   "monitoring-prometheus:latest"
+  :network "monitoring-net"
+  :port    (port-prometheus . 9090)
+  :memory  mem-prometheus
+  :command "/bin/prometheus"
+           "--config.file=/etc/prometheus/prometheus.yml"
+           "--storage.tsdb.path=/prometheus"
+           (string-append "--storage.tsdb.retention.time="
+                          (let ((r (env "PROM_RETENTION")))
+                            (if (null? r) "30d" r)))
+           "--web.enable-lifecycle")
+
+(define-service svc-loki "loki"
+  :image   "monitoring-loki:latest"
+  :network "monitoring-net"
+  :port    (port-loki . 3100)
+  :memory  mem-loki)
+
+(define-service svc-grafana "grafana"
+  :image      "monitoring-grafana:latest"
+  :network    "monitoring-net"
+  :depends-on "prometheus" port-prometheus
+  :depends-on "loki"       port-loki
+  :env        ("GF_SECURITY_ADMIN_PASSWORD" . (let ((p (env "GRAFANA_PASSWORD")))
+                                                (if (null? p) "admin" p)))
+              ("GF_SERVER_HTTP_PORT"        . (number->string port-grafana))
+              ("GF_LOG_LEVEL"               . (let ((l (env "GRAFANA_LOG_LEVEL")))
+                                                (if (null? l) "warn" l)))
+              ("GF_USERS_ALLOW_SIGN_UP"     . "false")
+              ("GF_AUTH_ANONYMOUS_ENABLED"  . "false")
+              ("GF_PATHS_PROVISIONING"      . "/etc/grafana/provisioning")
+  :port       (port-grafana . 3000)
+  :memory     mem-grafana)
+
+;; ── Assemble and run ──────────────────────────────────────────────
+
+(compose-up
+  (compose
+    net-monitoring
+    (volume "prometheus-data")
+    (volume "grafana-data")
+    svc-prometheus
+    svc-loki
+    svc-grafana))
