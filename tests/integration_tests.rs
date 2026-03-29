@@ -11082,6 +11082,92 @@ mod dns {
         cleanup_test_network(net_name);
         unsafe { std::env::remove_var("PELAGOS_DNS_BACKEND") };
     }
+
+    /// test_dns_stale_config_removed_on_bind_failure
+    ///
+    /// Requires root (writes to `/run/pelagos/dns/`).
+    /// Does NOT require a rootfs or running container.
+    ///
+    /// Writes a DNS config file for a fictitious network whose gateway IP
+    /// (192.0.2.1, RFC 5737 TEST-NET — never assigned to any real interface)
+    /// has no corresponding network interface.  Starts `pelagos-dns` pointing
+    /// at the config dir and waits briefly.  Asserts that:
+    ///   1. The stale config file has been deleted.
+    ///   2. The daemon exited cleanly (no real entries → auto-exit).
+    ///
+    /// Failure indicates that EADDRNOTAVAIL on bind is not triggering stale-config
+    /// removal, meaning the daemon will spam "failed to bind" on every SIGHUP for
+    /// the lifetime of any unrelated compose stack (issue #168).
+    #[test]
+    fn test_dns_stale_config_removed_on_bind_failure() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_stale_config_removed_on_bind_failure (requires root)");
+            return;
+        }
+
+        let config_dir = pelagos::paths::dns_config_dir();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Write a config file that looks like a real network but whose gateway
+        // IP (192.0.2.1) is not assigned to any interface on this host.
+        let stale_net = "stale-168";
+        let stale_config = config_dir.join(stale_net);
+        // Config format: "<gateway_ip> <upstream,...>\n<name> <ip>\n..."
+        std::fs::write(
+            &stale_config,
+            "192.0.2.1 8.8.8.8\norphan-container 192.0.2.10\n",
+        )
+        .unwrap();
+        assert!(
+            stale_config.exists(),
+            "stale config should exist before test"
+        );
+
+        // Start the daemon binary directly, pointing at the same config dir.
+        let dns_bin = std::path::Path::new(env!("CARGO_BIN_EXE_pelagos-dns"));
+        let mut daemon = std::process::Command::new(dns_bin)
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn pelagos-dns");
+
+        // Give the daemon time to reload and attempt the bind.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        // The stale config file must have been removed.
+        assert!(
+            !stale_config.exists(),
+            "stale config '{}' should have been removed by the daemon after EADDRNOTAVAIL",
+            stale_config.display()
+        );
+
+        // With no entries remaining, the daemon should have auto-exited.
+        // Give it a bit longer if it hasn't quit yet.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let exited = daemon.try_wait().unwrap().is_some();
+        if !exited {
+            // Force-kill in case it's still running (not a test failure by itself).
+            let _ = daemon.kill();
+        }
+        let output = daemon.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // The daemon must have logged the stale-config removal message, not the
+        // generic "failed to bind" error loop.
+        assert!(
+            stderr.contains("stale config"),
+            "expected 'stale config' message in daemon stderr, got: {}",
+            stderr
+        );
+        assert!(
+            !stderr.contains("failed to bind"),
+            "daemon should not log 'failed to bind' for a stale config, got: {}",
+            stderr
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
