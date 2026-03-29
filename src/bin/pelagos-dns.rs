@@ -310,34 +310,52 @@ impl ServerState {
 
     /// Rebind UDP sockets to match current config listen IPs.
     fn rebind_sockets(&mut self) {
-        // Collect desired listen addresses.
-        let desired: HashMap<Ipv4Addr, &str> = self
+        // Collect desired listen addresses as owned values so we can mutate
+        // self.configs during the loop when stale entries are removed.
+        let desired: Vec<(Ipv4Addr, String)> = self
             .configs
             .iter()
-            .map(|(name, cfg)| (cfg.listen_ip, name.as_str()))
+            .map(|(name, cfg)| (cfg.listen_ip, name.clone()))
             .collect();
 
+        let desired_ips: Vec<Ipv4Addr> = desired.iter().map(|(ip, _)| *ip).collect();
+
         // Remove sockets for IPs no longer needed.
-        self.sockets.retain(|s| desired.contains_key(&s.gateway_ip));
+        self.sockets.retain(|s| desired_ips.contains(&s.gateway_ip));
 
         // Determine which IPs already have sockets.
         let bound: Vec<Ipv4Addr> = self.sockets.iter().map(|s| s.gateway_ip).collect();
 
         // Bind new sockets for IPs not yet bound.
-        for &ip in desired.keys() {
-            if bound.contains(&ip) {
+        for (ip, network_name) in &desired {
+            if bound.contains(ip) {
                 continue;
             }
 
-            let bind_addr = SocketAddr::new(std::net::IpAddr::V4(ip), 53);
+            let bind_addr = SocketAddr::new(std::net::IpAddr::V4(*ip), 53);
             match UdpSocket::bind(bind_addr) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
                     self.sockets.push(ListenSocket {
                         socket: sock,
-                        gateway_ip: ip,
+                        gateway_ip: *ip,
                     });
                     eprintln!("pelagos-dns: listening on {}", bind_addr);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {
+                    // The gateway IP has no corresponding network interface — the
+                    // bridge is down and the config is stale (container exited
+                    // without cleanup).  Remove the file so we don't retry on every
+                    // reload.  When a container next starts on this network,
+                    // dns_add_entry will recreate it.
+                    let config_file = self.config_dir.join(network_name);
+                    let _ = std::fs::remove_file(&config_file);
+                    self.configs.remove(network_name);
+                    eprintln!(
+                        "pelagos-dns: removed stale config for '{}' \
+                         (gateway {} has no interface)",
+                        network_name, ip
+                    );
                 }
                 Err(e) => {
                     eprintln!("pelagos-dns: failed to bind {}: {}", bind_addr, e);

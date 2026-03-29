@@ -3918,3 +3918,17 @@ asserts it succeeds without requiring a manual `compose down` first.
 Failure indicates that `cmd_compose_up_reml` is not detecting the dead supervisor
 PID in the project state file, or that `cleanup_stale_project` is failing to
 remove lingering containers and project state before starting fresh (issue #161).
+
+### `test_dns_stale_config_removed_on_bind_failure`
+**Requires:** root (writes to `/run/pelagos/dns/`)
+**Module:** `dns`
+
+Writes a DNS config file for a fictitious network whose gateway IP (192.0.2.1,
+RFC 5737 TEST-NET) has no corresponding network interface on the host.  Starts
+`pelagos-dns` pointing at the config dir and asserts that the stale file is
+deleted and the daemon logs a "stale config" removal message rather than the
+generic "failed to bind" error.
+
+Failure indicates that EADDRNOTAVAIL on bind is not triggering the stale-config
+cleanup path, meaning the daemon will spam "failed to bind" on every SIGHUP for
+the lifetime of any unrelated compose stack (issue #168).
