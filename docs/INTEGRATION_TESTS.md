@@ -3986,17 +3986,20 @@ the file was removed.
 Failure indicates blob pruning is broken — build blobs will accumulate on disk
 (issue #126).
 
-### `test_system_prune_all_removes_image_layers_with_no_containers`
-**Requires:** root (reads/writes `/var/lib/pelagos/`)
-**Module:** `system_prune`
+### `cli::system::tests::test_prune_orphan_layers_keep_set` (unit test)
+**Requires:** none (uses temp directory)
+**Module:** `cli::system`
 
-Creates a synthetic image manifest + layer, runs `pelagos system prune --all`,
-and asserts the synthetic layer was removed.  Since `--all` removes layers for
-all images with no running containers, the test snapshots and restores any real
-images whose layers were also pruned, to avoid breaking other tests.
+Creates two synthetic layer directories in a temp dir, builds a keep-set
+containing only one of them, runs the orphan-removal loop, and asserts the
+non-kept directory is removed while the kept one survives.
 
-Failure indicates the `--all` flag is not treating referenced-but-idle image
-layers as prunable — the maximum-disk-space-reclaim contract is broken.
+The `--all` flag's behavior (removing referenced-but-idle layers) is tested via
+this unit test rather than an integration test because running `prune --all` on a
+shared layer store destroys layers needed by other integration tests and requires
+expensive re-pulls from external registries.
+
+Failure indicates the keep-set filtering logic in `prune_orphan_layers` is broken.
 
 ### `test_system_prune_volumes_removes_unused_volume`
 **Requires:** root (writes to `/var/lib/pelagos/volumes/`)
