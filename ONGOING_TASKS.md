@@ -1,5 +1,16 @@
 # Ongoing Tasks
 
+## Completed: system prune / system df (#126, #127) — 2026-03-29, HEAD: 80a92e6
+
+- `pelagos system prune [--all] [--volumes]` and `pelagos system df` implemented
+- `ensure_blob()` fix for image save/push when blob not retained after pull (#127)
+- 5 integration tests in `mod system_prune` (pure-synthetic, no network)
+- Mass `serial(nat)` audit: 20+ bridge/NAT/DNS/compose tests promoted from unnamed serial
+- `ensure_alpine()` check-before-pull guard added across all tutorial test modules
+- 306/306 integration tests pass (stable across consecutive runs)
+
+---
+
 ## In-progress: feat/compose-fixes-160-161-169
 
 ### Issues targeted
