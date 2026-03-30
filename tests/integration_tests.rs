@@ -10191,6 +10191,23 @@ mod dns {
         let _ = std::fs::remove_dir_all(&dns_dir);
     }
 
+    /// Unmount any stale pelagos overlay mounts left by crashed tests or
+    /// supervisors.  Mirrors the overlay-cleanup step in reset-test-env.sh.
+    fn unmount_stale_overlays() {
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        for line in mounts.lines() {
+            let mount_point = line.split_whitespace().nth(1).unwrap_or("");
+            if mount_point.starts_with("/run/pelagos/overlay-") {
+                unsafe {
+                    libc::umount2(
+                        std::ffi::CString::new(mount_point).unwrap().as_ptr(),
+                        libc::MNT_DETACH,
+                    )
+                };
+            }
+        }
+    }
+
     /// Container B resolves container A by name via the embedded DNS daemon.
     ///
     /// Requires root + rootfs.
@@ -10571,6 +10588,7 @@ mod dns {
         let net1 = "dnsmn1";
         let net2 = "dnsmn2";
         cleanup_dns();
+        unmount_stale_overlays();
         create_test_network(net1, "10.90.5.0/24");
         create_test_network(net2, "10.90.6.0/24");
 
