@@ -31,6 +31,17 @@ pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>>
                     }
                 }
             }
+            // Wait for the watcher to finish cleanup (nftables/veth/overlay teardown)
+            // before removing state.  The watcher exits shortly after the container dies.
+            if state.watcher_pid > 0 {
+                let watcher_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while check_liveness(state.watcher_pid as i32)
+                    && std::time::Instant::now() < watcher_deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
         } else {
             return Err(format!(
                 "container '{}' is running; use --force to remove it or `pelagos stop {}` first",

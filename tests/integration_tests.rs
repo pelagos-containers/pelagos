@@ -2772,6 +2772,7 @@ mod networking {
 
     /// N2: Bridge mode — container should receive a 172.19.0.x/24 address on eth0.
     #[test]
+    #[serial(nat)]
     fn test_bridge_network_ip() {
         if !is_root() {
             eprintln!("Skipping test_bridge_network_ip: requires root");
@@ -2812,6 +2813,7 @@ mod networking {
 
     /// N2: After spawn(), the host-side veth interface (vh-{hash}) should exist.
     #[test]
+    #[serial(nat)]
     fn test_bridge_network_veth_exists() {
         if !is_root() {
             eprintln!("Skipping test_bridge_network_veth_exists: requires root");
@@ -2857,6 +2859,7 @@ mod networking {
 
     /// N2: After wait(), the veth pair should be deleted (teardown_network called).
     #[test]
+    #[serial(nat)]
     fn test_bridge_network_cleanup() {
         if !is_root() {
             eprintln!("Skipping test_bridge_network_cleanup: requires root");
@@ -2902,6 +2905,7 @@ mod networking {
 
     /// N2: After wait(), the named netns (/run/netns/rem-*) should also be deleted.
     #[test]
+    #[serial(nat)]
     fn test_bridge_netns_cleanup() {
         if !is_root() {
             eprintln!("Skipping test_bridge_netns_cleanup: requires root");
@@ -2953,6 +2957,7 @@ mod networking {
     /// setup_bridge_network() runs `ip -n {ns_name} link set lo up` before fork;
     /// this test verifies that the container sees lo correctly.
     #[test]
+    #[serial(nat)]
     fn test_bridge_loopback_up() {
         if !is_root() {
             eprintln!("Skipping test_bridge_loopback_up: requires root");
@@ -2992,6 +2997,7 @@ mod networking {
     /// Verifies actual layer-3 connectivity through the veth pair: the container
     /// sends a ping, the packet traverses eth0→veth→bridge, and the host replies.
     #[test]
+    #[serial(nat)]
     fn test_bridge_gateway_reachable() {
         if !is_root() {
             eprintln!("Skipping test_bridge_gateway_reachable: requires root");
@@ -3035,6 +3041,7 @@ mod networking {
     /// real concurrency. Each thread builds, spawns, and collects its container
     /// entirely within that thread — no non-Send types cross thread boundaries.
     #[test]
+    #[serial(nat)]
     fn test_bridge_concurrent_spawn() {
         if !is_root() {
             eprintln!("Skipping test_bridge_concurrent_spawn: requires root");
@@ -6356,7 +6363,7 @@ mod linking {
     use super::*;
 
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_link_hosts() {
         if !is_root() {
             eprintln!("Skipping test_container_link_hosts: requires root");
@@ -6437,7 +6444,7 @@ mod linking {
     ///
     /// Failure indicates alias handling in the hosts file generation is broken.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_link_alias() {
         if !is_root() {
             eprintln!("Skipping test_container_link_alias: requires root");
@@ -6522,7 +6529,7 @@ mod linking {
     /// Failure indicates that the /etc/hosts entry is incorrect, the bridge network
     /// is misconfigured, or the containers can't reach each other.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_link_ping() {
         if !is_root() {
             eprintln!("Skipping test_container_link_ping: requires root");
@@ -6607,7 +6614,7 @@ mod linking {
     /// containers, even though ICMP (ping) may work. This was a real bug:
     /// iptables FORWARD policy DROP blocked TCP/UDP while allowing ICMP.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_link_tcp() {
         if !is_root() {
             eprintln!("Skipping test_container_link_tcp: requires root");
@@ -6700,6 +6707,7 @@ mod linking {
     /// Failure indicates that link resolution doesn't properly validate that
     /// the target container exists.
     #[test]
+    #[serial(nat)]
     fn test_container_link_missing() {
         if !is_root() {
             eprintln!("Skipping test_container_link_missing: requires root");
@@ -9526,7 +9534,7 @@ mod multi_network {
     ///
     /// Requires root: creates config dirs under /var/lib/pelagos/networks/.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_network_create_ls_rm() {
         if !is_root() {
             eprintln!("Skipping test_network_create_ls_rm (requires root)");
@@ -9565,7 +9573,7 @@ mod multi_network {
     ///
     /// Requires root: writes to /var/lib/pelagos/networks/.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_network_create_overlap_rejected() {
         if !is_root() {
             eprintln!("Skipping test_network_create_overlap_rejected (requires root)");
@@ -9744,7 +9752,7 @@ mod multi_network {
     ///
     /// Requires root.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_network_rm_refuses_default() {
         if !is_root() {
             eprintln!("Skipping test_network_rm_refuses_default (requires root)");
@@ -11261,7 +11269,7 @@ mod dns {
 /// Verify that dropping a Child without calling wait() still cleans up the
 /// network namespace (netns mount under /run/netns/rem-*).
 #[test]
-#[serial]
+#[serial(nat)]
 fn test_child_drop_cleans_up_netns() {
     if !is_root() {
         eprintln!("Skipping test_child_drop_cleans_up_netns (requires root)");
@@ -16261,7 +16269,7 @@ mod tutorial_e2e_p4 {
     ///
     /// Failure indicates compose up/down, scoped naming, or the supervisor is broken.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(nat)]
     fn test_tut_p4_compose_lifecycle() {
         if !is_root() {
             eprintln!("SKIP test_tut_p4_compose_lifecycle: requires root");
@@ -16348,7 +16356,7 @@ mod tutorial_e2e_p4 {
     /// Failure indicates the TCP readiness polling or topological ordering in the
     /// compose supervisor is broken.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(nat)]
     fn test_tut_p4_compose_depends_on() {
         if !is_root() {
             eprintln!("SKIP test_tut_p4_compose_depends_on: requires root");
@@ -16392,7 +16400,7 @@ mod tutorial_e2e_p4 {
     /// Failure indicates the DNS daemon (pelagos-dns or dnsmasq) is not registering
     /// compose service names, or the container's /etc/resolv.conf is misconfigured.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(nat)]
     fn test_tut_p4_compose_dns() {
         if !is_root() {
             eprintln!("SKIP test_tut_p4_compose_dns: requires root");
