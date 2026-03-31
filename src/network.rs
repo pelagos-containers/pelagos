@@ -765,15 +765,7 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
         log::warn!("network teardown veth (non-fatal): {}", e);
     }
-    if let Err(e) = run("ip", &["netns", "del", &setup.ns_name]) {
-        log::warn!("network teardown netns (non-fatal): {}", e);
-        // Fallback: directly remove the bind-mount file so that netns_exists()
-        // returns false for this ns_name on subsequent calls.  Without this,
-        // stale /run/netns/ entries inflate the NAT/port-forward refcount and
-        // prevent nftables table deletion after the last container exits.
-        let netns_file = format!("/run/netns/{}", setup.ns_name);
-        let _ = std::fs::remove_file(&netns_file);
-    }
+    delete_netns(&setup.ns_name);
     let net_def = match load_network_def(&setup.network_name) {
         Ok(n) => n,
         Err(e) => {
@@ -791,6 +783,71 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     if setup.nat_enabled {
         disable_nat(&setup.ns_name, &net_def);
     }
+}
+
+/// Remove a named network namespace, retrying briefly on `EBUSY`.
+///
+/// `ip netns del` calls `umount2(path, MNT_DETACH)` then `unlink(path)`.
+/// The umount can fail with `EBUSY` if the kernel has not yet finished
+/// tearing down in-netns devices (veth cleanup runs in softirq / workqueue
+/// context and may outlive the container process by a few milliseconds).
+///
+/// Strategy (see issue #183):
+/// 1. Retry `ip netns del` up to 5 times with 50 ms gaps — handles the
+///    common timing-race without leaving orphaned mounts.
+/// 2. If all retries fail, fall back to `umount2(..., MNT_DETACH)` +
+///    `unlink` directly, mirroring what `ip netns del` would do but
+///    tolerating a still-busy mount via MNT_DETACH (lazy unmount).
+/// 3. Regardless of outcome, ensure `/run/netns/{name}` is unlinked so
+///    that `netns_exists()` returns false and NAT/port-forward refcounts
+///    are correct.
+fn delete_netns(ns_name: &str) {
+    // Retry budget: 10 × 100 ms = 1 s total.  Kernel veth teardown is
+    // asynchronous (softirq / workqueue) and takes longer inside a VM.
+    const RETRIES: u32 = 10;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let netns_path = format!("/run/netns/{}", ns_name);
+
+    for attempt in 0..RETRIES {
+        if !std::path::Path::new(&netns_path).exists() {
+            return; // Already gone.
+        }
+        match run("ip", &["netns", "del", ns_name]) {
+            Ok(()) => return,
+            Err(e) => {
+                log::debug!(
+                    "network teardown: ip netns del {} failed (attempt {}/{}): {}",
+                    ns_name,
+                    attempt + 1,
+                    RETRIES,
+                    e
+                );
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+    }
+
+    // All retries exhausted — lazy-unmount + unlink as a last resort so
+    // that netns_exists() returns false and NAT/port-forward refcounts stay
+    // correct (see issue #183).  The orphaned mount is GC'd by the kernel.
+    log::warn!(
+        "network teardown: ip netns del {} failed after {} retries; \
+         falling back to lazy unmount + unlink (issue #183)",
+        ns_name,
+        RETRIES
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let path_cstr = match std::ffi::CString::new(netns_path.as_bytes()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        unsafe {
+            libc::umount2(path_cstr.as_ptr(), libc::MNT_DETACH);
+        }
+    }
+    let _ = std::fs::remove_file(&netns_path);
 }
 
 // ── Secondary network attachment ──────────────────────────────────────────────
