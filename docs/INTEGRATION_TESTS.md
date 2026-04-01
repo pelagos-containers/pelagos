@@ -831,6 +831,41 @@ Does **not** require host IPv6 internet connectivity — tests the localhost pro
 
 ---
 
+## Configurable Subnet Tests (`mod config_subnet`)
+
+### `test_ensure_network_custom_alloc_pool`
+**Requires:** nothing (no root, no rootfs — pure library API)
+
+Calls `ensure_network` twice with a custom `/16` pool (`10.202.0.0/16`) using distinct
+names. Asserts both get addresses within that pool and that they receive different /24
+blocks. Failure means the auto-allocation logic is ignoring the pool parameter or
+assigning overlapping subnets.
+
+### `test_config_loaded_from_xdg`
+**Requires:** nothing
+
+Writes a config TOML to a temp `$XDG_CONFIG_HOME/pelagos/config.toml` and calls
+`PelagosConfig::load()`. Asserts both `default_subnet` and `auto_alloc_pool` match the
+written values. Failure means the TOML parser or XDG path resolution is broken.
+
+### `test_network_create_auto_alloc`
+**Requires:** root
+
+Runs `pelagos network create cfg-auto-net --alloc-from 10.203.0.0/16` and asserts the
+printed subnet is within `10.203.x.x`. Failure means the `--alloc-from` CLI flag is not
+being passed to `ensure_network`, or `ensure_network`'s pool selection is wrong.
+
+### `test_default_subnet_bootstrap`
+**Requires:** root, rootfs
+
+Temporarily removes `pelagos0`'s `config.json`, calls `bootstrap_default_network` with
+`10.201.0.0/24`, then spawns a bridge container and asserts `eth0` has a `10.201.0.x`
+address. Restores the original config after. Failure means `bootstrap_default_network`
+is ignoring the override or the container's IP allocation is not reading the new
+`NetworkDef`.
+
+---
+
 ## Overlay Filesystem Tests
 
 ### `test_overlay_writes_to_upper`

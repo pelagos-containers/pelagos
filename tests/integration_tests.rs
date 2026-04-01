@@ -9937,7 +9937,7 @@ mod multi_network {
         }
         // The CLI refuses removal of "pelagos0" — but we test the concept:
         // the default network config should survive bootstrap.
-        let _ = pelagos::network::bootstrap_default_network().expect("bootstrap default");
+        let _ = pelagos::network::bootstrap_default_network(None).expect("bootstrap default");
         let config = pelagos::paths::network_config_dir("pelagos0").join("config.json");
         assert!(config.exists(), "default network config should exist");
     }
@@ -20933,3 +20933,183 @@ mod system_prune {
         );
     }
 } // mod system_prune
+
+// ── Configurable subnet tests ─────────────────────────────────────────────────
+
+mod config_subnet {
+    use super::*;
+
+    /// Verify that `ensure_network` carves /24s from a custom pool when given one,
+    /// and that two successive calls produce non-overlapping blocks within the pool.
+    ///
+    /// Uses only the library API; does not spawn containers or require root.
+    #[test]
+    fn test_ensure_network_custom_alloc_pool() {
+        let name1 = "cfg-test-n1";
+        let name2 = "cfg-test-n2";
+
+        // Clean up any pre-existing configs.
+        for name in &[name1, name2] {
+            let cfg = pelagos::paths::network_config_dir(name).join("config.json");
+            let _ = std::fs::remove_file(&cfg);
+        }
+
+        let pool = pelagos::network::Ipv4Net::from_cidr("10.202.0.0/16").unwrap();
+
+        let r1 = pelagos::network::ensure_network(name1, Some(&pool));
+        let r2 = pelagos::network::ensure_network(name2, Some(&pool));
+
+        // Load the created defs before cleanup so we can assert on their subnets.
+        let def1 = pelagos::network::NetworkDef::load(name1).ok();
+        let def2 = pelagos::network::NetworkDef::load(name2).ok();
+
+        for name in &[name1, name2] {
+            let cfg = pelagos::paths::network_config_dir(name).join("config.json");
+            let _ = std::fs::remove_file(&cfg);
+        }
+
+        r1.expect("ensure_network name1 should succeed");
+        r2.expect("ensure_network name2 should succeed");
+
+        let d1 = def1.expect("def1 should be loadable after ensure_network");
+        let d2 = def2.expect("def2 should be loadable after ensure_network");
+
+        assert!(
+            d1.subnet.addr.to_string().starts_with("10.202."),
+            "name1 subnet should be in 10.202.0.0/16 pool, got: {}",
+            d1.subnet.addr
+        );
+        assert!(
+            d2.subnet.addr.to_string().starts_with("10.202."),
+            "name2 subnet should be in 10.202.0.0/16 pool, got: {}",
+            d2.subnet.addr
+        );
+        assert_ne!(
+            d1.subnet.addr, d2.subnet.addr,
+            "two networks should get different /24 blocks"
+        );
+    }
+
+    /// Verify that `PelagosConfig::load()` reads `default_subnet` and
+    /// `auto_alloc_pool` from `$XDG_CONFIG_HOME/pelagos/config.toml`.
+    ///
+    /// Does not require root or rootfs.
+    #[test]
+    fn test_config_loaded_from_xdg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join("pelagos");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[network]\ndefault_subnet = \"10.88.0.0/24\"\nauto_alloc_pool = \"10.88.0.0/16\"\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded test; no other threads racing on env vars.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let cfg = pelagos::config::PelagosConfig::load();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+
+        assert_eq!(cfg.network.default_subnet, "10.88.0.0/24");
+        assert_eq!(cfg.network.auto_alloc_pool, "10.88.0.0/16");
+    }
+
+    /// Verify `pelagos network create <name>` without `--subnet` auto-allocates
+    /// from the config pool.  Uses `--alloc-from` CLI flag to avoid touching
+    /// the real config file.
+    ///
+    /// Requires root (network config dir is under /var/lib/pelagos).
+    #[test]
+    #[serial(nat)]
+    fn test_network_create_auto_alloc() {
+        if !is_root() {
+            eprintln!("Skipping test_network_create_auto_alloc: requires root");
+            return;
+        }
+
+        let name = "cfg-auto-net";
+        let cfg = pelagos::paths::network_config_dir(name).join("config.json");
+        let _ = std::fs::remove_file(&cfg);
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["network", "create", name, "--alloc-from", "10.203.0.0/16"])
+            .output()
+            .expect("network create");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_file(&cfg);
+
+        assert!(
+            out.status.success(),
+            "network create should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("10.203."),
+            "auto-allocated subnet should be from 10.203.0.0/16 pool, got: {}",
+            stdout
+        );
+    }
+
+    /// Verify that a bridge container gets an address from a custom default subnet
+    /// when `bootstrap_default_network` is called with that subnet before spawning.
+    ///
+    /// Requires root and rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_default_subnet_bootstrap() {
+        if !is_root() {
+            eprintln!("Skipping test_default_subnet_bootstrap: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_default_subnet_bootstrap: alpine-rootfs not found");
+            return;
+        };
+
+        // Stash and temporarily remove pelagos0 so bootstrap runs fresh.
+        let cfg_path = pelagos::paths::network_config_dir("pelagos0").join("config.json");
+        let stash = cfg_path
+            .exists()
+            .then(|| std::fs::read_to_string(&cfg_path).ok())
+            .flatten();
+        let _ = std::fs::remove_file(&cfg_path);
+
+        // Bootstrap pelagos0 with a custom subnet.
+        let subnet = pelagos::network::Ipv4Net::from_cidr("10.201.0.0/24").unwrap();
+        let bootstrap_ok = pelagos::network::bootstrap_default_network(Some(&subnet)).is_ok();
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "ip addr show eth0 | grep -q '10.201.0' && echo CUSTOM_SUBNET_OK",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(pelagos::network::NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let (_, stdout, _) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+
+        // Restore original config.
+        if let Some(data) = stash {
+            let _ = std::fs::create_dir_all(cfg_path.parent().unwrap());
+            let _ = std::fs::write(&cfg_path, data);
+        } else {
+            let _ = std::fs::remove_file(&cfg_path);
+        }
+
+        assert!(bootstrap_ok, "bootstrap_default_network should succeed");
+        assert!(
+            out.contains("CUSTOM_SUBNET_OK"),
+            "Container should get 10.201.0.x address from custom default subnet, got: {}",
+            out
+        );
+    }
+}

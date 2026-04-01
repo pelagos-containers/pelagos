@@ -38,62 +38,87 @@ fn bridge_name_for(name: &str) -> String {
     }
 }
 
-pub fn cmd_network_create(name: &str, subnet_cidr: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Create a named network.
+///
+/// `subnet_cidr` — explicit subnet; when `None`, auto-allocates a /24 from
+/// `alloc_from_cidr` (if given) or the config file's `auto_alloc_pool`.
+pub fn cmd_network_create(
+    name: &str,
+    subnet_cidr: Option<&str>,
+    alloc_from_cidr: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     validate_name(name)?;
 
-    let subnet = Ipv4Net::from_cidr(subnet_cidr)?;
-    let bridge_name = bridge_name_for(name);
-
-    // Bridge name must fit in IFNAMSIZ (15 chars).
-    if bridge_name.len() > 15 {
-        return Err(format!("bridge name '{}' exceeds 15 char kernel limit", bridge_name).into());
-    }
-
-    // Check for existing network with same name.
+    // Check for existing network with same name up front.
     let config_dir = pelagos::paths::network_config_dir(name);
     if config_dir.join("config.json").exists() {
         return Err(format!("network '{}' already exists", name).into());
     }
 
-    // Check subnet overlap against all existing networks.
-    let networks_dir = pelagos::paths::networks_config_dir();
-    if networks_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&networks_dir) {
-            for entry in entries.flatten() {
-                let cfg_path = entry.path().join("config.json");
-                if let Ok(data) = std::fs::read_to_string(&cfg_path) {
-                    if let Ok(existing) = serde_json::from_str::<NetworkDef>(&data) {
-                        if existing.subnet.overlaps(&subnet) {
-                            return Err(format!(
-                                "subnet {} overlaps with network '{}' ({})",
-                                subnet_cidr,
-                                existing.name,
-                                existing.subnet.cidr_string()
-                            )
-                            .into());
+    let bridge_name = bridge_name_for(name);
+    if bridge_name.len() > 15 {
+        return Err(format!("bridge name '{}' exceeds 15 char kernel limit", bridge_name).into());
+    }
+
+    if let Some(cidr) = subnet_cidr {
+        // Explicit subnet path.
+        let subnet = Ipv4Net::from_cidr(cidr)?;
+
+        // Check overlap against all existing networks.
+        let networks_dir = pelagos::paths::networks_config_dir();
+        if networks_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&networks_dir) {
+                for entry in entries.flatten() {
+                    let cfg_path = entry.path().join("config.json");
+                    if let Ok(data) = std::fs::read_to_string(&cfg_path) {
+                        if let Ok(existing) = serde_json::from_str::<NetworkDef>(&data) {
+                            if existing.subnet.overlaps(&subnet) {
+                                return Err(format!(
+                                    "subnet {} overlaps with network '{}' ({})",
+                                    cidr,
+                                    existing.name,
+                                    existing.subnet.cidr_string()
+                                )
+                                .into());
+                            }
                         }
                     }
                 }
             }
         }
+
+        let gateway = subnet.gateway();
+        let net = NetworkDef {
+            name: name.to_string(),
+            subnet: subnet.clone(),
+            gateway,
+            bridge_name,
+        };
+        net.save()?;
+        println!("Created network '{}' ({})", name, cidr);
+    } else {
+        // Auto-allocate a /24 from the pool.
+        let pool = match alloc_from_cidr {
+            Some(cidr) => Some(
+                Ipv4Net::from_cidr(cidr)
+                    .map_err(|e| format!("invalid --alloc-from '{}': {}", cidr, e))?,
+            ),
+            None => {
+                let cfg = pelagos::config::PelagosConfig::load();
+                Some(cfg.network.auto_alloc_pool_parsed())
+            }
+        };
+        pelagos::network::ensure_network(name, pool.as_ref())?;
+        let net = NetworkDef::load(name)?;
+        println!("Created network '{}' ({})", name, net.subnet.cidr_string());
     }
 
-    let gateway = subnet.gateway();
-    let net = NetworkDef {
-        name: name.to_string(),
-        subnet,
-        gateway,
-        bridge_name,
-    };
-    net.save()?;
-
-    println!("Created network '{}' ({})", name, subnet_cidr);
     Ok(())
 }
 
 pub fn cmd_network_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap default network so it always appears.
-    let _ = pelagos::network::bootstrap_default_network();
+    let _ = pelagos::network::bootstrap_default_network(None);
 
     let networks_dir = pelagos::paths::networks_config_dir();
     let entries = match std::fs::read_dir(&networks_dir) {
@@ -191,7 +216,7 @@ pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn cmd_network_inspect(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let net = if name == "pelagos0" {
-        pelagos::network::bootstrap_default_network()?
+        pelagos::network::bootstrap_default_network(None)?
     } else {
         NetworkDef::load(name)?
     };

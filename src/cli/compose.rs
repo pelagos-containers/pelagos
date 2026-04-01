@@ -242,17 +242,24 @@ fn cmd_compose_up_reml(
     // fails early before any infrastructure is created.
     pull_missing_images(&spec, no_pull)?;
 
+    let compose_cfg = pelagos::config::PelagosConfig::load();
     let mut created_networks = Vec::new();
     for net in &spec.networks {
         let scoped = scoped_network_name(&project, &net.name);
         let config = pelagos::paths::network_config_dir(&scoped).join("config.json");
         if !config.exists() {
-            let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
-            super::network::cmd_network_create(&scoped, subnet)
-                .map_err(|e| format!("compose: failed to create network '{}': {}", scoped, e))?;
+            // When the Remfile specifies an explicit subnet, use it.
+            // Otherwise auto-allocate from the config file's pool.
+            super::network::cmd_network_create(
+                &scoped,
+                net.subnet.as_deref(),
+                None, // alloc_from: use config's auto_alloc_pool
+            )
+            .map_err(|e| format!("compose: failed to create network '{}': {}", scoped, e))?;
         }
         created_networks.push(scoped);
     }
+    drop(compose_cfg);
 
     let mut created_volumes = Vec::new();
     for vol in &spec.volumes {

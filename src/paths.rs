@@ -11,6 +11,27 @@ pub fn is_rootless() -> bool {
     unsafe { libc::getuid() != 0 }
 }
 
+/// Pelagos config file.
+///
+/// - If `$XDG_CONFIG_HOME` is set (any UID): `$XDG_CONFIG_HOME/pelagos/config.toml`
+/// - Rootless (no `$XDG_CONFIG_HOME`): `~/.config/pelagos/config.toml`
+/// - Root (no `$XDG_CONFIG_HOME`): `/etc/pelagos/config.toml`
+pub fn config_file() -> PathBuf {
+    // XDG_CONFIG_HOME takes priority for any UID — useful for testing and
+    // for users who want an explicit override.
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("pelagos/config.toml");
+        }
+    }
+    if is_rootless() {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".config/pelagos/config.toml");
+        }
+    }
+    PathBuf::from("/etc/pelagos/config.toml")
+}
+
 /// Persistent data directory.
 ///
 /// - Root (or system store already initialised): `/var/lib/pelagos/`

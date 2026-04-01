@@ -417,13 +417,18 @@ pub(crate) enum ImageCmd {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum NetworkCmd {
-    /// Create a named network with a subnet
+    /// Create a named network
     Create {
         /// Network name (alphanumeric + hyphen, max 12 chars)
         name: String,
-        /// Subnet in CIDR notation (e.g. 10.88.1.0/24)
+        /// Explicit subnet in CIDR notation (e.g. 10.88.1.0/24).
+        /// When omitted, a /24 is carved from --alloc-from or the config
+        /// file's auto_alloc_pool (default 10.99.0.0/16).
         #[clap(long)]
-        subnet: String,
+        subnet: Option<String>,
+        /// Override the auto-allocation pool for this one create (CIDR, /16 or larger).
+        #[clap(long)]
+        alloc_from: Option<String>,
     },
     /// List networks
     Ls {
@@ -552,7 +557,11 @@ fn main() {
 
         // Network
         CliCommand::Network { cmd } => match cmd {
-            NetworkCmd::Create { name, subnet } => cli::network::cmd_network_create(&name, &subnet),
+            NetworkCmd::Create {
+                name,
+                subnet,
+                alloc_from,
+            } => cli::network::cmd_network_create(&name, subnet.as_deref(), alloc_from.as_deref()),
             NetworkCmd::Ls { format, json } => {
                 cli::network::cmd_network_ls(json || format == OutputFormat::Json)
             }

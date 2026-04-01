@@ -222,23 +222,25 @@ impl NetworkDef {
 
 /// Bootstrap or load the default `pelagos0` network definition.
 ///
-/// If a config file exists on disk, loads it. Otherwise creates the default
-/// definition (`172.19.0.0/24`, bridge `pelagos0`) and persists it.
+/// If a persisted config already exists on disk, loads it unchanged.
+/// Otherwise creates a new definition using `default_subnet` (or
+/// `172.19.0.0/24` when `None`) and persists it.
+///
 /// Also migrates old global state files to per-network directories if they exist.
-pub fn bootstrap_default_network() -> io::Result<NetworkDef> {
+pub fn bootstrap_default_network(default_subnet: Option<&Ipv4Net>) -> io::Result<NetworkDef> {
     let config_path = crate::paths::network_config_dir("pelagos0").join("config.json");
     if config_path.exists() {
         return NetworkDef::load("pelagos0");
     }
 
+    let fallback = Ipv4Net::from_cidr("172.19.0.0/24").expect("hardcoded CIDR is valid");
+    let subnet = default_subnet.unwrap_or(&fallback).clone();
+    let gateway = subnet.gateway();
     let net = NetworkDef {
         name: "pelagos0".to_string(),
-        subnet: Ipv4Net {
-            addr: Ipv4Addr::new(172, 19, 0, 0),
-            prefix_len: 24,
-        },
-        gateway: Ipv4Addr::new(172, 19, 0, 1),
+        gateway,
         bridge_name: "pelagos0".to_string(),
+        subnet,
     };
     net.save()?;
 
@@ -270,11 +272,15 @@ pub fn bootstrap_default_network() -> io::Result<NetworkDef> {
 
 /// Load a network definition by name.
 ///
-/// For `"pelagos0"`, calls [`bootstrap_default_network`] to ensure it exists.
+/// For `"pelagos0"`, calls [`bootstrap_default_network`] to ensure it exists,
+/// using the built-in default subnet (`172.19.0.0/24`).  Callers that have a
+/// [`crate::config::PelagosConfig`] should call `bootstrap_default_network`
+/// directly so the configured subnet is respected on first creation.
+///
 /// For other names, loads from config dir.
 pub fn load_network_def(name: &str) -> io::Result<NetworkDef> {
     if name == "pelagos0" {
-        bootstrap_default_network()
+        bootstrap_default_network(None)
     } else {
         NetworkDef::load(name)
     }
@@ -282,17 +288,20 @@ pub fn load_network_def(name: &str) -> io::Result<NetworkDef> {
 
 /// Ensure a named network exists, creating it if necessary.
 ///
-/// If the network config already exists, returns immediately.  Otherwise tries
-/// subnets in `10.99.0.0/24 … 10.99.255.0/24` until a non-overlapping one is
-/// found, then creates and persists the `NetworkDef`.
+/// If the network config already exists, returns immediately.  Otherwise carves
+/// a /24 from `auto_alloc_pool` (default `10.99.0.0/16`) until a
+/// non-overlapping block is found, then creates and persists the `NetworkDef`.
 ///
-/// Used by the Lisp runtime to auto-create networks referenced in service specs,
-/// mirroring what `compose up` does for the declarative compose path.
-pub fn ensure_network(name: &str) -> io::Result<()> {
+/// Used by the Lisp runtime and compose to auto-create networks referenced in
+/// service specs.
+pub fn ensure_network(name: &str, auto_alloc_pool: Option<&Ipv4Net>) -> io::Result<()> {
     let config = crate::paths::network_config_dir(name).join("config.json");
     if config.exists() {
         return Ok(());
     }
+
+    let fallback = Ipv4Net::from_cidr("10.99.0.0/16").expect("hardcoded CIDR is valid");
+    let pool = auto_alloc_pool.unwrap_or(&fallback);
 
     // Collect subnets already in use.
     let networks_dir = crate::paths::networks_config_dir();
@@ -310,33 +319,42 @@ pub fn ensure_network(name: &str) -> io::Result<()> {
         }
     }
 
-    // Find the first non-overlapping /24 in 10.99.x.0.
-    for octet in 0u8..=255 {
-        let cidr = format!("10.99.{}.0/24", octet);
-        let subnet = Ipv4Net::from_cidr(&cidr)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        if used.iter().any(|u| u.overlaps(&subnet)) {
-            continue;
+    // Carve /24 blocks from the pool until we find a non-overlapping one.
+    let pool_base = u32::from(pool.addr);
+    let pool_mask = !((1u32 << (32 - pool.prefix_len)) - 1);
+    let pool_end = pool_base | !pool_mask;
+
+    let mut candidate = pool_base & 0xFFFFFF00; // align to /24 boundary
+    while candidate <= pool_end {
+        let subnet_addr = Ipv4Addr::from(candidate);
+        let cidr = format!("{}/24", subnet_addr);
+        if let Ok(subnet) = Ipv4Net::from_cidr(&cidr) {
+            if !used.iter().any(|u| u.overlaps(&subnet)) {
+                let bridge_name = if name == "pelagos0" {
+                    "pelagos0".to_string()
+                } else {
+                    format!("rm-{}", name)
+                };
+                let net = NetworkDef {
+                    name: name.to_string(),
+                    gateway: subnet.gateway(),
+                    bridge_name,
+                    subnet,
+                };
+                net.save()?;
+                log::info!("ensure_network: created '{}' ({})", name, cidr);
+                return Ok(());
+            }
         }
-        let bridge_name = if name == "pelagos0" {
-            "pelagos0".to_string()
-        } else {
-            format!("rm-{}", name)
+        candidate = match candidate.checked_add(256) {
+            Some(n) => n,
+            None => break,
         };
-        let net = NetworkDef {
-            name: name.to_string(),
-            gateway: subnet.gateway(),
-            bridge_name,
-            subnet,
-        };
-        net.save()?;
-        log::info!("ensure_network: created '{}' ({})", name, cidr);
-        return Ok(());
     }
 
     Err(io::Error::other(format!(
-        "ensure_network: all subnets in 10.99.x.0/24 exhausted for '{}'",
-        name
+        "ensure_network: all /24 blocks in {} exhausted for '{}'",
+        pool.addr, name
     )))
 }
 

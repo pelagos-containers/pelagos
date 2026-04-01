@@ -29,6 +29,11 @@ pub struct BuildArgs {
     #[clap(long = "build-arg")]
     pub build_arg: Vec<String>,
 
+    /// Override the subnet used when bootstrapping pelagos0 for the first time.
+    /// Has no effect once pelagos0 already exists.
+    #[clap(long = "default-subnet", value_name = "CIDR")]
+    pub default_subnet: Option<String>,
+
     /// Build context directory (default: current directory)
     #[clap(default_value = ".")]
     pub context: String,
@@ -42,6 +47,19 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref backend) = args.dns_backend {
         // SAFETY: called early in single-threaded CLI startup, before spawning threads.
         unsafe { std::env::set_var("PELAGOS_DNS_BACKEND", backend) };
+    }
+
+    // Bootstrap pelagos0 with the configured (or CLI-overridden) default subnet.
+    // No-op when the network already exists on disk.
+    {
+        let cfg = pelagos::config::PelagosConfig::load();
+        let subnet = if let Some(ref cidr) = args.default_subnet {
+            pelagos::network::Ipv4Net::from_cidr(cidr)
+                .map_err(|e| format!("--default-subnet '{}': {}", cidr, e))?
+        } else {
+            cfg.network.default_subnet_parsed()
+        };
+        let _ = pelagos::network::bootstrap_default_network(Some(&subnet));
     }
 
     let context_dir = PathBuf::from(&args.context)
