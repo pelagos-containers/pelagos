@@ -10453,8 +10453,9 @@ mod dns {
             use std::time::Duration;
             // Minimal DNS query for "." A record.
             let query: &[u8] = &[
-                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
-                0x00,       // QNAME: root label
+                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, // header
+                0x00, // QNAME: root label
                 0x00, 0x01, // QTYPE A
                 0x00, 0x01, // QCLASS IN
             ];
@@ -12588,7 +12589,14 @@ mod registry_auth {
 
         // Push alpine to the local registry.
         let push_out = std::process::Command::new(bin)
-            .args(["image", "push", "alpine:3.21", "--dest", &dest_ref, "--insecure"])
+            .args([
+                "image",
+                "push",
+                "alpine:3.21",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+            ])
             .output()
             .expect("pelagos image push");
         assert!(
@@ -12745,7 +12753,14 @@ mod registry_auth {
 
         // ── 3. Push WITHOUT credentials — must fail ────────────────────────────
         let push_anon = std::process::Command::new(bin)
-            .args(["image", "push", "alpine:3.21", "--dest", &dest_ref, "--insecure"])
+            .args([
+                "image",
+                "push",
+                "alpine:3.21",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+            ])
             .output()
             .expect("push without creds");
         assert!(
@@ -12838,7 +12853,14 @@ mod registry_auth {
 
         // Push via docker config (no explicit --username/--password).
         let push_auth = std::process::Command::new(bin)
-            .args(["image", "push", "alpine:3.21", "--dest", &dest_ref, "--insecure"])
+            .args([
+                "image",
+                "push",
+                "alpine:3.21",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+            ])
             .env("HOME", &home_path)
             .output()
             .expect("push via docker config");
