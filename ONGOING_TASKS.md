@@ -1,5 +1,50 @@
 # Ongoing Tasks
 
+## Session completed: 2026-03-31 (SHA 023ef35)
+
+### Issues resolved this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| #179 | feat(build): auto-pull FROM base images (match docker build behaviour) | PR #181 |
+| #183 | fix(network): ip netns del EBUSY — retry loop + lazy-unmount fallback | PR #184 |
+| #180 | docs: AVF NAT blocks external port 53 | Closed — was stale; smoltcp relay fixed DNS as side-effect of PR #117 |
+
+### Key implementation details
+
+**#179 — `pelagos build` auto-pull (PRs #181, #182):**
+- `execute_build` / `execute_stage` accept `Option<PullFn<'_>>` callback
+- `PullFn<'a>` type alias introduced to satisfy `clippy::type_complexity`
+- When `load_image` fails for a FROM reference, pull callback is invoked; load retried after pull
+- CLI `build.rs` passes a closure that calls `cmd_image_pull`
+- All 24 `execute_build` call sites in integration tests pass `None`
+- `test_tut_p2_multistage_go_build` pre-pull boilerplate removed (now relies on auto-pull)
+
+**#183 — `delete_netns()` retry loop (PR #184):**
+- Replaces single `ip netns del` + naive `remove_file` fallback
+- 10 retries × 100 ms = 1 s budget; kernel veth teardown races resolved in the common case
+- If all retries fail: `umount2(MNT_DETACH)` (Linux-gated) + `unlink` as last resort
+- Ensures `netns_exists()` always returns false post-teardown → NAT/port-forward refcounts accurate
+- Fixes 5 previously-failing tests: `test_nat_cleanup`, `test_nat_refcount`,
+  `test_bridge_cleanup_after_sigkill`, `test_port_forward_cleanup`,
+  `test_port_forward_independent_teardown`
+
+**#180 — DNS investigation:**
+- Issue attributed DNS failure to AVF NAT; investigation showed VM uses smoltcp relay (PR #117), not VZNATNetworkDeviceAttachment
+- Root cause of original failure: `VZNATNetworkDeviceAttachment` degrades after ~5 VM boots (PF anchor lost); DNS was collateral damage
+- Confirmed 2026-03-31: both UDP/53 and TCP/53 work from inside the VM via the relay
+- `test_dns_upstream_forward` confirmed passing (not self-skipping) inside the VM
+- Issue closed as resolved by PR #117
+
+### PR #178 — pending merge
+
+`fix(build+tests): inject HOME in RUN containers; fix all 6 ignored tests`
+- Injects `HOME=/root` in build RUN containers (matches Docker behaviour; fixes Go/pip/npm)
+- Fixes all 6 `#[ignore]`-tagged tests: consistent `alpine:3.21` refs, pre-pull guards
+- CI passing (lint fmt fix pushed 2026-03-31); merge after CI green
+
+---
+
 ## Completed: system prune / system df (#126, #127) — 2026-03-29, HEAD: 80a92e6
 
 - `pelagos system prune [--all] [--volumes]` and `pelagos system df` implemented
