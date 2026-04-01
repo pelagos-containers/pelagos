@@ -42,6 +42,7 @@ tempfile = "3"  # Temp files for layer downloads
 sha2 = "0.10"  # SHA-256 for content-addressable layer digests
 ignore = "0.4"  # Gitignore-style pattern matching for .remignore
 ureq = "2"      # Blocking HTTP client for ADD URL downloads
+toml = { version = "0.8", features = ["parse"] }  # TOML config file parsing
 bzip2 = { version = "0.5", features = ["static"] }  # bz2 decompression; static links libbz2 for musl portability
 xz2 = { version = "0.1", features = ["static"] }    # xz decompression; static links liblzma for musl portability
 containerd-shim = "0.10"  # Shim v2 protocol (ttrpc) for containerd-shim-pelagos-wasm-v1 binary

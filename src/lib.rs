@@ -12,6 +12,7 @@ pub mod build;
 pub mod cgroup;
 pub mod cgroup_rootless;
 pub mod compose;
+pub mod config;
 pub mod container;
 pub mod dns;
 pub mod idmap;

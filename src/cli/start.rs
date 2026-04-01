@@ -144,5 +144,6 @@ fn spawn_config_to_run_args(
         attach: vec![],
         sig_proxy: None,
         upper_dir: None, // set by start_one after this call
+        default_subnet: None,
     }
 }

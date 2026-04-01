@@ -1394,8 +1394,10 @@ fn do_container_start_inner(
         .collect();
 
     // Ensure each network exists — create on demand, same as volumes.
+    let lisp_cfg = crate::config::PelagosConfig::load();
+    let alloc_pool = lisp_cfg.network.auto_alloc_pool_parsed();
     for net_name in &svc_network_names {
-        crate::network::ensure_network(net_name).map_err(|e| {
+        crate::network::ensure_network(net_name, Some(&alloc_pool)).map_err(|e| {
             LispError::new(format!(
                 "container-start: failed to ensure network '{}': {}",
                 net_name, e
