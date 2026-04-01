@@ -47,6 +47,51 @@ pelagos image ls
 
 ---
 
+## Configuration
+
+Pelagos reads an optional TOML config file on startup. All settings have built-in defaults
+so the file is never required — create it only when you need to change a default.
+
+### Config file location
+
+| Context | Path |
+|---------|------|
+| `$XDG_CONFIG_HOME` set (any UID) | `$XDG_CONFIG_HOME/pelagos/config.toml` |
+| Rootless (no `$XDG_CONFIG_HOME`) | `~/.config/pelagos/config.toml` |
+| Root (no `$XDG_CONFIG_HOME`) | `/etc/pelagos/config.toml` |
+
+`$XDG_CONFIG_HOME` takes priority for any UID. This is useful in CI environments or
+when running integration tests that need to inject a specific config without root access.
+
+### `[network]` section
+
+```toml
+[network]
+# Subnet for the default pelagos0 bridge.
+# Only applied when pelagos0 is first created; has no effect once it exists.
+default_subnet = "172.19.0.0/24"
+
+# Pool from which auto-allocated network subnets are carved.
+# `pelagos network create <name>` (without --subnet) picks the next free /24 from this pool.
+auto_alloc_pool = "10.99.0.0/16"
+```
+
+Both values must be valid CIDR notation. Invalid values are silently replaced by the
+built-in defaults and a `WARN`-level log message is emitted.
+
+### Overriding the default subnet at runtime
+
+Even without editing the config file you can override the subnet used when `pelagos0` is
+bootstrapped for the very first time:
+
+```bash
+# Use a different subnet for pelagos0 (no effect if it already exists)
+sudo pelagos run --default-subnet 192.168.200.0/24 --network bridge alpine /bin/sh
+sudo pelagos build --default-subnet 192.168.200.0/24 -t myapp:latest .
+```
+
+---
+
 ## Quick Start
 
 ### Rootless (no sudo)
@@ -545,6 +590,8 @@ pelagos build [OPTIONS] [CONTEXT]
 | `--network <MODE>` | | Network for RUN steps: `bridge`, `pasta`, `none`, `auto` (default) |
 | `--build-arg <KEY=VALUE>` | | Set a build-time variable (can be repeated) |
 | `--no-cache` | | Disable build cache; re-run all steps |
+| `--dns-backend <BE>` | | DNS backend for RUN steps: `builtin` or `dnsmasq` |
+| `--default-subnet <CIDR>` | | Override the subnet used when `pelagos0` is first created |
 | `CONTEXT` | | Build context directory (default: `.`) |
 
 `--network auto` selects `bridge` when running as root, `pasta` when rootless.
@@ -1221,6 +1268,76 @@ pelagos run --network pasta -i alpine /bin/sh
 
 Bridge networking requires root and is rejected in rootless mode.
 
+### Named Networks
+
+User-defined bridge networks give each group of containers its own L2 segment, subnet,
+and DNS domain — analogous to `docker network create`.
+
+```bash
+# Create a named network with an explicit subnet
+sudo pelagos network create frontend --subnet 10.0.1.0/24
+
+# Create a named network — subnet auto-allocated from the pool in config.toml
+# (default pool: 10.99.0.0/16 → picks the next free /24, e.g. 10.99.0.0/24)
+sudo pelagos network create backend
+
+# Create with an explicit allocation pool (overrides config for this call only)
+sudo pelagos network create staging --alloc-from 192.168.100.0/24
+
+# List all networks
+pelagos network ls
+
+# Inspect a network (subnet, gateway, active containers)
+pelagos network inspect frontend
+
+# Remove a network (containers must have exited first)
+sudo pelagos network rm frontend
+```
+
+Run containers on a named network:
+
+```bash
+# Attach to a named network
+sudo pelagos run -d --name web --network frontend --nat alpine /bin/sh -c 'sleep 3600'
+sudo pelagos run --network frontend alpine /bin/sh -c 'ping -c1 web'
+
+# Attach to multiple networks (eth0 = frontend, eth1 = backend)
+sudo pelagos run --network frontend --network backend alpine /bin/sh
+```
+
+Containers on different named networks are L2-isolated. Each network has its own
+IPAM counter, NAT refcount, and nftables table (`pelagos-<name>`).
+
+Auto-allocation carves successive /24 blocks from the pool. The first call to
+`pelagos network create backend` gets `10.99.0.0/24`, the next `10.99.1.0/24`,
+and so on. The pool and starting subnet are configurable via `config.toml` (see
+[Configuration](#configuration)).
+
+### IPv6
+
+Pelagos supports IPv6 dual-stack on bridge networks. When IPv6 is enabled in the
+kernel and configured on the bridge, containers receive both an IPv4 (IPAM from the
+subnet above) and a stateless auto-configured (SLAAC) IPv6 address.
+
+```bash
+# Run a container and check its IPv6 address
+sudo pelagos run -d --name v6box --network bridge --nat alpine ip -6 addr show eth0
+
+# Ping an IPv6 address from inside a container
+sudo pelagos run --network bridge --nat alpine ping6 -c3 2001:4860:4860::8888
+
+# Port-forward to an IPv6 endpoint
+sudo pelagos run --network bridge --nat -p 8080:80 alpine /bin/sh
+# From the host, reach it via both IPv4 and IPv6 loopback:
+#   curl http://127.0.0.1:8080/
+#   curl http://[::1]:8080/
+```
+
+**IPv6 DAD note:** A newly-assigned IPv6 address is "tentative" for ~1 second while
+the kernel runs Duplicate Address Detection (DAD). Packets sent during this window are
+silently dropped by the kernel. For scripted tests that run immediately after container
+start, poll until `ip -6 addr show eth0 | grep -v tentative` before sending traffic.
+
 ---
 
 ## Storage
@@ -1475,7 +1592,7 @@ pelagos run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 | `--detach` | `-d` | Run in background |
 | `--interactive` | `-i` | Allocate a PTY (incompatible with `--detach`) |
 | `--rootfs <ROOTFS>` | | Use a local rootfs instead of an OCI image (advanced) |
-| `--network <MODE>` | | `none` (default), `loopback`, `bridge`, `pasta` |
+| `--network <MODE>` | | `none` (default), `loopback`, `bridge`, `pasta`, or a named network (repeatable) |
 | `--publish <H:C>` | `-p` | TCP port forward host:container (repeatable) |
 | `--nat` | | Enable MASQUERADE NAT (requires bridge) |
 | `--dns <IP>` | | DNS server (repeatable) |
@@ -1502,6 +1619,7 @@ pelagos run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 | `--sysctl <K=V>` | | Kernel parameter (repeatable) |
 | `--masked-path <PATH>` | | Path to mask inside container (repeatable) |
 | `--rm` | | Remove container automatically when it exits |
+| `--default-subnet <CIDR>` | | Override the subnet used when `pelagos0` is first created (no-op if it already exists) |
 
 ---
 

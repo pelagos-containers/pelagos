@@ -1,5 +1,9 @@
 # Multi-Network Support — Design Plan
 
+> **Status: IMPLEMENTED** (v0.59+).
+> This document is the original design plan; it is preserved for historical context.
+> For current usage, see the [User Guide — Named Networks](USER_GUIDE.md#named-networks) section.
+
 ## Motivation
 
 Today Pelagos has exactly one bridge: `pelagos0` (172.19.0.0/24). Every container
@@ -384,22 +388,17 @@ rules.
 
 ---
 
-## Open Questions
+## Open Questions (resolved in implementation)
 
-1. **Bridge name length limit.** Linux interface names are capped at 15 bytes
-   (IFNAMSIZ − 1). Should we prefix user names (e.g. `rm-frontend` = 11 chars)
-   or let users pick raw names and validate length?
+1. **Bridge name length limit.** ✅ User-supplied names are used as-is;
+   `pelagos network create` rejects names that would exceed 15 bytes (IFNAMSIZ − 1).
 
-2. **Subnet defaults.** Should `pelagos network create frontend` auto-assign
-   a subnet (next available /24 from a pool like 10.0.0.0/8), or always
-   require `--subnet`? Auto-assignment is convenient; explicit is simpler to
-   implement and reason about.
+2. **Subnet defaults.** ✅ Auto-assignment implemented via `--alloc-from` and
+   `auto_alloc_pool` in `config.toml`. `--subnet` is optional; omitting it
+   carves the next free /24 from the configured pool.
 
-3. **Multi-network containers.** Docker allows attaching a container to
-   multiple networks. Do we need this? Probably not for v1 — one network
-   per container is sufficient. Can be added later by allowing multiple
-   `--network` flags.
+3. **Multi-network containers.** ✅ Implemented. `--network` is repeatable;
+   additional networks are attached as eth1, eth2, …
 
-4. **Network-scoped DNS.** If we add container-name DNS resolution, it
-   should be scoped to the network. This is a separate feature but the
-   network boundary established here is the right foundation.
+4. **Network-scoped DNS.** ✅ Implemented. The builtin `pelagos-dns` daemon
+   resolves container names within the network they are attached to.
