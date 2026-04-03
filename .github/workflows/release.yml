@@ -117,12 +117,13 @@ jobs:
             BINARY_NAME=$(echo $row | cut -d' ' -f2)
             BINARY="dist/$ARCH/$BINARY_NAME"
             chmod +x "$BINARY"
+            cp "$BINARY" ./pelagos-current
 
-            ARCH=$ARCH VERSION=$VERSION BINARY=$BINARY \
+            ARCH=$ARCH VERSION=$VERSION \
               nfpm package --config pkg/nfpm/nfpm.yaml --packager deb \
               --target "dist/packages/pelagos_${VERSION}_${ARCH}.deb"
 
-            ARCH=$ARCH VERSION=$VERSION BINARY=$BINARY \
+            ARCH=$ARCH VERSION=$VERSION \
               nfpm package --config pkg/nfpm/nfpm.yaml --packager rpm \
               --target "dist/packages/pelagos_${VERSION}_${ARCH}.rpm"
           done

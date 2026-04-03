@@ -20,7 +20,7 @@ suggests:
   - dnsmasq
 
 contents:
-  - src: "${BINARY}"
+  - src: ./pelagos-current
     dst: /usr/bin/pelagos
     file_info:
       mode: 0755
