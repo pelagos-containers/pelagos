@@ -201,8 +201,11 @@ cargo install --path .
 
 Pelagos defaults to **rootless** — most operations work without `sudo`. Root is
 required only for bridge networking, NAT, port mapping, and OCI lifecycle commands
-(`create`/`start`/`kill`/`delete`). For internet access without root, use
-`--network pasta` (requires `pasta` from [passt.top](https://passt.top)).
+(`create`/`start`/`kill`/`delete`).
+
+Network mode is auto-selected: root → bridge + NAT; rootless → pasta (requires
+`pasta` from [passt.top](https://passt.top)); rootless without pasta → loopback
+with a warning. No `--network` or `--nat` flags needed in the common case.
 
 On kernel 5.11+ Pelagos uses native overlayfs with `userxattr` (zero-copy,
 kernel-native). On older kernels it falls back to `fuse-overlayfs` automatically.
@@ -213,17 +216,18 @@ kernel-native). On older kernels it falls back to `fuse-overlayfs` automatically
 pelagos image pull alpine
 pelagos run alpine /bin/echo hello
 
-# Interactive shell with internet
-pelagos run -i --network pasta alpine /bin/sh
+# Interactive shell with internet (pasta auto-selected)
+pelagos run -i alpine /bin/sh
 ```
 
 ### Root (bridge networking, NAT, port mapping)
 
 ```bash
+# Bridge + NAT are auto-selected as root — no flags needed
 sudo pelagos run -i alpine /bin/sh
 
-# Detached container with bridge networking
-sudo pelagos run -d --name mybox --network bridge --nat alpine \
+# Detached container (bridge + NAT implied)
+sudo pelagos run -d --name mybox alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
 pelagos ps

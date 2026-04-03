@@ -45,7 +45,7 @@ If a non-root pull fails with "Permission denied":
 - OCI lifecycle: `create`, `start`, `state`, `kill`, `delete`
 
 **Rootless without restriction:**
-- `pelagos run` (no network, `--network pasta`, `--network loopback`)
+- `pelagos run` — auto-selects pasta (full internet) when available, loopback as fallback
 - `pelagos build` — pasta for RUN networking; native or fuse overlay for layers
 - `pelagos compose` when no `(network ...)` declarations are used
 - `pelagos ps`, `pelagos logs`, `pelagos rm` — state file ops

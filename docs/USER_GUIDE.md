@@ -1198,35 +1198,64 @@ pelagos exec -u 1000:1000 mybox /bin/id
 
 ## Networking
 
-By default, containers have no network (`--network none`).
+Pelagos selects a network mode automatically when `--network` is not specified:
+
+- **Running as root** → bridge + implied NAT (full internet access, Docker-compatible)
+- **Rootless + pasta available** → pasta (user-mode networking, no root needed)
+- **Rootless + no pasta** → loopback only (+ warning to install pasta)
+
+This means `pelagos run alpine ping -c 5 google.com` works out of the box in
+both root and rootless environments, with no extra flags.
 
 ### Network Modes
 
 ```bash
-# No network (default)
-sudo pelagos run alpine /bin/sh
+# Auto (default) — bridge+NAT as root, pasta as rootless:
+sudo pelagos run alpine /bin/sh        # bridge + NAT implied
+pelagos run alpine /bin/sh             # pasta (rootless, no sudo)
+
+# Explicit modes:
 
 # Loopback only (127.0.0.1, no external access)
 sudo pelagos run --network loopback alpine /bin/sh
 
-# Bridge networking (veth pair + pelagos0 bridge, 172.19.0.x/24)
-sudo pelagos run --network bridge --nat alpine /bin/sh
+# Bridge networking (veth pair + pelagos0 bridge, 172.19.0.x/24) + NAT
+sudo pelagos run --network bridge alpine /bin/sh     # NAT implied by bridge
+
+# Bridge without NAT (container has bridge IP, but no masquerade to internet)
+sudo pelagos run --network bridge --no-nat alpine /bin/sh
 
 # Pasta (rootless, full internet access via user-mode networking)
 pelagos run --network pasta alpine /bin/sh    # no sudo needed
+
+# No network at all (air-gapped)
+sudo pelagos run --network none alpine /bin/sh
+```
+
+### Upgrade Note
+
+Prior to v0.60, `pelagos run` defaulted to `--network none` (no network). If
+you have scripts relying on that isolation, add `--network none` explicitly:
+
+```bash
+# v0.59 and earlier default behaviour:
+sudo pelagos run --network none alpine /bin/sh
 ```
 
 ### NAT, Port Forwarding, and DNS
 
 ```bash
-# Enable outbound internet (MASQUERADE via nftables)
-sudo pelagos run --network bridge --nat alpine /bin/sh
+# Outbound internet: NAT is implied whenever bridge is selected (auto or explicit)
+sudo pelagos run alpine /bin/sh
+
+# Suppress NAT (routed prefix, no masquerade)
+sudo pelagos run --no-nat alpine /bin/sh
 
 # Publish ports (host:container TCP forwarding)
-sudo pelagos run --network bridge --nat -p 8080:80 alpine /bin/sh
+sudo pelagos run -p 8080:80 alpine /bin/sh
 
 # Custom DNS servers
-sudo pelagos run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
+sudo pelagos run --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
 ```
 
 ### DNS Backend
@@ -1252,19 +1281,25 @@ If dnsmasq is requested but not found on PATH, Pelagos logs a warning and falls 
 
 ```bash
 # Link containers by name (injects /etc/hosts entry)
-sudo pelagos run -d --name db --network bridge --nat alpine /bin/sh -c 'sleep 3600'
-sudo pelagos run --network bridge --nat --link db alpine /bin/sh -c 'ping -c1 db'
+sudo pelagos run -d --name db alpine /bin/sh -c 'sleep 3600'
+sudo pelagos run --link db alpine /bin/sh -c 'ping -c1 db'
 ```
 
 ### Rootless Networking
 
-For rootless containers (no sudo), use `--network pasta`. This requires
-[pasta](https://passt.top) (from the passt project) to be installed.
+Rootless containers automatically use [pasta](https://passt.top) (user-mode
+networking) when available — no flags needed:
 
 ```bash
-# Full internet access without root
+# Full internet access without root (pasta auto-selected)
+pelagos run -i alpine /bin/sh
+
+# Explicit pasta (same as above)
 pelagos run --network pasta -i alpine /bin/sh
 ```
+
+Install pasta with your distro's package manager (`passt` package on Arch/Fedora/Debian).
+If pasta is not found, pelagos falls back to loopback with a warning.
 
 Bridge networking requires root and is rejected in rootless mode.
 
@@ -1297,8 +1332,8 @@ sudo pelagos network rm frontend
 Run containers on a named network:
 
 ```bash
-# Attach to a named network
-sudo pelagos run -d --name web --network frontend --nat alpine /bin/sh -c 'sleep 3600'
+# Attach to a named network (NAT implied)
+sudo pelagos run -d --name web --network frontend alpine /bin/sh -c 'sleep 3600'
 sudo pelagos run --network frontend alpine /bin/sh -c 'ping -c1 web'
 
 # Attach to multiple networks (eth0 = frontend, eth1 = backend)
@@ -1320,14 +1355,14 @@ kernel and configured on the bridge, containers receive both an IPv4 (IPAM from 
 subnet above) and a stateless auto-configured (SLAAC) IPv6 address.
 
 ```bash
-# Run a container and check its IPv6 address
-sudo pelagos run -d --name v6box --network bridge --nat alpine ip -6 addr show eth0
+# Run a container and check its IPv6 address (NAT implied by bridge auto-default)
+sudo pelagos run -d --name v6box alpine ip -6 addr show eth0
 
 # Ping an IPv6 address from inside a container
-sudo pelagos run --network bridge --nat alpine ping6 -c3 2001:4860:4860::8888
+sudo pelagos run alpine ping -6 -c3 2001:4860:4860::8888
 
 # Port-forward to an IPv6 endpoint
-sudo pelagos run --network bridge --nat -p 8080:80 alpine /bin/sh
+sudo pelagos run -p 8080:80 alpine /bin/sh
 # From the host, reach it via both IPv4 and IPv6 loopback:
 #   curl http://127.0.0.1:8080/
 #   curl http://[::1]:8080/
@@ -1503,14 +1538,14 @@ just omit `sudo`.
 pelagos image pull alpine
 pelagos run alpine /bin/echo hello
 
-# Interactive shell with internet
-pelagos run -i --network pasta alpine /bin/sh
+# Interactive shell with internet (pasta auto-selected rootless)
+pelagos run -i alpine /bin/sh
 ```
 
 **What works rootless (no sudo):**
 - `pelagos image pull/push/ls/rm/save/load/tag/login/logout`
 - `pelagos build` — pasta for RUN networking, native or fuse overlay for layers
-- `pelagos run` with no network, `--network pasta`, or `--network loopback`
+- `pelagos run` — auto-selects pasta when available, loopback as fallback
 - `pelagos compose` when no `(network ...)` declarations are used
 - `pelagos ps`, `pelagos logs`, `pelagos rm` — state file operations
 - `pelagos volume create/ls/rm`
@@ -1592,9 +1627,10 @@ pelagos run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 | `--detach` | `-d` | Run in background |
 | `--interactive` | `-i` | Allocate a PTY (incompatible with `--detach`) |
 | `--rootfs <ROOTFS>` | | Use a local rootfs instead of an OCI image (advanced) |
-| `--network <MODE>` | | `none` (default), `loopback`, `bridge`, `pasta`, or a named network (repeatable) |
+| `--network <MODE>` | | Network mode: `bridge` (root default), `pasta` (rootless default), `loopback`, `none`, or a named network (repeatable) |
 | `--publish <H:C>` | `-p` | TCP port forward host:container (repeatable) |
-| `--nat` | | Enable MASQUERADE NAT (requires bridge) |
+| `--nat` | | Explicitly enable MASQUERADE NAT (implied by bridge; useful for named networks) |
+| `--no-nat` | | Suppress implied NAT when using bridge (for routed prefixes) |
 | `--dns <IP>` | | DNS server (repeatable) |
 | `--dns-backend <BE>` | | DNS backend: `builtin` (default) or `dnsmasq` |
 | `--link <NAME[:ALIAS]>` | | Link to another container |
