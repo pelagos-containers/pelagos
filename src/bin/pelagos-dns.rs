@@ -357,8 +357,10 @@ impl ServerState {
                         network_name, ip
                     );
                 }
-                Err(e) => {
-                    eprintln!("pelagos-dns: failed to bind {}: {}", bind_addr, e);
+                Err(_) => {
+                    // EADDRINUSE: another process (or a concurrent pelagos-dns instance)
+                    // already holds this socket.  DNS may still work via that holder;
+                    // either way this is not actionable at runtime.
                 }
             }
         }

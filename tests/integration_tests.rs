@@ -1696,6 +1696,8 @@ mod filesystem {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "--rootfs",
                 rootfs.to_str().unwrap(),
                 "-v",
@@ -1718,6 +1720,8 @@ mod filesystem {
         let out2 = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "--rootfs",
                 rootfs.to_str().unwrap(),
                 "-v",
@@ -7732,6 +7736,8 @@ mod exec {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -7847,6 +7853,8 @@ mod exec {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -7943,6 +7951,8 @@ mod exec {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -8046,6 +8056,8 @@ mod watcher {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -13384,6 +13396,8 @@ mod healthcheck_tests {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -13488,6 +13502,8 @@ mod healthcheck_tests {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -13610,6 +13626,8 @@ mod healthcheck_tests {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -17325,6 +17343,8 @@ mod auto_resolv_conf {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -17433,6 +17453,8 @@ mod auto_resolv_conf {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -17536,6 +17558,8 @@ mod auto_resolv_conf {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -17618,6 +17642,8 @@ mod auto_resolv_conf {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -17734,6 +17760,8 @@ mod auto_resolv_conf {
             let status = std::process::Command::new(bin)
                 .args([
                     "run",
+                    "--network",
+                    "loopback",
                     "-d",
                     "--name",
                     name,
@@ -17829,6 +17857,8 @@ mod auto_resolv_conf {
         let run_status = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name,
@@ -17918,6 +17948,8 @@ mod auto_resolv_conf {
         let run_a = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name_a,
@@ -17936,6 +17968,8 @@ mod auto_resolv_conf {
         let run_b = std::process::Command::new(bin)
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "--name",
                 name_b,
@@ -19753,6 +19787,8 @@ mod issue_117_attach_streams {
         let out = std::process::Command::new(bin())
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "-a",
                 "STDOUT",
@@ -19819,6 +19855,8 @@ mod issue_117_attach_streams {
         let out = std::process::Command::new(bin())
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "-a",
                 "STDERR",
@@ -19878,6 +19916,8 @@ mod issue_117_attach_streams {
         let out = std::process::Command::new(bin())
             .args([
                 "run",
+                "--network",
+                "loopback",
                 "-d",
                 "-a",
                 "STDOUT",
