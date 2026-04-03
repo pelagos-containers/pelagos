@@ -54,6 +54,26 @@ Pushing to a package name that does not yet exist **creates it** and makes you t
    git push aur master
    ```
 
+## Testing the AUR package locally
+
+If you have a manually-installed build in `/usr/local/bin`, remove it first so it doesn't shadow the AUR-installed binary:
+
+```bash
+sudo rm \
+  /usr/local/bin/pelagos \
+  /usr/local/bin/pelagos-dns \
+  /usr/local/bin/pelagos-shim-wasm
+```
+
+Then install and verify:
+
+```bash
+yay -S pelagos-bin
+which pelagos        # should be /usr/bin/pelagos
+pacman -Q pelagos-bin
+pelagos run --rm alpine echo hello
+```
+
 ## Rules for AUR repos
 
 - The AUR git repo must contain **only** `PKGBUILD`, `.SRCINFO`, and any `.install` or patch files — not the upstream source.
