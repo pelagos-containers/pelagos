@@ -153,10 +153,9 @@ jobs:
               exit 1
             fi
           }
+          # Buildkite registry only supports .deb — RPMs are on the GitHub release
           upload dist/packages/pelagos_${GITHUB_REF_NAME#v}_amd64.deb
           upload dist/packages/pelagos_${GITHUB_REF_NAME#v}_arm64.deb
-          upload dist/packages/pelagos_${GITHUB_REF_NAME#v}_amd64.rpm
-          upload dist/packages/pelagos_${GITHUB_REF_NAME#v}_arm64.rpm
 
   package-test:
     needs: [package]
