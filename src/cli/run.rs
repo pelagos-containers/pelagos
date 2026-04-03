@@ -454,16 +454,33 @@ fn build_image_run(
 
     // Resolve the image reference: load_image already tries <ref>:latest for
     // bare refs, so fall back directly to the normalised registry form.
+    // If neither succeeds, auto-pull then retry (Docker-compatible behaviour).
     let (full_ref, manifest) = if let Ok(m) = image::load_image(image_ref) {
         (image_ref.to_string(), m)
     } else {
         let normalised = normalise_image_reference(image_ref);
-        let m = image::load_image(&normalised).map_err(|e| {
-            format!(
-                "image '{}' not found locally (run 'pelagos image pull {}'): {}",
-                image_ref, image_ref, e
-            )
-        })?;
+        if image::load_image(&normalised).is_err() {
+            // Image not found locally — attempt an implicit pull.
+            eprintln!("Unable to find image '{}' locally", image_ref);
+            super::image::cmd_image_pull(image_ref, None, None, false, false).map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("Permission denied") || msg.contains("os error 13") {
+                    format!(
+                        "pull failed: {}\nhint: the pelagos image store requires write access.\n\
+                         Run 'sudo scripts/setup.sh' once, then add yourself to the group:\n\
+                         \tsudo usermod -aG pelagos $USER\n\
+                         Then log out and back in (or run 'newgrp pelagos' in this shell).",
+                        msg
+                    )
+                } else {
+                    format!("pull failed: {}", msg)
+                }
+            })?;
+        }
+        // Retry after pull (or if the normalised ref was already present).
+        let m = image::load_image(image_ref)
+            .or_else(|_| image::load_image(&normalised))
+            .map_err(|e| format!("image '{}' not found locally: {}", image_ref, e))?;
         (normalised, m)
     };
 

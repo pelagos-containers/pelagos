@@ -4083,3 +4083,17 @@ Creates a named volume via `pelagos volume create`, runs
 
 Failure indicates volume pruning is broken — unused volumes will persist even
 when the user explicitly requests `--volumes` cleanup (issue #126).
+
+### `test_run_auto_pulls_missing_image`
+**Requires:** root, internet access
+**Module:** `auto_pull`
+
+Removes the alpine image from the local store (all known reference forms), then
+runs `pelagos run --rm alpine /bin/echo auto-pull-ok` without a prior pull.
+Asserts the command succeeds, stdout contains `auto-pull-ok`, and stderr
+contains the "Unable to find image" notice that confirms the auto-pull path was
+taken.
+
+Failure indicates the auto-pull path in `build_image_run` is broken — either
+the pull was not attempted, the image was not re-loaded after the pull, or the
+pull itself failed (network issue in CI). Covers issue #189.

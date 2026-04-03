@@ -21131,3 +21131,72 @@ mod config_subnet {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #189 — `pelagos run` auto-pulls image when not found locally
+// ---------------------------------------------------------------------------
+
+mod auto_pull {
+    use std::process::Command;
+
+    fn pelagos_bin() -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("target/debug/pelagos");
+        p
+    }
+
+    /// test_run_auto_pulls_missing_image
+    ///
+    /// Requires: root (run spawns a bridge network container), internet access.
+    ///
+    /// Removes the alpine image from the local store, then runs
+    /// `pelagos run --rm alpine /bin/echo auto-pull-ok` without first pulling.
+    /// Verifies that pelagos auto-pulls the image and the container produces
+    /// the expected output — matching Docker's behaviour.
+    ///
+    /// Failure indicates: the auto-pull path in build_image_run is broken, the
+    /// image was not re-loaded after the pull, or the pull itself failed (network).
+    #[test]
+    #[serial_test::serial(nat)]
+    fn test_run_auto_pulls_missing_image() {
+        use crate::is_root;
+
+        if !is_root() {
+            eprintln!("SKIP test_run_auto_pulls_missing_image: requires root");
+            return;
+        }
+
+        // Remove alpine from the local store so the auto-pull path is exercised.
+        // Ignore errors (image may already be absent).
+        let _ = pelagos::image::remove_image("alpine");
+        let _ = pelagos::image::remove_image("alpine:latest");
+        let _ = pelagos::image::remove_image("docker.io/library/alpine:latest");
+
+        let bin = pelagos_bin();
+        let out = Command::new(&bin)
+            .args(["run", "--rm", "alpine", "/bin/echo", "auto-pull-ok"])
+            .output()
+            .expect("pelagos run");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            out.status.success(),
+            "pelagos run should succeed after auto-pull; stderr: {}",
+            stderr
+        );
+        assert!(
+            stdout.contains("auto-pull-ok"),
+            "container output should contain 'auto-pull-ok'; stdout: {}, stderr: {}",
+            stdout,
+            stderr
+        );
+        // The "Unable to find image" notice should have appeared on stderr.
+        assert!(
+            stderr.contains("Unable to find image"),
+            "stderr should mention auto-pull; stderr: {}",
+            stderr
+        );
+    }
+}
