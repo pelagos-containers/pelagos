@@ -142,9 +142,16 @@ jobs:
         run: |
           BASE_URL="https://api.buildkite.com/v2/packages/organizations/christopher-brown/registries/pelagos/packages"
           upload() {
-            curl -sS --fail-with-body -X POST "$BASE_URL" \
+            HTTP_STATUS=$(curl -sS -o /tmp/pkg_upload_response -w "%{http_code}" -X POST "$BASE_URL" \
               -H "Authorization: Bearer $PACKAGECLOUD_TOKEN" \
-              -F "file=@$1"
+              -F "file=@$1")
+            if [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "409" ]; then
+              echo "upload $1: HTTP $HTTP_STATUS (ok)"
+            else
+              echo "upload $1: HTTP $HTTP_STATUS (error)"
+              cat /tmp/pkg_upload_response
+              exit 1
+            fi
           }
           upload dist/packages/pelagos_${GITHUB_REF_NAME#v}_amd64.deb
           upload dist/packages/pelagos_${GITHUB_REF_NAME#v}_arm64.deb
