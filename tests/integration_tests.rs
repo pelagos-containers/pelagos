@@ -12787,10 +12787,20 @@ mod registry_auth {
             registry_addr
         );
 
-        // Pull alpine so we have something to push (may already be cached).
-        let _ = std::process::Command::new(bin)
+        // Pull alpine so we have something to push (skip if unavailable — rate limit / no network).
+        let pull_ok = std::process::Command::new(bin)
             .args(["image", "pull", "alpine:3.21"])
-            .status();
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !pull_ok {
+            // Check if it's already in the local store from a prior run.
+            let ls = std::process::Command::new(bin).args(["image", "ls"]).output().unwrap_or_default();
+            if !String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+                eprintln!("SKIP test_local_registry_push_pull_roundtrip: alpine:3.21 pull failed and not cached");
+                return;
+            }
+        }
 
         let dest_ref = format!("{}/library/alpine:3.21", registry_addr);
 
@@ -12951,10 +12961,19 @@ mod registry_auth {
         // Give registry time to initialise htpasswd auth.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Ensure alpine is available to push.
-        let _ = std::process::Command::new(bin)
+        // Ensure alpine is available to push (skip if unavailable — rate limit / no network).
+        let pull_ok = std::process::Command::new(bin)
             .args(["image", "pull", "alpine:3.21"])
-            .status();
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !pull_ok {
+            let ls = std::process::Command::new(bin).args(["image", "ls"]).output().unwrap_or_default();
+            if !String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+                eprintln!("SKIP test_registry_auth_push_pull: alpine:3.21 pull failed and not cached");
+                return;
+            }
+        }
 
         let dest_ref = format!("{}/library/alpine:3.21", registry_addr);
 
