@@ -38,8 +38,12 @@ impl PelagosConfig {
     /// Returns built-in defaults if the file does not exist or cannot be
     /// parsed — config is always optional.
     pub fn load() -> Self {
-        let path = crate::paths::config_file();
-        let data = match std::fs::read_to_string(&path) {
+        Self::load_from(&crate::paths::config_file())
+    }
+
+    /// Load config from an explicit path. Useful for tests and overrides.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        let data = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(_) => return Self::default(),
         };
@@ -189,28 +193,27 @@ auto_alloc_pool = "10.200.0.0/16"
 
     #[test]
     fn test_load_missing_file_returns_defaults() {
-        // Point XDG_CONFIG_HOME at a directory that doesn't contain pelagos/config.toml.
+        // Pass a path that does not exist — load_from must return defaults.
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        let cfg = PelagosConfig::load();
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let absent = tmp.path().join("pelagos/config.toml");
+        let cfg = PelagosConfig::load_from(&absent);
         assert_eq!(cfg.network.default_subnet, "172.19.0.0/24");
         assert_eq!(cfg.network.auto_alloc_pool, "10.99.0.0/16");
     }
 
     #[test]
     fn test_load_from_xdg_config_home() {
+        // Write a config file and load it directly via load_from — no env mutation.
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join("pelagos");
         std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_path = cfg_dir.join("config.toml");
         std::fs::write(
-            cfg_dir.join("config.toml"),
+            &cfg_path,
             "[network]\ndefault_subnet = \"10.77.0.0/24\"\nauto_alloc_pool = \"10.77.0.0/16\"\n",
         )
         .unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        let cfg = PelagosConfig::load();
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let cfg = PelagosConfig::load_from(&cfg_path);
         assert_eq!(cfg.network.default_subnet, "10.77.0.0/24");
         assert_eq!(cfg.network.auto_alloc_pool, "10.77.0.0/16");
     }
