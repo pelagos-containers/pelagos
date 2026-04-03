@@ -42,23 +42,23 @@ Pushing to a package name that does not yet exist **creates it** and makes you t
 The sha256sums are derived from the final release artifacts, which are only produced
 after all CI gates pass.
 
-1. Bump `pkgver` (and reset `pkgrel=1`) in both `PKGBUILD` files and `Cargo.toml`.
-2. Push the version bump commit and tag — CI builds the release and uploads artifacts.
-3. Once CI is green, fetch the real sha256sums from the release:
-   ```bash
-   curl -sL https://github.com/pelagos-containers/pelagos/releases/download/v<VERSION>/pelagos-x86_64-linux.sha256
-   curl -sL https://github.com/pelagos-containers/pelagos/releases/download/v<VERSION>/pelagos-aarch64-linux.sha256
-   curl -sL https://github.com/pelagos-containers/pelagos/archive/refs/tags/v<VERSION>.tar.gz | sha256sum
-   ```
-4. Update `sha256sums` in both `PKGBUILD` files.
-5. Regenerate `.SRCINFO` in each directory:
-   ```bash
-   makepkg --printsrcinfo > .SRCINFO
-   ```
-6. Commit the changes to this repo, then push to each AUR remote:
-   ```bash
-   git push aur master
-   ```
+Once CI is green, run the update script:
+
+```bash
+scripts/update-aur.sh <version>
+# e.g. scripts/update-aur.sh 0.61.0
+```
+
+This script:
+1. Fetches sha256sums for the x86_64 binary, aarch64 binary, and source tarball from the GitHub release
+2. Updates `pkgver` and `sha256sums` in both PKGBUILDs
+3. Regenerates `.SRCINFO` via `makepkg --printsrcinfo`
+4. Commits and pushes to both AUR remotes
+5. Commits the updated PKGBUILDs back to the main repo
+
+**Requires:** `makepkg` (Arch Linux), and both AUR git remotes configured in `pkg/aur/pelagos/` and `pkg/aur/pelagos-bin/` (see Initial publication section above).
+
+Note: Automating this in CI is tracked in [issue #190](https://github.com/pelagos-containers/pelagos/issues/190).
 
 ## Testing the AUR package locally
 
