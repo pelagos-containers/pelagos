@@ -152,6 +152,32 @@ else
     ok "created /etc/fuse.conf with user_allow_other"
 fi
 
+# ── Unprivileged user namespaces (Ubuntu 24.04+) ─────────────────────────────
+#
+# Ubuntu 24.04 ships with AppArmor restricting unprivileged user namespace
+# creation (kernel.apparmor_restrict_unprivileged_userns=1).  This breaks
+# rootless containers: CLONE_NEWUSER returns EINVAL for non-root processes.
+#
+# We write a sysctl.d drop-in that persists across reboots, then apply it
+# immediately.  On kernels/distros that don't have this knob the sysctl call
+# is a harmless no-op.
+
+USERNS_SYSCTL="kernel.apparmor_restrict_unprivileged_userns"
+USERNS_CONF="/etc/sysctl.d/99-pelagos-userns.conf"
+
+info "Checking unprivileged user namespace access..."
+current_val=$(sysctl -n "${USERNS_SYSCTL}" 2>/dev/null || echo "absent")
+
+if [[ "${current_val}" == "absent" ]]; then
+    done_ "kernel.apparmor_restrict_unprivileged_userns not present (no action needed)"
+elif [[ "${current_val}" == "0" ]] && grep -qsF "${USERNS_SYSCTL}=0" "${USERNS_CONF}" 2>/dev/null; then
+    done_ "unprivileged user namespaces already enabled"
+else
+    echo "${USERNS_SYSCTL}=0" > "${USERNS_CONF}"
+    sysctl -p "${USERNS_CONF}" >/dev/null
+    ok "enabled unprivileged user namespaces (${USERNS_CONF})"
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 echo ""
