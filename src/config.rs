@@ -18,11 +18,22 @@
 //! # Pool from which /24 blocks are carved when `pelagos network create`
 //! # is called without an explicit --subnet.
 //! auto_alloc_pool = "10.99.0.0/16"
+//!
+//! # DNS servers injected into bridge-networked containers when --dns is
+//! # not passed.  Default is Cloudflare dual-stack (IPv4 + IPv6).
+//! # Set to [] to disable auto-injection.
+//! # Override at runtime: PELAGOS_DEFAULT_DNS=9.9.9.9,2620:fe::fe
+//! default_dns = ["1.1.1.1", "2606:4700:4700::1111"]
 //! ```
 
 use serde::Deserialize;
 
 use crate::network::Ipv4Net;
+
+/// Default DNS servers injected into bridge-networked containers when no
+/// `--dns` flag is passed.  Cloudflare dual-stack: works for both IPv4 and
+/// IPv6 hosts.
+const DEFAULT_DNS: &[&str] = &["1.1.1.1", "2606:4700:4700::1111"];
 
 // ── Top-level config ──────────────────────────────────────────────────────────
 
@@ -76,6 +87,15 @@ pub struct NetworkConfig {
     /// without an explicit `--subnet`.  Must be a /16 or larger.
     #[serde(default = "NetworkConfig::default_alloc_pool_str")]
     pub auto_alloc_pool: String,
+
+    /// DNS servers injected into bridge-networked containers when `--dns` is
+    /// not passed explicitly.  Overridable via `PELAGOS_DEFAULT_DNS`
+    /// (comma-separated, env takes precedence over config file).
+    ///
+    /// Set to an empty list to disable auto-injection entirely:
+    /// `default_dns = []`
+    #[serde(default = "NetworkConfig::default_dns_list")]
+    pub default_dns: Vec<String>,
 }
 
 impl Default for NetworkConfig {
@@ -83,6 +103,7 @@ impl Default for NetworkConfig {
         Self {
             default_subnet: Self::default_subnet_str(),
             auto_alloc_pool: Self::default_alloc_pool_str(),
+            default_dns: Self::default_dns_list(),
         }
     }
 }
@@ -94,6 +115,23 @@ impl NetworkConfig {
 
     fn default_alloc_pool_str() -> String {
         "10.99.0.0/16".to_string()
+    }
+
+    fn default_dns_list() -> Vec<String> {
+        DEFAULT_DNS.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Resolve the effective default DNS list, applying the `PELAGOS_DEFAULT_DNS`
+    /// environment variable override if set.  Returns an empty vec if the env
+    /// var is set to an empty string (opt-out).
+    pub fn effective_default_dns(&self) -> Vec<String> {
+        if let Ok(val) = std::env::var("PELAGOS_DEFAULT_DNS") {
+            if val.is_empty() {
+                return vec![];
+            }
+            return val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+        self.default_dns.clone()
     }
 
     /// Parse `default_subnet` as an [`Ipv4Net`], falling back to the
@@ -134,6 +172,7 @@ mod tests {
         let cfg = PelagosConfig::default();
         assert_eq!(cfg.network.default_subnet, "172.19.0.0/24");
         assert_eq!(cfg.network.auto_alloc_pool, "10.99.0.0/16");
+        assert_eq!(cfg.network.default_dns, vec!["1.1.1.1", "2606:4700:4700::1111"]);
     }
 
     #[test]
@@ -184,11 +223,48 @@ auto_alloc_pool = "10.200.0.0/16"
         let cfg = NetworkConfig {
             default_subnet: "not-a-cidr".to_string(),
             auto_alloc_pool: "also-bad".to_string(),
+            default_dns: vec![],
         };
         let net = cfg.default_subnet_parsed();
         assert_eq!(net.addr.to_string(), "172.19.0.0");
         let pool = cfg.auto_alloc_pool_parsed();
         assert_eq!(pool.addr.to_string(), "10.99.0.0");
+    }
+
+    #[test]
+    fn test_default_dns_in_config_file() {
+        let toml = r#"
+[network]
+default_dns = ["9.9.9.9", "2620:fe::fe"]
+"#;
+        let cfg: PelagosConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.network.default_dns, vec!["9.9.9.9", "2620:fe::fe"]);
+    }
+
+    #[test]
+    fn test_empty_default_dns_disables_injection() {
+        let toml = "[network]\ndefault_dns = []\n";
+        let cfg: PelagosConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.network.effective_default_dns().is_empty());
+    }
+
+    #[test]
+    fn test_effective_default_dns_env_override() {
+        // Temporarily set the env var; restore on exit.
+        std::env::set_var("PELAGOS_DEFAULT_DNS", "8.8.8.8,8.8.4.4");
+        let cfg = NetworkConfig::default();
+        let dns = cfg.effective_default_dns();
+        std::env::remove_var("PELAGOS_DEFAULT_DNS");
+        assert_eq!(dns, vec!["8.8.8.8", "8.8.4.4"]);
+    }
+
+    #[test]
+    fn test_effective_default_dns_env_empty_opt_out() {
+        std::env::set_var("PELAGOS_DEFAULT_DNS", "");
+        let cfg = NetworkConfig::default();
+        let dns = cfg.effective_default_dns();
+        std::env::remove_var("PELAGOS_DEFAULT_DNS");
+        assert!(dns.is_empty());
     }
 
     #[test]

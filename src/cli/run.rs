@@ -686,8 +686,19 @@ fn apply_cli_options(
     if (is_bridge && !args.no_nat) || args.nat {
         cmd = cmd.with_nat();
     }
-    if !args.dns.is_empty() {
-        cmd = cmd.with_dns(&args.dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    // Resolve effective DNS: explicit --dns always wins; for bridge networks
+    // with no explicit --dns, auto-inject the configured defaults so that
+    // name resolution works without extra flags.  Pasta and loopback are
+    // excluded — pasta inherits host DNS via the user-mode network stack.
+    let effective_dns: Vec<String> = if !args.dns.is_empty() {
+        args.dns.clone()
+    } else if is_bridge {
+        pelagos::config::PelagosConfig::load().network.effective_default_dns()
+    } else {
+        vec![]
+    };
+    if !effective_dns.is_empty() {
+        cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     }
     for link_spec in &args.link {
         if let Some((name, alias)) = link_spec.split_once(':') {
