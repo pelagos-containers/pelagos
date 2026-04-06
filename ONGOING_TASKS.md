@@ -1,5 +1,34 @@
 # Ongoing Tasks
 
+## Session completed: 2026-04-06 (SHA e5b09c7, branch feat/rootless-subgid-reliability)
+
+### Issue #195: fix rootless fuse-overlayfs mode=0 mkdir (COMPLETE)
+
+**Root cause identified and fixed:**
+
+The previous "launcher" approach created fuse-overlayfs in a sibling user namespace
+to the container's. The kernel's `fuse_allow_current_process()` checks
+`current_in_userns(fc->user_ns)` — this returns false for sibling user namespaces,
+causing all fuse access to fail with EACCES (OS error 13).
+
+**Fix:** Remove the pre-fork launcher entirely. Fork fuse-overlayfs **inline in
+pre_exec** after `CLONE_NEWUSER+CLONE_NEWNS`, so it inherits the container's own
+user namespace. FUSE mount lives in container's private mount namespace; cleanup
+is automatic on container exit.
+
+**Removed:** `FuseOverlayRootless` struct, `spawn_fuse_overlay_rootless()` function,
+`fuse_fd_raw`/`fuse_proc_merged` variables, launcher lifecycle fields in `Child`.
+
+**Test:** `test_rootless_overlay_mode0_mkdir_succeeds` now passes.
+**Full suite:** 300/324 pass (15 pre-existing failures confirmed by git stash check).
+
+### Next: merge feat/rootless-subgid-reliability to main
+
+The branch has a chain of commits fixing rootless container reliability (subgid
+support, DNS/hosts pre-seeding, fuse-overlayfs user namespace fix). Ready to PR.
+
+---
+
 ## Session completed: 2026-04-02 (SHA 03cff6d)
 
 ### Issues resolved this session
