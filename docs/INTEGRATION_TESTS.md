@@ -1703,20 +1703,25 @@ broken, which would be a regression from the multi-UID changes.
 **Requires:** non-root + alpine image in local store
 
 Runs a rootless container with `with_image_layers()` and executes `mkdir -m 000
-/tmp/mode0test`. Asserts the container exits 0 and prints `ok`.
+/tmp/mode0test && echo ok`. Asserts the container exits 0 and stdout contains `ok`.
 
-This is the regression test for the dpkg/Debian image build failure: dpkg
-creates staging directories with mode=0 as a security measure.
+This is the regression test for the dpkg/Debian image build failure: dpkg creates
+staging directories with mode=0 as a security measure, and overlayfs copy-up of
+those directories fails unless `fuse-overlayfs` has `CAP_DAC_OVERRIDE` (which it
+gets when running as uid 0 inside its user namespace).
 
-Fixed in issue #195 by two changes: (1) removing a stale CVE-2023-0386 fast-path
-from `native_rootless_overlay_supported()` that incorrectly blocked native overlayfs
-for rootless containers; (2) pre-seeding `resolv.conf` and `/etc/hosts` into the
-overlay upper dir in the parent process before fork (extending the issue #112 CA
-cert pattern), avoiding bind-mounts of tmpfs files onto overlayfs paths inside user
-namespaces, which return EINVAL.
+Fixed across multiple commits (issue #195):
+- Removed a stale CVE-2023-0386 fast-path that incorrectly blocked native overlayfs
+- Pre-seeded `resolv.conf`/`/etc/hosts` into overlay upper dir to avoid bind-mount
+  EINVAL inside user namespaces (issue #112 pattern)
+- Changed rootless `fuse-overlayfs` launch: instead of a pre-fork "launcher"
+  process (whose user namespace was a sibling of the container's), `fuse-overlayfs`
+  is now forked **inline in `pre_exec`** after `CLONE_NEWUSER+CLONE_NEWNS`, so it
+  shares the container's user namespace. This fixes the `fuse_allow_current_process`
+  `current_in_userns` check that returned EACCES for sibling namespaces.
 
-Failure indicates either that the CVE fast-path guard was re-introduced, or that
-the pre-seeding of DNS/hosts files was removed and bind-mount EINVAL regressed.
+Failure indicates that the inline fuse-overlayfs launch was reverted, or that the
+`CLONE_NEWUSER` → fuse-overlayfs user-namespace relationship was broken.
 
 ### `test_rootless_multi_gid_chown_succeeds`
 **Requires:** non-root + rootfs + newuidmap/newgidmap + subgid range
