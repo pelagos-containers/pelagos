@@ -33,6 +33,20 @@ done
 echo "=== Removing pelagos bridge ==="
 ip link del pelagos0 2>/dev/null && echo "  deleted pelagos0" || echo "  (no pelagos0)"
 
+echo "=== Killing processes inside leftover network namespaces ==="
+for ns in $(ip netns list 2>/dev/null | awk '{print $1}' | grep '^rem-'); do
+    # Find all processes whose net namespace inode matches this named netns,
+    # and kill them so that ip netns del doesn't fail with EBUSY.
+    ns_ino=$(stat -Lc '%i' "/run/netns/$ns" 2>/dev/null) || continue
+    for pid_ns in /proc/[0-9]*/ns/net; do
+        pid=$(echo "$pid_ns" | cut -d/ -f3)
+        p_ino=$(stat -Lc '%i' "$pid_ns" 2>/dev/null) || continue
+        if [ "$p_ino" = "$ns_ino" ]; then
+            kill -9 "$pid" 2>/dev/null && echo "  killed pid $pid in netns $ns" || true
+        fi
+    done
+done
+
 echo "=== Cleaning up network namespaces ==="
 for ns in $(ip netns list 2>/dev/null | awk '{print $1}' | grep '^rem-'); do
     ip netns del "$ns" 2>/dev/null && echo "  deleted netns $ns" || true
@@ -54,6 +68,16 @@ done
 
 echo "=== Stopping pelagos-dns daemon ==="
 pkill -x pelagos-dns 2>/dev/null && echo "  stopped pelagos-dns" || echo "  (not running)"
+
+echo "=== Unmounting pasta-ns bind-mounts ==="
+if [ -d /run/pelagos/pasta-ns ]; then
+    for f in /run/pelagos/pasta-ns/*; do
+        [ -e "$f" ] || continue
+        umount -l "$f" 2>/dev/null || true
+        rm -f "$f" 2>/dev/null || true
+        echo "  unmounted $f"
+    done
+fi
 
 echo "=== Removing /run/pelagos ==="
 rm -rf /run/pelagos && echo "  done" || true

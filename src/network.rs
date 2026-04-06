@@ -876,6 +876,10 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
         log::warn!("network teardown veth (non-fatal): {}", e);
     }
+    // Kill any processes (e.g. orphaned nc grandchildren) still in the netns
+    // before attempting to delete it.  Without this, a SIGKILLed shell that
+    // had live subprocesses causes `ip netns del` to fail with EBUSY.
+    kill_netns_processes(&setup.ns_name);
     delete_netns(&setup.ns_name);
     let net_def = match load_network_def(&setup.network_name) {
         Ok(n) => n,
@@ -896,6 +900,54 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     }
 }
 
+/// Kill every process whose net namespace matches the named netns at
+/// `/run/netns/{ns_name}`.
+///
+/// Called before `delete_netns` so that orphaned container sub-processes
+/// (e.g. `nc` grandchildren of a killed shell) don't keep the namespace
+/// alive and cause `ip netns del` to fail with EBUSY.
+///
+/// Walks `/proc/*/ns/net` symlinks, reads their inode numbers, and sends
+/// SIGKILL to any process whose net namespace inode equals the target.
+/// Errors on individual processes (e.g. already-dead) are silently ignored.
+fn kill_netns_processes(ns_name: &str) {
+    let netns_path = format!("/run/netns/{}", ns_name);
+    // Stat the target namespace to get its device+inode pair.
+    let target_ino = match std::fs::metadata(&netns_path) {
+        Ok(m) => {
+            use std::os::unix::fs::MetadataExt as _;
+            m.ino()
+        }
+        Err(_) => return,
+    };
+
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only consider numeric (PID) entries.
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: i32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let ns_link = format!("/proc/{}/ns/net", pid);
+        let Ok(meta) = std::fs::metadata(&ns_link) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.ino() == target_ino {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Remove a named network namespace, retrying briefly on `EBUSY`.
 ///
 /// `ip netns del` calls `umount2(path, MNT_DETACH)` then `unlink(path)`.
@@ -904,7 +956,7 @@ pub fn teardown_network(mut setup: NetworkSetup) {
 /// context and may outlive the container process by a few milliseconds).
 ///
 /// Strategy (see issue #183):
-/// 1. Retry `ip netns del` up to 5 times with 50 ms gaps — handles the
+/// 1. Retry `ip netns del` up to 50 times with 100 ms gaps — handles the
 ///    common timing-race without leaving orphaned mounts.
 /// 2. If all retries fail, fall back to `umount2(..., MNT_DETACH)` +
 ///    `unlink` directly, mirroring what `ip netns del` would do but
@@ -913,9 +965,10 @@ pub fn teardown_network(mut setup: NetworkSetup) {
 ///    that `netns_exists()` returns false and NAT/port-forward refcounts
 ///    are correct.
 fn delete_netns(ns_name: &str) {
-    // Retry budget: 10 × 100 ms = 1 s total.  Kernel veth teardown is
-    // asynchronous (softirq / workqueue) and takes longer inside a VM.
-    const RETRIES: u32 = 10;
+    // Retry budget: 50 × 100 ms = 5 s total.  Kernel veth teardown is
+    // asynchronous (softirq / workqueue) and takes longer when many containers
+    // tear down concurrently (e.g. compose tests with 9+ simultaneous bridges).
+    const RETRIES: u32 = 50;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
     let netns_path = format!("/run/netns/{}", ns_name);

@@ -327,14 +327,50 @@ fn ensure_builtin_daemon() -> io::Result<()> {
                         unsafe {
                             libc::dup2(devnull, 0);
                             libc::dup2(devnull, 1);
-                            // Keep stderr for daemon's own logging
-                            libc::close(devnull);
+                            libc::dup2(devnull, 2);
+                            if devnull > 2 {
+                                libc::close(devnull);
+                            }
+                        }
+                    }
+                    // Close all inherited file descriptors above 2.  The double-fork
+                    // inherits every FD open in the spawning process, including pipe
+                    // read/write ends from containers started with Stdio::Piped.  If
+                    // those aren't closed, pelagos-dns holds their write ends open and
+                    // wait_with_output() hangs forever waiting for EOF.
+                    unsafe {
+                        // Use /proc/self/fd to enumerate only open FDs rather than
+                        // blindly iterating to a large limit.
+                        let mut fds_to_close: [i32; 256] = [-1; 256];
+                        let mut n = 0usize;
+                        let dir = libc::opendir(c"/proc/self/fd".as_ptr());
+                        if !dir.is_null() {
+                            loop {
+                                let e = libc::readdir(dir);
+                                if e.is_null() {
+                                    break;
+                                }
+                                let name = std::ffi::CStr::from_ptr((*e).d_name.as_ptr());
+                                if let Ok(s) = name.to_str() {
+                                    if let Ok(fd) = s.parse::<i32>() {
+                                        if fd > 2 && n < fds_to_close.len() {
+                                            fds_to_close[n] = fd;
+                                            n += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            libc::closedir(dir);
+                        }
+                        // Close after the readdir loop so we don't invalidate the
+                        // dirp by closing the fd it uses.
+                        for &fd in &fds_to_close[..n] {
+                            libc::close(fd);
                         }
                     }
 
                     let config_dir_str = config_dir.to_string_lossy().to_string();
-                    let err = exec_dns_binary(&dns_bin, &config_dir_str);
-                    eprintln!("pelagos: failed to exec pelagos-dns: {}", err);
+                    let _ = exec_dns_binary(&dns_bin, &config_dir_str);
                     unsafe { libc::_exit(1) };
                 }
                 _ => {
