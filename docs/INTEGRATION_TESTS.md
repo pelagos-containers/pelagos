@@ -1701,23 +1701,22 @@ broken, which would be a regression from the multi-UID changes.
 
 ### `test_rootless_overlay_mode0_mkdir_succeeds`
 **Requires:** non-root + alpine image in local store
-**Status:** `#[ignore]` — issue #195 not yet implemented
 
 Runs a rootless container with `with_image_layers()` and executes `mkdir -m 000
 /tmp/mode0test`. Asserts the container exits 0 and prints `ok`.
 
 This is the regression test for the dpkg/Debian image build failure: dpkg
-creates staging directories with mode=0 as a security measure. The current
-fuse-overlayfs approach uses `squash_to_uid=HOST_UID`; HOST_UID running outside
-a user namespace has no `CAP_DAC_OVERRIDE` on mode=0 directories, so `setxattr`
-fails with EACCES.
+creates staging directories with mode=0 as a security measure.
 
-The intended fix (issue #195) is to spawn fuse-overlayfs inside a user+mount
-namespace (where uid=0 has `CAP_DAC_OVERRIDE`) using `squash_to_uid=0`. The
-user-namespace-only approach (no `CLONE_NEWNS`) fails with EPERM because a
-user-namespace process cannot create a FUSE mount in the host mount namespace.
-This test will pass once the full user+mount namespace approach is implemented
-and the FUSE mount is shared back to the container.
+Fixed in issue #195 by two changes: (1) removing a stale CVE-2023-0386 fast-path
+from `native_rootless_overlay_supported()` that incorrectly blocked native overlayfs
+for rootless containers; (2) pre-seeding `resolv.conf` and `/etc/hosts` into the
+overlay upper dir in the parent process before fork (extending the issue #112 CA
+cert pattern), avoiding bind-mounts of tmpfs files onto overlayfs paths inside user
+namespaces, which return EINVAL.
+
+Failure indicates either that the CVE fast-path guard was re-introduced, or that
+the pre-seeding of DNS/hosts files was removed and bind-mount EINVAL regressed.
 
 ### `test_rootless_multi_gid_chown_succeeds`
 **Requires:** non-root + rootfs + newuidmap/newgidmap + subgid range

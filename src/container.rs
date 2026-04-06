@@ -160,15 +160,8 @@ fn layer_store_is_btrfs() -> bool {
 ///
 /// Returns false immediately when:
 /// - The layer store is on btrfs (64-bit inode overflow in user namespaces)
-/// - Running rootless with root-owned layer files: CVE-2023-0386 makes the
-///   kernel reject copy-up of files whose UID is not mapped in uid_map.
-///   Our uid_map is "0 HOST_UID 1", so host uid=0 files are unmapped and
-///   copy-up always fails with EOVERFLOW regardless of kernel version.
 fn native_rootless_overlay_supported() -> bool {
-    use std::os::unix::fs::MetadataExt;
     use std::sync::OnceLock;
-
-    let host_uid = unsafe { libc::getuid() };
 
     // Btrfs: inode number overflow in user namespaces — must use fuse-overlayfs.
     if layer_store_is_btrfs() {
@@ -176,22 +169,6 @@ fn native_rootless_overlay_supported() -> bool {
             "rootless overlay: layer store is btrfs — skipping native overlay (use fuse-overlayfs)"
         );
         return false;
-    }
-
-    // CVE-2023-0386 fast path: rootless + root-owned layer files → EOVERFLOW on
-    // copy-up.  Return false without probing.
-    if host_uid != 0 {
-        if let Ok(mut entries) = std::fs::read_dir(crate::paths::layers_dir()) {
-            if let Some(Ok(entry)) = entries.next() {
-                if entry.metadata().map(|m| m.uid() == 0).unwrap_or(false) {
-                    log::debug!(
-                        "rootless overlay: layer store has root-owned files — \
-                         CVE-2023-0386 blocks copy-up; using fuse-overlayfs"
-                    );
-                    return false;
-                }
-            }
-        }
     }
 
     static RESULT: OnceLock<bool> = OnceLock::new();
@@ -390,46 +367,22 @@ fn spawn_fuse_overlayfs(
     rootless: bool,
 ) -> io::Result<std::process::Child> {
     let opts = if rootless {
-        // Squash all lower-layer uid/gid ownership to the host user's own uid/gid.
+        // squash_to_uid=0,squash_to_gid=0: fuse-overlayfs runs inside a user namespace
+        // where it is uid=0 (mapped from HOST_UID).  With uid=0, it has CAP_DAC_OVERRIDE
+        // on upper-layer files owned by mapped uids — this is what allows setxattr to
+        // succeed on mode=0 staging directories created by dpkg (issue #195).
         //
-        // Why not squash_to_root (uid 0)?
-        //   fuse-overlayfs runs as HOST_UID (e.g. 1000) in rootless mode.  FUSE kernel
-        //   delivers access requests with the caller's host uid, which is also HOST_UID
-        //   (because the user namespace maps container uid 0 → HOST_UID on the host).
-        //   If files are presented as uid 0 (squash_to_root), the caller appears as
-        //   "other" relative to uid-0-owned files with mode 755, so writes fail EPERM.
-        //
-        // With squash_to_uid=HOST_UID / squash_to_gid=HOST_GID:
-        //   - All lower-layer files appear to be owned by HOST_UID:HOST_GID.
-        //   - The calling process IS HOST_UID, so it is the owner → rwx permission.
-        //   - Inside the user namespace, HOST_UID maps to uid 0, so the container
-        //     still perceives all files as owned by root.
-        //   - New files created in the upper layer are stored as HOST_UID:HOST_GID,
-        //     which fuse-overlayfs can write without CAP_CHOWN.
-        //
-        // Known limitation (issue #195): dpkg creates staging dirs with mode=0 as a
-        // security measure.  fuse-overlayfs running as HOST_UID has no CAP_DAC_OVERRIDE
-        // on mode=0 upper-layer directories, so setxattr fails with EACCES.  The fix
-        // requires spawning fuse-overlayfs inside a user+mount namespace (uid=0 with
-        // CAP_DAC_OVERRIDE), then sharing the FUSE mount back to the container via
-        // mount ns fd passing or propagation.  User-namespace-only (no CLONE_NEWNS)
-        // fails with EPERM — the process cannot create a FUSE mount in the host mount
-        // namespace.  This is tracked in GitHub issue #195.
-        let host_uid = unsafe { libc::getuid() };
-        let host_gid = unsafe { libc::getgid() };
+        // The FUSE mount is created in fuse-overlayfs's own private mount namespace
+        // (not the host namespace).  The container accesses it via an fd opened through
+        // /proc/<fuse-pid>/root/<merged> and uses fchdir+chroot to root itself there.
         format!(
-            "lowerdir={},upperdir={},workdir={},squash_to_uid={},squash_to_gid={},allow_other",
+            "lowerdir={},upperdir={},workdir={},squash_to_uid=0,squash_to_gid=0,allow_other",
             lower,
             upper.display(),
             work.display(),
-            host_uid,
-            host_gid,
         )
     } else {
         // Root mode: preserve real file ownership; root can read/write everything.
-        // allow_other lets container processes that change uid (e.g. su, setuid
-        // binaries) access the FUSE mount.  Root-owned FUSE mounts are exempt from
-        // the user_allow_other restriction in /etc/fuse.conf.
         format!(
             "lowerdir={},upperdir={},workdir={},allow_other",
             lower,
@@ -438,13 +391,88 @@ fn spawn_fuse_overlayfs(
         )
     };
 
-    std::process::Command::new("fuse-overlayfs")
-        .args(["-o", &opts])
+    let mut cmd = std::process::Command::new("fuse-overlayfs");
+    // -f (foreground): prevents daemonization so the spawned pid stays valid.
+    // Required for the rootless case where the parent opens /proc/<pid>/root to
+    // reach into the FUSE namespace.  Root mode doesn't use /proc/<pid>/root but
+    // -f is harmless there too (we reap the child explicitly after unmount).
+    cmd.args(["-f", "-o", &opts])
         .arg(merged)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+
+    if rootless {
+        let host_uid = unsafe { libc::getuid() };
+        let host_gid = unsafe { libc::getgid() };
+        // Enter a new user+mount namespace so fuse-overlayfs:
+        //   - is uid=0 (via HOST_UID → 0 mapping) with CAP_DAC_OVERRIDE
+        //   - can call mount() in its own mount namespace (which it owns)
+        // The FUSE mount lands in this private mount namespace; the container
+        // accesses it via /proc/<fuse-pid>/root/<merged>.
+        //
+        // PR_SET_DUMPABLE=1 is required after writing uid_map: entering a user
+        // namespace makes the process non-dumpable, which prevents the parent from
+        // accessing /proc/<pid>/root to reach into the FUSE mount namespace.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // A process may write its own uid_map when the mapped host uid
+                // equals its current uid — no parent synchronisation needed.
+                write_proc_file(b"/proc/self/setgroups\0", b"deny")?;
+                write_uid_gid_map(b"/proc/self/uid_map\0", host_uid)?;
+                write_uid_gid_map(b"/proc/self/gid_map\0", host_gid)?;
+                // Restore dumpable so the parent can access /proc/<pid>/root.
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn()
+}
+
+/// Poll until fuse-overlayfs's private mount of `merged` is accessible via
+/// `/proc/<pid>/root/<merged>`, then open it as a directory fd.
+///
+/// Returns an `OwnedFd` (O_CLOEXEC) that points into the FUSE mount inside
+/// fuse-overlayfs's mount namespace.  The container's pre_exec uses this fd
+/// with `fchdir` + `chroot(".")` to root itself into the overlay without
+/// needing the FUSE mount present in the host mount namespace.
+fn open_fuse_merged_fd(
+    fuse_pid: u32,
+    merged: &std::path::Path,
+) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::FromRawFd;
+    // /proc/<fuse_pid>/root resolves paths through fuse-overlayfs's mount namespace.
+    let proc_root = format!("/proc/{}/root{}", fuse_pid, merged.display());
+    let path_c = std::ffi::CString::new(proc_root.as_bytes())
+        .map_err(|_| io::Error::other("merged path contains NUL"))?;
+
+    // Poll up to 3 s in 50 ms increments — FUSE mount may take a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let fd = unsafe {
+            libc::open(
+                path_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "fuse-overlayfs did not mount {} within 3s: {}",
+                merged.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Write `deny` or similar short strings to /proc/self/setgroups etc. from a
@@ -2952,6 +2980,10 @@ impl Command {
         // Overlay backend selection: native kernel overlayfs vs fuse-overlayfs.
         let mut fuse_overlay_child: Option<std::process::Child> = None;
         let mut fuse_overlay_merged: Option<PathBuf> = None;
+        // When rootless fuse-overlayfs runs in its own user+mount namespace, we open
+        // an fd into its FUSE mount via /proc/<pid>/root/<merged>.  The container's
+        // pre_exec uses fchdir(fd)+chroot(".") to root itself there.
+        let mut fuse_overlay_merged_fd: Option<std::os::unix::io::OwnedFd> = None;
         let use_fuse_overlay: bool;
         if is_rootless && self.overlay.is_some() {
             if native_rootless_overlay_supported() {
@@ -2959,7 +2991,7 @@ impl Command {
                 use_fuse_overlay = false;
             } else if is_fuse_overlayfs_available() {
                 log::info!(
-                    "rootless overlay: using fuse-overlayfs (user-namespace, pre-fork)"
+                    "rootless overlay: using fuse-overlayfs (user+mount namespace, pre-fork)"
                 );
                 if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
                     let lower_str = if !ov.lower_dirs.is_empty() {
@@ -2975,17 +3007,15 @@ impl Command {
                             .to_string_lossy()
                             .into_owned()
                     };
-                    let child = spawn_fuse_overlayfs(
-                        &lower_str,
-                        &ov.upper_dir,
-                        &ov.work_dir,
-                        merged,
-                        true,
-                    )
-                    .map_err(Error::Io)?;
+                    let child =
+                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged, true)
+                            .map_err(Error::Io)?;
+                    let fuse_pid = child.id();
                     fuse_overlay_merged = Some(merged.clone());
                     fuse_overlay_child = Some(child);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    // Poll for mount and open fd into fuse-overlayfs's mount namespace.
+                    fuse_overlay_merged_fd =
+                        Some(open_fuse_merged_fd(fuse_pid, merged).map_err(Error::Io)?);
                 }
                 use_fuse_overlay = true;
             } else {
@@ -3133,10 +3163,35 @@ impl Command {
             None
         };
         // Pre-allocate the CString for the temp resolv.conf path (used in pre_exec).
-        let dns_temp_file_cstring: Option<std::ffi::CString> = dns_temp_dir.as_ref().map(|dir| {
+        // For native-overlay containers: pre-seed resolv.conf as a plain file in the overlay
+        // upper dir (same pattern as the CA cert pre-seeding, issue #112).  Bind-mounting a
+        // tmpfs file onto an overlayfs path returns EINVAL in user namespaces.  If pre-seeding
+        // succeeds we set dns_temp_file_cstring to None so the bind-mount step is skipped.
+        let dns_temp_file_cstring: Option<std::ffi::CString> = if let Some(ref dir) = dns_temp_dir {
             use std::os::unix::ffi::OsStrExt as _;
-            std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
-        });
+            let cstring =
+                std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap();
+            // Try to pre-seed into the overlay upper dir (if one has been configured).
+            let preseeded = if let Some(ref ov) = self.overlay {
+                if !ov.upper_dir.as_os_str().is_empty() {
+                    let etc_dir = ov.upper_dir.join("etc");
+                    std::fs::create_dir_all(&etc_dir).is_ok()
+                        && std::fs::copy(dir.join("resolv.conf"), etc_dir.join("resolv.conf"))
+                            .is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if preseeded {
+                None // bind-mount in pre_exec not needed
+            } else {
+                Some(cstring) // no overlay or pre-seed failed — fall back to bind-mount
+            }
+        } else {
+            None
+        };
 
         // Pasta containers need CA certs for HTTPS. Alpine base images don't include them.
         // Bind-mount the host's trust store read-only into the container so wget/curl/etc
@@ -3215,11 +3270,35 @@ impl Command {
             } else {
                 None
             };
-        let hosts_temp_file_cstring: Option<std::ffi::CString> =
-            hosts_temp_dir.as_ref().map(|dir| {
-                use std::os::unix::ffi::OsStrExt as _;
-                std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
-            });
+        // Pre-allocate the CString for the temp hosts path (used in pre_exec).
+        // For native-overlay containers: pre-seed hosts as a plain file in the overlay
+        // upper dir (same pattern as resolv.conf and the CA cert, issue #112).  Bind-mounting a
+        // tmpfs file onto an overlayfs path returns EINVAL in user namespaces.  If pre-seeding
+        // succeeds we set hosts_temp_file_cstring to None so the bind-mount step is skipped.
+        let hosts_temp_file_cstring: Option<std::ffi::CString> = if let Some(ref dir) =
+            hosts_temp_dir
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let cstring = std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap();
+            let preseeded = if let Some(ref ov) = self.overlay {
+                if !ov.upper_dir.as_os_str().is_empty() {
+                    let etc_dir = ov.upper_dir.join("etc");
+                    std::fs::create_dir_all(&etc_dir).is_ok()
+                        && std::fs::copy(dir.join("hosts"), etc_dir.join("hosts")).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if preseeded {
+                None // bind-mount in pre_exec not needed
+            } else {
+                Some(cstring) // no overlay or pre-seed failed — fall back to bind-mount
+            }
+        } else {
+            None
+        };
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         // (ready_w, done_r) go into the child closure; (ready_r, done_w) stay for the parent thread.
@@ -3277,6 +3356,30 @@ impl Command {
             }
         } else {
             (None, None)
+        };
+
+        // Extract the raw fd for the fuse-overlayfs merged directory (rootless case).
+        // The OwnedFd is held in the parent; fds survive fork, so the child's pre_exec
+        // can use the raw fd via fchdir+chroot to root itself into the FUSE mount.
+        // OwnedFd keeps the fd open until after Command::spawn() returns.
+        let fuse_fd_raw: Option<std::os::unix::io::RawFd> =
+            fuse_overlay_merged_fd.as_ref().map(|f| f.as_raw_fd());
+        // When using the fuse fd chroot, pre-chroot bind mount targets must be
+        // prefixed with /proc/<fuse-pid>/root so they resolve into the FUSE namespace.
+        let fuse_proc_merged: Option<PathBuf> = if let (Some(child), Some(merged)) =
+            (fuse_overlay_child.as_ref(), fuse_overlay_merged.as_ref())
+        {
+            if fuse_fd_raw.is_some() {
+                Some(PathBuf::from(format!(
+                    "/proc/{}/root{}",
+                    child.id(),
+                    merged.display()
+                )))
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         // Install our combined pre_exec hook
@@ -3356,12 +3459,7 @@ impl Command {
                                 libc::read(idmap_done_r, buf.as_mut_ptr() as *mut libc::c_void, 1);
                             libc::close(idmap_done_r);
                             if n != 1 || buf[0] == 0 {
-                                return Err(io::Error::other(
-                                    "rootless UID/GID map setup failed: newuidmap/newgidmap \
-                                     could not write the subordinate ID map — check that \
-                                     /etc/subuid and /etc/subgid are configured and that \
-                                     newuidmap/newgidmap are installed setuid-root",
-                                ));
+                                return Err(io::Error::other("rootless UID/GID map setup failed"));
                             }
                         } else {
                             // Single-UID map: write directly to /proc/self/{uid,gid}_map.
@@ -3412,8 +3510,9 @@ impl Command {
                         //     and full capabilities in the user namespace.
                         let remaining = namespaces & !Namespace::USER;
                         if !remaining.is_empty() {
-                            unshare(remaining.to_clone_flags())
-                                .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                            unshare(remaining.to_clone_flags()).map_err(|e| {
+                                io::Error::other(format!("unshare remaining: {}", e))
+                            })?;
                         }
                     } else {
                         // Privileged (root) mode: unshare all namespaces at once.
@@ -3713,12 +3812,36 @@ impl Command {
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
-                    // When overlay is active, the merged dir is the effective root.
-                    // Otherwise the chroot dir itself is the effective root.
-                    let effective_root: &std::path::Path = overlay_merged
-                        .as_ref()
-                        .map(|m| std::path::Path::new(m.to_str().unwrap()))
-                        .unwrap_or(dir.as_path());
+                    // For fuse-overlay containers, fchdir into the overlay root NOW —
+                    // before any bind-mount setup — so that target paths can be expressed
+                    // relative to the current working directory.  The grandchild is in its
+                    // own user namespace and cannot access /proc/<fuse-pid>/root/ via the
+                    // absolute path (different user-ns → ptrace check fails).  An open fd
+                    // does not require re-checking credentials.
+                    if let Some(fd) = fuse_fd_raw {
+                        if libc::fchdir(fd) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        // fd stays open; chroot(".") + close(fd) happen at the end of
+                        // this block after all bind mounts are set up.
+                    }
+
+                    // effective_root drives pre-chroot target path computation:
+                    //   fuse overlay  → "." (CWD is now the overlay root; relative paths)
+                    //   kernel overlay → the merged dir path
+                    //   plain chroot   → the chroot dir path
+                    let effective_root: &std::path::Path = if fuse_fd_raw.is_some() {
+                        std::path::Path::new(".")
+                    } else {
+                        fuse_proc_merged
+                            .as_deref()
+                            .or_else(|| {
+                                overlay_merged
+                                    .as_ref()
+                                    .map(|m| std::path::Path::new(m.to_str().unwrap()))
+                            })
+                            .unwrap_or(dir.as_path())
+                    };
 
                     // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
                     // Done here (before chroot) using the host-side effective_root path.
@@ -4121,10 +4244,23 @@ impl Command {
                         }
                     }
 
-                    // pivot_root atomically makes new_root the mount namespace root
-                    // and detaches the old root — stronger isolation than chroot(2).
-                    let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
-                    do_pivot_root(effective_root, put_old_name)?;
+                    if let Some(fd) = fuse_fd_raw {
+                        // fchdir was already called at the top of this block; CWD is
+                        // the fuse overlay root.  Now chroot and move into it.
+                        if libc::chroot(c".".as_ptr()) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::chdir(c"/".as_ptr()) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        libc::close(fd);
+                    } else {
+                        // Normal path: pivot_root atomically makes new_root the
+                        // mount namespace root and detaches the old root.
+                        let put_old_name =
+                            pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
+                        do_pivot_root(effective_root, put_old_name)?;
+                    }
 
                     // Apply container working directory (defaults to /).
                     let cwd = container_cwd
@@ -5355,6 +5491,7 @@ impl Command {
         // on the master when the container exits).
         let mut fuse_overlay_child: Option<std::process::Child> = None;
         let mut fuse_overlay_merged: Option<PathBuf> = None;
+        let mut fuse_overlay_merged_fd: Option<std::os::unix::io::OwnedFd> = None;
         let use_fuse_overlay: bool;
         if is_rootless && self.overlay.is_some() {
             unsafe {
@@ -5366,7 +5503,7 @@ impl Command {
                 use_fuse_overlay = false;
             } else if is_fuse_overlayfs_available() {
                 log::info!(
-                    "rootless overlay: using fuse-overlayfs (user-namespace, pre-fork)"
+                    "rootless overlay: using fuse-overlayfs (user+mount namespace, pre-fork)"
                 );
                 if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
                     let lower_str = if !ov.lower_dirs.is_empty() {
@@ -5382,17 +5519,14 @@ impl Command {
                             .to_string_lossy()
                             .into_owned()
                     };
-                    let child = spawn_fuse_overlayfs(
-                        &lower_str,
-                        &ov.upper_dir,
-                        &ov.work_dir,
-                        merged,
-                        true,
-                    )
-                    .map_err(Error::Io)?;
+                    let child =
+                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged, true)
+                            .map_err(Error::Io)?;
+                    let fuse_pid = child.id();
                     fuse_overlay_merged = Some(merged.clone());
                     fuse_overlay_child = Some(child);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    fuse_overlay_merged_fd =
+                        Some(open_fuse_merged_fd(fuse_pid, merged).map_err(Error::Io)?);
                 }
                 use_fuse_overlay = true;
             } else {
@@ -5525,10 +5659,31 @@ impl Command {
         } else {
             None
         };
-        let dns_temp_file_cstring: Option<std::ffi::CString> = dns_temp_dir.as_ref().map(|dir| {
+        // Pre-seed resolv.conf for native-overlay containers (see spawn() for details).
+        let dns_temp_file_cstring: Option<std::ffi::CString> = if let Some(ref dir) = dns_temp_dir {
             use std::os::unix::ffi::OsStrExt as _;
-            std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
-        });
+            let cstring =
+                std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap();
+            let preseeded = if let Some(ref ov) = self.overlay {
+                if !ov.upper_dir.as_os_str().is_empty() {
+                    let etc_dir = ov.upper_dir.join("etc");
+                    std::fs::create_dir_all(&etc_dir).is_ok()
+                        && std::fs::copy(dir.join("resolv.conf"), etc_dir.join("resolv.conf"))
+                            .is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if preseeded {
+                None
+            } else {
+                Some(cstring)
+            }
+        } else {
+            None
+        };
 
         let pasta_ca_cert_cstring: Option<std::ffi::CString> = if is_pasta
             && self.namespaces.contains(Namespace::MOUNT)
@@ -5604,11 +5759,31 @@ impl Command {
             } else {
                 None
             };
-        let hosts_temp_file_cstring: Option<std::ffi::CString> =
-            hosts_temp_dir.as_ref().map(|dir| {
-                use std::os::unix::ffi::OsStrExt as _;
-                std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap()
-            });
+        // Pre-seed hosts into the overlay upper dir when possible; see spawn() for rationale.
+        let hosts_temp_file_cstring: Option<std::ffi::CString> = if let Some(ref dir) =
+            hosts_temp_dir
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let cstring = std::ffi::CString::new(dir.join("hosts").as_os_str().as_bytes()).unwrap();
+            let preseeded = if let Some(ref ov) = self.overlay {
+                if !ov.upper_dir.as_os_str().is_empty() {
+                    let etc_dir = ov.upper_dir.join("etc");
+                    std::fs::create_dir_all(&etc_dir).is_ok()
+                        && std::fs::copy(dir.join("hosts"), etc_dir.join("hosts")).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if preseeded {
+                None
+            } else {
+                Some(cstring)
+            }
+        } else {
+            None
+        };
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         let (idmap_ready_w_i, idmap_done_r_i, idmap_ready_r_i, idmap_done_w_i) =
@@ -5659,6 +5834,24 @@ impl Command {
             }
         } else {
             (None, None)
+        };
+
+        let fuse_fd_raw: Option<std::os::unix::io::RawFd> =
+            fuse_overlay_merged_fd.as_ref().map(|f| f.as_raw_fd());
+        let fuse_proc_merged: Option<PathBuf> = if let (Some(child), Some(merged)) =
+            (fuse_overlay_child.as_ref(), fuse_overlay_merged.as_ref())
+        {
+            if fuse_fd_raw.is_some() {
+                Some(PathBuf::from(format!(
+                    "/proc/{}/root{}",
+                    child.id(),
+                    merged.display()
+                )))
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         unsafe {
@@ -6001,11 +6194,29 @@ impl Command {
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
-                    // When overlay is active, use the merged dir as the effective root.
-                    let effective_root: &std::path::Path = overlay_merged
-                        .as_ref()
-                        .map(|m| std::path::Path::new(m.to_str().unwrap()))
-                        .unwrap_or(dir.as_path());
+                    // For fuse-overlay containers, fchdir into the overlay root NOW
+                    // so that bind-mount targets resolve relative to the overlay via
+                    // the open fd — the grandchild cannot access /proc/<fuse-pid>/root/
+                    // via the path (different user namespace, ptrace check fails).
+                    if let Some(fd) = fuse_fd_raw {
+                        if libc::fchdir(fd) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+
+                    let effective_root: &std::path::Path = if fuse_fd_raw.is_some() {
+                        // CWD is now the overlay root; "." resolves relative to it.
+                        std::path::Path::new(".")
+                    } else {
+                        fuse_proc_merged
+                            .as_deref()
+                            .or_else(|| {
+                                overlay_merged
+                                    .as_ref()
+                                    .map(|m| std::path::Path::new(m.to_str().unwrap()))
+                            })
+                            .unwrap_or(dir.as_path())
+                    };
 
                     // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
                     if let Some(ref dns_src) = dns_temp_file_cstring {
@@ -6372,8 +6583,20 @@ impl Command {
                         }
                     }
 
-                    let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
-                    do_pivot_root(effective_root, put_old_name)?;
+                    if let Some(fd) = fuse_fd_raw {
+                        // fchdir already done at the top of this block.
+                        if libc::chroot(c".".as_ptr()) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::chdir(c"/".as_ptr()) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        libc::close(fd);
+                    } else {
+                        let put_old_name =
+                            pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
+                        do_pivot_root(effective_root, put_old_name)?;
+                    }
                     let cwd = container_cwd
                         .as_deref()
                         .unwrap_or(std::path::Path::new("/"));

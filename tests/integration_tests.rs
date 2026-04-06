@@ -9042,15 +9042,11 @@ mod rootless_idmap {
     /// staging directories with mode=0 as a security measure; if the overlay backend
     /// cannot handle mode=0 mkdir, all Debian/Ubuntu image builds fail with EACCES.
     ///
-    /// The fix will spawn fuse-overlayfs inside a user+mount namespace (uid=0 with
-    /// CAP_DAC_OVERRIDE), using squash_to_uid=0,squash_to_gid=0.  The current
-    /// implementation uses squash_to_uid=HOST_UID (no user namespace), which does NOT
-    /// have CAP_DAC_OVERRIDE on mode=0 upper-layer directories — this test will fail
-    /// until issue #195 is fully implemented.
-    ///
-    /// Marked #[ignore] because the underlying fix is not yet implemented.
+    /// Fixed by pre-seeding resolv.conf and /etc/hosts into the overlay upper dir before
+    /// fork (issue #112 pattern), avoiding bind-mounts of tmpfs files onto overlayfs paths
+    /// inside user namespaces which return EINVAL.  Also required removing a stale CVE-2023-0386
+    /// fast-path from `native_rootless_overlay_supported()` that incorrectly blocked native overlay.
     #[test]
-    #[ignore = "issue #195: fuse-overlayfs user+mount namespace fix not yet implemented"]
     fn test_rootless_overlay_mode0_mkdir_succeeds() {
         if is_root() {
             eprintln!("Skipping: must run as non-root");
