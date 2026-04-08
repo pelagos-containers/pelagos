@@ -6100,6 +6100,26 @@ impl Command {
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 }
 
+                // PTY session fix for PID-namespace containers (#198).
+                //
+                // setsid() at Step 0 ran before the double-fork while the process
+                // was still in the host PID namespace.  The resulting SID equals the
+                // host PID, which has no mapping inside the container namespace
+                // (NSsid=0 as seen from /proc/self/status inside the container).
+                //
+                // dash/bash save tcgetpgrp(0)->0 as initialpgrp at startup and call
+                // tcsetpgrp(0, 0) on exit.  Process group 0 does not exist, so the
+                // kernel returns ESRCH and dash prints "Cannot set tty process group
+                // (No such process)" with exit code 2.
+                //
+                // Calling setsid() here — while we are PID 1 in the container PID
+                // namespace — produces a SID that maps to 1 inside the container.
+                // TIOCSCTTY re-assigns the controlling terminal to the new session.
+                // After this, tcgetpgrp(0) returns 1, and tcsetpgrp(0, 1) on exit
+                // succeeds cleanly.
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0 as libc::c_int);
+
                 // Bridge mode — join the pre-configured named netns via setns.
                 if let Some(ref ns_path) = bridge_ns_path {
                     let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
