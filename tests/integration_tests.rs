@@ -1503,12 +1503,19 @@ mod user_notif {
         );
     }
 
+    // Alpine's busybox chmod calls SYS_chmod on x86_64; on aarch64 there is no
+    // SYS_chmod syscall so libc does not expose the constant — use SYS_fchmodat instead.
+    #[cfg(target_arch = "x86_64")]
+    const BUSYBOX_CHMOD_SYSCALL: libc::c_long = libc::SYS_chmod;
+    #[cfg(target_arch = "aarch64")]
+    const BUSYBOX_CHMOD_SYSCALL: libc::c_long = libc::SYS_fchmodat;
+
     #[test]
     #[ignore = "requires kernel seccomp supervisor capabilities unavailable on CI runner"]
     fn test_user_notif_deny_syscall() {
         // Verify that Deny(EPERM) causes the intercepted syscall to fail.
-        // Intercept SYS_chmod (what Alpine's busybox chmod uses directly) and deny it.
-        // The container creates a file then tries to chmod it; chmod should fail.
+        // Intercept the chmod syscall (SYS_chmod on x86_64, SYS_fchmodat on aarch64)
+        // and deny it. The container creates a file then tries to chmod it; chmod should fail.
         if !is_root() {
             eprintln!("Skipping test_user_notif_deny_syscall: requires root");
             return;
@@ -1528,7 +1535,7 @@ mod user_notif {
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
             .with_tmpfs("/tmp", "")
-            .with_seccomp_user_notif(vec![libc::SYS_chmod], DenyAll)
+            .with_seccomp_user_notif(vec![BUSYBOX_CHMOD_SYSCALL], DenyAll)
             .spawn()
             .expect("spawn failed");
 
@@ -1571,7 +1578,7 @@ mod user_notif {
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
             .with_tmpfs("/tmp", "")
-            .with_seccomp_user_notif(vec![libc::SYS_chmod], handler)
+            .with_seccomp_user_notif(vec![BUSYBOX_CHMOD_SYSCALL], handler)
             .spawn()
             .expect("spawn failed");
 
