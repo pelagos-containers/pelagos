@@ -52,9 +52,11 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             artifact: pelagos-x86_64-linux
+            dns_artifact: pelagos-dns-x86_64-linux
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             artifact: pelagos-aarch64-linux
+            dns_artifact: pelagos-dns-aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +71,8 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/pelagos ${{ matrix.artifact }}
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+          cp target/${{ matrix.target }}/release/pelagos-dns ${{ matrix.dns_artifact }}
+          sha256sum ${{ matrix.dns_artifact }} > ${{ matrix.dns_artifact }}.sha256
       - name: Verify static binary
         run: |
           file ${{ matrix.artifact }}
@@ -79,6 +83,8 @@ jobs:
           files: |
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.sha256
+            ${{ matrix.dns_artifact }}
+            ${{ matrix.dns_artifact }}.sha256
           generate_release_notes: true
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
