@@ -65,7 +65,7 @@ pub async fn start(
         body.detach
     );
 
-    let mut cmd = Command::new(app.pelagos_bin());
+    let mut cmd = Command::new(state.pelagos_bin());
     cmd.arg("exec");
 
     if let Some(wd) = &session.working_dir {
