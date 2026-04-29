@@ -74,6 +74,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 serial_test = "3"
+bollard = { version = "0.17", default-features = false, features = ["ssl"] }
 
 # Removed unused dependencies:
 # - subprocess (never used)
