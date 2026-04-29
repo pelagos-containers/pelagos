@@ -21,9 +21,7 @@ pub async fn create(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
-    log::info!("exec create raw body: {}", String::from_utf8_lossy(&body));
     let body: ExecCreateBody = serde_json::from_slice(&body).unwrap_or_default();
-    log::info!("exec create parsed cmd: {:?}", body.cmd);
     if pelagos_state::read_state(&container_id).is_err() {
         return (
             StatusCode::NOT_FOUND,
@@ -35,7 +33,7 @@ pub async fn create(
     let session = ExecSession {
         container_name: container_id.clone(),
         cmd: body.cmd,
-        tty: body.tty,
+        tty: body.tty.unwrap_or(false),
         env: body.env.unwrap_or_default(),
         working_dir: body.working_dir,
         user: body.user,
@@ -81,7 +79,7 @@ pub async fn start(
         session.tty,
     );
 
-    if exec_body.detach {
+    if exec_body.detach.unwrap_or(false) {
         let bin = state.pelagos_bin().to_string();
         let state2 = state.clone();
         let id2 = exec_id.clone();
