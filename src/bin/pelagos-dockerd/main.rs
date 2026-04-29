@@ -45,8 +45,11 @@ fn linux_run() {
 
 #[cfg(target_os = "linux")]
 async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
+    use tower::Service;
 
     if std::path::Path::new(&args.socket).exists() {
         std::fs::remove_file(&args.socket)?;
@@ -56,13 +59,21 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app_state = state::AppState::new();
-    let router = handlers::router(app_state);
+    let mut make_service = handlers::router(app_state).into_make_service();
 
     let listener = UnixListener::bind(&args.socket)?;
     std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o660))?;
 
     log::info!("listening on {}", args.socket);
 
-    axum::serve(listener, router).await?;
-    Ok(())
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let svc = make_service.call(()).await?;
+        tokio::spawn(async move {
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                log::debug!("connection error: {}", e);
+            }
+        });
+    }
 }
