@@ -46,19 +46,19 @@ pub struct HostConfig {
     pub privileged: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecCreateBody {
     #[serde(default)]
     pub cmd: Vec<String>,
     #[serde(default)]
-    pub attach_stdin: bool,
+    pub attach_stdin: Option<bool>,
     #[serde(default)]
-    pub attach_stdout: bool,
+    pub attach_stdout: Option<bool>,
     #[serde(default)]
-    pub attach_stderr: bool,
+    pub attach_stderr: Option<bool>,
     #[serde(default)]
-    pub tty: bool,
+    pub tty: Option<bool>,
     #[serde(default)]
     pub env: Option<Vec<String>>,
     #[serde(default)]
@@ -67,13 +67,13 @@ pub struct ExecCreateBody {
     pub user: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecStartBody {
     #[serde(default)]
-    pub detach: bool,
+    pub detach: Option<bool>,
     #[serde(default)]
-    pub tty: bool,
+    pub tty: Option<bool>,
 }
 
 // ── Pending container (stored locally, not yet started) ─────────────────────
