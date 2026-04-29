@@ -37,7 +37,7 @@ pub async fn list(Query(q): Query<ListQuery>) -> (StatusCode, Json<Value>) {
         if !filters.names.is_empty() && !matches_name(&c.name, &filters.names) {
             continue;
         }
-        if !filters.statuses.is_empty() && !filters.statuses.contains(&c.docker_status_str()) {
+        if !filters.statuses.is_empty() && !filters.statuses.iter().any(|s| s == c.docker_status_str()) {
             continue;
         }
         items.push(container_summary_json(&c));
