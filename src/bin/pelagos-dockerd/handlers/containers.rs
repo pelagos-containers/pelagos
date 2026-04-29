@@ -425,6 +425,21 @@ fn pending_inspect_json(p: &PendingContainer) -> Value {
     })
 }
 
+/// GET /volumes — list volumes (kubelet calls this to clean up emptyDir volumes)
+pub async fn list_volumes() -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(json!({"Volumes": [], "Warnings": []})))
+}
+
+/// DELETE /volumes/{name} — remove a volume
+pub async fn remove_volume(Path(_name): Path<String>) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// GET /containers/{id}/archive — download file from container (kubelet fallback path)
+pub async fn archive(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_FOUND, Json(json!({"message": format!("archive not supported for '{}'", id)})))
+}
+
 fn parse_label_filters(raw: Option<&str>) -> Vec<(String, String)> {
     let Some(raw) = raw else { return Vec::new() };
     // filters={"label":["key=value","key2=value2"]}
