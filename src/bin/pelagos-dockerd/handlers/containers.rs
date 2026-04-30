@@ -1,10 +1,13 @@
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{Response, StatusCode},
+    response::IntoResponse,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::{
     pelagos_state::{self, ContainerState},
     state::{self, AppState},
@@ -235,27 +238,92 @@ pub struct LogsQuery {
     #[serde(default)]
     pub stderr: Option<String>,
     #[serde(default)]
+    pub follow: Option<String>,
+    #[serde(default)]
     pub tail: Option<String>,
 }
 
-pub async fn logs(Path(id): Path<String>, Query(_q): Query<LogsQuery>) -> (StatusCode, Json<Value>) {
+pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Response<Body> {
     let c = match pelagos_state::read_state(&id) {
         Ok(c) => c,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})));
+            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)}))).into_response();
         }
     };
 
-    let mut output = String::new();
-    if let Some(log_path) = &c.stdout_log {
-        if let Ok(data) = std::fs::read_to_string(log_path) {
-            output.push_str(&data);
+    let log_path = match c.stdout_log.clone() {
+        Some(p) => p,
+        None => {
+            return (StatusCode::NO_CONTENT, Body::empty()).into_response();
         }
+    };
+
+    let follow = q.follow.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
+    let container_name = id.clone();
+
+    if !follow {
+        // Non-follow: read the whole log file and return it as a single framed body.
+        let data = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+        let mut body: Vec<u8> = Vec::new();
+        for line in data.lines() {
+            let mut payload = line.as_bytes().to_vec();
+            payload.push(b'\n');
+            body.extend_from_slice(&docker_frame_header(1, payload.len() as u32));
+            body.extend_from_slice(&payload);
+        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body))
+            .unwrap();
     }
 
-    // Return raw text for now (exec logs use multiplexed stream format, but
-    // a plain text body works for simple log reading use cases)
-    (StatusCode::OK, Json(json!({"logs": output})))
+    // follow=true: stream lines as they arrive until the container exits.
+    let stream = futures_util::stream::unfold(
+        (log_path, container_name, 0u64),
+        move |(path, name, offset)| async move {
+            loop {
+                let data = tokio::fs::read(&path).await.unwrap_or_default();
+                if data.len() as u64 > offset {
+                    let new_bytes = &data[offset as usize..];
+                    let new_offset = data.len() as u64;
+                    let mut body: Vec<u8> = Vec::new();
+                    for line in std::str::from_utf8(new_bytes).unwrap_or("").lines() {
+                        let mut payload = line.as_bytes().to_vec();
+                        payload.push(b'\n');
+                        body.extend_from_slice(&docker_frame_header(1, payload.len() as u32));
+                        body.extend_from_slice(&payload);
+                    }
+                    if !body.is_empty() {
+                        return Some((Ok::<_, std::io::Error>(body), (path, name, new_offset)));
+                    }
+                }
+                let still_running = pelagos_state::read_state(&name)
+                    .map(|s| s.is_running())
+                    .unwrap_or(false);
+                if !still_running {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+fn docker_frame_header(stream_type: u8, len: u32) -> Vec<u8> {
+    vec![
+        stream_type, 0, 0, 0,
+        (len >> 24) as u8,
+        (len >> 16) as u8,
+        (len >> 8) as u8,
+        len as u8,
+    ]
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────

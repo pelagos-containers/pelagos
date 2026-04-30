@@ -71,6 +71,7 @@ hyper = { version = "1", features = ["http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = "0.4"
 uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 serial_test = "3"
