@@ -196,6 +196,18 @@ jobs:
       - name: Smoke test — run a container
         run: sudo pelagos run --rm alpine echo pelagos-deb-ok
 
+  publish-crate:
+    needs: [package-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish to crates.io
+        run: cargo publish --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   update-tap:
     needs: [package-test]
     runs-on: ubuntu-latest
