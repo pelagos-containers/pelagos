@@ -25,6 +25,7 @@ pub mod notif;
 pub mod oci;
 pub mod paths;
 pub mod pty;
+pub mod rootless_check;
 pub mod seccomp;
 pub mod sexpr;
 pub mod wasm;

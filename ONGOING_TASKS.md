@@ -1,5 +1,214 @@
 # Ongoing Tasks
 
+## Session completed: 2026-05-08 (branch feat/220-rootless-setup-check)
+
+### #220 — proactive rootless setup detection (COMPLETE)
+
+Base SHA 93ef39a (main). Follow-up to the #219 errno-masking fix.
+
+**Module** (`src/rootless_check.rs`):
+- `Signals` struct + `Signals::probe()` (apparmor flag, idmap helpers, subuid/subgid entries)
+- `diagnose()` — pure decision: error iff `apparmor_restricted && !newuidmap_path_works`
+- `check()` — `PELAGOS_SKIP_ROOTLESS_CHECK=1` escape hatch with `log::debug!` on bypass
+- `RootlessSetupError::Display` — lists each independent blocker + three numbered workarounds
+
+**Wired in** at `src/container.rs:2635` (`spawn`) and `:5258` (`spawn_interactive`)
+inside the existing `is_rootless && !joining_user_ns && !skip_rootless_user_ns` block.
+
+**Bonus:** clippy fix in `tests/integration_tests.rs:20679`
+(`trim_start().split_whitespace()` → `split_whitespace()`).
+
+**Tests:** 9 unit tests in `rootless_check::tests`; full lib suite 344/344 green.
+**Verified live:** apparmor=0 host → silent (check returns Ok); bypass env var
+emits debug log + container runs to completion.
+
+---
+
+## Earlier planning notes (kept for reference)
+
+Started 2026-05-08, base SHA 93ef39a (main). Follows up on the masking-bug fix
+in #219 / 93ef39a, which made rootless failures report the *real* errno but
+still doesn't tell users *what to do*.
+
+### Goal
+
+Before pelagos calls `unshare(CLONE_NEWUSER)` in a rootless run, detect the
+combination of host conditions that will cause the `/proc/self/setgroups`
+EACCES (or any other rootless setup blocker) and abort with a targeted hint
+listing the precise workarounds — so the user never sees a raw kernel error
+for an environment we can recognise up front.
+
+Target UX (printed by pelagos, not by the OS):
+
+```
+pelagos: error: rootless container setup is not supported in this environment.
+
+Detected:
+  • kernel.apparmor_restrict_unprivileged_userns = 1 (Ubuntu 24.04+ default)
+  • uidmap package not installed (newuidmap/newgidmap missing)
+  • no /etc/subuid entry for chbrown
+  • no /etc/subgid entry for chbrown
+
+Pick one of the following:
+
+  1. Disable the AppArmor userns restriction:
+       sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+       echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
+         | sudo tee /etc/sysctl.d/60-pelagos.conf
+
+  2. Install uidmap and configure subordinate UID/GID:
+       sudo apt install uidmap
+       sudo usermod --add-subuids 100000-165535 chbrown
+       sudo usermod --add-subgids 100000-165535 chbrown
+
+  3. Run as root:  sudo -E pelagos run …
+
+See docs/USER_GUIDE.md → Troubleshooting for details.
+```
+
+### Detection conjunction
+
+The setgroups EACCES fires only when **all** of the following are true. The
+hint must mirror this conjunction so we don't false-positive on systems where
+the newuidmap path would have worked anyway.
+
+1. `kernel.apparmor_restrict_unprivileged_userns == 1`
+   (file at `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`;
+   absence ⇒ treat as 0)
+2. **AND** the newuidmap path will not be taken — i.e. **any** of:
+   - `newuidmap` missing on PATH (`idmap::has_newuidmap()`)
+   - `newgidmap` missing on PATH (`idmap::has_newgidmap()`)
+   - egid ≠ pw_gid (`idmap::newuidmap_will_work()` returns false)
+   - `/etc/subuid` has no entry for the current user
+     (`idmap::parse_subid_file` returns empty)
+   - `/etc/subgid` has no entry for the current user
+
+When (1) is false, AppArmor isn't blocking — proceed silently.
+When (1) is true but (2) is false, newuidmap will run and we never write
+setgroups directly — proceed silently.
+Only when (1) AND (2) both hold do we abort with the hint.
+
+### Module structure
+
+New file `src/rootless_check.rs` (suggested in the issue):
+
+```rust
+pub struct Signals {
+    pub apparmor_restricted: bool,
+    pub has_newuidmap: bool,
+    pub has_newgidmap: bool,
+    pub egid_matches_pw_gid: bool,
+    pub subuid_entries: usize,
+    pub subgid_entries: usize,
+    pub username: Option<String>,
+}
+
+impl Signals {
+    pub fn probe() -> Self { /* read from /proc, idmap helpers */ }
+}
+
+#[derive(Debug)]
+pub struct RootlessSetupError { signals: Signals }
+
+impl std::fmt::Display for RootlessSetupError { /* the bullet list */ }
+impl std::error::Error for RootlessSetupError {}
+
+/// Pure decision function — testable without filesystem.
+pub fn diagnose(s: &Signals) -> Option<RootlessSetupError> { /* the conjunction */ }
+
+/// Probe + diagnose convenience wrapper.
+pub fn check() -> Result<(), RootlessSetupError> {
+    diagnose(&Signals::probe()).map_or(Ok(()), Err)
+}
+```
+
+Add `pub mod rootless_check;` to `src/lib.rs`.
+
+### Wire-in points in `src/container.rs`
+
+Two sites, both right after `is_rootless && !joining_user_ns &&
+!self.skip_rootless_user_ns` is established:
+
+- `spawn()`            — currently line 2635
+- `spawn_interactive()`— currently line 5258 (offsets shift after #219 patch)
+
+```rust
+if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
+    crate::rootless_check::check()
+        .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+    self.namespaces |= Namespace::USER;
+    // … existing newuidmap / fallback logic unchanged
+}
+```
+
+The check is pre-flight; it does not need to map to a new `Error` variant
+(keeping it as a friendly `io::Error::other` keeps the CLI's existing
+`pelagos: error: …` rendering).
+
+### Escape hatch
+
+`PELAGOS_SKIP_ROOTLESS_CHECK=1` env var to suppress the check. Useful for:
+- Test environments that intentionally exercise the failing path
+- Environments where the conjunction triggers a false positive we haven't
+  anticipated (better to let the real syscall fail than to lock the user
+  out)
+
+### Tests (unit only — integration would need root + sysctl writes)
+
+`src/rootless_check.rs` `#[cfg(test)] mod tests`:
+
+1. all-clear: apparmor=0 → diagnose returns None
+2. apparmor=1, newuidmap fully wired → None (path 2 in spec)
+3. apparmor=1, newuidmap missing → Some, hint mentions "uidmap package"
+4. apparmor=1, helpers present but no /etc/subuid entry → Some, hint
+   mentions subuid
+5. apparmor=1, helpers + entries but egid mismatch → Some, hint mentions
+   newgrp / domain group
+6. all signals tripped → Some, hint lists all of them
+7. Display format includes username when known, generic when not
+8. Display format includes all three numbered workarounds in order
+
+### Out of scope (issue notes them explicitly as bonus refinements)
+
+- `setup.sh --enable-rootless` writing `/etc/sysctl.d/60-pelagos.conf` and
+  appending `/etc/subuid`/`/etc/subgid` entries — **separate follow-up PR**.
+- Shipping an AppArmor profile that lets `pelagos` keep capabilities in its
+  child userns (the `crun`/`bwrap` route on Ubuntu 24.04+) — **separate work**.
+
+### Risk / non-risk notes
+
+- **No behaviour change for environments that already work.** The check
+  short-circuits to Ok() on apparmor=0 *or* on a working newuidmap path.
+- **No behaviour change for root.** The wire-in sites are inside the
+  `is_rootless` block; root paths never see the check.
+- **No behaviour change for `pelagos exec` rootless join.** The check is
+  skipped when joining an existing user namespace
+  (`!joining_user_ns && !skip_rootless_user_ns`).
+- **The check is advisory.** If we false-negative (miss a real blocker),
+  the underlying syscall still fails with the now-faithful errno from #219.
+  The check is purely a UX win, never a correctness change.
+
+### Verification plan once implemented
+
+1. `cargo test --lib` — unit tests pass.
+2. With `apparmor_restrict_unprivileged_userns=1` and no uidmap installed,
+   `pelagos run -it alpine /bin/sh` prints the hint instead of EACCES.
+3. With `apparmor_restrict_unprivileged_userns=0`, same command runs the
+   container — check is silent.
+4. With apparmor=1 + uidmap installed + subuid configured + egid==pw_gid,
+   command runs the container — check is silent.
+5. `PELAGOS_SKIP_ROOTLESS_CHECK=1 pelagos run -it alpine /bin/sh` in case 2
+   bypasses the check and surfaces the underlying EACCES (preserved by
+   the #219 fix).
+
+### Open decisions before coding (asked of user)
+
+- Confirm scope: detection + hint only; defer setup.sh helper to its own PR.
+- Confirm escape hatch: `PELAGOS_SKIP_ROOTLESS_CHECK=1` is acceptable.
+- Branch strategy: feature branch + PR, or direct on main (issue is small).
+
+---
+
 ## Session completed: 2026-04-06 (SHA caf2f17, main)
 
 ### Rootless debian/ubuntu builds — all three root causes fixed (COMPLETE)

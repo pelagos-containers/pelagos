@@ -20676,7 +20676,7 @@ mod compose_shutdown_fixes {
                 let pid: u32 = e.file_name().to_string_lossy().parse().ok()?;
                 let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
                 let after_comm = stat.rfind(')')?;
-                let mut fields = stat[after_comm + 2..].trim_start().split_whitespace();
+                let mut fields = stat[after_comm + 2..].split_whitespace();
                 let _state = fields.next()?;
                 let _ppid = fields.next()?;
                 let pgrp: u32 = fields.next()?.parse().ok()?;
