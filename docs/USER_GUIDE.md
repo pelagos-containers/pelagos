@@ -1947,6 +1947,53 @@ sudo pelagos run --rootfs alpine /bin/sh
 Try rootless mode first (no sudo needed for image pull, run, volumes). If a specific
 feature requires root (bridge networking, cgroups), run with `sudo`.
 
+### `Failed to spawn process: Invalid argument (os error 22)` on Ubuntu 24.04+
+
+**Symptom:** rootless `pelagos run` fails immediately with:
+
+```
+pelagos: error: spawn_interactive failed: Failed to spawn process: Invalid argument (os error 22)
+```
+
+(or the same `Invalid argument (os error 22)` from the non-interactive path).
+
+**Cause:** Ubuntu 24.04+ ships with `kernel.apparmor_restrict_unprivileged_userns=1`
+enabled by default. Unprivileged processes can still call `unshare(CLONE_NEWUSER)`,
+but the new user namespace is stripped of the capabilities needed to write
+`/proc/self/setgroups` — which pelagos must do to set up the rootless single-UID
+mapping. The underlying `EACCES` is currently surfaced through `pre_exec`'s error
+pipe as a generic `EINVAL (22)`. Pelagos ≥ post-0.60.11 preserves the actual
+errno; older builds show the misleading `Invalid argument` only.
+
+**Fix (pick one):**
+
+```bash
+# 1. Disable the AppArmor userns restriction (simplest, recommended for dev hosts)
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
+    | sudo tee /etc/sysctl.d/60-pelagos.conf
+
+# 2. Use newuidmap/newgidmap (works alongside the AppArmor restriction)
+sudo apt install uidmap
+sudo usermod --add-subuids 100000-165535 "$USER"
+sudo usermod --add-subgids 100000-165535 "$USER"
+# Note: pelagos's newuidmap path requires that your effective GID matches
+# your passwd pw_gid. On domain-joined machines (e.g. NIS/LDAP `domain-users`
+# as primary group) this often isn't the case — option 1 is more reliable
+# in that environment.
+
+# 3. Run as root
+sudo -E pelagos run -it alpine /bin/sh
+```
+
+**Verifying the AppArmor restriction is on:**
+
+```bash
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+# 1 → restriction active, will trip pelagos rootless
+# 0 → unrestricted
+```
+
 ### Rootless overlay fails
 
 If you see an error about overlay mount failing:

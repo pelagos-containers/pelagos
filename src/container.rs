@@ -126,6 +126,32 @@ static HOSTS_COUNTER: AtomicU32 = AtomicU32::new(0);
 // Re-export SeccompProfile for public API
 pub use crate::seccomp::SeccompProfile;
 
+/// Wrap an `io::Error` inside a `pre_exec` hook while preserving its
+/// `raw_os_error()`.
+///
+/// `std::process::Command` reports `pre_exec` failures to the parent through a
+/// helper pipe whose wire format is essentially "the child's `errno`". When a
+/// pre_exec hook returns an `io::Error` whose `raw_os_error()` is `None` (which
+/// is what `io::Error::other(format!(...))` produces — `Other`-kind, no errno),
+/// std falls back to a generic `EINVAL (22)`. The actual cause (`EACCES`,
+/// `EPERM`, `ENOENT`, …) is silently discarded and the user sees the
+/// notoriously unhelpful `Failed to spawn process: Invalid argument (os error 22)`.
+///
+/// This helper preserves the original errno when present, so the parent
+/// surfaces the real failure reason. When the source error has no errno (a
+/// genuine custom error), we keep the formatted context — the parent will still
+/// see EINVAL but at least logging shows the message.
+#[inline]
+fn pre_exec_err<E: Into<io::Error>>(ctx: &str, e: E) -> io::Error {
+    let e: io::Error = e.into();
+    if let Some(eno) = e.raw_os_error() {
+        log::debug!("pre_exec: {}: {}", ctx, e);
+        io::Error::from_raw_os_error(eno)
+    } else {
+        io::Error::other(format!("{}: {}", ctx, e))
+    }
+}
+
 // ── Rootless overlay helpers ────────────────────────────────────────────────
 
 /// Returns true if the pelagos layer store resides on a btrfs filesystem.
@@ -3354,7 +3380,7 @@ impl Command {
                         let pid = libc::getpid();
                         let pid_str = format!("{}\n", pid);
                         std::fs::write(procs_path, pid_str.as_bytes())
-                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                            .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
                     }
                 }
 
@@ -3364,7 +3390,7 @@ impl Command {
                         // Rootless two-phase unshare:
                         // 1a. Unshare user namespace alone first.
                         unshare(CloneFlags::CLONE_NEWUSER)
-                            .map_err(|e| io::Error::other(format!("unshare USER: {}", e)))?;
+                            .map_err(|e| pre_exec_err("unshare USER", e))?;
                         // 1b. Write uid/gid maps.
                         if use_id_helpers {
                             // Multi-range maps: signal parent thread to run newuidmap/newgidmap.
@@ -3392,7 +3418,7 @@ impl Command {
                                 let mut sg = std::fs::OpenOptions::new()
                                     .write(true)
                                     .open("/proc/self/setgroups")
-                                    .map_err(|e| io::Error::other(format!("setgroups: {}", e)))?;
+                                    .map_err(|e| pre_exec_err("setgroups", e))?;
                                 sg.write_all(b"deny\n").map_err(|e| {
                                     io::Error::other(format!("setgroups write: {}", e))
                                 })?;
@@ -3408,7 +3434,7 @@ impl Command {
                                 let mut f = std::fs::OpenOptions::new()
                                     .write(true)
                                     .open("/proc/self/uid_map")
-                                    .map_err(|e| io::Error::other(format!("uid_map: {}", e)))?;
+                                    .map_err(|e| pre_exec_err("uid_map", e))?;
                                 f.write_all(content.as_bytes()).map_err(|e| {
                                     io::Error::other(format!("uid_map write: {}", e))
                                 })?;
@@ -3424,7 +3450,7 @@ impl Command {
                                 let mut f = std::fs::OpenOptions::new()
                                     .write(true)
                                     .open("/proc/self/gid_map")
-                                    .map_err(|e| io::Error::other(format!("gid_map: {}", e)))?;
+                                    .map_err(|e| pre_exec_err("gid_map", e))?;
                                 f.write_all(content.as_bytes()).map_err(|e| {
                                     io::Error::other(format!("gid_map write: {}", e))
                                 })?;
@@ -3441,7 +3467,7 @@ impl Command {
                     } else {
                         // Privileged (root) mode: unshare all namespaces at once.
                         unshare(namespaces.to_clone_flags())
-                            .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                            .map_err(|e| pre_exec_err("unshare error", e))?;
 
                         // If the OCI config specifies uid/gid maps for a root-created user
                         // namespace, the child cannot write /proc/self/uid_map after
@@ -3511,7 +3537,7 @@ impl Command {
                     // Step 1.6: Loopback mode — bring up lo after unshare(CLONE_NEWNET).
                     if bring_up_loopback {
                         crate::network::bring_up_loopback()
-                            .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
+                            .map_err(|e| pre_exec_err("loopback up", e))?;
                     }
 
                     // Step 1.61: Set container hostname in the UTS namespace.
@@ -3604,7 +3630,7 @@ impl Command {
                         let pid = libc::getpid();
                         let pid_str = format!("{}\n", pid);
                         std::fs::write(procs_path, pid_str.as_bytes())
-                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                            .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
                     }
                 } else if let Some(&(pid_join_fd, _)) =
                     join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
@@ -3881,7 +3907,7 @@ impl Command {
                     if let Some(ref dns_src) = dns_temp_file_cstring {
                         let etc_host = effective_root.join("etc");
                         std::fs::create_dir_all(&etc_host)
-                            .map_err(|e| io::Error::other(format!("dns mkdir /etc: {}", e)))?;
+                            .map_err(|e| pre_exec_err("dns mkdir /etc", e))?;
                         let resolv_host = etc_host.join("resolv.conf");
                         let tgt_c =
                             std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
@@ -3923,7 +3949,7 @@ impl Command {
                             let ssl_dir = effective_root.join("etc/ssl/certs");
                             let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
                             std::fs::create_dir_all(&ssl_dir)
-                                .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
+                                .map_err(|e| pre_exec_err("ca mkdir", e))?;
                             let tgt_c =
                                 std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
                             let fd = libc::open(
@@ -3955,7 +3981,7 @@ impl Command {
                     if let Some(ref hosts_src) = hosts_temp_file_cstring {
                         let etc_host = effective_root.join("etc");
                         std::fs::create_dir_all(&etc_host)
-                            .map_err(|e| io::Error::other(format!("hosts mkdir /etc: {}", e)))?;
+                            .map_err(|e| pre_exec_err("hosts mkdir /etc", e))?;
                         let hosts_host = etc_host.join("hosts");
                         let tgt_c =
                             std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
@@ -4110,7 +4136,7 @@ impl Command {
                         use std::os::unix::ffi::OsStrExt as _;
                         let dev_host = effective_root.join("dev");
                         std::fs::create_dir_all(&dev_host)
-                            .map_err(|e| io::Error::other(format!("mkdir /dev: {}", e)))?;
+                            .map_err(|e| pre_exec_err("mkdir /dev", e))?;
                         let dev_host_c = CString::new(dev_host.as_os_str().as_bytes()).unwrap();
                         let tmpfs_type = CString::new("tmpfs").unwrap();
                         let dev_opts = CString::new("mode=755,size=65536k").unwrap();
@@ -4288,7 +4314,7 @@ impl Command {
                         .unwrap_or(std::path::Path::new("/"));
                     if cwd != std::path::Path::new("/") {
                         std::env::set_current_dir(cwd)
-                            .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
+                            .map_err(|e| pre_exec_err("set_current_dir", e))?;
                     }
                 }
 
@@ -4345,7 +4371,7 @@ impl Command {
                 // Mount tmpfs filesystems AFTER chroot — tmpfs has no host-side source
                 for tm in &tmpfs_mounts {
                     std::fs::create_dir_all(&tm.target)
-                        .map_err(|e| io::Error::other(format!("tmpfs mkdir: {}", e)))?;
+                        .map_err(|e| pre_exec_err("tmpfs mkdir", e))?;
                     let tgt_c = CString::new(tm.target.as_os_str().as_encoded_bytes()).unwrap();
                     let tmpfs_c = CString::new("tmpfs").unwrap();
                     let opts_c = CString::new(tm.options.as_bytes()).unwrap();
@@ -5878,7 +5904,7 @@ impl Command {
                         let pid = libc::getpid();
                         let pid_str = format!("{}\n", pid);
                         std::fs::write(procs_path, pid_str.as_bytes())
-                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                            .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
                     }
                 }
 
@@ -5886,7 +5912,7 @@ impl Command {
                 if !namespaces.is_empty() {
                     if is_rootless && namespaces.contains(Namespace::USER) {
                         unshare(CloneFlags::CLONE_NEWUSER)
-                            .map_err(|e| io::Error::other(format!("unshare USER: {}", e)))?;
+                            .map_err(|e| pre_exec_err("unshare USER", e))?;
                         // 1b. Write uid/gid maps.
                         if use_id_helpers {
                             let pid: u32 = libc::getpid() as u32;
@@ -5919,7 +5945,7 @@ impl Command {
                                 let mut sg = std::fs::OpenOptions::new()
                                     .write(true)
                                     .open("/proc/self/setgroups")
-                                    .map_err(|e| io::Error::other(format!("setgroups: {}", e)))?;
+                                    .map_err(|e| pre_exec_err("setgroups", e))?;
                                 sg.write_all(b"deny\n").map_err(|e| {
                                     io::Error::other(format!("setgroups write: {}", e))
                                 })?;
@@ -5935,7 +5961,7 @@ impl Command {
                                 let mut f = std::fs::OpenOptions::new()
                                     .write(true)
                                     .open("/proc/self/uid_map")
-                                    .map_err(|e| io::Error::other(format!("uid_map: {}", e)))?;
+                                    .map_err(|e| pre_exec_err("uid_map", e))?;
                                 f.write_all(content.as_bytes()).map_err(|e| {
                                     io::Error::other(format!("uid_map write: {}", e))
                                 })?;
@@ -5951,7 +5977,7 @@ impl Command {
                                 let mut f = std::fs::OpenOptions::new()
                                     .write(true)
                                     .open("/proc/self/gid_map")
-                                    .map_err(|e| io::Error::other(format!("gid_map: {}", e)))?;
+                                    .map_err(|e| pre_exec_err("gid_map", e))?;
                                 f.write_all(content.as_bytes()).map_err(|e| {
                                     io::Error::other(format!("gid_map write: {}", e))
                                 })?;
@@ -5960,11 +5986,11 @@ impl Command {
                         let remaining = namespaces & !Namespace::USER;
                         if !remaining.is_empty() {
                             unshare(remaining.to_clone_flags())
-                                .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                                .map_err(|e| pre_exec_err("unshare error", e))?;
                         }
                     } else {
                         unshare(namespaces.to_clone_flags())
-                            .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                            .map_err(|e| pre_exec_err("unshare error", e))?;
 
                         if needs_parent_idmap {
                             let pid: u32 = libc::getpid() as u32;
@@ -6016,7 +6042,7 @@ impl Command {
 
                     if bring_up_loopback {
                         crate::network::bring_up_loopback()
-                            .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
+                            .map_err(|e| pre_exec_err("loopback up", e))?;
                     }
 
                     // Set container hostname in the UTS namespace.
@@ -6070,7 +6096,7 @@ impl Command {
                         let pid = libc::getpid();
                         let pid_str = format!("{}\n", pid);
                         std::fs::write(procs_path, pid_str.as_bytes())
-                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                            .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
                     }
                 } else if let Some(&(pid_join_fd, _)) =
                     join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
@@ -6325,7 +6351,7 @@ impl Command {
                     if let Some(ref dns_src) = dns_temp_file_cstring {
                         let etc_host = effective_root.join("etc");
                         std::fs::create_dir_all(&etc_host)
-                            .map_err(|e| io::Error::other(format!("dns mkdir /etc: {}", e)))?;
+                            .map_err(|e| pre_exec_err("dns mkdir /etc", e))?;
                         let resolv_host = etc_host.join("resolv.conf");
                         let tgt_c =
                             std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
@@ -6360,7 +6386,7 @@ impl Command {
                             let ssl_dir = effective_root.join("etc/ssl/certs");
                             let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
                             std::fs::create_dir_all(&ssl_dir)
-                                .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
+                                .map_err(|e| pre_exec_err("ca mkdir", e))?;
                             let tgt_c =
                                 std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
                             let fd = libc::open(
@@ -6391,7 +6417,7 @@ impl Command {
                     if let Some(ref hosts_src) = hosts_temp_file_cstring {
                         let etc_host = effective_root.join("etc");
                         std::fs::create_dir_all(&etc_host)
-                            .map_err(|e| io::Error::other(format!("hosts mkdir /etc: {}", e)))?;
+                            .map_err(|e| pre_exec_err("hosts mkdir /etc", e))?;
                         let hosts_host = etc_host.join("hosts");
                         let tgt_c =
                             std::ffi::CString::new(hosts_host.as_os_str().as_bytes()).unwrap();
@@ -6534,7 +6560,7 @@ impl Command {
                         use std::os::unix::ffi::OsStrExt as _;
                         let dev_host = effective_root.join("dev");
                         std::fs::create_dir_all(&dev_host)
-                            .map_err(|e| io::Error::other(format!("mkdir /dev: {}", e)))?;
+                            .map_err(|e| pre_exec_err("mkdir /dev", e))?;
                         let dev_host_c = CString::new(dev_host.as_os_str().as_bytes()).unwrap();
                         let tmpfs_type = CString::new("tmpfs").unwrap();
                         let dev_opts = CString::new("mode=755,size=65536k").unwrap();
@@ -6746,7 +6772,7 @@ impl Command {
                 // Mount tmpfs filesystems AFTER chroot
                 for tm in &tmpfs_mounts {
                     std::fs::create_dir_all(&tm.target)
-                        .map_err(|e| io::Error::other(format!("tmpfs mkdir: {}", e)))?;
+                        .map_err(|e| pre_exec_err("tmpfs mkdir", e))?;
                     let tgt_c = CString::new(tm.target.as_os_str().as_encoded_bytes()).unwrap();
                     let tmpfs_c = CString::new("tmpfs").unwrap();
                     let opts_c = CString::new(tm.options.as_bytes()).unwrap();
