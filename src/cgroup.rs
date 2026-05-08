@@ -123,9 +123,30 @@ pub struct CgroupDeviceRule {
 ///
 /// `name` must be unique — use [`cgroup_unique_name`] to generate one before
 /// fork when the child PID is not yet known.
+///
+/// Verifies the resulting `cgroup.procs` file exists before returning. On
+/// hybrid v1/v2 cgroup hierarchies the underlying `cgroups-rs` library
+/// silently swallows controller-enable failures (`enable_controllers` ignores
+/// write errors), so `mkdir` can succeed on a tmpfs entry that the kernel
+/// never populates with the v2 control files. Without this check, the failure
+/// surfaces only later as a bare `ENOENT` on `cgroup.procs` write inside
+/// `pre_exec`, where `std::process::Command`'s wire protocol strips the
+/// context and the user sees only `Failed to spawn process: No such file or
+/// directory (os error 2)`.
 pub fn create_cgroup_no_task(cfg: &CgroupConfig, name: &str) -> io::Result<(Cgroup, String)> {
     let cg = build_cgroup(cfg, name)?;
     let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
+    if !std::path::Path::new(&procs_path).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "cgroup limits requested but {} does not exist after creation \
+                 — pelagos requires the kernel cgroup v2 unified hierarchy at \
+                 /sys/fs/cgroup; hybrid v1/v2 setups are not supported",
+                procs_path
+            ),
+        ));
+    }
     Ok((cg, procs_path))
 }
 
