@@ -2633,6 +2633,11 @@ impl Command {
             .iter()
             .any(|(_, ns)| *ns == Namespace::USER);
         if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
+            // Pre-flight: catch host configurations that will fail with a
+            // confusing EACCES on /proc/self/setgroups and emit a targeted
+            // hint instead. Pure UX; bypassed by PELAGOS_SKIP_ROOTLESS_CHECK=1.
+            crate::rootless_check::check()
+                .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
             // Unprivileged containers require a user namespace.
             self.namespaces |= Namespace::USER;
             let host_uid = unsafe { libc::getuid() };
@@ -5256,6 +5261,11 @@ impl Command {
             .iter()
             .any(|(_, ns)| *ns == Namespace::USER);
         if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
+            // Pre-flight: catch host configurations that will fail with a
+            // confusing EACCES on /proc/self/setgroups and emit a targeted
+            // hint instead. Pure UX; bypassed by PELAGOS_SKIP_ROOTLESS_CHECK=1.
+            crate::rootless_check::check()
+                .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
             self.namespaces |= Namespace::USER;
             let host_uid = unsafe { libc::getuid() };
             let host_gid = unsafe { libc::getgid() };
