@@ -472,12 +472,18 @@ check_contains "$OUT" "16" "ulimit nofile=16"
 
 # Probe whether cgroup resource limits actually work on this host.
 # /sys/fs/cgroup/cgroup.controllers may list controllers that are present in
-# the kernel but not delegated to the runner's own cgroup scope, which causes
-# EINVAL when pelagos tries to write memory.max / pids.max / cpu.max.
-# Use a live probe so we skip rather than fail on constrained CI runners.
+# the kernel but not delegated to the runner's own cgroup scope. Failure modes
+# we've observed on CI runners:
+#   - Hybrid v1/v2 hierarchy: mkdir succeeds on /sys/fs/cgroup tmpfs, but
+#     cgroup.procs is never populated — pelagos's parent-side check now
+#     catches this with an Unsupported error.
+#   - Controller delegation missing: the cgroup.procs write inside pre_exec
+#     fails with ENOENT (post-#219, faithfully reported) or EINVAL (pre-#219,
+#     masked by the std::process::Command pipe protocol).
+# Skip rather than fail on any of these so unconstrained workloads still cover
+# the non-cgroup paths.
 CGROUP_LIMITS_WORK=true
-_PROBE=$($BINARY run --memory 128m alpine /bin/true 2>&1 || true)
-if echo "$_PROBE" | grep -q "Invalid argument"; then
+if ! $BINARY run --memory 128m alpine /bin/true >/dev/null 2>&1; then
     CGROUP_LIMITS_WORK=false
 fi
 
