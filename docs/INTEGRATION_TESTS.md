@@ -4043,6 +4043,23 @@ Failure indicates that EADDRNOTAVAIL on bind is not triggering the stale-config
 cleanup path, meaning the daemon will spam "failed to bind" on every SIGHUP for
 the lifetime of any unrelated compose stack (issue #168).
 
+### `test_pull_nonexistent_image_error`
+**Requires:** network access (no root)
+**Module:** `images`
+**Ignored by default:** yes (network)
+
+Pulls two image references that do not exist on Docker Hub and asserts the error
+says "image not found" rather than the opaque "Not authorized" that Docker Hub
+returns for missing public-library images (issue #206).  Covers two sub-cases:
+
+- No colon in the reference (`definitely-does-not-exist-xyz123456`): error must
+  include a colon hint, because it looks like a name-tag typo.
+- Explicit colon (`definitely-does-not-exist-xyz123456:latest`): "image not
+  found" only, no hint.
+
+Failure indicates `is_dockerhub_library_not_found()` is not matching, Docker Hub
+changed its 401-for-nonexistent behavior, or the error text was changed.
+
 ### `test_pull_does_not_retain_blob`
 **Requires:** root (writes to `/var/lib/pelagos/`)
 **Module:** `images`

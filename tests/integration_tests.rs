@@ -7313,6 +7313,70 @@ mod images {
         let _ = image::remove_image(reference);
     }
 
+    /// test_pull_nonexistent_image_error
+    ///
+    /// Requires: network access (no root).
+    ///
+    /// Pulls two image references that do not exist on Docker Hub and asserts
+    /// that the error message says "image not found" rather than the opaque
+    /// "Not authorized" that Docker Hub returns for missing public images (#206).
+    ///
+    /// Case 1 — reference with no colon: the error must also include a colon
+    /// hint, because the reference looks like a name-tag typo.
+    ///
+    /// Case 2 — reference with an explicit colon: "image not found" only, no
+    /// colon hint (the user already used the correct separator format).
+    ///
+    /// Failure indicates is_dockerhub_library_not_found() is not firing, or
+    /// the error text was changed.
+    #[test]
+    #[ignore]
+    fn test_pull_nonexistent_image_error() {
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Case 1: no colon — should get "image not found" + colon hint.
+        let out1 = std::process::Command::new(bin)
+            .args(["image", "pull", "definitely-does-not-exist-xyz123456"])
+            .output()
+            .expect("pelagos image pull (nonexistent, no colon)");
+        assert!(
+            !out1.status.success(),
+            "pull of nonexistent image should fail"
+        );
+        let stderr1 = String::from_utf8_lossy(&out1.stderr);
+        assert!(
+            stderr1.contains("image not found"),
+            "expected 'image not found' in error, got: {stderr1}"
+        );
+        assert!(
+            !stderr1.to_lowercase().contains("not authorized"),
+            "should not say 'not authorized' for a missing image, got: {stderr1}"
+        );
+        assert!(
+            stderr1.contains("hint:"),
+            "expected colon hint for no-colon reference, got: {stderr1}"
+        );
+
+        // Case 2: explicit colon — "image not found" but no colon hint.
+        let out2 = std::process::Command::new(bin)
+            .args(["image", "pull", "definitely-does-not-exist-xyz123456:latest"])
+            .output()
+            .expect("pelagos image pull (nonexistent, with colon)");
+        assert!(
+            !out2.status.success(),
+            "pull of nonexistent image should fail"
+        );
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            stderr2.contains("image not found"),
+            "expected 'image not found' in error, got: {stderr2}"
+        );
+        assert!(
+            !stderr2.contains("hint:"),
+            "should not emit colon hint when reference already has a colon, got: {stderr2}"
+        );
+    }
+
     /// test_pull_does_not_retain_blob
     ///
     /// Requires: root (writes to /var/lib/pelagos/).
