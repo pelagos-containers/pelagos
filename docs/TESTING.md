@@ -7,9 +7,12 @@ Per-test documentation lives in [`INTEGRATION_TESTS.md`](INTEGRATION_TESTS.md).
 
 ## Before You Start: What Testing Pelagos Involves
 
-**Building Pelagos is trivial.** It is pure Rust — `cargo build` is the entire build step,
-no C/C++ toolchain required, dependencies are statically linked, and a fresh build takes
-30–60 seconds. The build has no platform quirks beyond requiring Linux.
+**Building Pelagos is straightforward, but requires one-time setup.** The codebase is
+pure Rust, so `cargo build` is the entire build step and an incremental rebuild takes
+30–60 seconds. Before that first build you need the Rust toolchain (`rustup`), the
+system packages listed in the table below, and a recent stable compiler — the minimum
+version is specified in `Cargo.toml`. The build has no platform quirks beyond requiring
+Linux.
 
 **Testing is a different matter.** Most tests exercise real kernel features: namespaces,
 cgroups v2, overlayfs, nftables, seccomp-BPF, and user-mode networking. That means:
@@ -255,11 +258,25 @@ What it cleans up:
 - Overlay mounts under `/run/pelagos/`
 - The DNS daemon if it is running
 
-If overlays are stuck and `reset-test-env.sh` doesn't fully clear them:
+Two additional scripts exist for specific recovery situations that `reset-test-env.sh`
+does not cover:
+
+**`scripts/cleanup-fuse-overlayfs.sh`** — run as your normal user (no sudo) when
+rootless containers have left orphaned fuse-overlayfs mounts or stale overlay
+directories. It is interactive: it lists what it found and prompts before killing
+processes or removing directories. Use this after a rootless test run that crashed
+or was interrupted.
 
 ```bash
-sudo scripts/cleanup-fuse-overlayfs.sh   # orphaned fuse-overlayfs mounts
-sudo scripts/force-unmount.sh            # leftover /proc bind mounts
+scripts/cleanup-fuse-overlayfs.sh
+```
+
+**`scripts/cleanup-mounts.sh`** — unmounts `proc`, `sys`, and `dev` from the
+`alpine-rootfs/` tree. Only needed if you ran a test or manual command that left
+those filesystems mounted inside the rootfs directory itself (not under `/run/pelagos/`).
+
+```bash
+sudo scripts/cleanup-mounts.sh
 ```
 
 ---
