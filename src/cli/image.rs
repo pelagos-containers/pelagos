@@ -112,7 +112,7 @@ pub fn cmd_image_pull(
         .enable_all()
         .build()?;
     rt.block_on(async {
-        pull_image(&full_ref, username, resolved_password.as_deref(), insecure).await
+        pull_image(&full_ref, reference, username, resolved_password.as_deref(), insecure).await
     })
 }
 
@@ -280,8 +280,26 @@ pub fn cmd_image_logout(registry: &str) -> Result<(), Box<dyn std::error::Error>
 // Internal pull implementation
 // ---------------------------------------------------------------------------
 
+/// Returns true when Docker Hub returns 401 for a `library/` image that doesn't
+/// exist.  Docker Hub deliberately returns 401 (not 404) for nonexistent public
+/// images to prevent name enumeration, so this case is indistinguishable from a
+/// real auth failure without the registry+repo context check.
+fn is_dockerhub_library_not_found(
+    registry: &str,
+    oci_ref: &oci_client::Reference,
+    e: &oci_client::errors::OciDistributionError,
+) -> bool {
+    registry == "index.docker.io"
+        && oci_ref.repository().starts_with("library/")
+        && matches!(
+            e,
+            oci_client::errors::OciDistributionError::UnauthorizedError { .. }
+        )
+}
+
 async fn pull_image(
     reference: &str,
+    original_ref: &str,
     username: Option<&str>,
     password: Option<&str>,
     insecure: bool,
@@ -320,6 +338,23 @@ async fn pull_image(
                 .pull_manifest_and_config(&oci_ref, &auth)
                 .await
                 .map_err(|e| format!("failed to pull manifest: {}", oci_err(registry, e)))?
+        }
+        Err(e) if is_dockerhub_library_not_found(registry, &oci_ref, &e) => {
+            // Docker Hub returns 401 for nonexistent public images to prevent
+            // name enumeration.  Surface this as "not found" with a colon hint
+            // when the user omitted the separator between image name and tag.
+            let image_name = oci_ref.repository().trim_start_matches("library/");
+            let mut msg = format!(
+                "image not found: '{}' does not exist on Docker Hub",
+                image_name
+            );
+            if !original_ref.contains(':') && !original_ref.contains('/') {
+                msg.push_str(&format!(
+                    "\n  hint: to specify a tag use a colon, e.g. '{}:<tag>'",
+                    original_ref
+                ));
+            }
+            return Err(msg.into());
         }
         Err(e) => return Err(format!("failed to pull manifest: {}", oci_err(registry, e)).into()),
     };
@@ -1279,5 +1314,51 @@ mod tests {
         assert_eq!(parse_signal("9"), libc::SIGKILL);
         // Unknown string falls back to SIGTERM.
         assert_eq!(parse_signal("SIGWEIRD"), libc::SIGTERM);
+    }
+
+    /// `is_dockerhub_library_not_found` returns true only for Docker Hub
+    /// library images that get a 401 (the registry's "not found" signal).
+    #[test]
+    fn test_is_dockerhub_library_not_found() {
+        use oci_client::errors::OciDistributionError;
+
+        let dockerhub_registry = "index.docker.io";
+        let other_registry = "public.ecr.aws";
+        let unauthorized = OciDistributionError::UnauthorizedError {
+            url: "https://index.docker.io/v2/library/noexist/manifests/latest".to_string(),
+        };
+        let other_error = OciDistributionError::ImageManifestNotFoundError("x".to_string());
+
+        // Positive case: Docker Hub + library/ + 401
+        let lib_ref: oci_client::Reference =
+            "docker.io/library/noexist:latest".parse().unwrap();
+        assert!(is_dockerhub_library_not_found(
+            dockerhub_registry,
+            &lib_ref,
+            &unauthorized
+        ));
+
+        // Different registry — not a Docker Hub 401-for-nonexistent
+        assert!(!is_dockerhub_library_not_found(
+            other_registry,
+            &lib_ref,
+            &unauthorized
+        ));
+
+        // Different error type (a real 404) — not the pattern
+        assert!(!is_dockerhub_library_not_found(
+            dockerhub_registry,
+            &lib_ref,
+            &other_error
+        ));
+
+        // Non-library image (authenticated user namespace) — 401 is a real auth failure
+        let user_ref: oci_client::Reference =
+            "docker.io/myuser/myimage:latest".parse().unwrap();
+        assert!(!is_dockerhub_library_not_found(
+            dockerhub_registry,
+            &user_ref,
+            &unauthorized
+        ));
     }
 }

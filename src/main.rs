@@ -456,7 +456,16 @@ pub(crate) enum NetworkCmd {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    env_logger::init();
+    // Suppress WARN from oci_client::token_cache on cache-miss retries — these
+    // are normal operation (token expiry), not errors.  The filter_module call
+    // after from_default_env() would override RUST_LOG, so we only apply it
+    // when the user hasn't explicitly configured oci_client logging.
+    let mut log_builder = env_logger::Builder::from_default_env();
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    if !rust_log.contains("oci_client") {
+        log_builder.filter_module("oci_client::token_cache", log::LevelFilter::Error);
+    }
+    log_builder.init();
 
     let cli = Cli::parse();
 
