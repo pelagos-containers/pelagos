@@ -341,7 +341,7 @@ container lifecycle (`run`, `ps`, `stop`, `rm`, `logs`), rootfs/volume/image
 management, exec, networking flags, mount flags, security options, linking,
 OCI lifecycle commands, and error case validation.
 
-**`scripts/test-rootless.sh`** — rootless mode CLI (~8 minutes, no sudo):
+**`scripts/test-rootless.sh`** *(no sudo)* — rootless mode CLI (~8 minutes):
 pasta networking, rootless image pull, rootless exec, user namespace validation.
 
 ### Build and Compose
