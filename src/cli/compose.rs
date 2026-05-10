@@ -15,7 +15,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+// Set by the SIGTERM/SIGINT handler in the supervisor process to trigger a
+// graceful shutdown.  Atomic because signal handlers run on any thread.
+static COMPOSE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn compose_signal_handler(_: libc::c_int) {
+    COMPOSE_SHUTDOWN.store(true, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // CLI args (clap)
@@ -335,6 +344,15 @@ pub fn run_compose_with_hooks(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let supervisor_pid = unsafe { libc::getpid() };
 
+    // Install SIGTERM/SIGINT handlers so compose down can trigger a clean
+    // shutdown.  The handler sets COMPOSE_SHUTDOWN; the main loop detects it
+    // and runs the graceful teardown sequence before exiting.
+    COMPOSE_SHUTDOWN.store(false, Ordering::Relaxed);
+    unsafe {
+        libc::signal(libc::SIGTERM, compose_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, compose_signal_handler as *const () as libc::sighandler_t);
+    }
+
     let mut project_state = ComposeProject {
         name: project.to_string(),
         file_path: file.to_string_lossy().into_owned(),
@@ -354,9 +372,10 @@ pub fn run_compose_with_hooks(
 
     let mut container_pids: HashMap<String, i32> = HashMap::new();
     let mut container_ips: HashMap<String, String> = HashMap::new();
-    // Track (container_name, pid) for already-started services so we can
-    // roll back if a later service fails to start.
-    let mut started: Vec<(String, i32)> = Vec::new();
+    // Track (container_name, pid, waiter_handle) for already-started services.
+    // The JoinHandle is kept so the shutdown path can join each waiter thread,
+    // guaranteeing teardown_resources() completes before the supervisor exits.
+    let mut started: Vec<(String, i32, std::thread::JoinHandle<()>)> = Vec::new();
 
     let startup_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         for svc_name in order {
@@ -372,8 +391,9 @@ pub fn run_compose_with_hooks(
                 svc_name,
                 container_name
             );
-            let pid = spawn_service(project, svc, &container_name, compose, compose_dir)?;
-            started.push((container_name.clone(), pid));
+            let (pid, handle) =
+                spawn_service(project, svc, &container_name, compose, compose_dir)?;
+            started.push((container_name.clone(), pid, handle));
 
             if let Ok(cstate) = super::read_state(&container_name) {
                 if let Some(ip) = cstate.bridge_ip.as_ref() {
@@ -408,14 +428,18 @@ pub fn run_compose_with_hooks(
     })();
 
     if let Err(e) = startup_result {
-        // Roll back: kill all already-started containers and tear down networks
-        // so the user can re-run compose up without manual cleanup.
+        // Roll back: kill all already-started containers, join their waiter
+        // threads (so teardown_resources runs), then tear down networks.
         log::warn!("compose: startup failed ({}); rolling back", e);
-        for (cn, pid) in &started {
+        for (cn, pid, _handle) in &started {
             if *pid > 0 {
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
             let _ = std::fs::remove_dir_all(container_dir(cn));
+        }
+        // Join waiter threads — teardown_resources() runs inside each one.
+        for (_, _, handle) in started {
+            let _ = handle.join();
         }
         for svc_name in project_state.services.keys() {
             for net in created_networks {
@@ -440,6 +464,30 @@ pub fn run_compose_with_hooks(
 
     loop {
         std::thread::sleep(Duration::from_secs(2));
+
+        // SIGTERM or SIGINT received — run graceful shutdown then break.
+        if COMPOSE_SHUTDOWN.load(Ordering::Relaxed) {
+            log::info!("compose: shutdown requested; stopping all services");
+            // First pass: SIGTERM to all still-running containers.
+            for svc_state in project_state.services.values() {
+                if svc_state.status != "exited"
+                    && svc_state.pid > 0
+                    && check_liveness(svc_state.pid)
+                {
+                    unsafe { libc::kill(-svc_state.pid, libc::SIGTERM) };
+                }
+            }
+            // Grace period: give containers 5 s to exit cleanly.
+            std::thread::sleep(Duration::from_secs(5));
+            // Second pass: SIGKILL any that are still running.
+            for svc_state in project_state.services.values() {
+                if svc_state.pid > 0 && check_liveness(svc_state.pid) {
+                    unsafe { libc::kill(-svc_state.pid, libc::SIGKILL) };
+                }
+            }
+            break;
+        }
+
         let mut all_exited = true;
         for (svc_name, svc_state) in &mut project_state.services {
             if svc_state.status == "exited" {
@@ -459,6 +507,14 @@ pub fn run_compose_with_hooks(
         }
     }
 
+    // Join every waiter thread before the supervisor process exits.
+    // Each waiter calls child.wait() → teardown_resources(), so joining here
+    // guarantees that all veth/netns/nftables cleanup has completed.
+    // compose down polls our liveness; when we exit, cleanup is done.
+    for (_, _, handle) in started {
+        let _ = handle.join();
+    }
+
     Ok(())
 }
 
@@ -468,7 +524,7 @@ fn spawn_service(
     container_name: &str,
     compose: &ComposeFile,
     compose_dir: &std::path::Path,
-) -> Result<i32, Box<dyn std::error::Error>> {
+) -> Result<(i32, std::thread::JoinHandle<()>), Box<dyn std::error::Error>> {
     // Resolve image layers.
     let image_ref = &svc.image;
     let (full_ref, manifest) = resolve_image(image_ref)?;
@@ -775,12 +831,15 @@ fn spawn_service(
         stderr_log.clone(),
     );
 
-    // Spawn a waiter thread that updates state when the container exits.
+    // Spawn a waiter thread that runs teardown when the container exits.
+    // The JoinHandle is returned to the supervisor so it can be joined during
+    // shutdown — guaranteeing teardown_resources() completes before the
+    // supervisor process exits.
     let cn_wait = cn.clone();
     let all_ips_wait = all_ips.clone();
     let svc_name_wait = svc_name.clone();
-    std::thread::spawn(move || {
-        let exit = child.wait();
+    let handle = std::thread::spawn(move || {
+        let exit = child.wait(); // blocks until container exits; runs teardown_resources()
         // Deregister DNS.
         for (net_name, _) in &all_ips_wait {
             let _ = pelagos::dns::dns_remove_entry(net_name, &svc_name_wait);
@@ -793,7 +852,7 @@ fn spawn_service(
         }
     });
 
-    Ok(pid)
+    Ok((pid, handle))
 }
 
 fn resolve_image(
@@ -871,12 +930,26 @@ fn cmd_compose_down(
     let project_state = load_project_state(&project)
         .map_err(|_| format!("no running project '{}' found", project))?;
 
-    // Kill supervisor if alive.
+    // Signal the supervisor to run its graceful shutdown sequence, then wait
+    // for it to exit.  The supervisor joins all waiter threads before exiting,
+    // so when check_liveness returns false we know every teardown_resources()
+    // call has completed and the network is clean.
     if project_state.supervisor_pid > 0 && check_liveness(project_state.supervisor_pid) {
         unsafe { libc::kill(project_state.supervisor_pid, libc::SIGTERM) };
-        std::thread::sleep(Duration::from_millis(500));
-        if check_liveness(project_state.supervisor_pid) {
-            unsafe { libc::kill(project_state.supervisor_pid, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if !check_liveness(project_state.supervisor_pid) {
+                break; // supervisor exited; all network teardown complete
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!(
+                    "compose: supervisor (pid {}) did not exit within 60 s; sending SIGKILL (network cleanup may be incomplete)",
+                    project_state.supervisor_pid
+                );
+                unsafe { libc::kill(project_state.supervisor_pid, libc::SIGKILL) };
+                break;
+            }
         }
     }
 

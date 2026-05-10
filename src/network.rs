@@ -821,6 +821,12 @@ pub fn setup_bridge_network(
         enable_nat(ns_name, &net_def)?;
     }
 
+    log::info!(
+        target: "pelagos::teardown",
+        "ALLOC netns={} veth={} network={} nat={}",
+        ns_name, veth_host, network_name, nat
+    );
+
     // 8. Optionally install port-forward (DNAT) rules.
     if !port_forwards.is_empty() {
         enable_port_forwards(
@@ -879,14 +885,21 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     for handle in setup.proxy_udp_threads.drain(..) {
         let _ = handle.join();
     }
+    log::info!(
+        target: "pelagos::teardown",
+        "FREE_START netns={} veth={} network={} nat={}",
+        setup.ns_name, setup.veth_host, setup.network_name, setup.nat_enabled
+    );
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
         log::warn!("network teardown veth (non-fatal): {}", e);
     }
+    log::info!(target: "pelagos::teardown", "FREE_VETH veth={}", setup.veth_host);
     // Kill any processes (e.g. orphaned nc grandchildren) still in the netns
     // before attempting to delete it.  Without this, a SIGKILLed shell that
     // had live subprocesses causes `ip netns del` to fail with EBUSY.
     kill_netns_processes(&setup.ns_name);
     delete_netns(&setup.ns_name);
+    log::info!(target: "pelagos::teardown", "FREE_NETNS netns={}", setup.ns_name);
     let net_def = match load_network_def(&setup.network_name) {
         Ok(n) => n,
         Err(e) => {
@@ -1549,6 +1562,11 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
     }
     drop(file);
 
+    log::info!(
+        target: "pelagos::teardown",
+        "NAT_DISABLE netns={} network={} remaining_count={} remaining={:?}",
+        ns_name, net.name, remaining.len(), remaining
+    );
     if remaining.is_empty() {
         // Remove the iptables FORWARD rules added by enable_nat().
         let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
@@ -1573,10 +1591,22 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
             if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
                 log::warn!("nft delete table {} (non-fatal): {}", table, e);
             }
+            log::info!(target: "pelagos::teardown", "NAT_TABLE_DELETED network={} table={}", net.name, table);
         } else {
             // Port forwards still active — remove MASQUERADE but keep the ip table.
             let _ = run_nft(&format!("flush chain ip {} postrouting\n", table));
+            log::info!(
+                target: "pelagos::teardown",
+                "NAT_TABLE_KEPT network={} table={} reason=active_port_forwards count={}",
+                net.name, table, read_port_forwards_count(&net.name)
+            );
         }
+    } else {
+        log::info!(
+            target: "pelagos::teardown",
+            "NAT_TABLE_KEPT network={} table={} reason=active_nat_users remaining={:?}",
+            net.name, table, remaining
+        );
     }
 }
 
