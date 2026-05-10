@@ -285,24 +285,22 @@ in the user guide.
 
 ```bash
 # Unit tests (no root required):
-make test-unit
-# or: cargo test --lib
+cargo test --lib
 
-# Integration tests (require root):
-sudo -E make test-integration
-# or: sudo -E cargo test --test integration_tests
+# Integration tests (require root + alpine-rootfs):
+sudo -E cargo test --test integration_tests
 
-# E2E tests — exercises the full binary via BATS (require root + bats):
-sudo -E make test-e2e
-# or: sudo -E bats tests/e2e/hardening.bats tests/e2e/lifecycle.bats
+# E2E scripts (require root + built binary):
+sudo scripts/test-e2e.sh        # full CLI lifecycle
+sudo scripts/test-rootless.sh   # rootless mode (run without sudo)
+sudo scripts/test-build.sh      # pelagos build / Remfile parser
+sudo scripts/test-stress.sh     # concurrent containers, signal handling
 ```
 
-The E2E suite verifies that `pelagos compose up` applies all four security
-hardening defaults to every container it starts, and exercises the full
-compose lifecycle (up / ps / down).
-
-See [`docs/INTEGRATION_TESTS.md`](docs/INTEGRATION_TESTS.md) for documentation
-of every integration test.
+See [`docs/TESTING.md`](docs/TESTING.md) for the full guide: first-time setup,
+running subsets by category, environment reset, and troubleshooting. See
+[`docs/INTEGRATION_TESTS.md`](docs/INTEGRATION_TESTS.md) for per-test
+documentation.
 
 ---
 
@@ -328,6 +326,7 @@ requires syscalls it would otherwise block.
 |------|----------|
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | CLI and API reference |
 | [`docs/REML_EXECUTOR_MODEL.md`](docs/REML_EXECUTOR_MODEL.md) | Lisp scripting: futures graph, `run`, `then`, parallel execution |
+| [`docs/TESTING.md`](docs/TESTING.md) | Testing guide: setup, categories, E2E scripts, troubleshooting |
 | [`docs/INTEGRATION_TESTS.md`](docs/INTEGRATION_TESTS.md) | Every integration test documented |
 | [`docs/DESIGN_PRINCIPLES.md`](docs/DESIGN_PRINCIPLES.md) | Non-negotiable design principles |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | What's done and what's next |
@@ -348,7 +347,7 @@ requires syscalls it would otherwise block.
 - `pasta` ([passt](https://passt.top)) for rootless networking
 - `nft` (nftables) for NAT and port mapping (root only)
 - `ip` (iproute2) for bridge networking (root only)
-- `bats` for E2E tests (`sudo pacman -S bats` or `sudo apt install bats`)
+- `fuse-overlayfs` for rootless overlay on kernels < 5.11
 
 ---
 
