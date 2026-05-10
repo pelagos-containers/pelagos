@@ -349,8 +349,14 @@ pub fn run_compose_with_hooks(
     // and runs the graceful teardown sequence before exiting.
     COMPOSE_SHUTDOWN.store(false, Ordering::Relaxed);
     unsafe {
-        libc::signal(libc::SIGTERM, compose_signal_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, compose_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            compose_signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            compose_signal_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let mut project_state = ComposeProject {
@@ -391,8 +397,7 @@ pub fn run_compose_with_hooks(
                 svc_name,
                 container_name
             );
-            let (pid, handle) =
-                spawn_service(project, svc, &container_name, compose, compose_dir)?;
+            let (pid, handle) = spawn_service(project, svc, &container_name, compose, compose_dir)?;
             started.push((container_name.clone(), pid, handle));
 
             if let Ok(cstate) = super::read_state(&container_name) {
@@ -840,7 +845,6 @@ fn spawn_service(
     let svc_name_wait = svc_name.clone();
     let handle = std::thread::spawn(move || {
         let exit = child.wait(); // blocks until container exits; runs teardown_resources()
-        // Deregister DNS.
         for (net_name, _) in &all_ips_wait {
             let _ = pelagos::dns::dns_remove_entry(net_name, &svc_name_wait);
         }
