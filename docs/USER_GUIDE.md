@@ -1356,7 +1356,7 @@ subnet above) and a stateless auto-configured (SLAAC) IPv6 address.
 
 ```bash
 # Run a container and check its IPv6 address (NAT implied by bridge auto-default)
-sudo pelagos run -d --name v6box alpine ip -6 addr show eth0
+sudo pelagos run --name v6box alpine ip -6 addr show eth0
 
 # Ping an IPv6 address from inside a container
 sudo pelagos run alpine ping -6 -c3 2001:4860:4860::8888
