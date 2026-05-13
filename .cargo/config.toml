@@ -1,0 +1,3 @@
+# Native musl builds use musl-gcc (from musl-tools package).
+[target.aarch64-unknown-linux-musl]
+linker = "musl-gcc"
