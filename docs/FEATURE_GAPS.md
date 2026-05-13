@@ -32,13 +32,13 @@ first-class concerns — territory runc explicitly does not cover.
 | OCI image push | `pelagos image push` — distributes built/pulled images; blob cache for roundtrip |
 | Registry login | `pelagos image login/logout` — writes `~/.docker/config.json` |
 | Image build | `pelagos build` — Remfile (Dockerfile-compatible), multi-stage, ARG, ADD (URLs + archives), build cache, `.remignore` |
-| Networking | Loopback, bridge, NAT, TCP port mapping, DNS service discovery, named networks, multi-network containers, pasta (rootless) |
+| Networking | Loopback, bridge, NAT44 (IPv4), TCP port mapping, DNS service discovery, named networks, multi-network containers, pasta (IPv4+IPv6 internet, default for root and rootless) |
 | Multi-service orchestration | `pelagos compose up/down/ps/logs` — Lisp DSL + futures graph executor |
 | Imperative scripting | `.reml` Lisp interpreter: `container-start`, `await-port`, `with-cleanup`, `guard`, parallel graph |
 | Interactive containers | PTY, SIGWINCH relay, terminal restore |
 | `pelagos exec` | Namespace join + PTY |
 | Volumes / bind mounts / tmpfs / overlay | Full filesystem flexibility |
-| Rootless mode | Pull, build, run, overlay (native or fuse), pasta networking |
+| Rootless mode | Pull, build, run, overlay (native or fuse), pasta networking (IPv4+IPv6 internet) |
 | OCI Runtime Spec | `create` / `start` / `state` / `kill` / `delete` lifecycle |
 | Library API | Embeddable Rust crate — no daemon or subprocess needed |
 

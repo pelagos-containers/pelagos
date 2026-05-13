@@ -506,7 +506,7 @@ sudo pelagos build -t myapp:latest .
 # Build from a specific Remfile
 sudo pelagos build -t myapp:latest -f path/to/Remfile .
 
-# Specify network mode for RUN steps (default: bridge for root, pasta for rootless)
+# Specify network mode for RUN steps (default: pasta)
 sudo pelagos build -t myapp:latest --network bridge .
 
 # Rootless build (uses pasta networking for RUN steps)
@@ -594,7 +594,7 @@ pelagos build [OPTIONS] [CONTEXT]
 | `--default-subnet <CIDR>` | | Override the subnet used when `pelagos0` is first created |
 | `CONTEXT` | | Build context directory (default: `.`) |
 
-`--network auto` selects `bridge` when running as root, `pasta` when rootless.
+`--network auto` selects `pasta` when available, `loopback` otherwise — same for root and rootless.
 
 ---
 
@@ -1200,9 +1200,8 @@ pelagos exec -u 1000:1000 mybox /bin/id
 
 Pelagos selects a network mode automatically when `--network` is not specified:
 
-- **Running as root** → bridge + implied NAT (full internet access, Docker-compatible)
-- **Rootless + pasta available** → pasta (user-mode networking, no root needed)
-- **Rootless + no pasta** → loopback only (+ warning to install pasta)
+- **pasta available** → pasta (full IPv4 + IPv6 internet, works with or without root)
+- **pasta not installed** → loopback only (+ warning to install pasta)
 
 This means `pelagos run alpine ping -c 5 google.com` works out of the box in
 both root and rootless environments, with no extra flags.
@@ -1210,9 +1209,9 @@ both root and rootless environments, with no extra flags.
 ### Network Modes
 
 ```bash
-# Auto (default) — bridge+NAT as root, pasta as rootless:
-sudo pelagos run alpine /bin/sh        # bridge + NAT implied
-pelagos run alpine /bin/sh             # pasta (rootless, no sudo)
+# Auto (default) — pasta for both root and rootless:
+sudo pelagos run alpine /bin/sh        # pasta (full internet, IPv4 + IPv6)
+pelagos run alpine /bin/sh             # pasta (same, no sudo needed)
 
 # Explicit modes:
 
@@ -1220,13 +1219,14 @@ pelagos run alpine /bin/sh             # pasta (rootless, no sudo)
 sudo pelagos run --network loopback alpine /bin/sh
 
 # Bridge networking (veth pair + pelagos0 bridge, 172.19.0.x/24) + NAT
+# IPv4 internet via NAT44; no IPv6 internet (see IPv6 section below)
 sudo pelagos run --network bridge alpine /bin/sh     # NAT implied by bridge
 
 # Bridge without NAT (container has bridge IP, but no masquerade to internet)
 sudo pelagos run --network bridge --no-nat alpine /bin/sh
 
-# Pasta (rootless, full internet access via user-mode networking)
-pelagos run --network pasta alpine /bin/sh    # no sudo needed
+# Pasta (explicit; same as auto-default)
+pelagos run --network pasta alpine /bin/sh
 
 # No network at all (air-gapped)
 sudo pelagos run --network none alpine /bin/sh
@@ -1245,11 +1245,11 @@ sudo pelagos run --network none alpine /bin/sh
 ### NAT, Port Forwarding, and DNS
 
 ```bash
-# Outbound internet: NAT is implied whenever bridge is selected (auto or explicit)
-sudo pelagos run alpine /bin/sh
+# Outbound IPv4 internet: NAT is implied whenever bridge is selected (explicit)
+sudo pelagos run --network bridge alpine /bin/sh
 
 # Suppress NAT (routed prefix, no masquerade)
-sudo pelagos run --no-nat alpine /bin/sh
+sudo pelagos run --network bridge --no-nat alpine /bin/sh
 
 # Publish ports (host:container TCP forwarding)
 sudo pelagos run -p 8080:80 alpine /bin/sh
@@ -1285,14 +1285,17 @@ sudo pelagos run -d --name db alpine /bin/sh -c 'sleep 3600'
 sudo pelagos run --link db alpine /bin/sh -c 'ping -c1 db'
 ```
 
-### Rootless Networking
+### Pasta Networking
 
-Rootless containers automatically use [pasta](https://passt.top) (user-mode
-networking) when available — no flags needed:
+Pelagos uses [pasta](https://passt.top) (user-mode networking) by default for
+both root and rootless containers — no flags needed:
 
 ```bash
-# Full internet access without root (pasta auto-selected)
+# Full IPv4 + IPv6 internet, rootless
 pelagos run -i alpine /bin/sh
+
+# Full IPv4 + IPv6 internet, root
+sudo pelagos run -i alpine /bin/sh
 
 # Explicit pasta (same as above)
 pelagos run --network pasta -i alpine /bin/sh
@@ -1350,28 +1353,53 @@ and so on. The pool and starting subnet are configurable via `config.toml` (see
 
 ### IPv6
 
-Pelagos supports IPv6 dual-stack on bridge networks. When IPv6 is enabled in the
-kernel and configured on the bridge, containers receive both an IPv4 (IPAM from the
-subnet above) and a stateless auto-configured (SLAAC) IPv6 address.
+| Mode | IPv6 internet | Container-to-container IPv6 |
+|---|---|---|
+| pasta (default) | ✅ full internet via user-mode stack | N/A (pasta containers are isolated) |
+| bridge + NAT | ✅ ULA addresses (`fd7e:…/64`); **no internet** (NAT66 removed) | ✅ L2 bridge, 0% loss |
+| bridge --no-nat | ✅ ULA addresses | ✅ L2 bridge |
+
+**Internet IPv6 from containers** — use the default (pasta):
 
 ```bash
-# Run a container and check its IPv6 address (NAT implied by bridge auto-default)
-sudo pelagos run --name v6box alpine ip -6 addr show eth0
-
-# Ping an IPv6 address from inside a container
+# IPv6 internet works out of the box with the default network mode
 sudo pelagos run alpine ping -6 -c3 2001:4860:4860::8888
+pelagos run alpine ping -6 -c3 2001:4860:4860::8888
+```
 
-# Port-forward to an IPv6 endpoint
-sudo pelagos run -p 8080:80 alpine /bin/sh
+**Container-to-container IPv6 on bridge** — bridge containers get ULA addresses
+(`fd7e:73ca:9801::/64`) and can reach each other and the gateway directly:
+
+```bash
+# Start a server container
+sudo pelagos run -d --name server --network pelagos0 alpine sleep 300
+
+# Get its IPv6 (from the named netns in state.json)
+sudo ip netns exec <netns> ip -6 addr show eth0
+
+# Ping it from another container on the same bridge
+sudo pelagos run --network pelagos0 alpine ping -6 -c3 <server-ipv6>
+```
+
+**Why no NAT66 on bridge:** Writing `net.ipv6.conf.all.forwarding=1` (required for
+kernel IPv6 forwarding) propagates to every host interface and causes
+systemd-networkd to disable its RA client, removing SLAAC-managed IPv6 addresses
+on SLAAC networks (T-Mobile tethering, home WiFi). There is no kernel API to enable
+IPv6 forwarding without this side effect. See `docs/IPV6_HOST_FORWARDING.md`.
+
+**Port-forward with IPv6:**
+
+```bash
+sudo pelagos run --network pelagos0 -p 8080:80 alpine /bin/sh
 # From the host, reach it via both IPv4 and IPv6 loopback:
 #   curl http://127.0.0.1:8080/
 #   curl http://[::1]:8080/
 ```
 
-**IPv6 DAD note:** A newly-assigned IPv6 address is "tentative" for ~1 second while
-the kernel runs Duplicate Address Detection (DAD). Packets sent during this window are
-silently dropped by the kernel. For scripted tests that run immediately after container
-start, poll until `ip -6 addr show eth0 | grep -v tentative` before sending traffic.
+**IPv6 DAD note:** A newly-assigned bridge IPv6 address is "tentative" for ~1 second
+while the kernel runs Duplicate Address Detection (DAD). Packets sent during this
+window are silently dropped. For scripted tests, poll until
+`ip -6 addr show eth0 | grep -v tentative` before sending traffic.
 
 ---
 

@@ -1,6 +1,6 @@
 # Pelagos vs Established Container Runtimes
 
-**Last Updated:** 2026-02-20
+**Last Updated:** 2026-05-12
 **Compared Against:** runc (OCI reference), Docker Engine, Podman
 
 ---
@@ -58,7 +58,9 @@
 | **Networking** |
 | Loopback isolation | ✅ | ✅ | ✅ | ioctl in pre_exec |
 | Bridge (veth + IPAM) | ✅ | ✅ | ✅ | `pelagos0`, 172.19.0.x/24 |
-| NAT / MASQUERADE | ✅ | ✅ | ✅ | nftables, reference-counted |
+| NAT44 / IPv4 MASQUERADE | ✅ | ✅ | ✅ | nftables, reference-counted |
+| NAT66 / IPv6 MASQUERADE | ❌ | ✅ | ✅ | Removed: requires `all/forwarding=1` which corrupts SLAAC on managed interfaces |
+| IPv6 internet (pasta) | ✅ | 🚫 | ✅ | pasta default; full IPv4+IPv6, no kernel forwarding |
 | Port mapping (DNAT) | ✅ | 🚫 | ✅ | TCP; `with_port_forward()` |
 | DNS configuration | ✅ | ✅ | ✅ | `with_dns()` writes resolv.conf |
 | CNI plugins | ❌ | ✅ | ✅ | Not planned (native approach) |
