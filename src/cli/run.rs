@@ -244,22 +244,19 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // before we touch the state directory.
     let port_forwards = parse_port_forwards(&args.publish)?;
     let network_mode = if args.network.is_empty() {
-        // No explicit --network: auto-select based on privilege level.
-        // Root gets bridge (internet access via NAT, same default as Docker).
-        // Rootless gets pasta (full internet, no kernel privileges required).
-        // If pasta is not installed, fall back to loopback with a warning.
-        if pelagos::paths::is_rootless() {
-            if pelagos::network::is_pasta_available() {
-                NetworkMode::Pasta
-            } else {
-                eprintln!(
-                    "pelagos: pasta not found — using loopback (no internet). \
-                     Install pasta for rootless networking."
-                );
-                NetworkMode::Loopback
-            }
+        // No explicit --network: prefer pasta for both root and rootless.
+        // pasta provides full internet (IPv4 + IPv6) without kernel forwarding
+        // or NAT66 (which was removed — it required all/forwarding=1 and corrupted
+        // SLAAC-managed interfaces on T-Mobile / home WiFi networks).
+        // Fall back to loopback if pasta is not installed.
+        if pelagos::network::is_pasta_available() {
+            NetworkMode::Pasta
         } else {
-            NetworkMode::Bridge
+            eprintln!(
+                "pelagos: pasta not found — using loopback (no internet). \
+                 Install pasta for full networking."
+            );
+            NetworkMode::Loopback
         }
     } else {
         parse_network_mode(args.network.first().unwrap())?

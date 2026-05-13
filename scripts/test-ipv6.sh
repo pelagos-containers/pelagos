@@ -59,13 +59,21 @@ else
 fi
 echo
 
-# 6. Container IPv6 internet via pasta?
-echo "--- Container IPv6 internet (pasta) ---"
-pelagos run alpine ping -6 -c3 -W2 2001:4860:4860::8888
-if [ $? -eq 0 ]; then
-    pass "container ping6 via pasta"
+# 6. Container IPv6 internet via pasta (rootless)
+echo "--- Container IPv6 internet (pasta, rootless) ---"
+if pelagos run alpine ping -6 -c3 -W2 2001:4860:4860::8888; then
+    pass "rootless container ping6 via pasta"
 else
-    fail "container ping6 via pasta"
+    fail "rootless container ping6 via pasta"
+fi
+echo
+
+# 7. Container IPv6 internet via pasta (root)
+echo "--- Container IPv6 internet (pasta, root) ---"
+if sudo pelagos run alpine ping -6 -c3 -W2 2001:4860:4860::8888; then
+    pass "root container ping6 via pasta"
+else
+    fail "root container ping6 via pasta"
 fi
 echo
 
