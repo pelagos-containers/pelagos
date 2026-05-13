@@ -7359,7 +7359,11 @@ mod images {
 
         // Case 2: explicit colon — "image not found" but no colon hint.
         let out2 = std::process::Command::new(bin)
-            .args(["image", "pull", "definitely-does-not-exist-xyz123456:latest"])
+            .args([
+                "image",
+                "pull",
+                "definitely-does-not-exist-xyz123456:latest",
+            ])
             .output()
             .expect("pelagos image pull (nonexistent, with colon)");
         assert!(

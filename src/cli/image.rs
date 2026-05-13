@@ -112,7 +112,14 @@ pub fn cmd_image_pull(
         .enable_all()
         .build()?;
     rt.block_on(async {
-        pull_image(&full_ref, reference, username, resolved_password.as_deref(), insecure).await
+        pull_image(
+            &full_ref,
+            reference,
+            username,
+            resolved_password.as_deref(),
+            insecure,
+        )
+        .await
     })
 }
 
@@ -1330,8 +1337,7 @@ mod tests {
         let other_error = OciDistributionError::ImageManifestNotFoundError("x".to_string());
 
         // Positive case: Docker Hub + library/ + 401
-        let lib_ref: oci_client::Reference =
-            "docker.io/library/noexist:latest".parse().unwrap();
+        let lib_ref: oci_client::Reference = "docker.io/library/noexist:latest".parse().unwrap();
         assert!(is_dockerhub_library_not_found(
             dockerhub_registry,
             &lib_ref,
@@ -1353,8 +1359,7 @@ mod tests {
         ));
 
         // Non-library image (authenticated user namespace) — 401 is a real auth failure
-        let user_ref: oci_client::Reference =
-            "docker.io/myuser/myimage:latest".parse().unwrap();
+        let user_ref: oci_client::Reference = "docker.io/myuser/myimage:latest".parse().unwrap();
         assert!(!is_dockerhub_library_not_found(
             dockerhub_registry,
             &user_ref,
