@@ -1204,14 +1204,6 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
         }
     }
 
-    // Enable IPv6 forwarding on the bridge interface only — NOT on all/forwarding,
-    // which would reset accept_ra to 0 on every host interface (wlan0, eth0, etc.)
-    // and break SLAAC on networks like T-Mobile that use 464XLAT.  The kernel
-    // only checks forwarding on the *incoming* interface when deciding whether to
-    // forward a packet, so enabling it on the bridge alone is sufficient.
-    let bridge_fwd = format!("/proc/sys/net/ipv6/conf/{}/forwarding", net.name);
-    let _ = std::fs::write(&bridge_fwd, "1\n");
-
     log::debug!("IPv6: {} assigned {} (gw {})", ns_name, ip6, gw6);
     Some(ip6)
 }
@@ -1437,6 +1429,32 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         // Enable IP forwarding.
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
 
+        // Enable IPv6 forwarding.  The kernel's ip6_forward() checks
+        // net->ipv6.devconf_all->forwarding before doing anything — per-interface
+        // settings alone are not enough.  Writing to all/forwarding propagates to
+        // every interface, which would cause systemd-networkd to disable its RA
+        // client on host interfaces (wlan0, etc.) and break SLAAC-based IPv6.
+        //
+        // Fix: write all/forwarding=1, then immediately reset forwarding=0 on
+        // every interface except the bridge.  devconf_all->forwarding stays at 1
+        // (it is a separate struct from per-interface configs), so ip6_forward
+        // proceeds.  The per-interface reset races against networkd's inotify
+        // watcher, but wins in practice: sysctl writes take microseconds while
+        // networkd's event-loop latency is 5–50 ms.
+        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1\n");
+        if let Ok(entries) = std::fs::read_dir("/proc/sys/net/ipv6/conf") {
+            for entry in entries.flatten() {
+                let iface = entry.file_name().into_string().unwrap_or_default();
+                if iface == "all" || iface == "default" || iface == net.name {
+                    continue;
+                }
+                let _ = std::fs::write(
+                    format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface),
+                    "0\n",
+                );
+            }
+        }
+
         // Migration: if this is the default network, remove the old global
         // `ip pelagos` table that previous versions created.
         if net.name == "pelagos0" {
@@ -1571,6 +1589,9 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         ns_name, net.name, remaining.len(), remaining
     );
     if remaining.is_empty() {
+        // Restore IPv6 forwarding to off.
+        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "0\n");
+
         // Remove the iptables FORWARD rules added by enable_nat().
         let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
         let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
