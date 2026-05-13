@@ -1266,25 +1266,6 @@ fn build_nat_script(net: &NetworkDef) -> String {
     )
 }
 
-/// Build the nftables script that installs NAT66 MASQUERADE + FORWARD rules.
-///
-/// Uses the `ip6` address family table so it coexists cleanly with the `ip`
-/// (IPv4) table of the same name.  The masquerade rule applies only to ULA
-/// traffic leaving the bridge — traffic within the bridge is unaffected.
-fn build_nat6_script(net: &NetworkDef) -> String {
-    let table = net.nft_table_name();
-    let prefix = net.ipv6_prefix_addr().to_string();
-    let bridge = &net.bridge_name;
-    format!(
-        "add table ip6 {table}\n\
-         add chain ip6 {table} postrouting {{ type nat hook postrouting priority 100; }}\n\
-         add rule ip6 {table} postrouting ip6 saddr {prefix}/64 oifname != \"{bridge}\" masquerade\n\
-         add chain ip6 {table} forward {{ type filter hook forward priority 0; }}\n\
-         add rule ip6 {table} forward ip6 saddr {prefix}/64 accept\n\
-         add rule ip6 {table} forward ip6 daddr {prefix}/64 accept\n"
-    )
-}
-
 /// Pipe an nft script to `nft -f -`, returning an error on non-zero exit.
 fn run_nft(script: &str) -> io::Result<()> {
     use std::io::Write as IoWriteLocal;
@@ -1429,32 +1410,6 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         // Enable IP forwarding.
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
 
-        // Enable IPv6 forwarding.  The kernel's ip6_forward() checks
-        // net->ipv6.devconf_all->forwarding before doing anything — per-interface
-        // settings alone are not enough.  Writing to all/forwarding propagates to
-        // every interface, which would cause systemd-networkd to disable its RA
-        // client on host interfaces (wlan0, etc.) and break SLAAC-based IPv6.
-        //
-        // Fix: write all/forwarding=1, then immediately reset forwarding=0 on
-        // every interface except the bridge.  devconf_all->forwarding stays at 1
-        // (it is a separate struct from per-interface configs), so ip6_forward
-        // proceeds.  The per-interface reset races against networkd's inotify
-        // watcher, but wins in practice: sysctl writes take microseconds while
-        // networkd's event-loop latency is 5–50 ms.
-        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1\n");
-        if let Ok(entries) = std::fs::read_dir("/proc/sys/net/ipv6/conf") {
-            for entry in entries.flatten() {
-                let iface = entry.file_name().into_string().unwrap_or_default();
-                if iface == "all" || iface == "default" || iface == net.name {
-                    continue;
-                }
-                let _ = std::fs::write(
-                    format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface),
-                    "0\n",
-                );
-            }
-        }
-
         // Migration: if this is the default network, remove the old global
         // `ip pelagos` table that previous versions created.
         if net.name == "pelagos0" {
@@ -1476,36 +1431,6 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         while run_quiet("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).is_ok() {}
         let _ = run("iptables", &["-I", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
         let _ = run("iptables", &["-I", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
-
-        // Install NAT66 (IPv6 masquerade) rules.  Non-fatal: host may lack
-        // IPv6 NAT support (kernel module nf_nat_ipv6 absent).
-        let nat6_script = build_nat6_script(net);
-        if let Err(e) = run_nft(&nat6_script) {
-            log::warn!("NAT66 setup failed (IPv6 NAT unavailable): {}", e);
-        } else {
-            // Mirror ip6tables FORWARD rules (for legacy ip6tables firewalls).
-            let cidr6 = format!("{}/64", net.ipv6_prefix_addr());
-            while run_quiet(
-                "ip6tables",
-                &["-D", "FORWARD", "-s", &cidr6, "-j", "ACCEPT"],
-            )
-            .is_ok()
-            {}
-            while run_quiet(
-                "ip6tables",
-                &["-D", "FORWARD", "-d", &cidr6, "-j", "ACCEPT"],
-            )
-            .is_ok()
-            {}
-            let _ = run(
-                "ip6tables",
-                &["-I", "FORWARD", "-s", &cidr6, "-j", "ACCEPT"],
-            );
-            let _ = run(
-                "ip6tables",
-                &["-I", "FORWARD", "-d", &cidr6, "-j", "ACCEPT"],
-            );
-        }
     }
 
     active.push(ns_name.to_string());
@@ -1589,24 +1514,9 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         ns_name, net.name, remaining.len(), remaining
     );
     if remaining.is_empty() {
-        // Restore IPv6 forwarding to off.
-        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "0\n");
-
         // Remove the iptables FORWARD rules added by enable_nat().
         let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
         let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
-
-        // Remove ip6tables FORWARD rules and the ip6 NAT table.
-        let cidr6 = format!("{}/64", net.ipv6_prefix_addr());
-        let _ = run(
-            "ip6tables",
-            &["-D", "FORWARD", "-s", &cidr6, "-j", "ACCEPT"],
-        );
-        let _ = run(
-            "ip6tables",
-            &["-D", "FORWARD", "-d", &cidr6, "-j", "ACCEPT"],
-        );
-        let _ = run_nft_quiet(&format!("delete table ip6 {}\n", table));
 
         if read_port_forwards_count(&net.name) == 0 {
             // No active port forwards either — remove the entire ip table.

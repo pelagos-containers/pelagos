@@ -1,12 +1,12 @@
-# IPv6 Forwarding: Bridge-Scoped, Not Global
+# IPv6 Forwarding and NAT66: Why We Removed It
 
-**Status: working on home network (commit 7bbddb8), T-Mobile tethering still TBD**
+**Status: NAT66 removed; ULA container-to-container IPv6 verified; T-Mobile internet IPv6 via pasta (pending)**
 
 See also: GitHub issue #224
 
 ---
 
-## The Bug (pre-commit 19373ec)
+## The Original Bug (pre-commit 19373ec)
 
 The old `setup_ipv6_container()` code wrote:
 
@@ -56,47 +56,49 @@ userspace via a raw socket and deliberately sets `wlan0/accept_ra=0` to
 prevent the kernel from double-processing them.  Any write to `wlan0/accept_ra`
 by a "foreign process" is detected and immediately reverted.
 
-## The Fix (commit 7bbddb8)
+## Why NAT66 Is Fundamentally Incompatible with networkd-managed SLAAC
 
+NAT66 (IPv6 masquerade) requires the kernel's `ip6_forward()` path.
 `ip6_forward()` checks `net->ipv6.devconf_all->forwarding` at the very top
 and returns immediately if it is 0 — per-interface settings alone are not
-enough.  `all/forwarding=1` is required.
+enough.
 
-But writing `all/forwarding=1` propagates to every host interface, which
-causes systemd-networkd to disable its RA client (see above).
+The only way to set `devconf_all->forwarding` is to write `all/forwarding=1`.
+That write propagates to **every host interface** via `dev_forward_change()`,
+which causes systemd-networkd to disable its RA client and remove
+SLAAC-managed IPv6 state.
 
-The solution: write `all/forwarding=1` (which sets `devconf_all->forwarding`
-AND propagates to per-interface configs), then **immediately** reset
-`forwarding=0` on every interface except the pelagos bridge.
+An intermediate "hack" (commit 7bbddb8) wrote `all/forwarding=1` then
+immediately reset non-bridge interfaces to 0.  This races against networkd's
+inotify watcher and works in practice on a LAN with 5–50 ms networkd latency,
+but it is a timing-dependent hack, not a correct solution.
 
-```rust
-let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1\n");
-if let Ok(entries) = std::fs::read_dir("/proc/sys/net/ipv6/conf") {
-    for entry in entries.flatten() {
-        let iface = entry.file_name().into_string().unwrap_or_default();
-        if iface == "all" || iface == "default" || iface == net.name {
-            continue;
-        }
-        let _ = std::fs::write(
-            format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface),
-            "0\n",
-        );
-    }
-}
-```
+**The root problem:** the two operations — "set devconf_all->forwarding=1" and
+"propagate forwarding=1 to every interface" — cannot be decoupled.  There is no
+kernel API to set `devconf_all->forwarding` without the propagation side-effect.
 
-**Why this works:** `devconf_all->forwarding` is a separate kernel struct
-from each interface's `idev->cnf`.  Writing to a per-interface sysctl only
-changes that interface's `idev->cnf`; it does not touch `devconf_all`.  So
-after the reset loop, `devconf_all->forwarding` is still 1 and `ip6_forward`
-proceeds, while `wlan0->cnf.forwarding` is 0 and networkd is not disrupted.
+## The Correct Fix: Remove NAT66
 
-**The race:** this beats systemd-networkd's inotify watcher in practice.
-sysctl writes complete in microseconds; networkd's event-loop latency is
-5–50 ms.
+NAT66 is not a viable feature for bridge networks on SLAAC-managed hosts.
 
-On teardown of the last container, `all/forwarding=0` is written to restore
-the global state.
+The correct design is:
+
+- **Container-to-container IPv6:** Bridge networking is L2 (MAC-addressed).
+  Traffic between two containers on the same bridge never calls `ip6_forward()`.
+  It works without any sysctl changes.  Containers get ULA addresses
+  (`fd7e:73ca:9801::/64`) and can reach each other and the bridge gateway
+  with zero impact on host networking.
+
+- **Internet IPv6 from containers:** Use `pasta` (`--network pasta`), which
+  provides full internet access (including IPv6) via user-mode networking.
+  `pasta` needs no kernel forwarding and does not touch host sysctls.
+
+## Verified Behavior (post NAT66 removal)
+
+- Container-to-container IPv6: **0% packet loss** (5/5 pings, ~0.06 ms avg)
+- Bridge gateway ping: **0% packet loss** (fd7e:73ca:9801::1)
+- Host `wlan0/forwarding`: unmodified — networkd SLAAC unaffected
+- Host `all/forwarding`: 0 at all times during bridge container lifetime
 
 ## Kernel Behavior Reference
 
@@ -113,20 +115,19 @@ interface's `idev->cnf.forwarding`.  Setting only a per-interface value leaves
 When `dev_forward_change()` fires on an interface managed by networkd, networkd
 may disable its RA client and remove SLAAC-managed state for that interface.
 
-## Verification Steps (TODO)
+## Verification Steps for T-Mobile (issue #224)
 
-This fix has not yet been tested end-to-end on T-Mobile tethering.  Before
-closing the issue:
+Container-to-container IPv6 is verified.  Internet IPv6 via pasta on T-Mobile
+still needs testing:
 
-- [ ] Install fixed binary: `sudo cargo install --path .`
-- [ ] One-time state repair: `sudo systemctl restart systemd-networkd`
 - [ ] Connect to T-Mobile hotspot
-- [ ] Confirm host has IPv6: `ip -6 addr show wlan0` — expect a global (`scope global`) address
-- [ ] If no global address, T-Mobile hotspot may not deliver IPv6 via SLAAC on this device/plan — the fix is still correct but containers won't have internet IPv6 because the host doesn't either
-- [ ] If host has IPv6: `sudo pelagos run alpine ping -6 -c3 2001:4860:4860::8888` — expect 0% loss
-- [ ] Reconnect to T-Mobile a second time (without restarting networkd) to confirm no manual intervention is needed after the fix
+- [ ] Confirm host has IPv6: `ip -6 addr show wlan0` — expect a `scope global` address
+- [ ] Run `pelagos run alpine ping -6 -c3 2001:4860:4860::8888` (pasta mode, rootless)
+- [ ] Confirm host IPv6 is still intact after container exits: `ping -6 2001:4860:4860::8888`
+- [ ] Reconnect to T-Mobile a second time (without restarting networkd) to confirm
+      no manual intervention needed
 
-## Diagnosing a Corrupted Host
+## Diagnosing a Host Corrupted by Old Code
 
 ```bash
 for iface in all wlan0 pelagos0; do
@@ -135,10 +136,10 @@ accept_ra=$(cat /proc/sys/net/ipv6/conf/$iface/accept_ra)"
 done
 ```
 
-Expected healthy state on a SLAAC network with the fix:
+Expected healthy state (with fix):
 - `all/forwarding=0`
 - `wlan0/forwarding=0`, `wlan0/accept_ra=0` (networkd owns this — correct)
-- `pelagos0/forwarding=1` (set by pelagos — correct)
+- `pelagos0/forwarding=0` (no longer set by pelagos — correct)
 
 One-time recovery for hosts corrupted by old code:
 
@@ -146,6 +147,8 @@ One-time recovery for hosts corrupted by old code:
 sudo systemctl restart systemd-networkd
 ```
 
-## Commit
+## Commit History
 
-Fixed in commit `19373ec` — "fix(network): scope IPv6 forwarding to bridge only, not all interfaces"
+- `19373ec` — bridge-scoped forwarding (WRONG: kernel ignores per-iface for ip6_forward)
+- `7bbddb8` — timing hack: write all/forwarding=1 then reset non-bridge ifaces (FRAGILE)
+- NAT66 removed entirely — see current `src/network.rs`
