@@ -2624,10 +2624,26 @@ pub fn setup_pasta_network(
 /// level; the caller's stderr thread will collect pasta's output and log it at
 /// teardown.  On timeout the warning includes the container PID so the operator
 /// can inspect `/proc/{pid}/net/dev` and pasta's process state manually.
+/// Returns true if the host itself has at least one global-scope IPv6 address.
+/// Used to skip the container IPv6 readiness wait on IPv4-only hosts.
+fn host_has_ipv6() -> bool {
+    std::fs::read_to_string("/proc/net/if_inet6")
+        .map(|contents| {
+            contents.lines().any(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                // format: addr ifindex prefix_len scope flags ifname
+                // scope 00 = global
+                parts.len() >= 6 && parts[3] == "00" && parts[5] != "lo"
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
     let net_dev = format!("/proc/{}/net/dev", child_pid);
     let if_inet6 = format!("/proc/{}/net/if_inet6", child_pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let wait_for_ipv6 = host_has_ipv6();
     let mut tap_seen = false;
     loop {
         // Detect pasta exiting before the TAP interface appears — almost always
@@ -2671,7 +2687,9 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
         // line per address; scope field 00 = global.  Without this wait the
         // container process can start before IPv6 routes are ready, causing
         // the first IPv6 send to fail with ENETUNREACH.
-        if tap_seen {
+        // Skip entirely on IPv4-only hosts — pasta cannot provide IPv6 if the
+        // host has none, so there is nothing to wait for.
+        if tap_seen && wait_for_ipv6 {
             let ipv6_ready = std::fs::read_to_string(&if_inet6)
                 .map(|contents| {
                     contents.lines().any(|line| {
