@@ -2626,7 +2626,9 @@ pub fn setup_pasta_network(
 /// can inspect `/proc/{pid}/net/dev` and pasta's process state manually.
 fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
     let net_dev = format!("/proc/{}/net/dev", child_pid);
+    let if_inet6 = format!("/proc/{}/net/if_inet6", child_pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut tap_seen = false;
     loop {
         // Detect pasta exiting before the TAP interface appears — almost always
         // means pasta encountered an error (permission denied, missing /dev/net/tun,
@@ -2634,7 +2636,7 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
         // output is collected by the reader thread and logged in teardown.
         if let Ok(Some(status)) = process.try_wait() {
             log::warn!(
-                "pasta exited (status: {}) before TAP interface appeared in \
+                "pasta exited (status: {}) before network setup completed in \
                  /proc/{}/net/dev — network setup failed; stdout/stderr output \
                  will be logged at teardown",
                 status,
@@ -2643,19 +2645,46 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
             return;
         }
 
-        if let Ok(contents) = std::fs::read_to_string(&net_dev) {
-            // /proc/{pid}/net/dev has one line per interface; lo is always present.
-            // A second interface means pasta has created the TAP.
-            let has_non_lo = contents
-                .lines()
-                .skip(2) // header lines
-                .any(|line| {
-                    let iface = line.trim().split(':').next().unwrap_or("").trim();
-                    !iface.is_empty() && iface != "lo"
-                });
-            if has_non_lo {
+        if !tap_seen {
+            if let Ok(contents) = std::fs::read_to_string(&net_dev) {
+                // /proc/{pid}/net/dev has one line per interface; lo is always present.
+                // A second interface means pasta has created the TAP.
+                let has_non_lo = contents
+                    .lines()
+                    .skip(2) // header lines
+                    .any(|line| {
+                        let iface = line.trim().split(':').next().unwrap_or("").trim();
+                        !iface.is_empty() && iface != "lo"
+                    });
+                if has_non_lo {
+                    log::debug!(
+                        "pasta: TAP interface appeared in /proc/{}/net/dev",
+                        child_pid
+                    );
+                    tap_seen = true;
+                }
+            }
+        }
+
+        // After the TAP appears, also wait for a global IPv6 address to be
+        // configured by pasta --config-net.  /proc/{pid}/net/if_inet6 has one
+        // line per address; scope field 00 = global.  Without this wait the
+        // container process can start before IPv6 routes are ready, causing
+        // the first IPv6 send to fail with ENETUNREACH.
+        if tap_seen {
+            let ipv6_ready = std::fs::read_to_string(&if_inet6)
+                .map(|contents| {
+                    contents.lines().any(|line| {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        // format: addr ifindex prefix_len scope flags ifname
+                        // scope 00 = global, 10 = link-local, 20 = host
+                        parts.len() >= 4 && parts[3] == "00" && parts.last() != Some(&"lo")
+                    })
+                })
+                .unwrap_or(false);
+            if ipv6_ready {
                 log::debug!(
-                    "pasta: TAP interface appeared in /proc/{}/net/dev",
+                    "pasta: global IPv6 address configured in /proc/{}/net/if_inet6",
                     child_pid
                 );
                 return;
@@ -2663,11 +2692,19 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
         }
 
         if std::time::Instant::now() >= deadline {
-            log::warn!(
-                "pasta network setup timeout (5s) — no non-loopback interface in \
-                 /proc/{}/net/dev; container will proceed without pasta networking",
-                child_pid
-            );
+            if tap_seen {
+                // TAP up but IPv6 not configured — network has no IPv6, proceed.
+                log::debug!(
+                    "pasta: no global IPv6 address after 5s — IPv6 may be unavailable \
+                     on this network; proceeding with IPv4 only",
+                );
+            } else {
+                log::warn!(
+                    "pasta network setup timeout (5s) — no non-loopback interface in \
+                     /proc/{}/net/dev; container will proceed without pasta networking",
+                    child_pid
+                );
+            }
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
