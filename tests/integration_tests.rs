@@ -20268,10 +20268,15 @@ mod issue_118_start_returns_promptly {
         }
 
         // 1. Start a long-running container detached.
+        // --network none: this test is about pipe lifecycle, not networking.
+        // The default (pasta) adds process-spawn overhead that can exceed the
+        // 2-second deadline on slow CI runners.
         let out = std::process::Command::new(bin())
             .args([
                 "run",
                 "--detach",
+                "--network",
+                "none",
                 "--name",
                 name,
                 "public.ecr.aws/docker/library/alpine:latest",
