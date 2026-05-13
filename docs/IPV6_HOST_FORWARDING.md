@@ -1,6 +1,6 @@
 # IPv6 Forwarding: Bridge-Scoped, Not Global
 
-**Status: fix committed (19373ec), not yet verified on T-Mobile**
+**Status: working on home network (commit 7bbddb8), T-Mobile tethering still TBD**
 
 See also: GitHub issue #224
 
@@ -56,37 +56,59 @@ userspace via a raw socket and deliberately sets `wlan0/accept_ra=0` to
 prevent the kernel from double-processing them.  Any write to `wlan0/accept_ra`
 by a "foreign process" is detected and immediately reverted.
 
-## The Fix
+## The Fix (commit 7bbddb8)
 
-Write forwarding only to the **bridge interface**:
+`ip6_forward()` checks `net->ipv6.devconf_all->forwarding` at the very top
+and returns immediately if it is 0 — per-interface settings alone are not
+enough.  `all/forwarding=1` is required.
+
+But writing `all/forwarding=1` propagates to every host interface, which
+causes systemd-networkd to disable its RA client (see above).
+
+The solution: write `all/forwarding=1` (which sets `devconf_all->forwarding`
+AND propagates to per-interface configs), then **immediately** reset
+`forwarding=0` on every interface except the pelagos bridge.
 
 ```rust
-let bridge_fwd = format!("/proc/sys/net/ipv6/conf/{}/forwarding", net.name);
-let _ = std::fs::write(&bridge_fwd, "1\n");
+let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1\n");
+if let Ok(entries) = std::fs::read_dir("/proc/sys/net/ipv6/conf") {
+    for entry in entries.flatten() {
+        let iface = entry.file_name().into_string().unwrap_or_default();
+        if iface == "all" || iface == "default" || iface == net.name {
+            continue;
+        }
+        let _ = std::fs::write(
+            format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface),
+            "0\n",
+        );
+    }
+}
 ```
 
-### Why bridge-scoped is sufficient
+**Why this works:** `devconf_all->forwarding` is a separate kernel struct
+from each interface's `idev->cnf`.  Writing to a per-interface sysctl only
+changes that interface's `idev->cnf`; it does not touch `devconf_all`.  So
+after the reset loop, `devconf_all->forwarding` is still 1 and `ip6_forward`
+proceeds, while `wlan0->cnf.forwarding` is 0 and networkd is not disrupted.
 
-For the container → internet IPv6 path:
+**The race:** this beats systemd-networkd's inotify watcher in practice.
+sysctl writes complete in microseconds; networkd's event-loop latency is
+5–50 ms.
 
-1. Container sends packet out `eth0` → arrives at `vh-xxxx` (veth host side)
-2. Bridge processes it at L2 → passes to `pelagos0` for L3 routing
-3. `ip6_forward()` in the kernel checks the **incoming L3 device's** forwarding
-   flag: `skb->dev` at this point is the bridge device (`pelagos0`), not the
-   originating veth port
-4. `pelagos0/forwarding=1` → kernel will forward the packet
-5. Host looks up a route for the destination and forwards via NAT66
-
-The individual veth interfaces do not need forwarding enabled.  No host
-wireless or ethernet interface is touched.
+On teardown of the last container, `all/forwarding=0` is written to restore
+the global state.
 
 ## Kernel Behavior Reference
 
-| sysctl write | Propagates to existing interfaces? |
-|---|---|
-| `all/forwarding` | **Yes** — kernel iterates all netdevs and calls `dev_forward_change()` |
-| `all/accept_ra` | **No** — only updates `devconf_all`; per-interface `idev->cnf` unchanged |
-| `<iface>/forwarding` | Affects that interface only |
+| sysctl write | Propagates to existing interfaces? | Affects `devconf_all`? |
+|---|---|---|
+| `all/forwarding` | **Yes** — iterates all netdevs, calls `dev_forward_change()` | Yes |
+| `<iface>/forwarding` | Affects that interface's `idev->cnf` only | No |
+| `all/accept_ra` | **No** — only updates `devconf_all`; per-interface `idev->cnf` unchanged | Yes |
+
+`ip6_forward()` checks `net->ipv6.devconf_all->forwarding` — not the incoming
+interface's `idev->cnf.forwarding`.  Setting only a per-interface value leaves
+`devconf_all` at 0 and `ip6_forward` bails immediately.
 
 When `dev_forward_change()` fires on an interface managed by networkd, networkd
 may disable its RA client and remove SLAAC-managed state for that interface.
