@@ -1,5 +1,11 @@
 # IPv6 Forwarding: Bridge-Scoped, Not Global
 
+**Status: fix committed (19373ec), not yet verified on T-Mobile**
+
+See also: GitHub issue #224
+
+---
+
 ## The Bug (pre-commit 19373ec)
 
 The old `setup_ipv6_container()` code wrote:
@@ -85,23 +91,38 @@ wireless or ethernet interface is touched.
 When `dev_forward_change()` fires on an interface managed by networkd, networkd
 may disable its RA client and remove SLAAC-managed state for that interface.
 
+## Verification Steps (TODO)
+
+This fix has not yet been tested end-to-end on T-Mobile tethering.  Before
+closing the issue:
+
+- [ ] Install fixed binary: `sudo cargo install --path .`
+- [ ] One-time state repair: `sudo systemctl restart systemd-networkd`
+- [ ] Connect to T-Mobile hotspot
+- [ ] Confirm host has IPv6: `ip -6 addr show wlan0` — expect a global (`scope global`) address
+- [ ] If no global address, T-Mobile hotspot may not deliver IPv6 via SLAAC on this device/plan — the fix is still correct but containers won't have internet IPv6 because the host doesn't either
+- [ ] If host has IPv6: `sudo pelagos run alpine ping -6 -c3 2001:4860:4860::8888` — expect 0% loss
+- [ ] Reconnect to T-Mobile a second time (without restarting networkd) to confirm no manual intervention is needed after the fix
+
 ## Diagnosing a Corrupted Host
 
-If IPv6 is broken on the host after a prior pelagos run:
-
 ```bash
-# Check state
 for iface in all wlan0 pelagos0; do
   echo "$iface: forwarding=$(cat /proc/sys/net/ipv6/conf/$iface/forwarding) \
 accept_ra=$(cat /proc/sys/net/ipv6/conf/$iface/accept_ra)"
 done
-
-# One-time recovery — restarts networkd's RA client for all interfaces
-sudo systemctl restart systemd-networkd
 ```
 
-After restart, networkd will re-solicit Router Advertisements from the network,
-restore the global IPv6 address on `wlan0`, and reinstall the default route.
+Expected healthy state on a SLAAC network with the fix:
+- `all/forwarding=0`
+- `wlan0/forwarding=0`, `wlan0/accept_ra=0` (networkd owns this — correct)
+- `pelagos0/forwarding=1` (set by pelagos — correct)
+
+One-time recovery for hosts corrupted by old code:
+
+```bash
+sudo systemctl restart systemd-networkd
+```
 
 ## Commit
 
