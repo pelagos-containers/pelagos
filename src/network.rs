@@ -1204,10 +1204,13 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
         }
     }
 
-    // Enable IPv6 forwarding on the host.  accept_ra=2 keeps any SLAAC-learned
-    // default route intact even while forwarding is active.
-    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/accept_ra", "2\n");
-    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1\n");
+    // Enable IPv6 forwarding on the bridge interface only — NOT on all/forwarding,
+    // which would reset accept_ra to 0 on every host interface (wlan0, eth0, etc.)
+    // and break SLAAC on networks like T-Mobile that use 464XLAT.  The kernel
+    // only checks forwarding on the *incoming* interface when deciding whether to
+    // forward a packet, so enabling it on the bridge alone is sufficient.
+    let bridge_fwd = format!("/proc/sys/net/ipv6/conf/{}/forwarding", net.name);
+    let _ = std::fs::write(&bridge_fwd, "1\n");
 
     log::debug!("IPv6: {} assigned {} (gw {})", ns_name, ip6, gw6);
     Some(ip6)
@@ -2812,7 +2815,6 @@ pub fn is_pasta_available() -> bool {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Run a command, returning an error if it exits non-zero.
 fn run(cmd: &str, args: &[&str]) -> io::Result<()> {
     let status = SysCmd::new(cmd).args(args).status()?;
     if status.success() {
