@@ -7,3 +7,4 @@ scripts/e2e-creds.env
 scripts/.env
 rt-results.txt
 .DS_Store
+*.org
