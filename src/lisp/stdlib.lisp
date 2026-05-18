@@ -38,8 +38,8 @@
 ;;   :port     (host-var . container)            ; host maps to container
 ;;   :port     (8080 . 80) (2003 . 2003)         ; multiple ports under one :port
 ;;   :env      ("KEY1" . "val1") ("KEY2" . var)  ; host env maps to container env
-;;   :bind     ("./host/path" . "/container/path") ; read-only (safe default)
-;;   :bind-rw  ("./host/path" . "/container/path") ; read-write (explicit opt-in)
+;;   :bind     ("./host/path" . "/container/path") ; read-write (default)
+;;   :bind-ro  ("./host/path" . "/container/path") ; read-only
 ;;   :memory   mem-var
 ;;   :cap-add  net-raw sys-admin)                ; restore specific caps (all dropped by default)
 ;;

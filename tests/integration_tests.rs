@@ -21548,6 +21548,81 @@ mod compose_bind_network {
         false
     }
 
+    /// test_compose_bind_is_read_write
+    ///
+    /// Requires root. Regression test for issue #228.
+    ///
+    /// A service using `(list 'bind ...)` must be able to write to the bind-mounted
+    /// directory. Before the fix, `bind` was hardcoded as read-only; any write
+    /// inside the container failed with "Read-only file system".
+    ///
+    /// Failure indicates the bind/bind-rw distinction is broken or `bind` was
+    /// regressed back to read-only.
+    #[test]
+    #[serial_test::serial(nat)]
+    fn test_compose_bind_is_read_write() {
+        if !is_root() {
+            eprintln!("SKIP test_compose_bind_is_read_write: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let project = "issue228-bind-rw";
+        let bind_src = std::env::temp_dir().join("pelagos-issue228-bind-src");
+        std::fs::create_dir_all(&bind_src).expect("create bind src dir");
+
+        let compose_content = format!(
+            r#"(compose-up
+  (compose
+    (service "svc"
+      '(image "{}")
+      (list 'bind "{}" "/data")
+      '(command "sh" "-c" "touch /data/writetest && sleep 30"))))
+"#,
+            ALPINE_ECR,
+            bind_src.display()
+        );
+        let compose_file = std::env::temp_dir().join("pelagos-issue228.reml");
+        std::fs::write(&compose_file, compose_content.as_bytes()).expect("write compose file");
+
+        compose_down_project(project, compose_file.to_str().unwrap());
+
+        let up_status = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("compose up");
+        assert!(up_status.success(), "compose up should exit 0");
+
+        let container = format!("{}-svc", project);
+        let running = wait_for_running(&container, 8_000);
+
+        // The file must exist on the host — written from inside the container.
+        let wrote = bind_src.join("writetest").exists();
+
+        compose_down_project(project, compose_file.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&bind_src);
+        let _ = std::fs::remove_file(&compose_file);
+
+        assert!(
+            running,
+            "service '{}' never reached running state",
+            container
+        );
+        assert!(
+            wrote,
+            "bind mount was not writable: /data/writetest not found on host; \
+             issue #228 regression — bind option defaults to read-only"
+        );
+    }
+
     /// test_compose_bind_and_network_service_stays_alive
     ///
     /// Requires root. Regression test for issue #227.

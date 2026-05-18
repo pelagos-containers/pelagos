@@ -4167,3 +4167,15 @@ the exit status and the supervisor did not detect the early exit before printing
 "All services started". This test also exercises the new warning logging added
 in the waiter thread (`compose: service 'x' killed by signal N` or `exited with
 code N`).
+
+### `test_compose_bind_is_read_write`
+**Requires:** root, internet access (ECR image pull)
+**Module:** `compose_bind_network`
+
+Starts a compose project whose service uses `(list 'bind ...)` (no `-rw` suffix)
+and a command that writes a file to the bind-mounted path. After the service
+reaches `running` state, verifies the file exists on the host side.
+
+Failure indicates the `bind` option is read-only (regression for issue #228):
+before the fix, `apply_service_opt` hardcoded `read_only: true` for `"bind"`,
+causing writes inside the container to fail with "Read-only file system".

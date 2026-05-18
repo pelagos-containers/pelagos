@@ -396,22 +396,22 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
             let mount_path = str_or_sym_at("volume mount_path", vals, 1)?;
             spec.volumes.push(VolumeMount { name, mount_path });
         }
-        "bind" => {
+        "bind" | "bind-rw" => {
             let host_path = str_or_sym_at("bind host_path", vals, 0)?;
             let container_path = str_or_sym_at("bind container_path", vals, 1)?;
             spec.bind_mounts.push(BindMount {
                 host_path,
                 container_path,
-                read_only: true,
+                read_only: false,
             });
         }
-        "bind-rw" => {
-            let host_path = str_or_sym_at("bind-rw host_path", vals, 0)?;
-            let container_path = str_or_sym_at("bind-rw container_path", vals, 1)?;
+        "bind-ro" => {
+            let host_path = str_or_sym_at("bind-ro host_path", vals, 0)?;
+            let container_path = str_or_sym_at("bind-ro container_path", vals, 1)?;
             spec.bind_mounts.push(BindMount {
                 host_path,
                 container_path,
-                read_only: false,
+                read_only: true,
             });
         }
         "workdir" => {

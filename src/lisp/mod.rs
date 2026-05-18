@@ -901,6 +901,102 @@ mod tests {
         }
     }
 
+    // ── bind / bind-ro / bind-rw semantics (issue #228) ──────────────────────
+
+    #[test]
+    fn test_bind_is_read_write() {
+        // :bind must default to read-write (issue #228: was incorrectly read-only).
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            r#"(service "svc"
+                 (list 'image "img:1")
+                 (list 'bind "/host/data" "/data"))"#,
+        );
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.bind_mounts.len(), 1);
+                assert_eq!(s.bind_mounts[0].host_path, "/host/data");
+                assert_eq!(s.bind_mounts[0].container_path, "/data");
+                assert!(!s.bind_mounts[0].read_only, "bind must be read-write");
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
+    }
+
+    #[test]
+    fn test_bind_rw_is_read_write() {
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            r#"(service "svc"
+                 (list 'image "img:1")
+                 (list 'bind-rw "/host/data" "/data"))"#,
+        );
+        match v {
+            Value::ServiceSpec(s) => {
+                assert!(!s.bind_mounts[0].read_only, "bind-rw must be read-write");
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
+    }
+
+    #[test]
+    fn test_bind_ro_is_read_only() {
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            r#"(service "svc"
+                 (list 'image "img:1")
+                 (list 'bind-ro "/etc/config.yml" "/etc/app/config.yml"))"#,
+        );
+        match v {
+            Value::ServiceSpec(s) => {
+                assert!(s.bind_mounts[0].read_only, "bind-ro must be read-only");
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
+    }
+
+    #[test]
+    fn test_define_service_bind_is_read_write() {
+        // :bind in define-service form must be read-write (issue #228).
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "img:1"
+                 :bind  ("/host/data" . "/data"))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.bind_mounts.len(), 1);
+                assert!(!s.bind_mounts[0].read_only, ":bind must be read-write");
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
+    }
+
+    #[test]
+    fn test_define_service_bind_ro_is_read_only() {
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image   "img:1"
+                 :bind-ro ("/etc/conf" . "/etc/conf"))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.bind_mounts.len(), 1);
+                assert!(s.bind_mounts[0].read_only, ":bind-ro must be read-only");
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
+    }
+
     #[test]
     fn test_on_ready_hook_registered() {
         let mut i = interp();
