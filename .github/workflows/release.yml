@@ -91,6 +91,11 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+      - name: Upload pelagos-dns as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.dns_artifact }}
+          path: ${{ matrix.dns_artifact }}
 
   package:
     needs: [build]
@@ -107,6 +112,16 @@ jobs:
         with:
           name: pelagos-aarch64-linux
           path: dist/arm64
+      - name: Download x86_64 pelagos-dns binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pelagos-dns-x86_64-linux
+          path: dist/amd64
+      - name: Download aarch64 pelagos-dns binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pelagos-dns-aarch64-linux
+          path: dist/arm64
       - name: Install nfpm
         run: |
           echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
@@ -118,12 +133,15 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist/packages
 
-          for row in "amd64 pelagos-x86_64-linux" "arm64 pelagos-aarch64-linux"; do
+          for row in "amd64 pelagos-x86_64-linux pelagos-dns-x86_64-linux" "arm64 pelagos-aarch64-linux pelagos-dns-aarch64-linux"; do
             ARCH=$(echo $row | cut -d' ' -f1)
             BINARY_NAME=$(echo $row | cut -d' ' -f2)
+            DNS_BINARY_NAME=$(echo $row | cut -d' ' -f3)
             BINARY="dist/$ARCH/$BINARY_NAME"
-            chmod +x "$BINARY"
+            DNS_BINARY="dist/$ARCH/$DNS_BINARY_NAME"
+            chmod +x "$BINARY" "$DNS_BINARY"
             cp "$BINARY" ./pelagos-current
+            cp "$DNS_BINARY" ./pelagos-dns-current
 
             ARCH=$ARCH VERSION=$VERSION \
               nfpm package --config pkg/nfpm/nfpm.yaml --packager deb \

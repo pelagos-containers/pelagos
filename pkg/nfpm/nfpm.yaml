@@ -25,6 +25,11 @@ contents:
     file_info:
       mode: 0755
 
+  - src: ./pelagos-dns-current
+    dst: /usr/bin/pelagos-dns
+    file_info:
+      mode: 0755
+
   - src: scripts/setup.sh
     dst: /usr/share/pelagos/setup.sh
     file_info:

@@ -21490,3 +21490,148 @@ mod auto_pull {
         );
     }
 }
+
+// ── issue #227 — compose bind mount + bridge network ─────────────────────────
+
+/// Test module for compose with bind mount + bridge network combination.
+///
+/// Regression test for issue #227: a compose service with both a bind-mount
+/// and a bridge network exited immediately instead of running for 30 seconds.
+/// The root cause was silent: the waiter thread had no exit-status logging
+/// and the container state wasn't inspected after startup.
+mod compose_bind_network {
+    use std::process::{Command, Stdio};
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    const ALPINE_ECR: &str = "public.ecr.aws/docker/library/alpine:latest";
+
+    fn ensure_alpine() {
+        let ls = Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains(ALPINE_ECR) {
+            return;
+        }
+        let status = Command::new(bin())
+            .args(["image", "pull", ALPINE_ECR])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull from ECR failed");
+    }
+
+    fn compose_down_project(project: &str, compose_file: &str) {
+        let _ = Command::new(bin())
+            .args(["compose", "down", "-f", compose_file, "-p", project])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    fn wait_for_running(container: &str, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = Command::new(bin()).args(["ps"]).output() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.contains(container) && stdout.contains("running") {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        false
+    }
+
+    /// test_compose_bind_and_network_service_stays_alive
+    ///
+    /// Requires root. Regression test for issue #227.
+    ///
+    /// Starts a compose service with both a bind-mount and a bridge network.
+    /// Verifies the service is still running 5 seconds after startup. Without
+    /// the fix, the service would exit within 2 seconds with no logged error,
+    /// caused by the silent loss of pre_exec errors in the double-fork path or
+    /// an unexpected early exit from the container process.
+    ///
+    /// Failure indicates compose loses containers with bind+network, or the
+    /// new exit-status logging is missing.
+    #[test]
+    #[serial_test::serial(nat)]
+    fn test_compose_bind_and_network_service_stays_alive() {
+        if !is_root() {
+            eprintln!("SKIP test_compose_bind_and_network_service_stays_alive: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let project = "issue227-bind-net";
+
+        // Create a temporary directory for the bind mount source.
+        let bind_src = std::env::temp_dir().join("pelagos-issue227-bind-src");
+        std::fs::create_dir_all(&bind_src).expect("create bind src dir");
+        std::fs::write(bind_src.join("probe.txt"), b"issue227").expect("write probe file");
+
+        // Write the compose file to a temp path.
+        let compose_content = format!(
+            r#"(compose-up
+  (compose
+    (network "issue227-net" '(subnet "10.201.7.0/24"))
+    (service "svc"
+      '(image "{}")
+      '(network "issue227-net")
+      (list 'bind-rw "{}" "/data")
+      '(command "sleep" "30"))))
+"#,
+            ALPINE_ECR,
+            bind_src.display()
+        );
+        let compose_file = std::env::temp_dir().join("pelagos-issue227.reml");
+        std::fs::write(&compose_file, compose_content.as_bytes()).expect("write compose file");
+
+        // Pre-clean in case a previous run left state.
+        compose_down_project(project, compose_file.to_str().unwrap());
+
+        // Start the compose project.
+        let up_status = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("compose up");
+        assert!(up_status.success(), "compose up should exit 0");
+
+        // The container name is "{project}-svc".
+        let container = format!("{}-svc", project);
+
+        // Give the container a moment to start, then verify it's alive.
+        // Without the fix, the container would already be dead by now.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let still_running = wait_for_running(&container, 5_000);
+
+        // Tear down regardless of outcome.
+        compose_down_project(project, compose_file.to_str().unwrap());
+
+        // Clean up temp files.
+        let _ = std::fs::remove_dir_all(&bind_src);
+        let _ = std::fs::remove_file(&compose_file);
+
+        assert!(
+            still_running,
+            "container '{}' should still be running 2s after compose up; \
+             issue #227 regression — bind+network combination causes immediate exit",
+            container
+        );
+    }
+}

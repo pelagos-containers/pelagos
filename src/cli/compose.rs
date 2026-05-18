@@ -465,6 +465,26 @@ pub fn run_compose_with_hooks(
         return Err(e);
     }
 
+    // Warn if any container has already exited before the supervisor loop starts.
+    // This surfaces unexpected early exits (e.g. bind+network on ZFS — issue #227).
+    for (cn, pid, _) in &started {
+        if !check_liveness(*pid) {
+            let exit_code = super::read_state(cn)
+                .ok()
+                .and_then(|s| s.exit_code)
+                .map(|c| format!("exit code {}", c))
+                .unwrap_or_else(|| "unknown exit status (check logs)".to_string());
+            log::warn!(
+                "compose: service '{}' (pid {}) has already exited ({}) — \
+                 check 'pelagos logs {}' and enable RUST_LOG=debug for details",
+                cn,
+                pid,
+                exit_code,
+                cn
+            );
+        }
+    }
+
     println!("All services started for project '{}'", project);
 
     loop {
@@ -845,6 +865,31 @@ fn spawn_service(
     let svc_name_wait = svc_name.clone();
     let handle = std::thread::spawn(move || {
         let exit = child.wait(); // blocks until container exits; runs teardown_resources()
+                                 // Log the exit status so unexpected early exits are visible.
+        match &exit {
+            Ok(status) => {
+                if let Some(code) = status.code() {
+                    if code != 0 {
+                        log::warn!(
+                            "compose: service '{}' exited with code {}",
+                            svc_name_wait,
+                            code
+                        );
+                    } else {
+                        log::debug!("compose: service '{}' exited (code 0)", svc_name_wait);
+                    }
+                } else if let Some(sig) = status.signal() {
+                    log::warn!(
+                        "compose: service '{}' killed by signal {}",
+                        svc_name_wait,
+                        sig
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("compose: service '{}' wait error: {}", svc_name_wait, e);
+            }
+        }
         for (net_name, _) in &all_ips_wait {
             let _ = pelagos::dns::dns_remove_entry(net_name, &svc_name_wait);
         }

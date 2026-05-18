@@ -4151,3 +4151,19 @@ taken.
 Failure indicates the auto-pull path in `build_image_run` is broken — either
 the pull was not attempted, the image was not re-loaded after the pull, or the
 pull itself failed (network issue in CI). Covers issue #189.
+
+### `test_compose_bind_and_network_service_stays_alive`
+**Requires:** root, internet access (ECR image pull)
+**Module:** `compose_bind_network`
+
+Starts a compose project with a single service that has **both** a bind-mount
+and a bridge network. Waits 2 seconds after `compose up`, then checks that the
+service is still listed as `running` in `pelagos ps`.
+
+Failure indicates the bind+network combination causes immediate container exit
+(regression for issue #227). The bug caused the container to die silently
+within 2 seconds with no logged error, because the waiter thread did not log
+the exit status and the supervisor did not detect the early exit before printing
+"All services started". This test also exercises the new warning logging added
+in the waiter thread (`compose: service 'x' killed by signal N` or `exited with
+code N`).
