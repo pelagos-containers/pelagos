@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos"
-version = "0.61.2"
+version = "0.61.3"
 dependencies = [
  "axum",
  "bitflags 2.11.0",
