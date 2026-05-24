@@ -6,11 +6,8 @@ pub fn cmd_stop(name: &str, time: u64) -> Result<(), Box<dyn std::error::Error>>
     let mut state = read_state(name).map_err(|_| format!("no container named '{}'", name))?;
 
     if state.status != ContainerStatus::Running {
-        return Err(format!(
-            "container '{}' is not running (status: {})",
-            name, state.status
-        )
-        .into());
+        // Already stopped — idempotent like `docker stop`. Fixes #232.
+        return Ok(());
     }
 
     // In detached mode there is a brief window where pid==0: the watcher has
