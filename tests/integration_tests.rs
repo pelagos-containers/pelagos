@@ -21811,3 +21811,422 @@ mod issue_232_stop_idempotent {
         let _ = std::process::Command::new(bin).args(["rm", "-f", name]).output();
     }
 }
+
+mod sandbox {
+    //! Integration tests for `pelagos sandbox` — pod sandbox support (issue #234).
+    //!
+    //! Tests verify:
+    //! 1. `sandbox create` → pause process running, netns exists
+    //! 2. Two containers with `--sandbox <id>` share the same network namespace inode
+    //! 3. Container A can reach container B on `localhost:<port>` within the same sandbox
+    //! 4. Both containers report the same IP address
+    //! 5. `sandbox rm` → pause process gone, netns cleaned up
+
+    use serial_test::serial;
+
+    const ALPINE: &str = "public.ecr.aws/docker/library/alpine:latest";
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    /// Ensure the alpine image is pulled; skip test with a message if not available
+    /// after a reasonable timeout (avoids long waits in CI without internet).
+    fn ensure_alpine_image() -> bool {
+        let b = bin();
+        let ls = std::process::Command::new(b)
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains(ALPINE) {
+            return true;
+        }
+        let pull = std::process::Command::new(b)
+            .args(["image", "pull", ALPINE])
+            .output()
+            .expect("pelagos image pull");
+        if !pull.status.success() {
+            eprintln!("SKIP: could not pull alpine: {}", String::from_utf8_lossy(&pull.stderr));
+            return false;
+        }
+        true
+    }
+
+    /// Wait for a container to appear in `pelagos ps` (running list) within timeout.
+    fn wait_for_container(name: &str, timeout_secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while std::time::Instant::now() < deadline {
+            let ps = std::process::Command::new(bin())
+                .args(["ps"])
+                .output()
+                .expect("pelagos ps");
+            if String::from_utf8_lossy(&ps.stdout).contains(name) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// Cleanup helper: stop and remove a container.
+    fn cleanup_container(name: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin())
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// Cleanup helper: remove a sandbox by ID.
+    fn cleanup_sandbox(id: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["sandbox", "rm", id])
+            .output();
+    }
+
+    // ── Test 1: sandbox create → pause process running, netns exists ─────────
+
+    /// Verify that `pelagos sandbox create` starts a pause process and creates
+    /// a named network namespace.
+    #[test]
+    #[serial]
+    fn test_sandbox_create_pause_and_netns() {
+        if !super::is_root() {
+            eprintln!("SKIP test_sandbox_create_pause_and_netns: requires root");
+            return;
+        }
+
+        let b = bin();
+        let out = std::process::Command::new(b)
+            .args(["sandbox", "create"])
+            .output()
+            .expect("pelagos sandbox create");
+
+        assert!(
+            out.status.success(),
+            "sandbox create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sandbox_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            !sandbox_id.is_empty(),
+            "sandbox create printed no ID to stdout"
+        );
+        assert_eq!(
+            sandbox_id.len(),
+            16,
+            "sandbox ID should be 16 hex chars, got: {:?}",
+            sandbox_id
+        );
+
+        // Load the state to find the pause PID and ns_name.
+        let state_path = format!("/run/pelagos/sandboxes/{}/state.json", sandbox_id);
+        assert!(
+            std::path::Path::new(&state_path).exists(),
+            "sandbox state file not found: {}",
+            state_path
+        );
+        let state_data = std::fs::read_to_string(&state_path).expect("read state.json");
+        let state: serde_json::Value =
+            serde_json::from_str(&state_data).expect("parse state.json");
+
+        let pause_pid = state["pause_pid"].as_i64().expect("pause_pid in state") as i32;
+        assert!(pause_pid > 0, "pause_pid should be > 0");
+
+        // Verify pause process is running.
+        let proc_path = format!("/proc/{}", pause_pid);
+        assert!(
+            std::path::Path::new(&proc_path).exists(),
+            "pause process /proc/{} does not exist — process not running",
+            pause_pid
+        );
+
+        // Verify the named network namespace exists.
+        let ns_name = state["ns_name"].as_str().expect("ns_name in state");
+        let netns_path = format!("/run/netns/{}", ns_name);
+        assert!(
+            std::path::Path::new(&netns_path).exists(),
+            "named netns '{}' not found at {}",
+            ns_name,
+            netns_path
+        );
+
+        // Also verify via `sandbox ls`
+        let ls = std::process::Command::new(b)
+            .args(["sandbox", "ls"])
+            .output()
+            .expect("sandbox ls");
+        assert!(ls.status.success(), "sandbox ls failed");
+        let ls_out = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            ls_out.contains(&sandbox_id),
+            "sandbox ls does not show sandbox ID {}",
+            sandbox_id
+        );
+
+        // Cleanup.
+        cleanup_sandbox(&sandbox_id);
+    }
+
+    // ── Test 5: sandbox rm → pause process gone, netns cleaned up ────────────
+
+    /// Verify that `pelagos sandbox rm <id>` stops the pause process and removes
+    /// the named network namespace.
+    #[test]
+    #[serial]
+    fn test_sandbox_rm_cleanup() {
+        if !super::is_root() {
+            eprintln!("SKIP test_sandbox_rm_cleanup: requires root");
+            return;
+        }
+
+        let b = bin();
+
+        // Create a sandbox.
+        let out = std::process::Command::new(b)
+            .args(["sandbox", "create", "--name", "test-rm-sandbox"])
+            .output()
+            .expect("sandbox create");
+        assert!(out.status.success(), "sandbox create failed");
+        let sandbox_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Read state for pause PID and ns_name.
+        let state_path = format!("/run/pelagos/sandboxes/{}/state.json", sandbox_id);
+        let state_data = std::fs::read_to_string(&state_path).expect("read state");
+        let state: serde_json::Value = serde_json::from_str(&state_data).expect("parse state");
+        let pause_pid = state["pause_pid"].as_i64().expect("pause_pid") as i32;
+        let ns_name = state["ns_name"].as_str().expect("ns_name").to_string();
+
+        // Verify setup is good.
+        assert!(
+            std::path::Path::new(&format!("/proc/{}", pause_pid)).exists(),
+            "pause process should be running before rm"
+        );
+
+        // Remove the sandbox.
+        let rm = std::process::Command::new(b)
+            .args(["sandbox", "rm", &sandbox_id])
+            .output()
+            .expect("sandbox rm");
+        assert!(
+            rm.status.success(),
+            "sandbox rm failed: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+
+        // Wait briefly for process cleanup.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Verify pause process is gone.
+        // kill(pid, 0) should fail with ESRCH if process doesn't exist.
+        let proc_gone = !std::path::Path::new(&format!("/proc/{}", pause_pid)).exists();
+        assert!(proc_gone, "pause process {} still running after sandbox rm", pause_pid);
+
+        // Verify named netns is removed.
+        let netns_path = format!("/run/netns/{}", ns_name);
+        assert!(
+            !std::path::Path::new(&netns_path).exists(),
+            "named netns '{}' still exists after sandbox rm",
+            netns_path
+        );
+
+        // Verify state directory is removed.
+        assert!(
+            !std::path::Path::new(&format!("/run/pelagos/sandboxes/{}", sandbox_id)).exists(),
+            "sandbox state dir still exists after sandbox rm"
+        );
+    }
+
+    // ── Test 2 & 4: two containers share net namespace + same IP ─────────────
+
+    /// Verify that two containers started with `--sandbox <id>` share the same
+    /// network namespace inode and report the same IP address.
+    #[test]
+    #[serial]
+    fn test_sandbox_containers_share_netns() {
+        if !super::is_root() {
+            eprintln!("SKIP test_sandbox_containers_share_netns: requires root");
+            return;
+        }
+        if !ensure_alpine_image() {
+            return;
+        }
+
+        let b = bin();
+        let c1 = "test-sbx-ns-a";
+        let c2 = "test-sbx-ns-b";
+
+        // Pre-clean.
+        cleanup_container(c1);
+        cleanup_container(c2);
+
+        // Create a sandbox.
+        let out = std::process::Command::new(b)
+            .args(["sandbox", "create"])
+            .output()
+            .expect("sandbox create");
+        assert!(out.status.success(), "sandbox create failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+        let sandbox_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Run container A: print the net namespace inode.
+        let run_a = std::process::Command::new(b)
+            .args([
+                "run", "--detach", "--name", c1,
+                "--sandbox", &sandbox_id,
+                ALPINE, "/bin/sh", "-c", "sleep 60",
+            ])
+            .output()
+            .expect("run container A");
+        assert!(run_a.status.success(), "run A failed: {}", String::from_utf8_lossy(&run_a.stderr));
+
+        // Run container B: print the net namespace inode.
+        let run_b = std::process::Command::new(b)
+            .args([
+                "run", "--detach", "--name", c2,
+                "--sandbox", &sandbox_id,
+                ALPINE, "/bin/sh", "-c", "sleep 60",
+            ])
+            .output()
+            .expect("run container B");
+        assert!(run_b.status.success(), "run B failed: {}", String::from_utf8_lossy(&run_b.stderr));
+
+        // Wait for both containers.
+        assert!(wait_for_container(c1, 10), "container A never started");
+        assert!(wait_for_container(c2, 10), "container B never started");
+
+        // Get net namespace inode from container A.
+        let ns_a = std::process::Command::new(b)
+            .args(["exec", c1, "stat", "-L", "-c", "%i", "/proc/self/ns/net"])
+            .output()
+            .expect("exec ns check A");
+        assert!(ns_a.status.success(), "exec ns check A failed: {}",
+            String::from_utf8_lossy(&ns_a.stderr));
+        let inode_a = String::from_utf8_lossy(&ns_a.stdout).trim().to_string();
+
+        // Get net namespace inode from container B.
+        let ns_b = std::process::Command::new(b)
+            .args(["exec", c2, "stat", "-L", "-c", "%i", "/proc/self/ns/net"])
+            .output()
+            .expect("exec ns check B");
+        assert!(ns_b.status.success(), "exec ns check B failed: {}",
+            String::from_utf8_lossy(&ns_b.stderr));
+        let inode_b = String::from_utf8_lossy(&ns_b.stdout).trim().to_string();
+
+        assert!(
+            !inode_a.is_empty() && !inode_b.is_empty(),
+            "could not read ns inodes (A={:?}, B={:?})",
+            inode_a, inode_b
+        );
+        assert_eq!(
+            inode_a, inode_b,
+            "containers A and B should share the same network namespace inode"
+        );
+
+        // Test 4: verify both containers have the same IP.
+        let ip_a = std::process::Command::new(b)
+            .args(["exec", c1, "/bin/sh", "-c", "ip -4 addr show eth0 | grep 'inet ' | awk '{print $2}'"])
+            .output()
+            .expect("exec ip A");
+        let ip_b = std::process::Command::new(b)
+            .args(["exec", c2, "/bin/sh", "-c", "ip -4 addr show eth0 | grep 'inet ' | awk '{print $2}'"])
+            .output()
+            .expect("exec ip B");
+        let ip_a_str = String::from_utf8_lossy(&ip_a.stdout).trim().to_string();
+        let ip_b_str = String::from_utf8_lossy(&ip_b.stdout).trim().to_string();
+
+        if !ip_a_str.is_empty() && !ip_b_str.is_empty() {
+            assert_eq!(
+                ip_a_str, ip_b_str,
+                "containers A and B should have the same IP address (they share the netns)"
+            );
+        }
+
+        // Cleanup.
+        cleanup_container(c1);
+        cleanup_container(c2);
+        cleanup_sandbox(&sandbox_id);
+    }
+
+    // ── Test 3: container A can reach container B on localhost:<port> ─────────
+
+    /// Verify that two containers in the same sandbox can communicate via
+    /// `localhost` (they share the network namespace so 127.0.0.1 is loopback
+    /// within the shared namespace).
+    ///
+    /// Strategy:
+    ///   - Server: detached container running `nc -l -p 9876`
+    ///   - Client: foreground container that connects to 127.0.0.1:9876 and
+    ///     captures stdout directly — avoids the exec-on-exited-container problem.
+    #[test]
+    #[serial]
+    fn test_sandbox_localhost_communication() {
+        if !super::is_root() {
+            eprintln!("SKIP test_sandbox_localhost_communication: requires root");
+            return;
+        }
+        if !ensure_alpine_image() {
+            return;
+        }
+
+        let b = bin();
+        let server = "test-sbx-server";
+
+        // Pre-clean.
+        cleanup_container(server);
+
+        // Create sandbox.
+        let out = std::process::Command::new(b)
+            .args(["sandbox", "create"])
+            .output()
+            .expect("sandbox create");
+        assert!(out.status.success(), "sandbox create failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+        let sandbox_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Run server container: listen on localhost:9876 with nc.
+        let run_srv = std::process::Command::new(b)
+            .args([
+                "run", "--detach", "--name", server,
+                "--sandbox", &sandbox_id,
+                ALPINE, "/bin/sh", "-c",
+                "echo 'hello-sandbox' | nc -l -p 9876",
+            ])
+            .output()
+            .expect("run server");
+        assert!(run_srv.status.success(), "run server failed: {}",
+            String::from_utf8_lossy(&run_srv.stderr));
+
+        // Wait for server container to be running.
+        assert!(wait_for_container(server, 10), "server container never started");
+        // Let nc start listening before the client connects.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        // Run client container FOREGROUND: connect to localhost:9876.
+        // Capturing stdout directly avoids exec-on-exited-container issues.
+        let client_out = std::process::Command::new(b)
+            .args([
+                "run",
+                "--sandbox", &sandbox_id,
+                ALPINE, "/bin/sh", "-c",
+                "nc -w 3 127.0.0.1 9876",
+            ])
+            .output()
+            .expect("run client (foreground)");
+
+        let result = String::from_utf8_lossy(&client_out.stdout).trim().to_string();
+        assert!(
+            result.contains("hello-sandbox"),
+            "client did not receive 'hello-sandbox' from server via localhost; \
+             stdout={:?} stderr={:?}",
+            result,
+            String::from_utf8_lossy(&client_out.stderr).trim()
+        );
+
+        // Cleanup.
+        cleanup_container(server);
+        cleanup_sandbox(&sandbox_id);
+    }
+}

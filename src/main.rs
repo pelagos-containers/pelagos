@@ -167,6 +167,13 @@ pub(crate) enum CliCommand {
         cmd: ContainerCmd,
     },
 
+    // ── Sandbox (pod sandbox) ─────────────────────────────────────────────
+    /// Manage pod sandboxes (shared net/IPC/UTS namespaces)
+    Sandbox {
+        #[clap(subcommand)]
+        cmd: cli::sandbox::SandboxCmd,
+    },
+
     // ── System maintenance ────────────────────────────────────────────────
     /// System-wide maintenance commands (disk usage, pruning)
     System {
@@ -586,6 +593,9 @@ fn main() {
 
         // Compose
         CliCommand::Compose { cmd } => cli::compose::cmd_compose(cmd),
+
+        // Sandbox
+        CliCommand::Sandbox { cmd } => cli::sandbox::cmd_sandbox(cmd),
 
         // System
         CliCommand::System { cmd } => cli::system::cmd_system(cmd),

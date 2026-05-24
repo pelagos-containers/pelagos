@@ -275,6 +275,34 @@ pub fn network_port_forwards_file(name: &str) -> PathBuf {
 pub fn network_ipv6_ipam_file(name: &str) -> PathBuf {
     network_runtime_dir(name).join("next_ipv6")
 }
+// ── Sandbox directories ──────────────────────────────────────────────────────
+
+/// Parent directory for all sandbox state: `<runtime>/sandboxes/`.
+pub fn sandboxes_dir() -> PathBuf {
+    runtime_dir().join("sandboxes")
+}
+
+/// State directory for a specific sandbox: `<runtime>/sandboxes/<id>/`.
+pub fn sandbox_dir(id: &str) -> PathBuf {
+    sandboxes_dir().join(id)
+}
+
+/// PID file for a sandbox's pause process: `<runtime>/sandboxes/<id>/pause.pid`.
+pub fn sandbox_pid_file(id: &str) -> PathBuf {
+    sandbox_dir(id).join("pause.pid")
+}
+
+/// Named network namespace name file: `<runtime>/sandboxes/<id>/ns_name`.
+///
+/// Contains the `/run/netns/<name>` namespace name used at teardown.
+pub fn sandbox_ns_name_file(id: &str) -> PathBuf {
+    sandbox_dir(id).join("ns_name")
+}
+
+/// Optional human-readable name file: `<runtime>/sandboxes/<id>/name`.
+pub fn sandbox_name_file(id: &str) -> PathBuf {
+    sandbox_dir(id).join("name")
+}
 
 #[cfg(test)]
 mod tests {

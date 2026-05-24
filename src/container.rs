@@ -1401,6 +1401,48 @@ impl Command {
         self
     }
 
+    /// Join an existing pod sandbox's NET, IPC, and UTS namespaces.
+    ///
+    /// The sandbox must have been created with `pelagos sandbox create`.
+    /// This is equivalent to calling `with_namespace_join` three times for
+    /// the sandbox's NET (named netns), IPC, and UTS namespaces.
+    ///
+    /// Containers joining a sandbox share the same IP address and can reach
+    /// each other via `localhost`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sandbox state cannot be loaded (sandbox not
+    /// found or pause process dead).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use pelagos::container::Command;
+    ///
+    /// let child = Command::new("/bin/sh")
+    ///     .with_chroot("/path/to/rootfs")
+    ///     .with_sandbox("abc123def456")?
+    ///     .spawn()?;
+    /// ```
+    pub fn with_sandbox(self, sandbox_id: &str) -> Result<Self, crate::sandbox::SandboxError> {
+        let state = crate::sandbox::SandboxState::load(sandbox_id)
+            .map_err(|e| crate::sandbox::SandboxError::NotFound(e.to_string()))?;
+
+        if !state.is_alive() {
+            return Err(crate::sandbox::SandboxError::NotRunning(sandbox_id.to_string()));
+        }
+
+        let net_ns = state.net_ns_path();
+        let ipc_ns = state.ipc_ns_path();
+        let uts_ns = state.uts_ns_path();
+
+        Ok(self
+            .with_namespace_join(net_ns, Namespace::NET)
+            .with_namespace_join(ipc_ns, Namespace::IPC)
+            .with_namespace_join(uts_ns, Namespace::UTS))
+    }
+
     /// Automatically mount /proc filesystem after chroot.
     ///
     /// This mounts a new proc filesystem at /proc inside the container.

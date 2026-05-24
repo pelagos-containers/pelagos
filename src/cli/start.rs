@@ -146,5 +146,6 @@ fn spawn_config_to_run_args(
         sig_proxy: None,
         upper_dir: None, // set by start_one after this call
         default_subnet: None,
+        sandbox: None,
     }
 }

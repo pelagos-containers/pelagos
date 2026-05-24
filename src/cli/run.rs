@@ -63,6 +63,10 @@ pub struct RunArgs {
     #[clap(long)]
     pub network: Vec<String>,
 
+    /// Join an existing pod sandbox (shared net/IPC/UTS namespaces)
+    #[clap(long)]
+    pub sandbox: Option<String>,
+
     /// TCP port forward HOST:CONTAINER (repeatable; requires bridge/pasta)
     #[clap(long = "publish", short = 'p')]
     pub publish: Vec<String>,
@@ -659,6 +663,15 @@ fn apply_cli_options(
     container_name: &str,
 ) -> Result<Command, Box<dyn std::error::Error>> {
     // Network
+    // Sandbox: when --sandbox is given, join the sandbox's NET/IPC/UTS namespaces
+    // instead of setting up independent networking.
+    if let Some(ref sandbox_id) = args.sandbox {
+        cmd = cmd
+            .with_sandbox(sandbox_id)
+            .map_err(|e| format!("sandbox '{}': {}", sandbox_id, e))?;
+        // Skip standard network setup — the sandbox provides the network namespace.
+        // (We still fall through to apply non-network CLI options below.)
+    } else {
     // NAT is implied whenever a bridge network is selected (default or explicit),
     // matching Docker's behaviour.  --no-nat suppresses it (e.g. routed IPv6 prefix).
     // --nat is kept as an explicit override for completeness and named-network use.
@@ -725,6 +738,8 @@ fn apply_cli_options(
     if !effective_dns.is_empty() {
         cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     }
+    } // end of `else` block for non-sandbox networking
+
     for link_spec in &args.link {
         if let Some((name, alias)) = link_spec.split_once(':') {
             cmd = cmd.with_link_alias(name, alias);
