@@ -4233,39 +4233,48 @@ mod ipv6 {
         assert!(status.success(), "Container exited with failure");
     }
 
-    /// N3+IPv6: A container with NAT enabled should be able to reach an
-    /// IPv6 address on the internet (NAT66 masquerade via ip6 nftables table).
+    /// N3+IPv6: A pasta-networked container should be able to reach an IPv6
+    /// address on the internet via pasta's user-mode relay.
     ///
-    /// Skipped when host has no IPv6 connectivity.
+    /// NAT66 was removed in commit 68148a2 — writing all/forwarding=1 corrupts
+    /// SLAAC-managed host interfaces. pasta provides IPv6 internet without any
+    /// kernel forwarding or sysctl changes and is the settled design for
+    /// internet-bound IPv6 (see issue #225).
+    ///
+    /// Skipped when host has no IPv6 connectivity or pasta is not installed.
     #[test]
-    #[serial(nat)]
-    fn test_ipv6_outbound_nat() {
+    fn test_ipv6_outbound_pasta() {
         if !is_root() {
-            eprintln!("Skipping test_ipv6_outbound_nat: requires root");
+            eprintln!("Skipping test_ipv6_outbound_pasta: requires root");
+            return;
+        }
+        let pasta_ok = std::process::Command::new("pasta")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !pasta_ok {
+            eprintln!("Skipping test_ipv6_outbound_pasta: pasta not installed");
             return;
         }
         let Some(rootfs) = get_test_rootfs() else {
-            eprintln!("Skipping test_ipv6_outbound_nat: alpine-rootfs not found");
+            eprintln!("Skipping test_ipv6_outbound_pasta: alpine-rootfs not found");
             return;
         };
         if !host_has_ipv6() {
-            eprintln!("Skipping test_ipv6_outbound_nat: host has no IPv6 connectivity");
+            eprintln!("Skipping test_ipv6_outbound_pasta: host has no IPv6 connectivity");
             return;
         }
 
-        // Wait for DAD (Duplicate Address Detection) before pinging: while an
-        // address is in the 'tentative' state the kernel silently drops outbound
-        // packets, causing the ping to fail spuriously.
         let mut child = Command::new("/bin/ash")
             .args([
                 "-c",
-                "while ip -6 addr show eth0 | grep -q tentative; do sleep 0.1; done; \
-                 ping6 -c 2 -W 5 2606:4700:4700::1111 >/dev/null 2>&1 && echo NAT6_OK",
+                "ping6 -c 2 -W 5 2606:4700:4700::1111 >/dev/null 2>&1 && echo IPV6_OK",
             ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
-            .with_network(NetworkMode::Bridge)
-            .with_nat()
-            .with_dns(&["2606:4700:4700::1111"])
+            .with_network(NetworkMode::Pasta)
             .with_chroot(&rootfs)
             .with_proc_mount()
             .env("PATH", ALPINE_PATH)
@@ -4273,13 +4282,13 @@ mod ipv6 {
             .stdout(Stdio::Piped)
             .stderr(Stdio::Null)
             .spawn()
-            .expect("Failed to spawn NAT6 container");
+            .expect("Failed to spawn pasta IPv6 container");
 
         let (status, stdout, _) = child.wait_with_output().expect("wait");
         let out = String::from_utf8_lossy(&stdout);
         assert!(
-            out.contains("NAT6_OK"),
-            "Container should reach IPv6 internet via NAT66, got: {}",
+            out.contains("IPV6_OK"),
+            "Container should reach IPv6 internet via pasta, got: {}",
             out
         );
         assert!(status.success(), "Container exited with failure");
