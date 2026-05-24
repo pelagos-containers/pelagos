@@ -85,10 +85,13 @@ pub(crate) enum CliCommand {
         filter: Vec<String>,
     },
 
-    /// Send SIGTERM to a running container
+    /// Send SIGTERM to a running container, wait for exit, SIGKILL if needed
     Stop {
         /// Container name
         name: String,
+        /// Seconds to wait for clean exit before sending SIGKILL (default: 10)
+        #[clap(long, short = 't', default_value = "10")]
+        time: u64,
     },
 
     /// Stop then start a container (running or exited)
@@ -252,10 +255,13 @@ pub(crate) enum ContainerCmd {
         /// Container name
         name: String,
     },
-    /// Send SIGTERM to a running container
+    /// Send SIGTERM to a running container, wait for exit, SIGKILL if needed
     Stop {
         /// Container name
         name: String,
+        /// Seconds to wait for clean exit before sending SIGKILL (default: 10)
+        #[clap(long, short = 't', default_value = "10")]
+        time: u64,
     },
     /// Remove a container
     Rm {
@@ -480,7 +486,7 @@ fn main() {
             json,
             filter,
         } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
-        CliCommand::Stop { name } => cli::stop::cmd_stop(&name),
+        CliCommand::Stop { name, time } => cli::stop::cmd_stop(&name, time),
         CliCommand::Restart { name, time } => cli::restart::cmd_restart(&name, time),
         CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),
         CliCommand::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
@@ -494,7 +500,7 @@ fn main() {
                 filter,
             } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
             ContainerCmd::Inspect { name } => cli::ps::cmd_inspect(&name),
-            ContainerCmd::Stop { name } => cli::stop::cmd_stop(&name),
+            ContainerCmd::Stop { name, time } => cli::stop::cmd_stop(&name, time),
             ContainerCmd::Rm { name, force } => cli::rm::cmd_rm(&name, force),
             ContainerCmd::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
         },

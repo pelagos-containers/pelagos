@@ -1,8 +1,8 @@
-//! `pelagos stop` — send SIGTERM to a running container.
+//! `pelagos stop` — send SIGTERM to a running container, wait for exit, SIGKILL if needed.
 
 use super::{check_liveness, read_state, write_state, ContainerStatus};
 
-pub fn cmd_stop(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_stop(name: &str, time: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = read_state(name).map_err(|_| format!("no container named '{}'", name))?;
 
     if state.status != ContainerStatus::Running {
@@ -37,13 +37,30 @@ pub fn cmd_stop(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let r = unsafe { libc::kill(state.pid, libc::SIGTERM) };
+    let pid = state.pid;
+
+    let r = unsafe { libc::kill(pid, libc::SIGTERM) };
     if r != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
             // Process already gone.
         } else {
-            return Err(format!("kill({}): {}", state.pid, err).into());
+            return Err(format!("kill({}): {}", pid, err).into());
+        }
+    }
+
+    // Wait up to `time` seconds for the process to exit cleanly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(time.max(1));
+    while check_liveness(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // If still alive after the grace period, escalate to SIGKILL.
+    if check_liveness(pid) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while check_liveness(pid) && std::time::Instant::now() < kill_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
