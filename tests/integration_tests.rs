@@ -21710,3 +21710,104 @@ mod compose_bind_network {
         );
     }
 }
+
+mod issue_232_stop_idempotent {
+    /// test_stop_on_exited_container_is_idempotent
+    ///
+    /// Requires: root.
+    ///
+    /// Runs a short-lived container (`/bin/echo done`) in detached mode, waits
+    /// for it to exit naturally, then calls `pelagos stop` twice.  Before the
+    /// fix, stop returned an error when the container status was not Running,
+    /// causing the rusternetes kubelet to loop indefinitely and never clean up
+    /// container directories after pod deletion (issue #232).
+    ///
+    /// Both stop calls must succeed (exit 0).
+    #[test]
+    fn test_stop_on_exited_container_is_idempotent() {
+        if !super::is_root() {
+            eprintln!("SKIP test_stop_on_exited_container_is_idempotent: requires root");
+            return;
+        }
+
+        const ALPINE: &str = "public.ecr.aws/docker/library/alpine:latest";
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "test-stop-idem-232";
+
+        // Pre-clean any leftover state.
+        let _ = std::process::Command::new(bin).args(["stop", name]).output();
+        let _ = std::process::Command::new(bin).args(["rm", "-f", name]).output();
+
+        // Pull image if not already cached.
+        let ls = std::process::Command::new(bin)
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if !String::from_utf8_lossy(&ls.stdout).contains(ALPINE) {
+            let pull = std::process::Command::new(bin)
+                .args(["image", "pull", ALPINE])
+                .output()
+                .expect("pelagos image pull");
+            assert!(
+                pull.status.success(),
+                "image pull failed: {}",
+                String::from_utf8_lossy(&pull.stderr)
+            );
+        }
+
+        // Run a container whose command exits immediately.
+        let run = std::process::Command::new(bin)
+            .args([
+                "run", "--detach", "--network", "none",
+                "--name", name,
+                ALPINE, "/bin/echo", "done",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(run.success(), "pelagos run --detach failed");
+
+        // Wait up to 5s for the container to disappear from `pelagos ps`
+        // (running list only), which confirms it has exited naturally.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ps = std::process::Command::new(bin)
+                .args(["ps"])
+                .output()
+                .expect("pelagos ps");
+            if !String::from_utf8_lossy(&ps.stdout).contains(name) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break; // proceed; stop should still succeed
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // First stop: must succeed even though the container has already exited.
+        let stop1 = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output()
+            .expect("pelagos stop (1st call)");
+        assert!(
+            stop1.status.success(),
+            "pelagos stop on exited container returned error (1st call) — issue #232: {}",
+            String::from_utf8_lossy(&stop1.stderr).trim()
+        );
+
+        // Second stop: also must succeed (fully idempotent).
+        let stop2 = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output()
+            .expect("pelagos stop (2nd call)");
+        assert!(
+            stop2.status.success(),
+            "pelagos stop on exited container returned error (2nd call) — issue #232: {}",
+            String::from_utf8_lossy(&stop2.stderr).trim()
+        );
+
+        // Cleanup.
+        let _ = std::process::Command::new(bin).args(["rm", "-f", name]).output();
+    }
+}
