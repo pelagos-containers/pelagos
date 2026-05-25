@@ -21,6 +21,19 @@ pub struct CriSandbox {
     pub annotations: HashMap<String, String>,
     pub created_at_ns: i64,
     pub state: SandboxState,
+    /// Named netns for CNI sandboxes (e.g. "pcri-a1b2c3d4").
+    /// Empty string means pelagos native networking was used.
+    #[serde(default)]
+    pub netns: String,
+    /// IP assigned to this sandbox (by CNI or pelagos native IPAM).
+    #[serde(default)]
+    pub ip: String,
+    /// Path to the CNI config file used for ADD; needed for DEL on teardown.
+    #[serde(default)]
+    pub cni_conf: String,
+    /// PID of the pause process holding IPC/UTS namespaces open (CNI path only).
+    #[serde(default)]
+    pub pause_pid: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -128,6 +141,48 @@ pub fn save_container(c: &CriContainer) -> std::io::Result<()> {
 
 pub fn remove_sandbox_file(id: &str) {
     let _ = std::fs::remove_file(format!("{}/{}.json", SANDBOXES_DIR, id));
+}
+
+// ── Pelagos runtime sandbox state (for `pelagos run --sandbox`) ──────────────
+
+const PELAGOS_SANDBOXES_DIR: &str = "/run/pelagos/sandboxes";
+
+/// Write the pelagos-format sandbox state so that `pelagos run --sandbox <id>`
+/// can join the CNI-configured network namespace.
+///
+/// The JSON schema mirrors `pelagos::sandbox::SandboxState`.
+pub fn write_pelagos_sandbox_state(
+    id: &str,
+    name: Option<&str>,
+    pause_pid: i32,
+    ns_name: &str,
+    container_ip: &str,
+) -> std::io::Result<()> {
+    let dir = format!("{}/{}", PELAGOS_SANDBOXES_DIR, id);
+    std::fs::create_dir_all(&dir)?;
+
+    let json = serde_json::json!({
+        "id": id,
+        "name": name,
+        "pause_pid": pause_pid,
+        "ns_name": ns_name,
+        "veth_host": "",        // CNI owns its own veth — pelagos must not delete it
+        "container_ip": container_ip,
+    });
+    std::fs::write(
+        format!("{}/state.json", dir),
+        serde_json::to_string(&json).unwrap(),
+    )?;
+    // pause.pid and ns_name files are read by some pelagos internals.
+    std::fs::write(format!("{}/pause.pid", dir), format!("{}", pause_pid))?;
+    std::fs::write(format!("{}/ns_name", dir), ns_name)?;
+    Ok(())
+}
+
+/// Remove the pelagos-format sandbox state directory.
+pub fn remove_pelagos_sandbox_state(id: &str) {
+    let dir = format!("{}/{}", PELAGOS_SANDBOXES_DIR, id);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 pub fn remove_container_file(id: &str) {
