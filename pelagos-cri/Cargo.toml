@@ -1,0 +1,27 @@
+[package]
+name = "pelagos-cri"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+description = "Kubernetes CRI gRPC server that delegates to the pelagos container runtime"
+license = "Apache-2.0"
+
+[[bin]]
+name = "pelagos-cri"
+path = "src/main.rs"
+
+[dependencies]
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "3.1.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "process", "fs", "macros", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+uuid = { version = "1", features = ["v4"] }
+futures-core = "0.3"
+
+[build-dependencies]
+tonic-build = "0.12"
