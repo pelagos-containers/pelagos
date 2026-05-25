@@ -11,11 +11,12 @@
 #
 # Usage:
 #   sudo -E env "PATH=$PATH" bash scripts/test-cri.sh
+#   BINARY=/usr/local/bin/pelagos CRI_BINARY=/usr/local/bin/pelagos-cri sudo bash scripts/test-cri.sh
 
 set -uo pipefail
 
-BINARY="./target/debug/pelagos"
-CRI_BINARY="./target/debug/pelagos-cri"
+BINARY="${BINARY:-./target/debug/pelagos}"
+CRI_BINARY="${CRI_BINARY:-./target/debug/pelagos-cri}"
 CRI_SOCK="/run/pelagos/cri.sock"
 CRICTL="crictl --runtime-endpoint unix://${CRI_SOCK}"
 CRI_PID_FILE="/tmp/pelagos-cri-test.pid"
