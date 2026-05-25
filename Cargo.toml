@@ -2,6 +2,12 @@
 members = [".", "pelagos-dockerd", "pelagos-cri"]
 resolver = "2"
 
+[patch.crates-io]
+# k3s/kubelet sends the Unix socket path URL-encoded as :authority (e.g. %2Frun%2Fpelagos%2Fcri.sock).
+# The http crate rejects this, causing h2 to RST_STREAM with PROTOCOL_ERROR. This local patch
+# falls back to "localhost" instead of failing the stream.
+h2 = { path = "vendor/h2" }
+
 [package]
 name = "pelagos"
 version = "0.61.3"

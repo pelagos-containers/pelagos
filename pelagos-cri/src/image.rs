@@ -42,6 +42,24 @@ struct ImageConfig {
     entrypoint: Vec<String>,
 }
 
+/// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
+async fn dir_disk_usage(path: &str) -> u64 {
+    let out = tokio::process::Command::new("du")
+        .args(["--apparent-size", "-sb", path])
+        .output()
+        .await;
+    if let Ok(o) = out {
+        if o.status.success() {
+            if let Ok(s) = std::str::from_utf8(&o.stdout) {
+                if let Some(n) = s.split_whitespace().next() {
+                    return n.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    0
+}
+
 pub struct ImageSvc {
     pub state: AppState,
 }
@@ -69,12 +87,13 @@ impl ImageSvc {
     async fn compute_image_size(manifest: &ImageManifest) -> u64 {
         let mut total: u64 = 0;
         for layer in &manifest.layers {
-            let layer_file = format!("{}/{}/layer.tar.gz", LAYERS_DIR, layer);
-            if let Ok(meta) = tokio::fs::metadata(&layer_file).await {
-                total += meta.len();
-            }
+            // Layers are stored as extracted directories; digest may carry a "sha256:" prefix.
+            let digest = layer.strip_prefix("sha256:").unwrap_or(layer.as_str());
+            let layer_dir = format!("{}/{}", LAYERS_DIR, digest);
+            total += dir_disk_usage(&layer_dir).await;
         }
-        total
+        // Always report at least 1 byte; kubelet rejects images with Size_ == 0.
+        total.max(1)
     }
 
     fn manifest_to_image(manifest: &ImageManifest, size: u64) -> Image {
