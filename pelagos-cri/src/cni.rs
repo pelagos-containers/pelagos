@@ -13,7 +13,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const CNI_CONF_DIR: &str = "/etc/cni/net.d";
+/// CNI config directories searched in order; first file found wins.
+/// The k3s agent path is listed first so its managed configs (Flannel, etc.)
+/// take priority over stale files that may linger in /etc/cni/net.d/.
+const CNI_CONF_DIRS: &[&str] = &["/var/lib/rancher/k3s/agent/etc/cni/net.d", "/etc/cni/net.d"];
 const CNI_BIN_DIRS: &[&str] = &[
     "/opt/cni/bin",
     "/var/lib/rancher/k3s/data/current/bin",
@@ -39,21 +42,30 @@ struct Conf {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Returns the path to the first CNI config file found in `/etc/cni/net.d/`,
-/// sorted lexicographically.  Returns `None` if the directory is absent or empty.
+/// Returns the first CNI config file found by searching `CNI_CONF_DIRS` in order.
+/// Within each directory files are sorted lexicographically; the first entry wins.
+/// Returns `None` if no config is found in any directory.
 pub fn find_cni_conf() -> Option<PathBuf> {
-    let mut entries: Vec<_> = std::fs::read_dir(CNI_CONF_DIR)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            matches!(
-                e.path().extension().and_then(|x| x.to_str()),
-                Some("conf") | Some("conflist")
-            )
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    entries.into_iter().next().map(|e| e.path())
+    for dir in CNI_CONF_DIRS {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                matches!(
+                    e.path().extension().and_then(|x| x.to_str()),
+                    Some("conf") | Some("conflist")
+                )
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        entries.sort_by_key(|e| e.file_name());
+        return entries.into_iter().next().map(|e| e.path());
+    }
+    None
 }
 
 /// Create a named network namespace via `ip netns add`.
