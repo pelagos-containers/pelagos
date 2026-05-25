@@ -3,16 +3,17 @@
 use crate::cri::runtime_service_server::RuntimeService;
 use crate::cri::{
     AttachRequest, AttachResponse, CheckpointContainerRequest, CheckpointContainerResponse,
-    ContainerEventResponse, ContainerMetadata, ContainerState as CriContainerStateEnum,
-    ContainerStatsRequest, ContainerStatsResponse, ContainerStatus as CriContainerStatus,
-    ContainerStatusRequest, ContainerStatusResponse, CreateContainerRequest,
-    CreateContainerResponse, ExecRequest, ExecResponse, ExecSyncRequest, ExecSyncResponse,
-    GetEventsRequest, ImageSpec, LinuxPodSandboxStatus, ListContainerStatsRequest,
+    ContainerAttributes, ContainerEventResponse, ContainerMetadata,
+    ContainerState as CriContainerStateEnum, ContainerStats, ContainerStatsRequest,
+    ContainerStatsResponse, ContainerStatus as CriContainerStatus, ContainerStatusRequest,
+    ContainerStatusResponse, CpuUsage, CreateContainerRequest, CreateContainerResponse,
+    ExecRequest, ExecResponse, ExecSyncRequest, ExecSyncResponse, FilesystemIdentifier,
+    FilesystemUsage, GetEventsRequest, ImageSpec, LinuxPodSandboxStatus, ListContainerStatsRequest,
     ListContainerStatsResponse, ListContainersRequest, ListContainersResponse,
     ListMetricDescriptorsRequest, ListMetricDescriptorsResponse, ListPodSandboxMetricsRequest,
     ListPodSandboxMetricsResponse, ListPodSandboxRequest, ListPodSandboxResponse,
-    ListPodSandboxStatsRequest, ListPodSandboxStatsResponse, Namespace, NamespaceOption,
-    PodSandbox, PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState,
+    ListPodSandboxStatsRequest, ListPodSandboxStatsResponse, MemoryUsage, Namespace,
+    NamespaceOption, PodSandbox, PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState,
     PodSandboxStatsRequest, PodSandboxStatsResponse, PodSandboxStatus as CriPodSandboxStatus,
     PodSandboxStatusRequest, PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse,
     RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
@@ -23,9 +24,10 @@ use crate::cri::{
     StreamContainerStatsRequest, StreamContainerStatsResponse, StreamContainersRequest,
     StreamContainersResponse, StreamPodSandboxMetricsRequest, StreamPodSandboxMetricsResponse,
     StreamPodSandboxStatsRequest, StreamPodSandboxStatsResponse, StreamPodSandboxesRequest,
-    StreamPodSandboxesResponse, UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
-    UpdatePodSandboxResourcesRequest, UpdatePodSandboxResourcesResponse,
-    UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
+    StreamPodSandboxesResponse, UInt64Value, UpdateContainerResourcesRequest,
+    UpdateContainerResourcesResponse, UpdatePodSandboxResourcesRequest,
+    UpdatePodSandboxResourcesResponse, UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
+    VersionRequest, VersionResponse,
 };
 use crate::invoke::run_pelagos;
 use crate::state::{
@@ -78,6 +80,90 @@ fn now_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as i64
+}
+
+// Linux CLK_TCK is 100 on virtually all architectures (jiffies).
+const CLK_TCK: u64 = 100;
+
+fn read_proc_cpu_nanos(pid: i32) -> u64 {
+    let path = format!("/proc/{}/stat", pid);
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    // Skip past comm "(name)" — it can contain spaces and parens.
+    let after_comm = data.rfind(')').map(|i| &data[i + 2..]).unwrap_or("");
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // After state: ppid(0) … utime(11) stime(12) (0-indexed from state field).
+    let utime: u64 = fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stime: u64 = fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (utime + stime) * (1_000_000_000 / CLK_TCK)
+}
+
+fn read_proc_mem_bytes(pid: i32) -> u64 {
+    let path = format!("/proc/{}/status", pid);
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    for line in data.lines() {
+        if line.starts_with("VmRSS:") {
+            let kb: u64 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            return kb * 1024;
+        }
+    }
+    0
+}
+
+fn build_container_stats(c: &CriContainer) -> ContainerStats {
+    let ts = now_ns();
+    let pid = read_pelagos_container_state(&c.pelagos_name)
+        .map(|s| s.pid)
+        .unwrap_or(0);
+    let (cpu_nanos, mem_bytes) = if pid > 0 {
+        (read_proc_cpu_nanos(pid), read_proc_mem_bytes(pid))
+    } else {
+        (0, 0)
+    };
+    ContainerStats {
+        attributes: Some(ContainerAttributes {
+            id: c.id.clone(),
+            metadata: Some(ContainerMetadata {
+                name: c.name.clone(),
+                attempt: 0,
+            }),
+            labels: c.labels.clone(),
+            annotations: c.annotations.clone(),
+        }),
+        cpu: Some(CpuUsage {
+            timestamp: ts,
+            usage_core_nano_seconds: Some(UInt64Value { value: cpu_nanos }),
+            usage_nano_cores: Some(UInt64Value { value: 0 }),
+            psi: None,
+        }),
+        memory: Some(MemoryUsage {
+            timestamp: ts,
+            working_set_bytes: Some(UInt64Value { value: mem_bytes }),
+            available_bytes: None,
+            usage_bytes: Some(UInt64Value { value: mem_bytes }),
+            rss_bytes: None,
+            page_faults: None,
+            major_page_faults: None,
+            psi: None,
+        }),
+        writable_layer: Some(FilesystemUsage {
+            timestamp: ts,
+            fs_id: Some(FilesystemIdentifier {
+                mountpoint: "/var/lib/pelagos".to_string(),
+            }),
+            used_bytes: Some(UInt64Value { value: 0 }),
+            inodes_used: Some(UInt64Value { value: 0 }),
+        }),
+        swap: None,
+        io: None,
+    }
 }
 
 fn read_pelagos_sandbox_ip(sandbox_id: &str) -> Option<String> {
@@ -800,14 +886,14 @@ impl RuntimeService for RuntimeSvc {
         &self,
         _request: Request<UpdateContainerResourcesRequest>,
     ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
 
     async fn reopen_container_log(
         &self,
         _request: Request<ReopenContainerLogRequest>,
     ) -> Result<Response<ReopenContainerLogResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        Ok(Response::new(ReopenContainerLogResponse {}))
     }
 
     async fn exec(&self, _request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
@@ -830,16 +916,49 @@ impl RuntimeService for RuntimeSvc {
 
     async fn container_stats(
         &self,
-        _request: Request<ContainerStatsRequest>,
+        request: Request<ContainerStatsRequest>,
     ) -> Result<Response<ContainerStatsResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let id = request.into_inner().container_id;
+        let container = {
+            let st = self.state.inner.lock().await;
+            st.containers.get(&id).cloned()
+        };
+        let container = container.ok_or_else(|| Status::not_found("container not found"))?;
+        Ok(Response::new(ContainerStatsResponse {
+            stats: Some(build_container_stats(&container)),
+        }))
     }
 
     async fn list_container_stats(
         &self,
-        _request: Request<ListContainerStatsRequest>,
+        request: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let filter = request.into_inner().filter;
+        let containers: Vec<CriContainer> = {
+            let st = self.state.inner.lock().await;
+            st.containers
+                .values()
+                .filter(|c| {
+                    if let Some(ref f) = filter {
+                        if !f.id.is_empty() && c.id != f.id {
+                            return false;
+                        }
+                        if !f.pod_sandbox_id.is_empty() && c.sandbox_id != f.pod_sandbox_id {
+                            return false;
+                        }
+                        if !f.label_selector.is_empty()
+                            && !labels_match(&c.labels, &f.label_selector)
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect()
+        };
+        let stats = containers.iter().map(build_container_stats).collect();
+        Ok(Response::new(ListContainerStatsResponse { stats }))
     }
 
     async fn pod_sandbox_stats(
@@ -858,9 +977,15 @@ impl RuntimeService for RuntimeSvc {
 
     async fn update_runtime_config(
         &self,
-        _request: Request<UpdateRuntimeConfigRequest>,
+        request: Request<UpdateRuntimeConfigRequest>,
     ) -> Result<Response<UpdateRuntimeConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let req = request.into_inner();
+        if let Some(cfg) = &req.runtime_config {
+            if let Some(net) = &cfg.network_config {
+                log::info!("update_runtime_config: pod_cidr={}", net.pod_cidr);
+            }
+        }
+        Ok(Response::new(UpdateRuntimeConfigResponse {}))
     }
 
     async fn checkpoint_container(
@@ -895,7 +1020,7 @@ impl RuntimeService for RuntimeSvc {
         &self,
         _request: Request<UpdatePodSandboxResourcesRequest>,
     ) -> Result<Response<UpdatePodSandboxResourcesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        Ok(Response::new(UpdatePodSandboxResourcesResponse {}))
     }
 
     // ── Streaming RPCs ───────────────────────────────────────────────────────

@@ -263,6 +263,16 @@ step "C6: Container status"
 OUT=$($CRICTL inspect "$CONTAINER_ID" 2>&1)
 check_contains "crictl inspect: state=CONTAINER_RUNNING" "$OUT" "CONTAINER_RUNNING"
 
+# ── Container stats ──────────────────────────────────────────────────────────
+
+step "C6: ListContainerStats / ContainerStats"
+
+OUT=$($CRICTL stats --output json 2>&1)
+check_contains "crictl stats returns JSON output with stats array" "$OUT" '"stats"'
+
+OUT=$($CRICTL stats "$CONTAINER_ID" 2>&1)
+check_exit_ok "crictl stats <id> exits 0" $CRICTL stats "$CONTAINER_ID"
+
 # ── Stop / remove ─────────────────────────────────────────────────────────────
 
 step "C6: Stop and remove"
