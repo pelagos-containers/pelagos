@@ -254,6 +254,30 @@ impl RuntimeSvc {
     async fn bin(&self) -> String {
         self.state.inner.lock().await.pelagos_bin.clone()
     }
+
+    /// Resolve a digest-form image ref (sha256:...) to a repo tag by scanning the image store.
+    /// Kubelet may pass the digest it received from ImageStatus rather than the original tag.
+    async fn resolve_image_ref(image_ref: &str) -> String {
+        if !image_ref.starts_with("sha256:") {
+            return image_ref.to_string();
+        }
+        let Ok(mut rd) = tokio::fs::read_dir("/var/lib/pelagos/images").await else {
+            return image_ref.to_string();
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let manifest_path = entry.path().join("manifest.json");
+            if let Ok(data) = tokio::fs::read_to_string(&manifest_path).await {
+                if let Ok(m) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if m["digest"].as_str() == Some(image_ref) {
+                        if let Some(tag) = m["reference"].as_str() {
+                            return tag.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        image_ref.to_string()
+    }
 }
 
 // ── Trait impl ───────────────────────────────────────────────────────────────
@@ -695,13 +719,15 @@ impl RuntimeService for RuntimeSvc {
         for m in &container.mounts {
             args.push("-v".into());
             if m.readonly {
-                args.push(format!("{}{}:ro", m.host_path, m.container_path));
+                args.push(format!("{}:{}:ro", m.host_path, m.container_path));
             } else {
                 args.push(format!("{}:{}", m.host_path, m.container_path));
             }
         }
 
-        args.push(container.image.clone());
+        // Kubelet may pass the sha256 digest form rather than the tag; resolve to a known tag.
+        let image = Self::resolve_image_ref(&container.image).await;
+        args.push(image);
 
         // pelagos run treats all positional args after the image as the full
         // command (replacing both ENTRYPOINT and CMD). Combine CRI command
