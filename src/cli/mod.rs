@@ -33,11 +33,11 @@ pub mod restart;
 pub mod rm;
 pub mod rootfs;
 pub mod run;
+pub mod sandbox;
 pub mod start;
 pub mod stop;
 pub mod subscribe;
 pub mod system;
-pub mod sandbox;
 pub mod volume;
 
 // ---------------------------------------------------------------------------

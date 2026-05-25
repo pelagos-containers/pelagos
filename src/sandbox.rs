@@ -79,9 +79,8 @@ impl SandboxState {
     /// Load from `<runtime>/sandboxes/<id>/state.json`.
     pub fn load(id: &str) -> io::Result<Self> {
         let path = crate::paths::sandbox_dir(id).join("state.json");
-        let data = std::fs::read_to_string(&path).map_err(|e| {
-            io::Error::other(format!("sandbox '{}' not found: {}", id, e))
-        })?;
+        let data = std::fs::read_to_string(&path)
+            .map_err(|e| io::Error::other(format!("sandbox '{}' not found: {}", id, e)))?;
         serde_json::from_str(&data).map_err(|e| io::Error::other(e.to_string()))
     }
 
@@ -89,8 +88,8 @@ impl SandboxState {
     pub fn save(&self) -> io::Result<()> {
         let dir = crate::paths::sandbox_dir(&self.id);
         std::fs::create_dir_all(&dir)?;
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| io::Error::other(e.to_string()))?;
         std::fs::write(dir.join("state.json"), json)
     }
 
@@ -287,5 +286,3 @@ pub fn remove_sandbox(id: &str) -> io::Result<()> {
 
     Ok(())
 }
-
-

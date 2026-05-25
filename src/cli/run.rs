@@ -672,72 +672,72 @@ fn apply_cli_options(
         // Skip standard network setup — the sandbox provides the network namespace.
         // (We still fall through to apply non-network CLI options below.)
     } else {
-    // NAT is implied whenever a bridge network is selected (default or explicit),
-    // matching Docker's behaviour.  --no-nat suppresses it (e.g. routed IPv6 prefix).
-    // --nat is kept as an explicit override for completeness and named-network use.
-    let is_bridge = matches!(
-        network_mode,
-        NetworkMode::Bridge | NetworkMode::BridgeNamed(_)
-    );
-    if let NetworkMode::Container(ref target_name) = network_mode {
-        // Join the target container's named network namespace instead of creating
-        // a new one.  The target must have been started with bridge networking so
-        // that its network_ns_name is populated in its ContainerState.
-        let target_state = super::read_state(target_name).map_err(|_| {
-            format!(
-                "container '{}' not found — cannot join its network namespace",
-                target_name
-            )
-        })?;
-        let ns_name = target_state.network_ns_name.ok_or_else(|| {
-            format!(
-                "container '{}' has no named network namespace \
+        // NAT is implied whenever a bridge network is selected (default or explicit),
+        // matching Docker's behaviour.  --no-nat suppresses it (e.g. routed IPv6 prefix).
+        // --nat is kept as an explicit override for completeness and named-network use.
+        let is_bridge = matches!(
+            network_mode,
+            NetworkMode::Bridge | NetworkMode::BridgeNamed(_)
+        );
+        if let NetworkMode::Container(ref target_name) = network_mode {
+            // Join the target container's named network namespace instead of creating
+            // a new one.  The target must have been started with bridge networking so
+            // that its network_ns_name is populated in its ContainerState.
+            let target_state = super::read_state(target_name).map_err(|_| {
+                format!(
+                    "container '{}' not found — cannot join its network namespace",
+                    target_name
+                )
+            })?;
+            let ns_name = target_state.network_ns_name.ok_or_else(|| {
+                format!(
+                    "container '{}' has no named network namespace \
                  (must be a bridge-networked container)",
-                target_name
-            )
-        })?;
-        let netns_path = format!("/run/netns/{}", ns_name);
-        if !std::path::Path::new(&netns_path).exists() {
-            return Err(format!(
-                "network namespace '{}' not found — is container '{}' still running?",
-                netns_path, target_name
-            )
-            .into());
+                    target_name
+                )
+            })?;
+            let netns_path = format!("/run/netns/{}", ns_name);
+            if !std::path::Path::new(&netns_path).exists() {
+                return Err(format!(
+                    "network namespace '{}' not found — is container '{}' still running?",
+                    netns_path, target_name
+                )
+                .into());
+            }
+            cmd = cmd.with_namespace_join(netns_path, Namespace::NET);
+        } else if network_mode != NetworkMode::None {
+            cmd = cmd.with_network(network_mode);
         }
-        cmd = cmd.with_namespace_join(netns_path, Namespace::NET);
-    } else if network_mode != NetworkMode::None {
-        cmd = cmd.with_network(network_mode);
-    }
-    for net_name in additional_networks {
-        cmd = cmd.with_additional_network(net_name);
-    }
-    for &(host, container, proto) in port_forwards {
-        use pelagos::network::PortProto;
-        cmd = match proto {
-            PortProto::Tcp => cmd.with_port_forward(host, container),
-            PortProto::Udp => cmd.with_port_forward_udp(host, container),
-            PortProto::Both => cmd.with_port_forward_both(host, container),
+        for net_name in additional_networks {
+            cmd = cmd.with_additional_network(net_name);
+        }
+        for &(host, container, proto) in port_forwards {
+            use pelagos::network::PortProto;
+            cmd = match proto {
+                PortProto::Tcp => cmd.with_port_forward(host, container),
+                PortProto::Udp => cmd.with_port_forward_udp(host, container),
+                PortProto::Both => cmd.with_port_forward_both(host, container),
+            };
+        }
+        if (is_bridge && !args.no_nat) || args.nat {
+            cmd = cmd.with_nat();
+        }
+        // Resolve effective DNS: explicit --dns always wins; for bridge networks
+        // with no explicit --dns, auto-inject the configured defaults so that
+        // name resolution works without extra flags.  Pasta and loopback are
+        // excluded — pasta inherits host DNS via the user-mode network stack.
+        let effective_dns: Vec<String> = if !args.dns.is_empty() {
+            args.dns.clone()
+        } else if is_bridge {
+            pelagos::config::PelagosConfig::load()
+                .network
+                .effective_default_dns()
+        } else {
+            vec![]
         };
-    }
-    if (is_bridge && !args.no_nat) || args.nat {
-        cmd = cmd.with_nat();
-    }
-    // Resolve effective DNS: explicit --dns always wins; for bridge networks
-    // with no explicit --dns, auto-inject the configured defaults so that
-    // name resolution works without extra flags.  Pasta and loopback are
-    // excluded — pasta inherits host DNS via the user-mode network stack.
-    let effective_dns: Vec<String> = if !args.dns.is_empty() {
-        args.dns.clone()
-    } else if is_bridge {
-        pelagos::config::PelagosConfig::load()
-            .network
-            .effective_default_dns()
-    } else {
-        vec![]
-    };
-    if !effective_dns.is_empty() {
-        cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    }
+        if !effective_dns.is_empty() {
+            cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        }
     } // end of `else` block for non-sandbox networking
 
     for link_spec in &args.link {
