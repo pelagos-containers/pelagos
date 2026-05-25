@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -e
+
+cargo fmt --check || { echo "Run 'cargo fmt' to fix formatting."; exit 1; }
+cargo clippy -- -D warnings
