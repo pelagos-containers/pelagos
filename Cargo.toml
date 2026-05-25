@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "pelagos-dockerd"]
+members = [".", "pelagos-dockerd", "pelagos-cri"]
 resolver = "2"
 
 [package]
