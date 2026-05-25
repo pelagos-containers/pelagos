@@ -5,6 +5,7 @@ pub mod cri {
     tonic::include_proto!("runtime.v1");
 }
 
+mod cni;
 mod image;
 mod invoke;
 mod runtime;

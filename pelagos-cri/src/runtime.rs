@@ -1,5 +1,6 @@
 //! CRI RuntimeService implementation.
 
+use crate::cni;
 use crate::cri::runtime_service_server::RuntimeService;
 use crate::cri::{
     AttachRequest, AttachResponse, CheckpointContainerRequest, CheckpointContainerResponse,
@@ -313,16 +314,76 @@ impl RuntimeService for RuntimeSvc {
         let uid = meta.uid.clone();
         let bin = self.bin().await;
 
-        let raw = run_pelagos(&bin, &["sandbox", "create", "--name", &uid])
-            .await
-            .map_err(|e| Status::internal(format!("exec error: {}", e)))?;
-        if !raw.success {
-            return Err(Status::internal(format!(
-                "sandbox create failed: {}",
-                raw.stderr
-            )));
-        }
-        let sandbox_id = raw.stdout.trim().to_string();
+        // Try CNI networking first; fall back to pelagos native if no config is present.
+        let (sandbox_id, netns, ip, cni_conf, pause_pid) = if let Some(conf_path) =
+            cni::find_cni_conf()
+        {
+            // ── CNI path ───────────────────────────────────────────────────
+            let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+            let ns_name = format!("pcri-{}", &id[..12]);
+
+            let netns_path = cni::create_netns(&ns_name)
+                .map_err(|e| Status::internal(format!("create netns for CNI sandbox: {}", e)))?;
+
+            let ip = match cni::cni_add(&id, &netns_path, &conf_path) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    cni::delete_netns(&ns_name);
+                    return Err(Status::internal(format!("CNI ADD: {}", e)));
+                }
+            };
+
+            // Spawn pause process: joins the CNI-configured netns, unshares IPC+UTS.
+            // We re-use pelagos's own `sandbox __pause__ <ns_name>` subcommand.
+            let pause = std::process::Command::new(&bin)
+                .args(["sandbox", "__pause__", &ns_name])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| Status::internal(format!("spawn pause process: {}", e)))?;
+            let pause_pid = pause.id() as i32;
+            // Intentionally leaked — killed explicitly on StopPodSandbox.
+            std::mem::forget(pause);
+
+            // Brief pause for the process to enter namespaces before containers join.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Write pelagos-format sandbox state so `pelagos run --sandbox` works.
+            state::write_pelagos_sandbox_state(&id, Some(&meta.name), pause_pid, &ns_name, &ip)
+                .map_err(|e| Status::internal(format!("write sandbox state: {}", e)))?;
+
+            log::info!(
+                "CNI sandbox {} created: netns={} ip={} conf={}",
+                id,
+                ns_name,
+                ip,
+                conf_path.display()
+            );
+
+            (
+                id,
+                ns_name,
+                ip,
+                conf_path.to_string_lossy().to_string(),
+                pause_pid,
+            )
+        } else {
+            // ── Pelagos native path ────────────────────────────────────────
+            log::info!("no CNI config found — using pelagos native bridge networking");
+            let raw = run_pelagos(&bin, &["sandbox", "create", "--name", &uid])
+                .await
+                .map_err(|e| Status::internal(format!("exec error: {}", e)))?;
+            if !raw.success {
+                return Err(Status::internal(format!(
+                    "sandbox create failed: {}",
+                    raw.stderr
+                )));
+            }
+            let sandbox_id = raw.stdout.trim().to_string();
+            let ip = read_pelagos_sandbox_ip(&sandbox_id).unwrap_or_default();
+            (sandbox_id, String::new(), ip, String::new(), 0)
+        };
 
         let sandbox = CriSandbox {
             id: sandbox_id.clone(),
@@ -334,6 +395,10 @@ impl RuntimeService for RuntimeSvc {
             annotations: config.annotations.clone(),
             created_at_ns: now_ns(),
             state: SandboxState::Running,
+            netns,
+            ip,
+            cni_conf,
+            pause_pid,
         };
 
         {
@@ -370,7 +435,30 @@ impl RuntimeService for RuntimeSvc {
             }
         }
 
-        let _ = run_pelagos(&bin, &["sandbox", "rm", &sandbox_id]).await;
+        let sandbox = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes.get(&sandbox_id).cloned()
+        };
+
+        if let Some(ref sb) = sandbox {
+            if !sb.netns.is_empty() {
+                // ── CNI teardown ───────────────────────────────────────────────
+                let netns_path = format!("/run/netns/{}", sb.netns);
+                if !sb.cni_conf.is_empty() {
+                    cni::cni_del(&sandbox_id, &netns_path, std::path::Path::new(&sb.cni_conf));
+                }
+                if sb.pause_pid > 0 {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &sb.pause_pid.to_string()])
+                        .output();
+                }
+                cni::delete_netns(&sb.netns);
+                state::remove_pelagos_sandbox_state(&sandbox_id);
+            } else {
+                // ── Pelagos native teardown ────────────────────────────────────
+                let _ = run_pelagos(&bin, &["sandbox", "rm", &sandbox_id]).await;
+            }
+        }
 
         let mut st = self.state.inner.lock().await;
         if let Some(s) = st.sandboxes.get_mut(&sandbox_id) {
@@ -420,7 +508,13 @@ impl RuntimeService for RuntimeSvc {
             .clone();
         drop(st);
 
-        let ip = read_pelagos_sandbox_ip(&sandbox_id).unwrap_or_default();
+        // For CNI sandboxes, ip is stored directly in CriSandbox.
+        // For native sandboxes, fall back to reading the pelagos state file.
+        let ip = if sandbox.ip.is_empty() {
+            read_pelagos_sandbox_ip(&sandbox_id).unwrap_or_default()
+        } else {
+            sandbox.ip.clone()
+        };
 
         let status = CriPodSandboxStatus {
             id: sandbox.id.clone(),
