@@ -1,0 +1,8 @@
+(compose-up
+  (compose
+    (network "testbind" '(subnet "10.200.1.0/24"))
+    (service "svc"
+      '(image "alpine:latest")
+      '(network "testbind")
+      (list 'bind-rw "/tmp/test-bind-src" "/data")
+      '(command "sleep" "30"))))

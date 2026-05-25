@@ -1,5 +1,7 @@
 /target
 alpine-rootfs/**
+.claude/
+claude_session.txt
 *.tar.gz
 test_syscalls
 *.o
