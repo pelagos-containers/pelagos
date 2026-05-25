@@ -133,13 +133,21 @@ sudo scripts/setup.sh
 Creates `/var/lib/pelagos/` with correct ownership, sets up the `pelagos` group,
 and initializes network state directories.
 
-**4. Build the binary:**
+**4. Activate the pre-commit hook:**
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This runs `cargo fmt --check` and `cargo clippy -- -D warnings` before every commit, catching lint failures before they reach CI.
+
+**5. Build the binary:**
 
 ```bash
 cargo build
 ```
 
-**5. Reset the test environment:**
+**6. Reset the test environment:**
 
 ```bash
 sudo scripts/reset-test-env.sh
@@ -149,7 +157,7 @@ Run this before every full suite execution. It flushes stale veth pairs, leftove
 nftables rules, orphaned overlay mounts, and stopped DNS daemons. **Skipping this
 is the most common cause of cascading test failures.**
 
-**6. Run the full suite:**
+**7. Run the full suite:**
 
 ```bash
 sudo -E cargo test --test integration_tests

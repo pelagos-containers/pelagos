@@ -478,6 +478,13 @@ The spawn process has a carefully orchestrated setup:
 
 ## Development Workflow
 
+### First-Time Repo Setup
+After cloning, activate the pre-commit hook (enforces `cargo fmt` + `cargo clippy`):
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ### Making Changes
 1. Write code
 2. Run unit tests: `cargo test --lib`
