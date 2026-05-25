@@ -1430,7 +1430,9 @@ impl Command {
             .map_err(|e| crate::sandbox::SandboxError::NotFound(e.to_string()))?;
 
         if !state.is_alive() {
-            return Err(crate::sandbox::SandboxError::NotRunning(sandbox_id.to_string()));
+            return Err(crate::sandbox::SandboxError::NotRunning(
+                sandbox_id.to_string(),
+            ));
         }
 
         let net_ns = state.net_ns_path();

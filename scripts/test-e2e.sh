@@ -207,8 +207,8 @@ check_contains "$OUT" "e2e-detach" "ps -a shows e2e-detach"
 check_contains "$OUT" "exited" "ps -a shows exited"
 
 echo "--- Test: stop already stopped ---"
-OUT=$($BINARY stop e2e-detach 2>&1 || true)
-check_contains "$OUT" "not running" "stop already stopped"
+$BINARY stop e2e-detach 2>/dev/null
+check_exit_ok "stop already stopped" $BINARY stop e2e-detach
 
 echo "--- Test: rm ---"
 check_exit_ok "rm e2e-detach" $BINARY rm e2e-detach
@@ -676,6 +676,28 @@ wait_for_sub_line() {
     done
 }
 
+# Wait up to TIMEOUT seconds for a line matching PATTERN to appear anywhere
+# in the subscribe output file, then print the matching line.
+wait_for_sub_event() {
+    local pattern="$1"
+    local timeout="${2:-10}"
+    local deadline
+    deadline=$(( $(date +%s) + timeout ))
+    while true; do
+        local match
+        match=$(grep -m1 "$pattern" "$SUBSCRIBE_OUT" 2>/dev/null || true)
+        if [ -n "$match" ]; then
+            echo "$match"
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo ""   # timed out
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
 echo "--- Test: initial snapshot ---"
 SNAP_LINE=$(wait_for_sub_line 1)
 if echo "$SNAP_LINE" | grep -q '"type":"snapshot"' && echo "$SNAP_LINE" | grep -q '"vm_running":true'; then
@@ -696,7 +718,7 @@ fi
 
 echo "--- Test: ContainerExited event ---"
 $BINARY stop e2e-sub-test 2>/dev/null || true
-EXITED_LINE=$(wait_for_sub_line 3)
+EXITED_LINE=$(wait_for_sub_event '"type":"container_exited"' 10)
 if echo "$EXITED_LINE" | grep -q '"type":"container_exited"'; then
     pass "subscribe: container_exited event"
 else

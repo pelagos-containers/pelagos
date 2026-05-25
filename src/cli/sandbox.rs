@@ -83,7 +83,10 @@ fn cmd_sandbox_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{:<18} {:<20} {:<8} {:<16} {}", "ID", "NAME", "STATUS", "IP", "NS_NAME");
+    println!(
+        "{:<18} {:<20} {:<8} {:<16} NS_NAME",
+        "ID", "NAME", "STATUS", "IP"
+    );
     for s in &sandboxes {
         let status = if s.is_alive() { "running" } else { "dead" };
         let name = s.name.as_deref().unwrap_or("-");
@@ -139,20 +142,11 @@ fn cmd_sandbox_pause(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Unshare IPC and UTS namespaces so containers in the sandbox share them.
     let rc = unsafe { libc::unshare(libc::CLONE_NEWIPC | libc::CLONE_NEWUTS) };
     if rc != 0 {
-        return Err(format!(
-            "unshare IPC/UTS: {}",
-            std::io::Error::last_os_error()
-        )
-        .into());
+        return Err(format!("unshare IPC/UTS: {}", std::io::Error::last_os_error()).into());
     }
 
-    // Sleep until signalled.
-    // Block SIGTERM and SIGINT to allow clean exit on signal.
-    loop {
-        unsafe { libc::pause() };
-        // pause() returns on any signal; check if we should exit.
-        break;
-    }
+    // Sleep until signalled. pause() returns on any signal delivery.
+    unsafe { libc::pause() };
 
     Ok(())
 }

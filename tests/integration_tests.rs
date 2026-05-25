@@ -21744,8 +21744,12 @@ mod issue_232_stop_idempotent {
         let name = "test-stop-idem-232";
 
         // Pre-clean any leftover state.
-        let _ = std::process::Command::new(bin).args(["stop", name]).output();
-        let _ = std::process::Command::new(bin).args(["rm", "-f", name]).output();
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
 
         // Pull image if not already cached.
         let ls = std::process::Command::new(bin)
@@ -21767,9 +21771,15 @@ mod issue_232_stop_idempotent {
         // Run a container whose command exits immediately.
         let run = std::process::Command::new(bin)
             .args([
-                "run", "--detach", "--network", "none",
-                "--name", name,
-                ALPINE, "/bin/echo", "done",
+                "run",
+                "--detach",
+                "--network",
+                "none",
+                "--name",
+                name,
+                ALPINE,
+                "/bin/echo",
+                "done",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -21817,7 +21827,9 @@ mod issue_232_stop_idempotent {
         );
 
         // Cleanup.
-        let _ = std::process::Command::new(bin).args(["rm", "-f", name]).output();
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
     }
 }
 
@@ -21855,7 +21867,10 @@ mod sandbox {
             .output()
             .expect("pelagos image pull");
         if !pull.status.success() {
-            eprintln!("SKIP: could not pull alpine: {}", String::from_utf8_lossy(&pull.stderr));
+            eprintln!(
+                "SKIP: could not pull alpine: {}",
+                String::from_utf8_lossy(&pull.stderr)
+            );
             return false;
         }
         true
@@ -21938,8 +21953,7 @@ mod sandbox {
             state_path
         );
         let state_data = std::fs::read_to_string(&state_path).expect("read state.json");
-        let state: serde_json::Value =
-            serde_json::from_str(&state_data).expect("parse state.json");
+        let state: serde_json::Value = serde_json::from_str(&state_data).expect("parse state.json");
 
         let pause_pid = state["pause_pid"].as_i64().expect("pause_pid in state") as i32;
         assert!(pause_pid > 0, "pause_pid should be > 0");
@@ -22031,7 +22045,11 @@ mod sandbox {
         // Verify pause process is gone.
         // kill(pid, 0) should fail with ESRCH if process doesn't exist.
         let proc_gone = !std::path::Path::new(&format!("/proc/{}", pause_pid)).exists();
-        assert!(proc_gone, "pause process {} still running after sandbox rm", pause_pid);
+        assert!(
+            proc_gone,
+            "pause process {} still running after sandbox rm",
+            pause_pid
+        );
 
         // Verify named netns is removed.
         let netns_path = format!("/run/netns/{}", ns_name);
@@ -22076,31 +22094,56 @@ mod sandbox {
             .args(["sandbox", "create"])
             .output()
             .expect("sandbox create");
-        assert!(out.status.success(), "sandbox create failed: {}",
-            String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "sandbox create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let sandbox_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
         // Run container A: print the net namespace inode.
         let run_a = std::process::Command::new(b)
             .args([
-                "run", "--detach", "--name", c1,
-                "--sandbox", &sandbox_id,
-                ALPINE, "/bin/sh", "-c", "sleep 60",
+                "run",
+                "--detach",
+                "--name",
+                c1,
+                "--sandbox",
+                &sandbox_id,
+                ALPINE,
+                "/bin/sh",
+                "-c",
+                "sleep 60",
             ])
             .output()
             .expect("run container A");
-        assert!(run_a.status.success(), "run A failed: {}", String::from_utf8_lossy(&run_a.stderr));
+        assert!(
+            run_a.status.success(),
+            "run A failed: {}",
+            String::from_utf8_lossy(&run_a.stderr)
+        );
 
         // Run container B: print the net namespace inode.
         let run_b = std::process::Command::new(b)
             .args([
-                "run", "--detach", "--name", c2,
-                "--sandbox", &sandbox_id,
-                ALPINE, "/bin/sh", "-c", "sleep 60",
+                "run",
+                "--detach",
+                "--name",
+                c2,
+                "--sandbox",
+                &sandbox_id,
+                ALPINE,
+                "/bin/sh",
+                "-c",
+                "sleep 60",
             ])
             .output()
             .expect("run container B");
-        assert!(run_b.status.success(), "run B failed: {}", String::from_utf8_lossy(&run_b.stderr));
+        assert!(
+            run_b.status.success(),
+            "run B failed: {}",
+            String::from_utf8_lossy(&run_b.stderr)
+        );
 
         // Wait for both containers.
         assert!(wait_for_container(c1, 10), "container A never started");
@@ -22111,8 +22154,11 @@ mod sandbox {
             .args(["exec", c1, "stat", "-L", "-c", "%i", "/proc/self/ns/net"])
             .output()
             .expect("exec ns check A");
-        assert!(ns_a.status.success(), "exec ns check A failed: {}",
-            String::from_utf8_lossy(&ns_a.stderr));
+        assert!(
+            ns_a.status.success(),
+            "exec ns check A failed: {}",
+            String::from_utf8_lossy(&ns_a.stderr)
+        );
         let inode_a = String::from_utf8_lossy(&ns_a.stdout).trim().to_string();
 
         // Get net namespace inode from container B.
@@ -22120,14 +22166,18 @@ mod sandbox {
             .args(["exec", c2, "stat", "-L", "-c", "%i", "/proc/self/ns/net"])
             .output()
             .expect("exec ns check B");
-        assert!(ns_b.status.success(), "exec ns check B failed: {}",
-            String::from_utf8_lossy(&ns_b.stderr));
+        assert!(
+            ns_b.status.success(),
+            "exec ns check B failed: {}",
+            String::from_utf8_lossy(&ns_b.stderr)
+        );
         let inode_b = String::from_utf8_lossy(&ns_b.stdout).trim().to_string();
 
         assert!(
             !inode_a.is_empty() && !inode_b.is_empty(),
             "could not read ns inodes (A={:?}, B={:?})",
-            inode_a, inode_b
+            inode_a,
+            inode_b
         );
         assert_eq!(
             inode_a, inode_b,
@@ -22136,11 +22186,23 @@ mod sandbox {
 
         // Test 4: verify both containers have the same IP.
         let ip_a = std::process::Command::new(b)
-            .args(["exec", c1, "/bin/sh", "-c", "ip -4 addr show eth0 | grep 'inet ' | awk '{print $2}'"])
+            .args([
+                "exec",
+                c1,
+                "/bin/sh",
+                "-c",
+                "ip -4 addr show eth0 | grep 'inet ' | awk '{print $2}'",
+            ])
             .output()
             .expect("exec ip A");
         let ip_b = std::process::Command::new(b)
-            .args(["exec", c2, "/bin/sh", "-c", "ip -4 addr show eth0 | grep 'inet ' | awk '{print $2}'"])
+            .args([
+                "exec",
+                c2,
+                "/bin/sh",
+                "-c",
+                "ip -4 addr show eth0 | grep 'inet ' | awk '{print $2}'",
+            ])
             .output()
             .expect("exec ip B");
         let ip_a_str = String::from_utf8_lossy(&ip_a.stdout).trim().to_string();
@@ -22191,25 +22253,40 @@ mod sandbox {
             .args(["sandbox", "create"])
             .output()
             .expect("sandbox create");
-        assert!(out.status.success(), "sandbox create failed: {}",
-            String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "sandbox create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let sandbox_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
         // Run server container: listen on localhost:9876 with nc.
         let run_srv = std::process::Command::new(b)
             .args([
-                "run", "--detach", "--name", server,
-                "--sandbox", &sandbox_id,
-                ALPINE, "/bin/sh", "-c",
+                "run",
+                "--detach",
+                "--name",
+                server,
+                "--sandbox",
+                &sandbox_id,
+                ALPINE,
+                "/bin/sh",
+                "-c",
                 "echo 'hello-sandbox' | nc -l -p 9876",
             ])
             .output()
             .expect("run server");
-        assert!(run_srv.status.success(), "run server failed: {}",
-            String::from_utf8_lossy(&run_srv.stderr));
+        assert!(
+            run_srv.status.success(),
+            "run server failed: {}",
+            String::from_utf8_lossy(&run_srv.stderr)
+        );
 
         // Wait for server container to be running.
-        assert!(wait_for_container(server, 10), "server container never started");
+        assert!(
+            wait_for_container(server, 10),
+            "server container never started"
+        );
         // Let nc start listening before the client connects.
         std::thread::sleep(std::time::Duration::from_millis(800));
 
@@ -22218,14 +22295,19 @@ mod sandbox {
         let client_out = std::process::Command::new(b)
             .args([
                 "run",
-                "--sandbox", &sandbox_id,
-                ALPINE, "/bin/sh", "-c",
+                "--sandbox",
+                &sandbox_id,
+                ALPINE,
+                "/bin/sh",
+                "-c",
                 "nc -w 3 127.0.0.1 9876",
             ])
             .output()
             .expect("run client (foreground)");
 
-        let result = String::from_utf8_lossy(&client_out.stdout).trim().to_string();
+        let result = String::from_utf8_lossy(&client_out.stdout)
+            .trim()
+            .to_string();
         assert!(
             result.contains("hello-sandbox"),
             "client did not receive 'hello-sandbox' from server via localhost; \
