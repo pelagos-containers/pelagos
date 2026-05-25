@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "pelagos-dockerd"]
+resolver = "2"
+
 [package]
 name = "pelagos"
 version = "0.61.3"
@@ -61,21 +65,8 @@ path = "src/bin/pelagos-dns.rs"
 name = "pelagos-shim-wasm"
 path = "src/bin/pelagos-shim-wasm.rs"
 
-[[bin]]
-name = "pelagos-dockerd"
-path = "src/bin/pelagos-dockerd/main.rs"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-axum = "0.7"
-hyper = { version = "1", features = ["http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
-tower = "0.4"
-uuid = { version = "1", features = ["v4"] }
-futures-util = "0.3"
-
 [dev-dependencies]
 serial_test = "3"
-bollard = { version = "0.17", default-features = false, features = ["ssl"] }
 futures-util = "0.3"
 
 # Removed unused dependencies:
