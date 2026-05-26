@@ -202,6 +202,7 @@ struct ExecState {
     stdin_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
     stdout_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
     stderr_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
+    error_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
     resize_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
     ready_notify: tokio::sync::Notify,
 }
@@ -214,6 +215,7 @@ impl ExecState {
             stdin_stream: Mutex::new(None),
             stdout_stream: Mutex::new(None),
             stderr_stream: Mutex::new(None),
+            error_stream: Mutex::new(None),
             resize_stream: Mutex::new(None),
             ready_notify: tokio::sync::Notify::new(),
         }
@@ -224,8 +226,8 @@ impl ExecState {
             "stdin" => *self.stdin_stream.lock().await = Some(stream),
             "stdout" => *self.stdout_stream.lock().await = Some(stream),
             "stderr" => *self.stderr_stream.lock().await = Some(stream),
+            "error" => *self.error_stream.lock().await = Some(stream),
             "resize" => *self.resize_stream.lock().await = Some(stream),
-            "error" => {} // kubelet error-reporting stream; we don't relay it
             other => log::warn!(
                 "exec: unknown stream type {other:?} on stream {}",
                 stream.stream_id
@@ -236,19 +238,34 @@ impl ExecState {
 
     async fn wait_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
+            // Register for the notification BEFORE checking state, so a
+            // notify_one() that fires between the condition check and the
+            // .await is not lost (the permit is already stored in the future).
+            let notified = self.ready_notify.notified();
+
             let has_stdout = self.stdout_stream.lock().await.is_some();
             let has_stderr = self.stderr_stream.lock().await.is_some();
-            // stdin may be absent if not requested
-            if has_stdout && has_stderr {
+            // Wait for stdin only when the caller requested it; the stream IDs are
+            // assigned in open order so stdin (id=1) always precedes stdout (id=3)
+            // and stderr (id=5), but they are dispatched to different worker tasks
+            // so there is a real (if unlikely) race.
+            let stdin_ok = !self.pending.stdin || self.stdin_stream.lock().await.is_some();
+            // error stream uses a different worker than stdout/stderr so it
+            // may not have arrived yet; wait for it since we need it for exit code.
+            let has_error = self.error_stream.lock().await.is_some();
+            log::debug!(
+                "wait_ready: stdout={has_stdout} stderr={has_stderr} stdin_ok={stdin_ok} error={has_error}"
+            );
+            if has_stdout && has_stderr && stdin_ok && has_error {
                 return Ok(());
             }
-            self.ready_notify.notified().await;
+            notified.await;
         }
     }
 
     async fn run(
         &self,
-        conn: Arc<spdystream_rs::connection::Connection>,
+        _conn: Arc<spdystream_rs::connection::Connection>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
@@ -276,21 +293,23 @@ impl ExecState {
         let child_stdout = child.stdout.take().expect("stdout piped");
         let child_stderr = child.stderr.take().expect("stderr piped");
 
+        // Keep Arcs for FIN sending after relay tasks complete.
         let stdout_stream = self.stdout_stream.lock().await.clone();
         let stderr_stream = self.stderr_stream.lock().await.clone();
         let stdin_stream = self.stdin_stream.lock().await.clone();
+        let error_stream = self.error_stream.lock().await.clone();
 
-        // Relay stdout: child → SPDY stream
-        let stdout_task = if let Some(spdy_out) = stdout_stream {
-            let t = tokio::spawn(relay_read_to_spdy(child_stdout, spdy_out));
+        // Relay stdout: child → SPDY stream (data only; FIN sent explicitly below)
+        let stdout_task = if let Some(ref spdy_out) = stdout_stream {
+            let t = tokio::spawn(relay_read_to_spdy_data(child_stdout, Arc::clone(spdy_out)));
             Some(t)
         } else {
             None
         };
 
-        // Relay stderr: child → SPDY stream
-        let stderr_task = if let Some(spdy_err) = stderr_stream {
-            let t = tokio::spawn(relay_read_to_spdy(child_stderr, spdy_err));
+        // Relay stderr: child → SPDY stream (data only; FIN sent explicitly below)
+        let stderr_task = if let Some(ref spdy_err) = stderr_stream {
+            let t = tokio::spawn(relay_read_to_spdy_data(child_stderr, Arc::clone(spdy_err)));
             Some(t)
         } else {
             None
@@ -313,9 +332,19 @@ impl ExecState {
             };
 
         // Wait for child to exit.
-        let _status = child.wait().await?;
+        let status = child.wait().await?;
+        log::info!(
+            "streaming exec: child exited with status={:?} code={:?}",
+            status,
+            status.code()
+        );
 
-        // Drain relay tasks.
+        // Drain relay tasks so all stdout/stderr data is flushed.
+        // We do NOT send FINs from relay tasks — they are sent explicitly
+        // below in the correct order so the error stream FIN arrives at
+        // crictl before stdout/stderr FINs.  This prevents crictl from
+        // closing the TCP connection (on receipt of stdout+stderr FINs)
+        // before it reads the exit-code payload from the error stream.
         if let Some(t) = stdout_task {
             let _ = t.await;
         }
@@ -326,14 +355,50 @@ impl ExecState {
             let _ = t.await;
         }
 
-        // Close the SPDY connection.
-        let _ = conn.close().await;
+        // 1. Send error stream FIN FIRST with the exit code payload.
+        //    kubelet reads a JSON-encoded metav1.Status; for exit 0 we send
+        //    an empty FIN frame; for non-zero we send the structured message.
+        let exit_code = status.code().unwrap_or(1);
+        if let Some(ref err_stream) = error_stream {
+            let payload = if exit_code != 0 {
+                let msg = format!(
+                    r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with exit code {exit_code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{exit_code}"}}]}}}}"#
+                );
+                Bytes::from(msg)
+            } else {
+                Bytes::new()
+            };
+            err_stream.write_data(payload, true).await.ok();
+        }
+
+        // Yield to the executor so the write task can flush the error stream
+        // frame to TCP before we send stdout/stderr FINs.  For zero-output
+        // commands (e.g. `exit 42`) the relay tasks complete instantly and
+        // the write queue is empty except for the error frame; yielding here
+        // guarantees the error DATA+FIN is in-flight before crictl receives
+        // the stdout/stderr FINs that signal "exec complete".
+        tokio::task::yield_now().await;
+
+        // 2. Send stdout / stderr FINs after the error stream FIN.
+        if let Some(ref spdy_out) = stdout_stream {
+            spdy_out.write_data(Bytes::new(), true).await.ok();
+        }
+        if let Some(ref spdy_err) = stderr_stream {
+            spdy_err.write_data(Bytes::new(), true).await.ok();
+        }
+
+        // Do not send GoAway — let crictl close the connection naturally
+        // after reading all stream FINs.  Sending GoAway here races with
+        // crictl's error-stream goroutine: if crictl processes GoAway before
+        // it reads the error DATA frame, it may report exit code 0.
         Ok(())
     }
 }
 
-/// Read from any AsyncRead and write as SPDY data frames, sending FIN at EOF.
-async fn relay_read_to_spdy<R: tokio::io::AsyncRead + Unpin>(
+/// Read from any AsyncRead and write as SPDY data frames.
+/// Does NOT send the final FIN frame — the caller sends FINs explicitly
+/// in the correct order (error stream before stdout/stderr).
+async fn relay_read_to_spdy_data<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     stream: Arc<spdystream_rs::Stream>,
 ) {
@@ -350,7 +415,6 @@ async fn relay_read_to_spdy<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
-    stream.write_data(Bytes::new(), true).await.ok();
 }
 
 // ── PortForward handler ───────────────────────────────────────────────────────

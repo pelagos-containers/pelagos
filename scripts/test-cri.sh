@@ -216,7 +216,7 @@ cat > /tmp/test-container.json <<'EOF'
   },
   "image": {"image": "alpine:latest"},
   "command": ["/bin/sh"],
-  "args": ["-c", "echo hello-from-cri; sleep 30"],
+  "args": ["-c", "echo hello-from-cri; sleep 3600"],
   "working_dir": "/",
   "envs": [{"key": "TEST_VAR", "value": "hello"}],
   "mounts": [],
@@ -285,6 +285,24 @@ check_contains "crictl exec (streaming): env var relay" "$OUT" "hello"
 OUT=$(timeout 10 $CRICTL exec "$CONTAINER_ID" /bin/sh -c 'echo err >&2; echo out' 2>&1)
 check_contains "crictl exec (streaming): stderr relay" "$OUT" "err"
 check_contains "crictl exec (streaming): stdout relay with stderr" "$OUT" "out"
+
+# ── Streaming exec: exit code and stdin ──────────────────────────────────────
+
+step "C6: Streaming Exec — exit code and stdin"
+
+# Non-zero exit should propagate back to crictl (exit code via SPDY error stream).
+_exit42_out=$(timeout 10 $CRICTL exec "$CONTAINER_ID" /bin/sh -c 'exit 42' 2>&1)
+_exit42_code=$?
+info "exit42: code=$_exit42_code out=$_exit42_out"
+if [ "$_exit42_code" -ne 0 ]; then
+    pass "crictl exec (streaming): non-zero exit propagated (crictl exit non-zero)"
+else
+    fail "crictl exec (streaming): non-zero exit should return non-zero crictl exit"
+fi
+
+# Stdin relay: pipe data through the container and get it back on stdout.
+OUT=$(echo "hello-stdin" | timeout -k 1 10 $CRICTL exec -i "$CONTAINER_ID" /bin/cat 2>&1)
+check_contains "crictl exec (streaming): stdin relay via cat" "$OUT" "hello-stdin"
 
 # ── Container status ──────────────────────────────────────────────────────────
 
