@@ -10,6 +10,7 @@ mod image;
 mod invoke;
 mod runtime;
 mod state;
+mod streaming;
 
 use clap::Parser;
 use image::ImageSvc;
@@ -27,6 +28,9 @@ struct Args {
     /// Path to the pelagos binary.
     #[clap(long, default_value = "pelagos")]
     pelagos_bin: String,
+    /// TCP address for the SPDY streaming server (exec/attach/port-forward).
+    #[clap(long, default_value = "127.0.0.1:0")]
+    streaming_addr: String,
 }
 
 fn main() {
@@ -54,14 +58,28 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_file(&args.socket)?;
     }
 
+    // Bind streaming TCP listener before starting anything else so we know the
+    // assigned port (when streaming_addr uses port 0).
+    let streaming_listener = tokio::net::TcpListener::bind(&args.streaming_addr).await?;
+    let streaming_base_url = format!("http://{}", streaming_listener.local_addr()?);
+    log::info!("pelagos-cri streaming server on {streaming_base_url}");
+
+    let registry = streaming::new_registry();
+
     let app_state = AppState::new(args.pelagos_bin.clone());
 
     let runtime_svc = RuntimeSvc {
         state: app_state.clone(),
+        streaming_base_url: streaming_base_url.clone(),
+        registry: registry.clone(),
     };
     let image_svc = ImageSvc {
         state: app_state.clone(),
     };
+
+    // Spawn the SPDY streaming server.
+    let pelagos_bin = args.pelagos_bin.clone();
+    tokio::spawn(streaming::serve(streaming_listener, registry, pelagos_bin));
 
     let uds = tokio::net::UnixListener::bind(&args.socket)?;
     std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o660))?;
