@@ -1,9 +1,9 @@
 # Ongoing Tasks
 
-## Session 2026-05-25/26 — multi-node k3s validation (issue #243)
+## Session 2026-05-25/26 — multi-node k3s validation (issue #243) COMPLETE ✅
 
-Base SHA 2995e8d (main). Continued from prior session where issue #239 (single-node nginx
-acceptance criterion) was met and merged as PR #242.
+Base SHA 2995e8d → 601c2f0 (main). Continued from prior session where issue #239 (single-node
+nginx acceptance criterion) was met and merged as PR #242.
 
 ### What was done this session
 
@@ -22,19 +22,30 @@ k3s agents. This exposed 6 bugs in pelagos-cri fixed in commit 184f39b:
 6. **SystemD unit fix** — remove `RuntimeDirectory=pelagos` (wiped /run/pelagos/ on restart).
    Use `ExecStartPre=/usr/bin/mkdir -p /run/pelagos` instead.
 
-### Current state (SHA 2995e8d)
+### Formal acceptance test results (issue #243 CLOSED)
 
-- All 3 nodes: `Ready`, `pelagos://0.1.0`
-- kube-system pods: coredns ✅, metrics-server ✅, traefik ✅, local-path-provisioner ✅
-- Flannel VXLAN: confirmed cross-node connectivity (ipc1↔ipc2↔ipc3, 0% packet loss)
-- Application pods: ImagePullBackOff on nginx/hello/backend — Docker Hub rate limit, not CRI
+Cross-node Service reachability verified with `xnode-test` deployment (3 replicas, one per node,
+ECR-mirrored nginx:alpine) + ClusterIP service `xnode-test-svc` (10.43.214.132:80):
 
-### Pending for #243
+| Source | Destination | Result |
+|---|---|---|
+| ipc2 pod (10.42.5.7) | ClusterIP 10.43.214.132 | HTTP 200 ✅ |
+| ipc2 pod (10.42.5.7) | ipc1 pod 10.42.0.80 | HTTP 200 ✅ |
+| ipc2 pod (10.42.5.7) | ipc3 pod 10.42.6.231 | HTTP 200 ✅ |
+| ipc3 pod (10.42.6.231) | ClusterIP 10.43.214.132 | HTTP 200 ✅ |
+| ipc3 pod (10.42.6.231) | ipc1 pod 10.42.0.80 | HTTP 200 ✅ |
+| ipc3 pod (10.42.6.231) | ipc2 pod 10.42.5.7 | HTTP 200 ✅ |
+| ipc1 host | ClusterIP 10.43.214.132 | HTTP 200 ✅ |
+| ipc2 host | ClusterIP 10.43.214.132 | HTTP 200 ✅ |
+| ipc3 host | ClusterIP 10.43.214.132 | HTTP 200 ✅ |
 
-- [ ] `kubectl exec` returns "error stream protocol error" — streaming Exec API unimplemented
-- [ ] Formal issue #243 test: schedule a pod on ipc2 and ipc3, verify cross-node Service reachability
-- [ ] Docker Hub rate limit on nginx-test pod — pull manually or use ECR mirror
-- [ ] pasta not installed on ipc2/ipc3 — `sudo apt-get install passt` (currently falls back to loopback, no internet for containers on those nodes)
+Flannel VXLAN cross-node pod networking is fully functional with pelagos-cri.
+
+### Remaining known gaps (not blocking #243)
+
+- [ ] `kubectl exec` — streaming Exec API unimplemented in pelagos-cri; returns
+  "error stream protocol error: unknown error" — next major CRI work item
+- [ ] pasta not installed on ipc2/ipc3 — `sudo apt-get install passt` (containers fall back to loopback)
 
 ---
 
