@@ -257,6 +257,20 @@ check_contains "crictl exec --sync echo" "$OUT" "hello-exec"
 OUT=$($CRICTL exec --sync "$CONTAINER_ID" /bin/sh -c 'echo $TEST_VAR' 2>&1)
 check_contains "crictl exec: env var TEST_VAR is set" "$OUT" "hello"
 
+# crictl itself exits 1 for any non-zero container exit; the actual exit code
+# appears in its stderr as "exited with N". Verify 42 is propagated correctly.
+OUT=$($CRICTL exec --sync "$CONTAINER_ID" /bin/sh -c 'exit 42' 2>&1 || true)
+check_contains "crictl exec --sync: non-zero exit code propagated" "$OUT" "exited with 42"
+
+START=$(date +%s)
+$CRICTL exec --sync --timeout 2 "$CONTAINER_ID" /bin/sh -c 'sleep 30' 2>&1 || true
+ELAPSED=$(( $(date +%s) - START ))
+if [ "$ELAPSED" -le 5 ]; then
+    pass "crictl exec --sync: timeout kills long-running command (${ELAPSED}s)"
+else
+    fail "crictl exec --sync: timeout did not fire (${ELAPSED}s elapsed)"
+fi
+
 # ── Container status ──────────────────────────────────────────────────────────
 
 step "C6: Container status"
