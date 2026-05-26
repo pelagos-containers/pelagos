@@ -3594,7 +3594,7 @@ dependencies = [
 [[package]]
 name = "spdystream-rs"
 version = "0.1.0"
-source = "git+https://github.com/pelagos-containers/spdystream-rs.git?rev=68c020d#68c020d50fcb5f1b6a406048b0dff3525eac09d2"
+source = "git+https://github.com/pelagos-containers/spdystream-rs.git?rev=9b709af#9b709af18a07217b18b94df3a652b693c09931f2"
 dependencies = [
  "bytes",
  "flate2",
