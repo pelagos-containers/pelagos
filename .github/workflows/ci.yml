@@ -9,6 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pelagos-containers/spdystream-rs
+          path: ../spdystream-rs
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
@@ -21,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pelagos-containers/spdystream-rs
+          path: ../spdystream-rs
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
@@ -32,6 +40,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pelagos-containers/spdystream-rs
+          path: ../spdystream-rs
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
@@ -53,6 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pelagos-containers/spdystream-rs
+          path: ../spdystream-rs
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
@@ -72,6 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pelagos-containers/spdystream-rs
+          path: ../spdystream-rs
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
@@ -90,6 +110,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pelagos-containers/spdystream-rs
+          path: ../spdystream-rs
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"

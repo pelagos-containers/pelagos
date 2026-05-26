@@ -22,7 +22,7 @@ tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 uuid = { version = "1", features = ["v4"] }
 futures-core = "0.3"
-spdystream-rs = { git = "https://github.com/pelagos-containers/spdystream-rs.git", rev = "68c020d" }
+spdystream-rs = { path = "../../spdystream-rs" }
 bytes = "1"
 http = "1"
 
