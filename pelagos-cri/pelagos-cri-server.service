@@ -1,0 +1,17 @@
+[Unit]
+Description=Pelagos CRI gRPC server
+Documentation=https://github.com/pelagos-containers/pelagos
+After=network.target
+Before=k3s.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/pelagos
+ExecStart=/usr/local/bin/pelagos-cri --pelagos-bin /usr/local/bin/pelagos --socket /run/pelagos/cri.sock
+Restart=always
+RestartSec=5s
+Environment=RUST_LOG=info
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
