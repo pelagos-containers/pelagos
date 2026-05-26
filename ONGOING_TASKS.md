@@ -1,5 +1,43 @@
 # Ongoing Tasks
 
+## Session 2026-05-25/26 — multi-node k3s validation (issue #243)
+
+Base SHA 2995e8d (main). Continued from prior session where issue #239 (single-node nginx
+acceptance criterion) was met and merged as PR #242.
+
+### What was done this session
+
+Deployed pelagos-cri to ipc2 (192.168.88.52) and ipc3 (192.168.88.54), joined them as
+k3s agents. This exposed 6 bugs in pelagos-cri fixed in commit 184f39b:
+
+1. **CRI entrypoint semantics** — when `container.entrypoint` is empty, must fall back to
+   image ENTRYPOINT. Fixes coredns (scratch image with `/coredns` entrypoint).
+2. **Better error logging** — log full stdout+stderr from pelagos run on failure.
+3. **Stale sandbox purge on startup** — AppState::new() checks pause_pid liveness; purges
+   dead sandboxes + their containers. Fixes "sandbox not found" after pelagos-cri restart.
+4. **Sandbox netns sysctl** — set `net.ipv4.ip_unprivileged_port_start=0` in CNI netns via
+   `nsenter --net=<path>`. Required for coredns (nonroot user, binds port 53).
+5. **runAsUser/runAsGroup from CRI security context** — pass `--user uid:gid` to pelagos
+   run. Required for projected volumes (serviceaccount token mode 600, owned by runAsUser).
+6. **SystemD unit fix** — remove `RuntimeDirectory=pelagos` (wiped /run/pelagos/ on restart).
+   Use `ExecStartPre=/usr/bin/mkdir -p /run/pelagos` instead.
+
+### Current state (SHA 2995e8d)
+
+- All 3 nodes: `Ready`, `pelagos://0.1.0`
+- kube-system pods: coredns ✅, metrics-server ✅, traefik ✅, local-path-provisioner ✅
+- Flannel VXLAN: confirmed cross-node connectivity (ipc1↔ipc2↔ipc3, 0% packet loss)
+- Application pods: ImagePullBackOff on nginx/hello/backend — Docker Hub rate limit, not CRI
+
+### Pending for #243
+
+- [ ] `kubectl exec` returns "error stream protocol error" — streaming Exec API unimplemented
+- [ ] Formal issue #243 test: schedule a pod on ipc2 and ipc3, verify cross-node Service reachability
+- [ ] Docker Hub rate limit on nginx-test pod — pull manually or use ECR mirror
+- [ ] pasta not installed on ipc2/ipc3 — `sudo apt-get install passt` (currently falls back to loopback, no internet for containers on those nodes)
+
+---
+
 ## Session completed: 2026-05-08 (branch feat/220-rootless-setup-check)
 
 ### #220 — proactive rootless setup detection (COMPLETE)
