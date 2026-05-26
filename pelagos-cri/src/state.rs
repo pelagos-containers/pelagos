@@ -72,6 +72,12 @@ pub struct CriContainer {
     pub finished_at_ns: i64,
     pub state: ContainerState,
     pub exit_code: i32,
+    /// Override UID from pod securityContext.runAsUser (None = use image default).
+    #[serde(default)]
+    pub run_as_user: Option<i64>,
+    /// Override GID from pod securityContext.runAsGroup (None = use image default).
+    #[serde(default)]
+    pub run_as_group: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -115,6 +121,45 @@ impl AppState {
         let _ = std::fs::create_dir_all(CONTAINERS_DIR);
         let mut inner = StateInner::load();
         inner.pelagos_bin = pelagos_bin;
+
+        // Purge stale sandboxes whose pause process no longer exists.
+        // This happens when pelagos-cri restarts (e.g. after a system reboot or
+        // RuntimeDirectory wipe) and the in-memory /run/pelagos/ state is gone.
+        // k3s persists container IDs across its own restarts and will call
+        // StartContainer on those old IDs, hitting "sandbox not found".
+        // Removing the records here gives k3s a clean slate and causes it to
+        // recreate the pods from scratch.
+        let stale_sandbox_ids: Vec<String> = inner
+            .sandboxes
+            .values()
+            .filter(|s| {
+                if s.pause_pid <= 0 {
+                    return false;
+                }
+                // Process is alive iff /proc/<pid> exists.
+                !std::path::Path::new(&format!("/proc/{}", s.pause_pid)).exists()
+            })
+            .map(|s| s.id.clone())
+            .collect();
+
+        for sid in &stale_sandbox_ids {
+            log::info!("startup: removing stale sandbox {sid} (pause process gone)");
+            // Remove all containers that belonged to this sandbox.
+            let stale_ctrs: Vec<String> = inner
+                .containers
+                .values()
+                .filter(|c| &c.sandbox_id == sid)
+                .map(|c| c.id.clone())
+                .collect();
+            for cid in stale_ctrs {
+                inner.containers.remove(&cid);
+                remove_container_file(&cid);
+            }
+            inner.sandboxes.remove(sid);
+            remove_sandbox_file(sid);
+            remove_pelagos_sandbox_state(sid);
+        }
+
         AppState {
             inner: Arc::new(Mutex::new(inner)),
         }

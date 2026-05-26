@@ -278,6 +278,44 @@ impl RuntimeSvc {
         }
         image_ref.to_string()
     }
+
+    /// Load the default ENTRYPOINT and CMD from the stored image manifest.
+    /// Returns `(entrypoint, cmd)` as string vecs; empty if the manifest can't be read.
+    async fn load_image_defaults(image_ref: &str) -> (Vec<String>, Vec<String>) {
+        let Ok(mut rd) = tokio::fs::read_dir("/var/lib/pelagos/images").await else {
+            return (vec![], vec![]);
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let manifest_path = entry.path().join("manifest.json");
+            let Ok(data) = tokio::fs::read_to_string(&manifest_path).await else {
+                continue;
+            };
+            let Ok(m) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
+            if m["reference"].as_str() == Some(image_ref) || m["digest"].as_str() == Some(image_ref)
+            {
+                let ep = m["config"]["entrypoint"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cmd = m["config"]["cmd"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return (ep, cmd);
+            }
+        }
+        (vec![], vec![])
+    }
 }
 
 // ── Trait impl ───────────────────────────────────────────────────────────────
@@ -356,6 +394,31 @@ impl RuntimeService for RuntimeSvc {
                     return Err(Status::internal(format!("CNI ADD: {}", e)));
                 }
             };
+
+            // Allow non-root container processes (e.g. coredns running as "nonroot") to
+            // bind privileged ports inside this netns.  This matches containerd's default.
+            let net_arg = format!("--net={}", netns_path);
+            match tokio::process::Command::new("nsenter")
+                .args([
+                    net_arg.as_str(),
+                    "--",
+                    "sysctl",
+                    "-w",
+                    "net.ipv4.ip_unprivileged_port_start=0",
+                ])
+                .output()
+                .await
+            {
+                Ok(out) if !out.status.success() => {
+                    log::warn!(
+                        "sysctl ip_unprivileged_port_start in {}: {}",
+                        ns_name,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                Err(e) => log::warn!("nsenter sysctl in {}: {}", ns_name, e),
+                _ => {}
+            }
 
             // Spawn pause process: joins the CNI-configured netns, unshares IPC+UTS.
             // We re-use pelagos's own `sandbox __pause__ <ns_name>` subcommand.
@@ -652,6 +715,19 @@ impl RuntimeService for RuntimeSvc {
             })
             .collect();
 
+        // Extract runAsUser/runAsGroup from the Linux security context.
+        let (run_as_user, run_as_group) = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map(|sc| {
+                (
+                    sc.run_as_user.as_ref().map(|v| v.value),
+                    sc.run_as_group.as_ref().map(|v| v.value),
+                )
+            })
+            .unwrap_or((None, None));
+
         let container = CriContainer {
             id: id.clone(),
             sandbox_id,
@@ -670,6 +746,8 @@ impl RuntimeService for RuntimeSvc {
             finished_at_ns: 0,
             state: MyContainerState::Created,
             exit_code: 0,
+            run_as_user,
+            run_as_group,
         };
 
         {
@@ -727,13 +805,43 @@ impl RuntimeService for RuntimeSvc {
 
         // Kubelet may pass the sha256 digest form rather than the tag; resolve to a known tag.
         let image = Self::resolve_image_ref(&container.image).await;
-        args.push(image);
 
-        // pelagos run treats all positional args after the image as the full
-        // command (replacing both ENTRYPOINT and CMD). Combine CRI command
-        // (entrypoint override) + args (cmd override) in order.
-        args.extend(container.entrypoint.iter().cloned());
-        args.extend(container.args.iter().cloned());
+        // CRI entrypoint semantics:
+        //   container.entrypoint (CRI "command") overrides the image ENTRYPOINT when non-empty.
+        //   container.args (CRI "args") overrides the image CMD when non-empty.
+        //   When entrypoint is empty the image's default ENTRYPOINT must be used — omitting it
+        //   would cause `pelagos run` to exec the first arg as the binary, which is wrong.
+        let (image_entrypoint, image_cmd) = Self::load_image_defaults(&image).await;
+        let effective_entrypoint: Vec<String> = if !container.entrypoint.is_empty() {
+            container.entrypoint.clone()
+        } else {
+            image_entrypoint
+        };
+        let effective_cmd: Vec<String> = if !container.args.is_empty() {
+            container.args.clone()
+        } else {
+            image_cmd
+        };
+
+        // If the pod securityContext specifies runAsUser, override the image default user.
+        // This is required for projected volume permissions (e.g. serviceaccount tokens
+        // are written with the fsGroup/runAsUser UID and readable only by that UID).
+        if let Some(uid) = container.run_as_user {
+            match container.run_as_group {
+                Some(gid) => {
+                    args.push("--user".into());
+                    args.push(format!("{}:{}", uid, gid));
+                }
+                None => {
+                    args.push("--user".into());
+                    args.push(uid.to_string());
+                }
+            }
+        }
+
+        args.push(image);
+        args.extend(effective_entrypoint);
+        args.extend(effective_cmd);
 
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = run_pelagos(&bin, &args_ref)
@@ -741,9 +849,15 @@ impl RuntimeService for RuntimeSvc {
             .map_err(|e| Status::internal(format!("exec error: {}", e)))?;
 
         if !out.success {
+            log::error!(
+                "start_container {}: pelagos run failed\nstdout: {}\nstderr: {}",
+                container_id,
+                out.stdout.trim(),
+                out.stderr.trim()
+            );
             return Err(Status::internal(format!(
                 "pelagos run failed: {}",
-                out.stderr
+                out.stderr.trim()
             )));
         }
 
