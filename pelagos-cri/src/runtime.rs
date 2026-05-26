@@ -35,6 +35,7 @@ use crate::state::{
     self, AppState, ContainerState as MyContainerState, CriContainer, CriMount, CriSandbox,
     SandboxState,
 };
+use crate::streaming::{PendingExec, PendingPortForward, Registry};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -248,6 +249,8 @@ fn container_to_proto(c: &CriContainer) -> crate::cri::Container {
 
 pub struct RuntimeSvc {
     pub state: AppState,
+    pub streaming_base_url: String,
+    pub registry: Registry,
 }
 
 impl RuntimeSvc {
@@ -1130,22 +1133,112 @@ impl RuntimeService for RuntimeSvc {
         Ok(Response::new(ReopenContainerLogResponse {}))
     }
 
-    async fn exec(&self, _request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+    async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
+        let req = request.into_inner();
+        let container_id = &req.container_id;
+
+        let (pelagos_name, _sandbox_id) = {
+            let st = self.state.inner.lock().await;
+            let c = st
+                .containers
+                .get(container_id)
+                .ok_or_else(|| Status::not_found(format!("container {container_id} not found")))?;
+            (c.pelagos_name.clone(), c.sandbox_id.clone())
+        };
+
+        let token = uuid::Uuid::new_v4().to_string();
+        crate::streaming::register_exec(
+            &self.registry,
+            token.clone(),
+            PendingExec {
+                container_name: pelagos_name,
+                cmd: req.cmd,
+                stdin: req.stdin,
+                stdout: req.stdout,
+                stderr: req.stderr,
+                tty: req.tty,
+            },
+        )
+        .await;
+
+        let url = format!("{}/exec/{}", self.streaming_base_url, token);
+        log::debug!("exec: token={token} url={url}");
+        Ok(Response::new(ExecResponse { url }))
     }
 
     async fn attach(
         &self,
-        _request: Request<AttachRequest>,
+        request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let req = request.into_inner();
+        let container_id = &req.container_id;
+
+        let pelagos_name = {
+            let st = self.state.inner.lock().await;
+            st.containers
+                .get(container_id)
+                .ok_or_else(|| Status::not_found(format!("container {container_id} not found")))?
+                .pelagos_name
+                .clone()
+        };
+
+        // Attach is exec with the container's default command (empty cmd).
+        let token = uuid::Uuid::new_v4().to_string();
+        crate::streaming::register_exec(
+            &self.registry,
+            token.clone(),
+            PendingExec {
+                container_name: pelagos_name,
+                cmd: vec![],
+                stdin: req.stdin,
+                stdout: req.stdout,
+                stderr: req.stderr,
+                tty: req.tty,
+            },
+        )
+        .await;
+
+        let url = format!("{}/attach/{}", self.streaming_base_url, token);
+        log::debug!("attach: token={token} url={url}");
+        Ok(Response::new(AttachResponse { url }))
     }
 
     async fn port_forward(
         &self,
-        _request: Request<PortForwardRequest>,
+        request: Request<PortForwardRequest>,
     ) -> Result<Response<PortForwardResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let req = request.into_inner();
+        let sandbox_id = &req.pod_sandbox_id;
+
+        let pod_ip = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?
+                .ip
+                .clone()
+        };
+
+        if pod_ip.is_empty() {
+            return Err(Status::failed_precondition(
+                "sandbox has no IP assigned (native networking not supported for port-forward)",
+            ));
+        }
+
+        let token = uuid::Uuid::new_v4().to_string();
+        crate::streaming::register_port_forward(
+            &self.registry,
+            token.clone(),
+            PendingPortForward {
+                pod_ip,
+                ports: req.port.iter().map(|p| *p as u32).collect(),
+            },
+        )
+        .await;
+
+        let url = format!("{}/portforward/{}", self.streaming_base_url, token);
+        log::debug!("portforward: token={token} url={url}");
+        Ok(Response::new(PortForwardResponse { url }))
     }
 
     async fn container_stats(

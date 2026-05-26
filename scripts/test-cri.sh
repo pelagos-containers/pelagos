@@ -271,6 +271,21 @@ else
     fail "crictl exec --sync: timeout did not fire (${ELAPSED}s elapsed)"
 fi
 
+# ── Streaming Exec (kubectl-style) ───────────────────────────────────────────
+# Uses crictl exec WITHOUT --sync to exercise the SPDY streaming path.
+
+step "C6: Streaming Exec"
+
+OUT=$(timeout 10 $CRICTL exec "$CONTAINER_ID" /bin/echo streaming-hello 2>&1)
+check_contains "crictl exec (streaming): stdout relay" "$OUT" "streaming-hello"
+
+OUT=$(timeout 10 $CRICTL exec "$CONTAINER_ID" /bin/sh -c 'echo $TEST_VAR' 2>&1)
+check_contains "crictl exec (streaming): env var relay" "$OUT" "hello"
+
+OUT=$(timeout 10 $CRICTL exec "$CONTAINER_ID" /bin/sh -c 'echo err >&2; echo out' 2>&1)
+check_contains "crictl exec (streaming): stderr relay" "$OUT" "err"
+check_contains "crictl exec (streaming): stdout relay with stderr" "$OUT" "out"
+
 # ── Container status ──────────────────────────────────────────────────────────
 
 step "C6: Container status"
