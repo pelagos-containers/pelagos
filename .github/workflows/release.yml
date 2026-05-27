@@ -312,7 +312,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up SSH for AUR
         run: |
-          printf '%s' "${{ secrets.AUR_SSH_KEY }}" | install -Dm600 /dev/stdin ~/.ssh/id_ed25519
+          install -Dm600 /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.AUR_SSH_KEY }}" >> ~/.ssh/id_ed25519
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
           git config --global user.email "cjbrown102@gmail.com"
           git config --global user.name "Christopher Brown"
