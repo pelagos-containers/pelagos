@@ -302,3 +302,62 @@ jobs:
             --field message="chore: update pelagos formula to v${VERSION}" \
             --field content="$(base64 -w0 pelagos.rb)" \
             --field sha="$FILE_SHA"
+
+  update-aur:
+    needs: [package-test]
+    runs-on: ubuntu-latest
+    if: ${{ secrets.AUR_SSH_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up SSH for AUR
+        run: |
+          install -Dm600 /dev/stdin ~/.ssh/id_ed25519 <<< "${{ secrets.AUR_SSH_KEY }}"
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          git config --global user.email "cjbrown102@gmail.com"
+          git config --global user.name "Christopher Brown"
+      - name: Fetch sha256sums from release
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          X86=$(curl -sL "https://github.com/pelagos-containers/pelagos/releases/download/v${VERSION}/pelagos-x86_64-linux.sha256" | awk '{print $1}')
+          ARM=$(curl -sL "https://github.com/pelagos-containers/pelagos/releases/download/v${VERSION}/pelagos-aarch64-linux.sha256" | awk '{print $1}')
+          SRC=$(curl -sL "https://github.com/pelagos-containers/pelagos/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | awk '{print $1}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "X86_SHA=$X86"     >> $GITHUB_ENV
+          echo "ARM_SHA=$ARM"     >> $GITHUB_ENV
+          echo "SRC_SHA=$SRC"     >> $GITHUB_ENV
+      - name: Update PKGBUILDs
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" pkg/aur/pelagos/PKGBUILD
+          sed -i "s/^sha256sums=(.*/sha256sums=('${SRC_SHA}')/" pkg/aur/pelagos/PKGBUILD
+
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" pkg/aur/pelagos-bin/PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${X86_SHA}' 'SKIP' '${SRC_SHA}')/" pkg/aur/pelagos-bin/PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${ARM_SHA}' 'SKIP' '${SRC_SHA}')/" pkg/aur/pelagos-bin/PKGBUILD
+      - name: Generate .SRCINFO files
+        run: |
+          docker run --rm -v "$PWD:/src" archlinux:latest bash -c "
+            pacman -Sy --noconfirm pacman-contrib > /dev/null 2>&1
+            cd /src/pkg/aur/pelagos     && makepkg --printsrcinfo > .SRCINFO
+            cd /src/pkg/aur/pelagos-bin && makepkg --printsrcinfo > .SRCINFO
+          "
+      - name: Push pelagos to AUR
+        run: |
+          git clone ssh://aur@aur.archlinux.org/pelagos.git /tmp/aur-pelagos
+          cp pkg/aur/pelagos/PKGBUILD pkg/aur/pelagos/.SRCINFO /tmp/aur-pelagos/
+          cd /tmp/aur-pelagos
+          git add PKGBUILD .SRCINFO
+          git diff --staged --quiet || git commit -m "upgpkg: pelagos ${VERSION}" && git push
+      - name: Push pelagos-bin to AUR
+        run: |
+          git clone ssh://aur@aur.archlinux.org/pelagos-bin.git /tmp/aur-pelagos-bin
+          cp pkg/aur/pelagos-bin/PKGBUILD pkg/aur/pelagos-bin/.SRCINFO /tmp/aur-pelagos-bin/
+          cd /tmp/aur-pelagos-bin
+          git add PKGBUILD .SRCINFO
+          git diff --staged --quiet || git commit -m "upgpkg: pelagos-bin ${VERSION}" && git push
+      - name: Commit updated PKGBUILDs to main repo
+        run: |
+          git add pkg/aur/
+          git diff --staged --quiet || \
+            git commit -m "chore(aur): update sha256sums for v${VERSION}" && git push
