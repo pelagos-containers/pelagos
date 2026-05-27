@@ -306,7 +306,6 @@ jobs:
   update-aur:
     needs: [package-test]
     runs-on: ubuntu-latest
-    if: ${{ secrets.AUR_SSH_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
