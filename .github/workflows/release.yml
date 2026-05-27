@@ -362,4 +362,4 @@ jobs:
         run: |
           git add pkg/aur/
           git diff --staged --quiet || \
-            git commit -m "chore(aur): update sha256sums for v${VERSION}" && git push
+            git commit -m "chore(aur): update sha256sums for v${VERSION}" && git push origin HEAD:main
