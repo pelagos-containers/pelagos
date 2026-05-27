@@ -222,7 +222,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Publish to crates.io
-        run: cargo publish --no-verify
+        run: cargo publish --no-verify || cargo publish --no-verify 2>&1 | grep -q "already exists" && echo "already published, skipping"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -339,6 +339,7 @@ jobs:
           docker run --rm -v "$PWD:/src" archlinux:latest bash -c "
             pacman -Sy --noconfirm pacman-contrib > /dev/null 2>&1
             useradd -m builder
+            chown -R builder /src/pkg/aur
             su builder -c 'cd /src/pkg/aur/pelagos     && makepkg --printsrcinfo > .SRCINFO'
             su builder -c 'cd /src/pkg/aur/pelagos-bin && makepkg --printsrcinfo > .SRCINFO'
           "
