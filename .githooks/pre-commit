@@ -4,8 +4,11 @@ set -e
 cargo fmt --check || { echo "Run 'cargo fmt' to fix formatting."; exit 1; }
 cargo clippy -- -D warnings
 
-if command -v actionlint > /dev/null 2>&1; then
-    if git diff --cached --name-only | grep -q '^\.github/workflows/'; then
+if git diff --cached --name-only | grep -q '^\.github/workflows/'; then
+    if command -v actionlint > /dev/null 2>&1; then
         actionlint $(git diff --cached --name-only | grep '^\.github/workflows/.*\.yml$')
+    else
+        echo "warning: actionlint not installed — workflow files not validated."
+        echo "  Install: go install github.com/rhysd/actionlint/cmd/actionlint@latest"
     fi
 fi
