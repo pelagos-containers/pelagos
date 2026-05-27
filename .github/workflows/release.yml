@@ -338,8 +338,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" archlinux:latest bash -c "
             pacman -Sy --noconfirm pacman-contrib > /dev/null 2>&1
-            cd /src/pkg/aur/pelagos     && makepkg --printsrcinfo > .SRCINFO
-            cd /src/pkg/aur/pelagos-bin && makepkg --printsrcinfo > .SRCINFO
+            useradd -m builder
+            su builder -c 'cd /src/pkg/aur/pelagos     && makepkg --printsrcinfo > .SRCINFO'
+            su builder -c 'cd /src/pkg/aur/pelagos-bin && makepkg --printsrcinfo > .SRCINFO'
           "
       - name: Push pelagos to AUR
         run: |
