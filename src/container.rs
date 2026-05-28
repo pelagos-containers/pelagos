@@ -7887,7 +7887,7 @@ pub enum Error {
     Seccomp(#[source] io::Error),
 
     /// Generic I/O error
-    #[error("I/O error: {0}")]
+    #[error("{0}")]
     Io(#[from] io::Error),
 }
 

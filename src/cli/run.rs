@@ -1392,8 +1392,20 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("pelagos watcher: spawn failed: {}", e);
-                    unsafe { libc::_exit(1) };
+                    // Write the error message to the sync pipe so the parent can surface it,
+                    // then close the pipe and exit.  The parent distinguishes success (\x00)
+                    // from error (any other bytes) by reading more than 1 byte.
+                    let msg = e.to_string();
+                    let bytes = msg.as_bytes();
+                    unsafe {
+                        libc::write(
+                            sync_pipe[1],
+                            bytes.as_ptr() as *const libc::c_void,
+                            bytes.len(),
+                        );
+                        libc::close(sync_pipe[1]);
+                        libc::_exit(1);
+                    }
                 }
             };
             let pid = child.pid();
@@ -1516,13 +1528,20 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             // we also wait here to make the guarantee explicit and to avoid SIGPIPE
             // on the watcher's write end.
             unsafe { libc::close(sync_pipe[1]) };
-            let mut one = [0u8; 1];
-            let n = unsafe { libc::read(sync_pipe[0], one.as_mut_ptr() as *mut libc::c_void, 1) };
+            // Protocol: watcher writes \x00 (1 byte) on success, or an error string on
+            // failure.  Read up to 4096 bytes; n<=0 means unexpected watcher death.
+            let mut buf = [0u8; 4096];
+            let n =
+                unsafe { libc::read(sync_pipe[0], buf.as_mut_ptr() as *mut libc::c_void, 4096) };
             unsafe { libc::close(sync_pipe[0]) };
             if n <= 0 {
                 return Err(
                     "container failed to start (watcher exited before writing state)".into(),
                 );
+            }
+            if buf[0] != 0 {
+                let msg = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+                return Err(msg.into());
             }
 
             if attach_stdout || attach_stderr {

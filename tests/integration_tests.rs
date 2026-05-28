@@ -9996,6 +9996,103 @@ mod port_proxy {
         );
     }
 
+    /// test_bridge_duplicate_host_port_rejected_cli
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Same scenario as `test_bridge_duplicate_host_port_rejected` but exercises
+    /// the `pelagos run -d` CLI path (watcher process) rather than the library
+    /// API directly.  Verifies that the spawn error is propagated from the watcher
+    /// back to the CLI parent via the sync pipe and printed to stderr.
+    ///
+    /// Failure indicates the watcher exits silently on spawn failure, causing the
+    /// CLI to emit the generic "watcher exited before writing state" message
+    /// instead of the actual port-conflict error.
+    #[test]
+    #[serial(nat)]
+    fn test_bridge_duplicate_host_port_rejected_cli() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_duplicate_host_port_rejected_cli: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_bridge_duplicate_host_port_rejected_cli: alpine-rootfs not found"
+            );
+            return;
+        };
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name1 = "pf-cli-conflict-c1";
+        let name2 = "pf-cli-conflict-c2";
+
+        // Ensure clean state.
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name1])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name2])
+            .output();
+
+        // Start container 1 — should succeed.
+        let out1 = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--network",
+                "bridge",
+                "-p",
+                "19878:80",
+                "--name",
+                name1,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "60",
+            ])
+            .output()
+            .expect("pelagos run c1");
+        assert!(out1.status.success(), "c1 failed: {:?}", out1);
+
+        // Start container 2 with same host port — should fail with a clear error.
+        let out2 = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--network",
+                "bridge",
+                "-p",
+                "19878:80",
+                "--name",
+                name2,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "60",
+            ])
+            .output()
+            .expect("pelagos run c2");
+
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name1])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name2])
+            .output();
+
+        assert!(!out2.status.success(), "c2 should have been rejected");
+        let stderr = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            stderr.contains("19878") || stderr.contains("host port"),
+            "stderr should name the conflicting port; got: {}",
+            stderr
+        );
+        assert!(
+            !stderr.contains("watcher exited before writing state"),
+            "generic watcher error should not appear; got: {}",
+            stderr
+        );
+    }
+
     /// test_pasta_duplicate_host_port_rejected
     ///
     /// Requires: root, alpine-rootfs, pasta installed.
