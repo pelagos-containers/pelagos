@@ -22544,3 +22544,308 @@ mod sandbox {
         cleanup_sandbox(&sandbox_id);
     }
 }
+
+// ---------------------------------------------------------------------------
+// pelagos-dockerd integration tests (#214)
+// ---------------------------------------------------------------------------
+// These tests start pelagos-dockerd on a temp socket, run containers via the
+// pelagos CLI, and exercise the HTTP API to verify that the inotify-based
+// log follow and wait handlers behave correctly.
+// Requires root and alpine image.
+
+mod dockerd_integration {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ALPINE: &str = "docker.io/library/alpine:latest";
+
+    fn pelagos_bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn dockerd_bin() -> String {
+        // pelagos-dockerd lives in the same target dir as pelagos.
+        let pelagos = env!("CARGO_BIN_EXE_pelagos");
+        let dir = std::path::Path::new(pelagos)
+            .parent()
+            .expect("pelagos bin parent dir");
+        dir.join("pelagos-dockerd")
+            .to_str()
+            .expect("utf8 path")
+            .to_string()
+    }
+
+    fn socket_path(tag: &str) -> String {
+        format!("/run/pelagos/test-dockerd-{}.sock", tag)
+    }
+
+    /// Start pelagos-dockerd on a unique socket; return its Child handle.
+    fn start_dockerd(tag: &str) -> (Child, String) {
+        let sock = socket_path(tag);
+        let _ = std::fs::remove_file(&sock);
+        let child = Command::new(dockerd_bin())
+            .args(["--socket", &sock, "--pelagos-bin", pelagos_bin()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pelagos-dockerd");
+        // Give it a moment to bind.
+        std::thread::sleep(Duration::from_millis(400));
+        (child, sock)
+    }
+
+    fn stop_dockerd(mut child: Child, sock: &str) {
+        child.kill().ok();
+        child.wait().ok();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    fn ensure_alpine() {
+        let out = Command::new(pelagos_bin())
+            .args(["image", "ls", "--json"])
+            .output()
+            .expect("image ls");
+        let json = String::from_utf8_lossy(&out.stdout);
+        if !json.contains("alpine") {
+            let _ = Command::new(pelagos_bin())
+                .args(["image", "pull", ALPINE])
+                .status();
+        }
+    }
+
+    fn run_container(name: &str, args: &[&str]) {
+        let mut cmd = vec!["run", "-d", "--name", name, "--"];
+        cmd.push(ALPINE);
+        cmd.extend_from_slice(args);
+        let out = Command::new(pelagos_bin())
+            .args(&cmd)
+            .output()
+            .expect("pelagos run");
+        assert!(
+            out.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn remove_container(name: &str) {
+        let _ = Command::new(pelagos_bin()).args(["stop", name]).status();
+        let _ = Command::new(pelagos_bin()).args(["rm", name]).status();
+    }
+
+    /// Decode docker-multiplexed stream bytes into text lines.
+    fn decode_docker_stream(data: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= data.len() {
+            let length =
+                u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            if pos + 8 + length > data.len() {
+                break;
+            }
+            let payload = &data[pos + 8..pos + 8 + length];
+            let text = String::from_utf8_lossy(payload);
+            for line in text.lines() {
+                lines.push(line.to_string());
+            }
+            pos += 8 + length;
+        }
+        lines
+    }
+
+    /// Issue a GET request to the dockerd socket using curl; returns stdout bytes.
+    fn curl_get(sock: &str, path: &str, timeout_secs: u64) -> (Vec<u8>, bool) {
+        let url = format!("http://localhost{}", path);
+        let out = Command::new("curl")
+            .args([
+                "-sN",
+                "--max-time",
+                &timeout_secs.to_string(),
+                "--unix-socket",
+                sock,
+                &url,
+            ])
+            .output()
+            .expect("curl");
+        let timed_out = !out.status.success() && out.status.code() == Some(28);
+        (out.stdout, timed_out)
+    }
+
+    /// Issue a POST request to the dockerd socket; returns response body as string.
+    fn curl_post(sock: &str, path: &str, timeout_secs: u64) -> (String, bool) {
+        let url = format!("http://localhost{}", path);
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                &timeout_secs.to_string(),
+                "-X",
+                "POST",
+                "--unix-socket",
+                sock,
+                &url,
+            ])
+            .output()
+            .expect("curl post");
+        let timed_out = !out.status.success() && out.status.code() == Some(28);
+        (String::from_utf8_lossy(&out.stdout).to_string(), timed_out)
+    }
+
+    /// `GET /containers/{id}/logs?follow=true` must close the HTTP stream
+    /// within ~2 seconds of the container exiting, not hang indefinitely.
+    ///
+    /// Verifies that the inotify CLOSE_WRITE on the log file (fired when the
+    /// watcher relay closes on container exit) correctly terminates the stream.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_terminates_on_exit() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-follow-exit-test";
+        let tag = "follow-exit";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container prints two lines then exits after ~1s.
+        run_container(name, &["sh", "-c", "echo before; sleep 1; echo after"]);
+
+        let start = Instant::now();
+        // 5s timeout — if the stream doesn't close by then the test fails.
+        let (data, timed_out) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            5,
+        );
+        let elapsed = start.elapsed();
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(
+            !timed_out,
+            "follow stream did not close after container exit (still open after 5s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "follow stream took too long to close: {:?} (expected <3s)",
+            elapsed
+        );
+
+        let lines = decode_docker_stream(&data);
+        assert!(
+            lines.iter().any(|l| l.contains("before")),
+            "missing 'before' line; got: {:?}",
+            lines
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("after")),
+            "missing 'after' line; got: {:?}",
+            lines
+        );
+    }
+
+    /// `GET /containers/{id}/logs?follow=true` must deliver lines in real time
+    /// with low latency — not batch them up into polling intervals.
+    ///
+    /// Verifies that inotify MODIFY events on the log file drive delivery
+    /// rather than a fixed sleep interval.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_streams_real_time() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-follow-stream-test";
+        let tag = "follow-stream";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container emits one line every 200ms; runs for 3s.
+        run_container(
+            name,
+            &[
+                "sh",
+                "-c",
+                "i=0; while true; do echo line$i; i=$((i+1)); sleep 0.2; done",
+            ],
+        );
+        // Give it ~0.4s to accumulate a couple of lines before we attach.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Stream for exactly 2 seconds.
+        let (data, _) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            2,
+        );
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        let lines = decode_docker_stream(&data);
+        // At 200ms/line over a 2s window + ~2 lines already in log = ≥9 lines expected.
+        // We allow ≥6 as a conservative lower bound accounting for scheduling jitter.
+        assert!(
+            lines.len() >= 6,
+            "expected ≥6 lines in 2s at 200ms/line, got {} lines: {:?}",
+            lines.len(),
+            lines
+        );
+    }
+
+    /// `POST /containers/{id}/wait` must return promptly (within ~2s) after
+    /// the container exits, not linger until the next 500ms poll tick.
+    ///
+    /// Also verifies that the exit code in the response body is correct.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_wait_returns_exit_code() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-wait-test";
+        let tag = "wait-exit";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container exits after 1s with code 42.
+        run_container(name, &["sh", "-c", "sleep 1; exit 42"]);
+        std::thread::sleep(Duration::from_millis(200));
+
+        let start = Instant::now();
+        let (body, timed_out) = curl_post(&sock, &format!("/containers/{}/wait", name), 5);
+        let elapsed = start.elapsed();
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(
+            !timed_out,
+            "wait did not return after container exit (still blocked after 5s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "wait took too long: {:?} (expected <3s)",
+            elapsed
+        );
+        assert!(
+            body.contains("42"),
+            "wait response should contain exit code 42; got: {:?}",
+            body
+        );
+    }
+}

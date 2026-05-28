@@ -415,7 +415,10 @@ pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Respons
 
         let log_wd = match inotify.watches().add(
             &log_path,
-            WatchMask::MODIFY | WatchMask::DELETE_SELF | WatchMask::MOVE_SELF,
+            WatchMask::MODIFY
+                | WatchMask::CLOSE_WRITE
+                | WatchMask::DELETE_SELF
+                | WatchMask::MOVE_SELF,
         ) {
             Ok(wd) => wd,
             Err(_) => return,
@@ -457,45 +460,64 @@ pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Respons
         };
 
         loop {
-            let ev = match event_stream.next().await {
-                Some(Ok(e)) => e,
-                Some(Err(e)) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-                None => break,
+            // Wait for an inotify event or a 1-second fallback tick.
+            let ev_opt = tokio::select! {
+                ev = event_stream.next() => match ev {
+                    Some(Ok(e)) => Some(e),
+                    Some(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
+                    None => break,
+                },
+                // Safety-net: if inotify misses an event (e.g. state.json
+                // written via rename on some kernels), poll at most once per
+                // second so we don't hang indefinitely.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => None,
             };
 
-            if ev.wd == log_wd
-                && (ev.mask.contains(EventMask::DELETE_SELF)
-                    || ev.mask.contains(EventMask::MOVE_SELF))
-            {
-                break;
-            }
+            let mut log_closed = false;
 
-            // Read any new bytes from the log file (MODIFY on log or Q_OVERFLOW).
-            if ev.mask.contains(EventMask::Q_OVERFLOW)
-                || (ev.mask.contains(EventMask::MODIFY) && ev.wd == log_wd)
-            {
-                loop {
-                    match file.read(&mut read_buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let chunk = frames_from_bytes(&mut line_buf, &read_buf[..n]);
-                            if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
-                                return;
+            if let Some(ev) = ev_opt {
+                if ev.wd == log_wd
+                    && (ev.mask.contains(EventMask::DELETE_SELF)
+                        || ev.mask.contains(EventMask::MOVE_SELF))
+                {
+                    break;
+                }
+
+                // CLOSE_WRITE on the log: the watcher relay closed the file,
+                // meaning the container has exited. Drain then stop.
+                if ev.wd == log_wd && ev.mask.contains(EventMask::CLOSE_WRITE) {
+                    log_closed = true;
+                }
+
+                // Read any new bytes from the log file (MODIFY on log or Q_OVERFLOW).
+                if ev.mask.contains(EventMask::Q_OVERFLOW)
+                    || (ev.mask.contains(EventMask::MODIFY) && ev.wd == log_wd)
+                    || log_closed
+                {
+                    loop {
+                        match file.read(&mut read_buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let chunk = frames_from_bytes(&mut line_buf, &read_buf[..n]);
+                                if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+                                    return;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
                 }
+            }
+
+            if log_closed {
+                break;
             }
 
             let still_running = pelagos_state::read_state(&container_name)
                 .map(|s| s.is_running())
                 .unwrap_or(false);
             if !still_running {
-                // Drain any tail that arrived before the state write.
+                // Drain any tail that arrived between the last MODIFY and state write.
                 loop {
                     match file.read(&mut read_buf).await {
                         Ok(0) => break,

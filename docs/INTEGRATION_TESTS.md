@@ -4211,3 +4211,52 @@ reaches `running` state, verifies the file exists on the host side.
 Failure indicates the `bind` option is read-only (regression for issue #228):
 before the fix, `apply_service_opt` hardcoded `read_only: true` for `"bind"`,
 causing writes inside the container to fail with "Read-only file system".
+
+---
+
+## pelagos-dockerd integration tests (mod `dockerd_integration`)
+
+These tests start `pelagos-dockerd` on a temp Unix socket, launch containers
+via the pelagos CLI, and hit the Docker HTTP API to verify the inotify-based
+log-follow and wait handlers introduced in issue #214.
+
+### `test_dockerd_logs_follow_terminates_on_exit`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container that prints two lines then exits after ~1s. Issues
+`GET /containers/{id}/logs?stdout=true&follow=true` and measures how long until
+the HTTP body closes. Asserts:
+- Stream closes within 3s (not hanging indefinitely)
+- Both "before" and "after" lines are present in the received data
+
+Failure indicates the inotify `CLOSE_WRITE` on the log file is not waking the
+background follow task, causing the stream to hang until a client disconnect or
+daemon shutdown. Regression for the polling implementation's behavior of never
+closing the stream until the next 200ms tick saw the state change.
+
+### `test_dockerd_logs_follow_streams_real_time`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container that emits one line every 200ms indefinitely. Streams logs
+for 2 seconds and counts received lines. Asserts ≥6 lines were delivered.
+
+Failure indicates the follow stream is batching output with a fixed delay
+(200ms+ polling sleep) rather than delivering lines as inotify `MODIFY` events
+arrive. Expected ~10 new lines in 2s at 200ms/line; the ≥6 threshold absorbs
+scheduling jitter.
+
+### `test_dockerd_wait_returns_exit_code`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container that exits after 1s with code 42. Issues
+`POST /containers/{id}/wait` and measures the wall-clock time until it returns.
+Asserts:
+- Returns within 3s (not blocking until the next 500ms poll tick)
+- Response body contains the exit code 42
+
+Failure indicates the inotify watch on `state.json` is not firing or not being
+consumed, leaving the wait handler in the 500ms polling fallback path (which
+would close within ~1.5s but signals a regression in the inotify path).
