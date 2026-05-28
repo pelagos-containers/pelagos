@@ -1936,6 +1936,27 @@ Failure indicates the tokio accept loop exits prematurely after the first relay
 task completes, or that `copy_bidirectional` does not propagate server-side EOF
 cleanly (causing subsequent connections to hang or return empty data).
 
+### `test_bridge_duplicate_host_port_rejected`
+**Requires:** root, alpine-rootfs
+
+Starts a bridge-networked container with host port 19876 forwarded to container port 80.
+While that container is running, attempts to start a second container with the same host
+port. Asserts the second spawn returns an error whose message names the conflicting port.
+
+Failure indicates `enable_port_forwards` is not checking the existing port-forward registry
+for live conflicts, allowing two containers to race for the same nftables DNAT rule and TCP
+proxy binding (silent misbehaviour: only the first or last container gets traffic).
+
+### `test_pasta_duplicate_host_port_rejected`
+**Requires:** root, alpine-rootfs, pasta installed
+
+Pre-binds host port 19877 with a `TcpListener`, then attempts to spawn a pasta-networked
+container forwarding that port. Asserts spawn returns an error.
+
+Failure indicates `setup_pasta_network` is not checking port availability before spawning
+pasta, meaning pasta's port-bind failure ("Couldn't listen on requested ports", exit 1) is
+silently swallowed and the container starts with no working port forwarding.
+
 ---
 
 ## Multi-Network Tests

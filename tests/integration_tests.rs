@@ -9928,6 +9928,132 @@ mod port_proxy {
             failures.join("\n")
         );
     }
+
+    /// test_bridge_duplicate_host_port_rejected
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts a bridge-networked container with host port 19876 forwarded to
+    /// container port 80.  While the first container is running, attempts to
+    /// start a second container with the same host port.  Asserts that the
+    /// second spawn returns an error mentioning the port, and that the first
+    /// container is unaffected.
+    ///
+    /// Failure indicates the fail-fast conflict check in `enable_port_forwards`
+    /// is missing or not working, meaning two containers would silently share a
+    /// host port with undefined nftables DNAT behaviour and a broken TCP proxy.
+    #[test]
+    #[serial(nat)]
+    fn test_bridge_duplicate_host_port_rejected() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_duplicate_host_port_rejected: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_duplicate_host_port_rejected: alpine-rootfs not found");
+            return;
+        };
+
+        let mut c1 = Command::new("/bin/sleep")
+            .args(["60"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(19876, 80)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("first container should start");
+
+        let result = Command::new("/bin/sleep")
+            .args(["60"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(19876, 80)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        unsafe { libc::kill(c1.pid(), libc::SIGKILL) };
+        let _ = c1.wait();
+
+        assert!(
+            result.is_err(),
+            "second container with duplicate host port 19876 should be rejected"
+        );
+        let err_msg = result.err().expect("expected Err").to_string();
+        assert!(
+            err_msg.contains("19876") || err_msg.contains("host port"),
+            "error should name the conflicting port; got: {}",
+            err_msg
+        );
+    }
+
+    /// test_pasta_duplicate_host_port_rejected
+    ///
+    /// Requires: root, alpine-rootfs, pasta installed.
+    ///
+    /// Pre-binds host port 19877 with a TCP listener, then attempts to start a
+    /// pasta-networked container forwarding that port.  Asserts that spawn
+    /// returns an error — pasta exits with code 1, `wait_for_pasta_network`
+    /// propagates that as `Err`, and the container is never fully started.
+    ///
+    /// Failure indicates `wait_for_pasta_network` is not propagating the pasta
+    /// exit status, meaning port-conflict errors from pasta are silently swallowed
+    /// and the container starts with no working port forwarding.
+    #[test]
+    #[serial(nat)]
+    fn test_pasta_duplicate_host_port_rejected() {
+        if !is_root() {
+            eprintln!("Skipping test_pasta_duplicate_host_port_rejected: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_pasta_duplicate_host_port_rejected: alpine-rootfs not found");
+            return;
+        };
+        if !pelagos::network::is_pasta_available() {
+            eprintln!("Skipping test_pasta_duplicate_host_port_rejected: pasta not installed");
+            return;
+        }
+
+        // Pre-bind the port so pasta cannot claim it.
+        let _listener = std::net::TcpListener::bind("0.0.0.0:19877")
+            .expect("pre-bind port 19877 for conflict test");
+
+        let result = Command::new("/bin/sleep")
+            .args(["1"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Pasta)
+            .with_port_forward(19877, 80)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn();
+
+        // _listener is dropped here, releasing port 19877.
+        drop(_listener);
+
+        assert!(
+            result.is_err(),
+            "container with pasta port forward on pre-bound host port 19877 should be rejected"
+        );
+        let err_msg = result.err().expect("expected Err").to_string();
+        assert!(
+            err_msg.contains("pasta") || err_msg.contains("port") || err_msg.contains("19877"),
+            "error should indicate pasta/port failure; got: {}",
+            err_msg
+        );
+    }
 }
 
 // ==========================================================================

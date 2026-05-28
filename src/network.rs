@@ -1752,11 +1752,22 @@ fn enable_port_forwards(
 
     // Load existing entries and evict stale ones (crashed containers).
     let existing = read_port_forwards_locked(&mut file)?;
-    let mut live: Vec<PortForwardEntry> = existing
+    let live: Vec<PortForwardEntry> = existing
         .into_iter()
         .filter(|(n, _, _, _, _, _)| !n.is_empty() && netns_exists(n))
         .collect();
 
+    // Fail fast if any requested host port is already held by a live container.
+    for &(host_port, _, _) in forwards {
+        if live.iter().any(|(_, _, hp, _, _, _)| *hp == host_port) {
+            return Err(io::Error::other(format!(
+                "host port {} is already forwarded by another container",
+                host_port
+            )));
+        }
+    }
+
+    let mut live = live;
     for &(host_port, container_port, proto) in forwards {
         live.push((
             ns_name.to_string(),
@@ -2046,18 +2057,20 @@ fn start_tcp_proxies_async(
 /// Binds a `TcpListener` on `0.0.0.0:{host_port}` and spawns a `tcp_relay`
 /// task for each accepted connection.  Runs until the runtime is dropped.
 async fn tcp_accept_loop(host_port: u16, target: SocketAddr) {
-    let listener =
-        match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port))).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!(
-                    "tcp proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
+    let listener = match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port)))
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!(
+                    "tcp proxy: cannot bind 0.0.0.0:{}: {} \
+                     (localhost port forwarding broken; nftables DNAT still active for external traffic)",
                     host_port,
                     e
                 );
-                return;
-            }
-        };
+            return;
+        }
+    };
 
     log::debug!("tcp proxy: 0.0.0.0:{} -> {}", host_port, target);
 
@@ -2409,6 +2422,29 @@ pub fn setup_pasta_network(
     // SAFETY: geteuid() is always safe to call.
     let running_as_root = unsafe { libc::geteuid() } == 0;
 
+    // Fail fast if any requested host port is already bound.  pasta would start,
+    // create the TAP (so wait_for_pasta_network returns OK), and only then fail to
+    // bind the host relay socket — leaving an orphaned container process.  Checking
+    // here lets us return an error before the child is ever forked.
+    for &(host_port, _, proto) in port_forwards {
+        if matches!(proto, PortProto::Tcp | PortProto::Both)
+            && std::net::TcpListener::bind(("0.0.0.0", host_port)).is_err()
+        {
+            return Err(io::Error::other(format!(
+                "host port {} is already in use",
+                host_port
+            )));
+        }
+        if matches!(proto, PortProto::Udp | PortProto::Both)
+            && std::net::UdpSocket::bind(("0.0.0.0", host_port)).is_err()
+        {
+            return Err(io::Error::other(format!(
+                "host port {} (UDP) is already in use",
+                host_port
+            )));
+        }
+    }
+
     for &(host, container, proto) in port_forwards {
         if matches!(proto, PortProto::Tcp | PortProto::Both) {
             args.push("-t".to_string());
@@ -2605,7 +2641,30 @@ pub fn setup_pasta_network(
     //
     // We poll /proc/{pid}/net/dev until a non-loopback interface appears (success),
     // pasta exits before that happens (failure), or a 5-second timeout fires.
-    wait_for_pasta_network(child_pid, &mut process);
+    if let Err(e) = wait_for_pasta_network(child_pid, &mut process) {
+        // pasta failed (e.g. host port conflict).  Collect its output for a
+        // diagnostic message, then clean up before returning the error.
+        let _ = process.kill();
+        let _ = process.wait();
+        let pasta_output = output_thread
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+        if let Some(ref p) = ns_bind_mount {
+            unsafe {
+                libc::umount2(
+                    p.as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
+                    libc::MNT_DETACH,
+                )
+            };
+            let _ = std::fs::remove_file(p);
+        }
+        let detail = pasta_output.trim().lines().last().unwrap_or("").to_string();
+        return Err(io::Error::other(if detail.is_empty() {
+            e.to_string()
+        } else {
+            format!("{} (pasta: {})", e, detail)
+        }));
+    }
 
     Ok(PastaSetup {
         process,
@@ -2639,7 +2698,7 @@ fn host_has_ipv6() -> bool {
         .unwrap_or(false)
 }
 
-fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
+fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) -> io::Result<()> {
     let net_dev = format!("/proc/{}/net/dev", child_pid);
     let if_inet6 = format!("/proc/{}/net/if_inet6", child_pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2648,17 +2707,18 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
     loop {
         // Detect pasta exiting before the TAP interface appears — almost always
         // means pasta encountered an error (permission denied, missing /dev/net/tun,
-        // bad PID, etc.).  The exit status is the only clue available here; stderr
-        // output is collected by the reader thread and logged in teardown.
+        // bad PID, host port conflict, etc.).
         if let Ok(Some(status)) = process.try_wait() {
-            log::warn!(
-                "pasta exited (status: {}) before network setup completed in \
-                 /proc/{}/net/dev — network setup failed; stdout/stderr output \
-                 will be logged at teardown",
-                status,
-                child_pid
-            );
-            return;
+            if status.success() {
+                // pasta exited cleanly (unusual, but not fatal — continue).
+                return Ok(());
+            }
+            return Err(io::Error::other(format!(
+                "pasta exited with {} before network setup completed — \
+                 host port already in use or missing /dev/net/tun? \
+                 Run with RUST_LOG=warn to see pasta output.",
+                status
+            )));
         }
 
         if !tap_seen {
@@ -2705,7 +2765,7 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
                     "pasta: global IPv6 address configured in /proc/{}/net/if_inet6",
                     child_pid
                 );
-                return;
+                return Ok(());
             }
         }
 
@@ -2723,7 +2783,7 @@ fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
                     child_pid
                 );
             }
-            return;
+            return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
