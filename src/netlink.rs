@@ -323,7 +323,7 @@ pub fn create_bridge(name: &str) -> io::Result<()> {
     let cname = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bridge name contains NUL"))?;
     let fd = udp_sock()?;
-    let ret = unsafe { libc::ioctl(fd, SIOCBRADDBR, cname.as_ptr()) };
+    let ret = unsafe { libc::ioctl(fd, SIOCBRADDBR as _, cname.as_ptr()) };
     let err = io::Error::last_os_error();
     unsafe { libc::close(fd) };
     if ret < 0 && err.raw_os_error() != Some(libc::EEXIST) {
@@ -405,7 +405,7 @@ pub fn link_set_master(ifname: &str, master: &str) -> io::Result<()> {
     copy_ifname(&mut req.ifr_name, master)?;
 
     let fd = udp_sock()?;
-    let ret = unsafe { libc::ioctl(fd, SIOCBRADDIF, &req as *const IfreqIdx) };
+    let ret = unsafe { libc::ioctl(fd, SIOCBRADDIF as _, &req as *const IfreqIdx) };
     let err = io::Error::last_os_error();
     unsafe { libc::close(fd) };
     if ret < 0 {

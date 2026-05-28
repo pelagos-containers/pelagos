@@ -2684,13 +2684,13 @@ pub fn setup_pasta_network(
         // case by checking whether the file is already an nsfs bind-mount
         // (f_type == NSFS_MAGIC = 0x6e736673).  If not, do the mount ourselves
         // using /proc/{child_pid}/ns/net (works as long as the process is alive).
-        const NSFS_MAGIC: libc::__fsword_t = 0x6e736673;
+        const NSFS_MAGIC: u64 = 0x6e736673;
         let already_mounted = if mount_path.exists() {
             let cpath = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
             let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
             // SAFETY: cpath is valid, sfs is zeroed.
             let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut sfs) };
-            rc == 0 && sfs.f_type == NSFS_MAGIC
+            rc == 0 && sfs.f_type as u64 == NSFS_MAGIC
         } else {
             false
         };
