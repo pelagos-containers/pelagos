@@ -3301,16 +3301,22 @@ mod networking {
         );
     }
 
-    /// N3: iptables FORWARD rules must exist while a NAT container is running.
+    /// N3: nft compat FORWARD rules must exist while a NAT container is running.
     ///
-    /// On hosts with UFW or Docker, the iptables FORWARD chain has `policy DROP`
-    /// which blocks TCP/UDP traffic even when nftables MASQUERADE is set up.
-    /// `enable_nat()` adds `iptables -I FORWARD -s/-d 172.19.0.0/24 -j ACCEPT`
-    /// rules to work around this. This test verifies those rules exist.
+    /// On hosts with UFW or Docker, `ip filter FORWARD` (the iptables-nft chain)
+    /// has `policy drop`.  Because an nft `accept` in one base chain does not
+    /// prevent subsequent base chains from running, pelagos adds accept rules
+    /// directly into `ip filter FORWARD` via a dedicated named chain
+    /// (`pelagos-pelagos0-fwd`).  This test verifies that chain and its jump
+    /// rule are present while a NAT container is running and are cleaned up
+    /// after it exits.
     ///
-    /// Failure indicates that `enable_nat()` is not adding the iptables FORWARD
-    /// rules, which would cause TCP/UDP to be blocked on hosts with UFW/Docker
-    /// while ICMP (ping) continues to work — a subtle and hard-to-debug issue.
+    /// Failure indicates that `enable_nat()` is not adding the iptables-nft
+    /// compat rules, which would cause TCP/UDP to be blocked on UFW/Docker
+    /// hosts while ICMP continues to work — a subtle, hard-to-debug failure.
+    ///
+    /// Skipped on systems where `ip filter` does not exist (pure nftables, no
+    /// iptables installed).
     #[test]
     #[serial(nat)]
     fn test_nat_iptables_forward_rules() {
@@ -3323,6 +3329,18 @@ mod networking {
             eprintln!("Skipping test_nat_iptables_forward_rules: alpine-rootfs not found");
             return;
         };
+
+        // Skip on systems without the iptables-nft filter table.
+        let filter_exists = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "filter"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !filter_exists {
+            eprintln!("Skipping test_nat_iptables_forward_rules: ip filter table not present");
+            return;
+        }
 
         let mut child = Command::new("/bin/ash")
             .args(["-c", "sleep 3"])
@@ -3337,42 +3355,42 @@ mod networking {
             .spawn()
             .expect("Failed to spawn NAT container");
 
-        // Check iptables FORWARD rule for source 172.19.0.0/24.
-        let status_src = std::process::Command::new("iptables")
-            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+        // The compat chain should exist in ip filter.
+        let chain_exists = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "filter", "pelagos-pelagos0-fwd"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("Failed to run iptables -C (source)");
+            .is_ok_and(|s| s.success());
         assert!(
-            status_src.success(),
-            "iptables FORWARD rule for source 172.19.0.0/24 should exist while NAT container runs"
+            chain_exists,
+            "nft chain ip filter pelagos-pelagos0-fwd should exist while NAT container runs"
         );
 
-        // Check iptables FORWARD rule for destination 172.19.0.0/24.
-        let status_dst = std::process::Command::new("iptables")
-            .args(["-C", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("Failed to run iptables -C (dest)");
+        // The jump rule should be present in ip filter FORWARD.
+        let jump_exists = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "filter", "FORWARD"])
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).contains("jump pelagos-pelagos0-fwd")
+            });
         assert!(
-            status_dst.success(),
-            "iptables FORWARD rule for dest 172.19.0.0/24 should exist while NAT container runs"
+            jump_exists,
+            "jump rule to pelagos-pelagos0-fwd should be in ip filter FORWARD while NAT container runs"
         );
 
         child.wait().expect("Failed to wait for NAT container");
 
-        // After cleanup, the iptables FORWARD rules should be gone.
-        let status_after = std::process::Command::new("iptables")
-            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+        // After cleanup, the compat chain should be gone.
+        let chain_after = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "filter", "pelagos-pelagos0-fwd"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("Failed to run iptables -C after cleanup");
+            .is_ok_and(|s| s.success());
         assert!(
-            !status_after.success(),
-            "iptables FORWARD rule should be removed after NAT container exits"
+            !chain_after,
+            "nft chain pelagos-pelagos0-fwd should be removed after NAT container exits"
         );
     }
 
@@ -3982,12 +4000,12 @@ mod networking {
     /// N2+N3: Bridge + NAT cleanup must work even after SIGKILL.
     ///
     /// Spawns a bridge+NAT container (`sleep 60`), records veth name, netns name,
-    /// and verifies iptables FORWARD rules exist. Then SIGKILLs the container
-    /// and calls `wait()`. Asserts all resources are cleaned up:
+    /// and verifies the nft compat FORWARD chain exists. Then SIGKILLs the
+    /// container and calls `wait()`. Asserts all resources are cleaned up:
     /// - veth pair removed
     /// - named netns removed
     /// - nftables table removed
-    /// - iptables FORWARD rules removed
+    /// - iptables-nft compat FORWARD chain removed
     ///
     /// All existing cleanup tests use normal exit. This catches teardown bugs
     /// that only manifest when the container process dies unexpectedly.
@@ -4030,17 +4048,26 @@ mod networking {
             .success();
         assert!(veth_exists, "veth {} should exist before kill", veth);
 
-        let iptables_exists = std::process::Command::new("iptables")
-            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+        // On iptables-nft systems, verify the compat chain is present.
+        // On pure-nftables systems (no ip filter table), skip this check.
+        let filter_exists = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "filter"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .expect("iptables -C")
-            .success();
-        assert!(
-            iptables_exists,
-            "iptables FORWARD rule should exist before kill"
-        );
+            .is_ok_and(|s| s.success());
+        if filter_exists {
+            let compat_chain_exists = std::process::Command::new("nft")
+                .args(["list", "chain", "ip", "filter", "pelagos-pelagos0-fwd"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(
+                compat_chain_exists,
+                "nft compat chain pelagos-pelagos0-fwd should exist before kill"
+            );
+        }
 
         // SIGKILL the container.
         unsafe {
@@ -4083,17 +4110,19 @@ mod networking {
             "nftables table should be gone after SIGKILL + wait()"
         );
 
-        let iptables_after = std::process::Command::new("iptables")
-            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("iptables -C after kill")
-            .success();
-        assert!(
-            !iptables_after,
-            "iptables FORWARD rule should be gone after SIGKILL + wait()"
-        );
+        // On iptables-nft systems, verify compat chain is cleaned up.
+        if filter_exists {
+            let compat_chain_after = std::process::Command::new("nft")
+                .args(["list", "chain", "ip", "filter", "pelagos-pelagos0-fwd"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(
+                !compat_chain_after,
+                "nft compat chain pelagos-pelagos0-fwd should be gone after SIGKILL + wait()"
+            );
+        }
     }
 
     /// N3: NAT must actually allow outbound TCP traffic, not just have rules.

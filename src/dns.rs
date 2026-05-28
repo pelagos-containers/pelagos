@@ -204,9 +204,11 @@ pub fn dns_add_entry(
     drop(lock_file);
     let _ = std::fs::remove_file(&lock_path);
 
-    // Ensure firewall allows DNS on this bridge.
+    // Ensure firewall allows DNS on this bridge (nft INPUT rule).
     if let Ok(net_def) = crate::network::load_network_def(network_name) {
-        allow_dns_on_bridge(&net_def.bridge_name);
+        if let Err(e) = crate::network::add_dns_input_rule(&net_def) {
+            log::warn!("add_dns_input_rule (non-fatal): {}", e);
+        }
     }
 
     // For dnsmasq backend: regenerate hosts file.
@@ -254,10 +256,10 @@ pub fn dns_remove_entry(network_name: &str, container_name: &str) -> io::Result<
     }
 
     if entries.is_empty() {
-        // No more containers on this network — remove config file and firewall rule.
+        // No more containers on this network — remove config file and nft DNS rule.
         let _ = std::fs::remove_file(&config_file);
         if let Ok(net_def) = crate::network::load_network_def(network_name) {
-            disallow_dns_on_bridge(&net_def.bridge_name);
+            crate::network::remove_dns_input_rule(&net_def);
         }
         // Remove dnsmasq hosts file for this network.
         if active_backend() == DnsBackend::Dnsmasq {
@@ -669,54 +671,6 @@ fn exec_dnsmasq(bin: &std::path::Path, conf: &std::path::Path) -> io::Error {
         libc::execv(bin_c.as_ptr(), args.as_ptr());
     }
     io::Error::last_os_error()
-}
-
-// ---------------------------------------------------------------------------
-// Firewall helpers
-// ---------------------------------------------------------------------------
-
-/// Add an iptables INPUT rule to allow UDP port 53 on a bridge interface.
-///
-/// Hosts with restrictive INPUT policies (DROP/REJECT) block DNS queries
-/// from containers to the gateway. This rule ensures the DNS daemon can
-/// receive queries on the bridge.
-fn allow_dns_on_bridge(bridge: &str) {
-    use std::process::Command as SysCmd;
-
-    // Purge any stale duplicates first.
-    while SysCmd::new("iptables")
-        .args([
-            "-D", "INPUT", "-i", bridge, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-    {}
-
-    // Insert fresh rule.
-    let _ = SysCmd::new("iptables")
-        .args([
-            "-I", "INPUT", "-i", bridge, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-/// Remove the iptables INPUT rule for DNS on a bridge interface.
-fn disallow_dns_on_bridge(bridge: &str) {
-    use std::process::Command as SysCmd;
-
-    while SysCmd::new("iptables")
-        .args([
-            "-D", "INPUT", "-i", bridge, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-    {}
 }
 
 /// Apply an exclusive flock on the file.

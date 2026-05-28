@@ -1256,14 +1256,168 @@ fn build_nat_script(net: &NetworkDef) -> String {
     let table = net.nft_table_name();
     let cidr = net.subnet.cidr_string();
     let bridge = &net.bridge_name;
+    // Forward chain at priority -100 so it runs before any iptables chains
+    // (iptables is effectively priority 0).  This ensures our accept rules
+    // win on hosts with UFW/Docker/firewalld setting FORWARD policy to DROP.
     format!(
         "add table ip {table}\n\
          add chain ip {table} postrouting {{ type nat hook postrouting priority 100; }}\n\
          add rule ip {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade\n\
-         add chain ip {table} forward {{ type filter hook forward priority 0; }}\n\
+         add chain ip {table} forward {{ type filter hook forward priority -100; }}\n\
          add rule ip {table} forward ip saddr {cidr} accept\n\
          add rule ip {table} forward ip daddr {cidr} accept\n"
     )
+}
+
+/// Add DNS INPUT rules for a network so containers can reach the DNS daemon.
+///
+/// Two layers:
+/// 1. Per-network nft table INPUT chain at priority -100 — handles systems
+///    that have no iptables (pure nftables), where this is the only filter.
+/// 2. `ip filter INPUT` compat chain — handles iptables-nft systems where
+///    UFW/firewalld sets INPUT policy to DROP.  Silently skipped when the
+///    `ip filter` table does not exist (iptables not installed).
+///
+/// Idempotent: flushes our chain before re-adding the rule, so repeated
+/// calls on the same network are safe.
+pub fn add_dns_input_rule(net: &NetworkDef) -> io::Result<()> {
+    let table = net.nft_table_name();
+    let bridge = &net.bridge_name;
+    // Layer 1: per-network table at priority -100 (pure-nftables systems).
+    let script = format!(
+        "add table ip {table}\n\
+         add chain ip {table} input {{ type filter hook input priority -100; }}\n\
+         flush chain ip {table} input\n\
+         add rule ip {table} input iifname \"{bridge}\" udp dport 53 accept\n"
+    );
+    run_nft(&script)?;
+    // Layer 2: iptables-nft compat (best-effort; silently skipped on legacy/no iptables).
+    add_iptables_nft_dns_compat(net);
+    Ok(())
+}
+
+/// Remove the DNS INPUT rules installed by [`add_dns_input_rule`].
+///
+/// Cleans up both the per-network nft table INPUT chain and the iptables-nft
+/// compat chain in `ip filter INPUT`.  Both operations are best-effort.
+pub fn remove_dns_input_rule(net: &NetworkDef) {
+    let table = net.nft_table_name();
+    let script = format!(
+        "flush chain ip {table} input\n\
+         delete chain ip {table} input\n"
+    );
+    let _ = run_nft_quiet(&script);
+    // Layer 2 cleanup.
+    remove_iptables_nft_dns_compat(net);
+}
+
+// ── iptables-nft compatibility helpers ───────────────────────────────────────
+//
+// On systems using iptables-nft, iptables rules live in nftables tables
+// (`ip filter`).  Because nft `accept` in one base chain does not prevent
+// subsequent base chains (e.g. `ip filter FORWARD`) from running and applying
+// their DROP policy, we must also write rules directly into `ip filter`.
+//
+// Approach: create a dedicated named chain (pelagos-<net>-fwd / -dns) inside
+// `ip filter` and add a single jump rule from the relevant base chain.  Named
+// chains make cleanup deterministic — find the jump handle, delete it, then
+// flush and delete the named chain.
+//
+// All operations use `run_nft_quiet`: if `ip filter` does not exist (no
+// iptables on the system) the call silently succeeds without doing anything.
+
+/// Find all handles of "jump <target>" rules in a given nft chain.
+/// Returns an empty vec when the chain or table does not exist.
+fn find_jump_rule_handles(family: &str, table: &str, chain: &str, target: &str) -> Vec<u64> {
+    use std::process::Stdio as ProcStdio;
+    let output = match SysCmd::new("nft")
+        .args(["-a", "list", "chain", family, table, chain])
+        .stdout(ProcStdio::piped())
+        .stderr(ProcStdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!("jump {}", target);
+    let mut handles = Vec::new();
+    for line in text.lines() {
+        if line.contains(&needle) {
+            if let Some(pos) = line.rfind("handle ") {
+                let s = line[pos + 7..].trim();
+                if let Ok(h) = s.parse::<u64>() {
+                    handles.push(h);
+                }
+            }
+        }
+    }
+    handles
+}
+
+/// Delete all "jump <chain>" rules from a given nft base chain (idempotent).
+fn delete_jump_rules(family: &str, table: &str, base_chain: &str, target: &str) {
+    for handle in find_jump_rule_handles(family, table, base_chain, target) {
+        let script = format!("delete rule {family} {table} {base_chain} handle {handle}\n");
+        let _ = run_nft_quiet(&script);
+    }
+}
+
+/// Add iptables-nft compat FORWARD rules so container traffic is not blocked
+/// by `ip filter FORWARD`'s DROP policy (UFW, Docker, firewalld hosts).
+///
+/// Creates `ip filter pelagos-<net>-fwd`, adds src/dst CIDR accept rules,
+/// then jumps from `ip filter FORWARD`.  Idempotent: existing jump removed
+/// first, chain flushed before re-adding rules.
+fn add_iptables_nft_forward_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-fwd", net.name);
+    let cidr = net.subnet.cidr_string();
+    // Remove stale jump rule and flush the chain before re-adding.
+    delete_jump_rules("ip", "filter", "FORWARD", &chain);
+    let script = format!(
+        "add chain ip filter {chain}\n\
+         flush chain ip filter {chain}\n\
+         add rule ip filter {chain} ip saddr {cidr} accept\n\
+         add rule ip filter {chain} ip daddr {cidr} accept\n\
+         add rule ip filter FORWARD jump {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
+}
+
+/// Remove the iptables-nft compat FORWARD rules for a network.
+fn remove_iptables_nft_forward_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-fwd", net.name);
+    delete_jump_rules("ip", "filter", "FORWARD", &chain);
+    let script = format!(
+        "flush chain ip filter {chain}\n\
+         delete chain ip filter {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
+}
+
+/// Add iptables-nft compat INPUT rule for DNS on a network's bridge.
+fn add_iptables_nft_dns_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-dns", net.name);
+    let bridge = &net.bridge_name;
+    delete_jump_rules("ip", "filter", "INPUT", &chain);
+    let script = format!(
+        "add chain ip filter {chain}\n\
+         flush chain ip filter {chain}\n\
+         add rule ip filter {chain} iifname \"{bridge}\" udp dport 53 accept\n\
+         add rule ip filter INPUT jump {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
+}
+
+/// Remove the iptables-nft compat INPUT rule for DNS on a network's bridge.
+fn remove_iptables_nft_dns_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-dns", net.name);
+    delete_jump_rules("ip", "filter", "INPUT", &chain);
+    let script = format!(
+        "flush chain ip filter {chain}\n\
+         delete chain ip filter {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
 }
 
 /// Pipe an nft script to `nft -f -`, returning an error on non-zero exit.
@@ -1420,17 +1574,12 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         let script = build_nat_script(net);
         run_nft(&script)?;
 
-        // Also insert iptables FORWARD rules for compatibility with hosts
-        // running UFW, Docker, or other iptables-based firewalls that set
-        // the FORWARD chain policy to DROP.
-        //
-        // Purge any stale duplicates first (from previous crashes where the
-        // active set was lost but the kernel rules survived).
-        let cidr = net.subnet.cidr_string();
-        while run_quiet("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]).is_ok() {}
-        while run_quiet("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).is_ok() {}
-        let _ = run("iptables", &["-I", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
-        let _ = run("iptables", &["-I", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
+        // On iptables-nft hosts (UFW, Docker, firewalld), the ip filter FORWARD
+        // chain has policy DROP.  nft accept in our chain does not prevent that
+        // subsequent chain from dropping the packet, so we also add accept rules
+        // directly into ip filter FORWARD.  Silently skipped on pure-nftables or
+        // iptables-legacy systems where ip filter doesn't exist.
+        add_iptables_nft_forward_compat(net);
     }
 
     active.push(ns_name.to_string());
@@ -1494,7 +1643,6 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         .collect();
 
     let table = net.nft_table_name();
-    let cidr = net.subnet.cidr_string();
 
     if let Err(e) = file
         .seek(SeekFrom::Start(0))
@@ -1514,9 +1662,8 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         ns_name, net.name, remaining.len(), remaining
     );
     if remaining.is_empty() {
-        // Remove the iptables FORWARD rules added by enable_nat().
-        let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
-        let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
+        // Remove the iptables-nft compat FORWARD rules (no-op on non-iptables systems).
+        remove_iptables_nft_forward_compat(net);
 
         if read_port_forwards_count(&net.name) == 0 {
             // No active port forwards either — remove the entire ip table.
@@ -2863,25 +3010,6 @@ pub fn is_pasta_available() -> bool {
 
 fn run(cmd: &str, args: &[&str]) -> io::Result<()> {
     let status = SysCmd::new(cmd).args(args).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "`{} {}` exited with {}",
-            cmd,
-            args.join(" "),
-            status
-        )))
-    }
-}
-
-/// Like `run` but suppresses stderr (for best-effort cleanup loops).
-fn run_quiet(cmd: &str, args: &[&str]) -> io::Result<()> {
-    use std::process::Stdio as ProcStdio;
-    let status = SysCmd::new(cmd)
-        .args(args)
-        .stderr(ProcStdio::null())
-        .status()?;
     if status.success() {
         Ok(())
     } else {
