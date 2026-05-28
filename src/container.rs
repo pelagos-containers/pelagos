@@ -3589,7 +3589,41 @@ impl Command {
                             .map_err(|e| pre_exec_err("loopback up", e))?;
                     }
 
-                    // Step 1.61: Set container hostname in the UTS namespace.
+                    // Step 1.61: Pasta (root mode) — bind-mount this process's
+                    // netns to a stable path BEFORE exec so the parent can pass
+                    // it to pasta even if this process exits before the parent
+                    // reaches setup_pasta_network.
+                    //
+                    // We are still in the host mount namespace here (CLONE_NEWMNT
+                    // has not happened yet), so mounts made here are visible to
+                    // the parent.  The bind-mount survives exec and process exit.
+                    if is_pasta && !is_rootless {
+                        let pid = libc::getpid() as u32;
+                        let dir = b"/run/pelagos/pasta-ns\0";
+                        libc::mkdir(dir.as_ptr() as *const libc::c_char, 0o755);
+                        let mount_path = format!("/run/pelagos/pasta-ns/{}\0", pid);
+                        let mp = mount_path.as_ptr() as *const libc::c_char;
+                        // Create the empty bind-mount target file.
+                        let fd = libc::open(mp, libc::O_CREAT | libc::O_WRONLY, 0o644);
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        // Bind-mount /proc/thread-self/ns/net onto the stable path.
+                        let src = b"/proc/thread-self/ns/net\0";
+                        let fstype = b"\0";
+                        let rc = libc::mount(
+                            src.as_ptr() as *const libc::c_char,
+                            mp,
+                            fstype.as_ptr() as *const libc::c_char,
+                            libc::MS_BIND,
+                            std::ptr::null(),
+                        );
+                        if rc != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+
+                    // Step 1.62: Set container hostname in the UTS namespace.
                     if let Some(ref name) = hostname {
                         let r = libc::sethostname(name.as_ptr() as *const libc::c_char, name.len());
                         if r != 0 {
@@ -5067,16 +5101,16 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
+        // Pasta: spawn the relay after the child has unshared its NET namespace.
         //
-        // pasta is started AFTER exec because we need the container's network namespace
-        // to exist. The container may reach network syscalls (DNS, connect) before pasta
-        // has configured the TAP. We eliminate this race by temporarily stopping the
-        // container process (SIGSTOP), setting up pasta, then resuming it (SIGCONT).
+        // In root mode the child bind-mounts its own netns to
+        // /run/pelagos/pasta-ns/{pid} in pre_exec (step 1.61), before exec.
+        // setup_pasta_network detects the existing bind-mount and skips re-creating
+        // it.  This avoids the race where a fast command exits before the parent
+        // reaches this point.
         //
-        // SIGSTOP cannot be caught or ignored, so it reliably pauses the container.
-        // We stop/continue the actual container process (C, the grandchild in PID-ns
-        // containers) rather than the intermediate process P.
+        // SIGSTOP/SIGCONT below prevents the container from making network syscalls
+        // before pasta has configured the TAP interface.
         let pasta: Option<crate::network::PastaSetup> = if is_pasta {
             // find_container_pid returns C's host PID for PID-ns containers, or
             // child_inner.id() itself for non-PID-ns containers.

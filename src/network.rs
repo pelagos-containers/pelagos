@@ -587,29 +587,21 @@ pub fn bring_up_loopback() -> io::Result<()> {
 ///
 /// Idempotent — safe to call for every container spawn.
 fn ensure_bridge(net: &NetworkDef) -> io::Result<()> {
-    // Create bridge (ignore error if it already exists)
-    let _ = SysCmd::new("ip")
-        .args(["link", "add", &net.bridge_name, "type", "bridge"])
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Create bridge (create_bridge returns Ok if already exists)
+    crate::netlink::create_bridge(&net.bridge_name)?;
 
-    // Assign gateway IP (ignore error if already assigned)
-    let gw_cidr = net.subnet.gateway_cidr();
-    let _ = SysCmd::new("ip")
-        .args(["addr", "add", &gw_cidr, "dev", &net.bridge_name])
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Assign gateway IP (addr_add_ipv4 returns Ok if already assigned)
+    crate::netlink::addr_add_ipv4(
+        &net.bridge_name,
+        net.subnet.gateway(),
+        net.subnet.prefix_len,
+    )?;
 
-    // Bring up (idempotent)
-    run("ip", &["link", "set", &net.bridge_name, "up"])?;
+    // Bring up (idempotent — RTM_NEWLINK IFF_UP is a no-op when already up)
+    crate::netlink::link_set_up(&net.bridge_name)?;
 
-    // Assign IPv6 ULA gateway to bridge (idempotent; errors suppressed — host
-    // may not have IPv6 support, which is fine).
-    let gw6_cidr = format!("{}/64", net.ipv6_gateway());
-    let _ = SysCmd::new("ip")
-        .args(["-6", "addr", "add", &gw6_cidr, "dev", &net.bridge_name])
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Assign IPv6 ULA gateway to bridge (errors suppressed — host may not have IPv6)
+    let _ = crate::netlink::addr_add_ipv6(&net.bridge_name, net.ipv6_gateway(), 64, false);
 
     Ok(())
 }
@@ -770,47 +762,47 @@ pub fn setup_bridge_network(
     let container_ip = allocate_ip(&net_def)?;
     let (veth_host, veth_peer) = veth_names_for(ns_name);
 
-    // 1. Create the named netns — this creates /run/netns/{ns_name}
-    run("ip", &["netns", "add", ns_name])?;
+    // 1. Create the named netns — creates /run/netns/{ns_name}
+    crate::netlink::netns_create(ns_name)?;
 
-    // 2. Bring up loopback inside the named netns (kernel assigns 127.0.0.1/8)
-    run("ip", &["-n", ns_name, "link", "set", "lo", "up"])?;
+    // 2. Bring up loopback inside the named netns
+    let netns_path = format!("/run/netns/{}", ns_name);
+    crate::netlink::in_netns(&netns_path, || crate::netlink::link_set_up("lo"))?;
 
     // 3. Create veth pair in the host netns
-    run(
-        "ip",
-        &[
-            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
-        ],
-    )?;
+    crate::netlink::create_veth(&veth_host, &veth_peer)?;
 
-    // 4. Move the peer into the named netns
-    run("ip", &["link", "set", &veth_peer, "netns", ns_name])?;
+    // 4. Move the peer into the named netns and atomically rename it to eth0
+    {
+        let nfd = unsafe {
+            libc::open(
+                std::ffi::CString::new(netns_path.as_bytes())
+                    .unwrap()
+                    .as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if nfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = crate::netlink::link_move_to_netns(&veth_peer, nfd, Some("eth0"));
+        unsafe { libc::close(nfd) };
+        result?;
+    }
 
-    let ip_cidr = format!("{}/{}", container_ip, net_def.subnet.prefix_len);
-    let gw_str = net_def.gateway.to_string();
+    let gw = net_def.gateway;
+    let prefix = net_def.subnet.prefix_len;
 
-    // 5. Configure eth0 inside the named netns (rename, assign IP, bring up, add route)
-    run(
-        "ip",
-        &["-n", ns_name, "link", "set", &veth_peer, "name", "eth0"],
-    )?;
-    run(
-        "ip",
-        &["-n", ns_name, "addr", "add", &ip_cidr, "dev", "eth0"],
-    )?;
-    run("ip", &["-n", ns_name, "link", "set", "eth0", "up"])?;
-    run(
-        "ip",
-        &["-n", ns_name, "route", "add", "default", "via", &gw_str],
-    )?;
+    // 5. Configure eth0 inside the named netns (assign IP, bring up, add route)
+    crate::netlink::in_netns(&netns_path, move || {
+        crate::netlink::addr_add_ipv4("eth0", container_ip, prefix)?;
+        crate::netlink::link_set_up("eth0")?;
+        crate::netlink::route_add_default_ipv4(gw, "eth0")
+    })?;
 
     // 6. Attach host-side veth to bridge and bring it up
-    run(
-        "ip",
-        &["link", "set", &veth_host, "master", &net_def.bridge_name],
-    )?;
-    run("ip", &["link", "set", &veth_host, "up"])?;
+    crate::netlink::link_set_master(&veth_host, &net_def.bridge_name)?;
+    crate::netlink::link_set_up(&veth_host)?;
 
     // 6b. Configure IPv6 dual-stack on the container's eth0.
     //     Errors are non-fatal — container falls back to IPv4-only.
@@ -890,7 +882,7 @@ pub fn teardown_network(mut setup: NetworkSetup) {
         "FREE_START netns={} veth={} network={} nat={}",
         setup.ns_name, setup.veth_host, setup.network_name, setup.nat_enabled
     );
-    if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
+    if let Err(e) = crate::netlink::link_del(&setup.veth_host) {
         log::warn!("network teardown veth (non-fatal): {}", e);
     }
     log::info!(target: "pelagos::teardown", "FREE_VETH veth={}", setup.veth_host);
@@ -967,6 +959,28 @@ fn kill_netns_processes(ns_name: &str) {
     }
 }
 
+/// Unmount and unlink a named network namespace at `/run/netns/{name}`.
+fn netns_del(ns_name: &str) -> io::Result<()> {
+    let path = format!("/run/netns/{}", ns_name);
+    let cpath = std::ffi::CString::new(path.as_bytes())
+        .map_err(|_| io::Error::other("invalid netns name"))?;
+    #[cfg(target_os = "linux")]
+    {
+        let ret = unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ENOENT) {
+                return Err(e);
+            }
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Remove a named network namespace, retrying briefly on `EBUSY`.
 ///
 /// `ip netns del` calls `umount2(path, MNT_DETACH)` then `unlink(path)`.
@@ -996,11 +1010,11 @@ fn delete_netns(ns_name: &str) {
         if !std::path::Path::new(&netns_path).exists() {
             return; // Already gone.
         }
-        match run("ip", &["netns", "del", ns_name]) {
+        match netns_del(ns_name) {
             Ok(()) => return,
             Err(e) => {
                 log::debug!(
-                    "network teardown: ip netns del {} failed (attempt {}/{}): {}",
+                    "network teardown: netns_del {} failed (attempt {}/{}): {}",
                     ns_name,
                     attempt + 1,
                     RETRIES,
@@ -1015,7 +1029,7 @@ fn delete_netns(ns_name: &str) {
     // that netns_exists() returns false and NAT/port-forward refcounts stay
     // correct (see issue #183).  The orphaned mount is GC'd by the kernel.
     log::warn!(
-        "network teardown: ip netns del {} failed after {} retries; \
+        "network teardown: netns_del {} failed after {} retries; \
          falling back to lazy unmount + unlink (issue #183)",
         ns_name,
         RETRIES
@@ -1059,40 +1073,42 @@ pub fn attach_network_to_netns(
     let (veth_host, veth_peer) = veth_names_for_network(ns_name, network_name);
 
     // 1. Create veth pair in host netns
-    run(
-        "ip",
-        &[
-            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
-        ],
-    )?;
+    crate::netlink::create_veth(&veth_host, &veth_peer)?;
 
-    // 2. Move the peer into the existing named netns
-    run("ip", &["link", "set", &veth_peer, "netns", ns_name])?;
+    // 2. Move the peer into the existing named netns, renaming it atomically
+    let netns_path = format!("/run/netns/{}", ns_name);
+    {
+        let nfd = unsafe {
+            libc::open(
+                std::ffi::CString::new(netns_path.as_bytes())
+                    .map_err(|_| io::Error::other("invalid ns_name"))?
+                    .as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if nfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mv = crate::netlink::link_move_to_netns(&veth_peer, nfd, Some(iface_name));
+        unsafe { libc::close(nfd) };
+        mv?;
+    }
 
-    let ip_cidr = format!("{}/{}", container_ip, net_def.subnet.prefix_len);
-
-    // 3. Configure the interface inside the netns (rename, assign IP, bring up)
-    run(
-        "ip",
-        &["-n", ns_name, "link", "set", &veth_peer, "name", iface_name],
-    )?;
-    run(
-        "ip",
-        &["-n", ns_name, "addr", "add", &ip_cidr, "dev", iface_name],
-    )?;
-    run("ip", &["-n", ns_name, "link", "set", iface_name, "up"])?;
-
-    // The kernel automatically creates the subnet route when the interface
-    // comes up with an IP in CIDR notation (e.g. 10.99.2.2/24 → route for
-    // 10.99.2.0/24 dev eth1). No explicit `route add` needed — and attempting
-    // one would fail with EEXIST.
+    // 3. Configure the interface inside the netns (assign IP, bring up)
+    //    The kernel automatically creates the subnet route when the interface
+    //    comes up with an IP in CIDR notation.  No explicit `route add` needed.
+    {
+        let iface = iface_name.to_string();
+        let prefix = net_def.subnet.prefix_len;
+        crate::netlink::in_netns(&netns_path, move || {
+            crate::netlink::addr_add_ipv4(&iface, container_ip, prefix)?;
+            crate::netlink::link_set_up(&iface)
+        })?;
+    }
 
     // 4. Attach host-side veth to bridge and bring it up
-    run(
-        "ip",
-        &["link", "set", &veth_host, "master", &net_def.bridge_name],
-    )?;
-    run("ip", &["link", "set", &veth_host, "up"])?;
+    crate::netlink::link_set_master(&veth_host, &net_def.bridge_name)?;
+    crate::netlink::link_set_up(&veth_host)?;
 
     // Secondary interfaces get IPv6 too (subnet route only, no default route).
     let ipv6_container_ip = setup_ipv6_secondary(&net_def, ns_name, iface_name);
@@ -1117,7 +1133,7 @@ pub fn attach_network_to_netns(
 /// primary network owns it). Only the host-side veth is deleted — the kernel
 /// cascades removal of the container-side peer.
 pub fn teardown_secondary_network(setup: &NetworkSetup) {
-    if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
+    if let Err(e) = crate::netlink::link_del(&setup.veth_host) {
         log::warn!("secondary network teardown veth (non-fatal): {}", e);
     }
 }
@@ -1145,9 +1161,6 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
             return None;
         }
     };
-    let gw6 = net.ipv6_gateway().to_string();
-    let ip6_cidr = format!("{}/64", ip6);
-
     // Assign IPv6 address to eth0 inside the named netns.
     //
     // `nodad` skips Duplicate Address Detection.  DAD puts the address in
@@ -1156,24 +1169,18 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
     // consistent first-packet loss.  Pelagos ULA addresses are derived
     // deterministically (FNV-1a of the network name + sequential counter), so
     // the collision probability is negligible and DAD adds no safety value.
-    if let Err(e) = run(
-        "ip",
-        &[
-            "-n", ns_name, "addr", "add", &ip6_cidr, "dev", "eth0", "nodad",
-        ],
-    ) {
-        log::warn!("IPv6 addr add failed for {} — IPv4-only: {}", ns_name, e);
-        return None;
-    }
-    // Add default IPv6 route via the bridge gateway.
-    if let Err(e) = run(
-        "ip",
-        &[
-            "-n", ns_name, "-6", "route", "add", "default", "via", &gw6, "dev", "eth0",
-        ],
-    ) {
-        log::warn!("IPv6 route add failed for {} — IPv4-only: {}", ns_name, e);
-        return None;
+    let netns_path = format!("/run/netns/{}", ns_name);
+    {
+        let ip6_for_ns = ip6;
+        let gw6_for_ns = net.ipv6_gateway();
+        let res = crate::netlink::in_netns(&netns_path, move || {
+            crate::netlink::addr_add_ipv6("eth0", ip6_for_ns, 64, true)?;
+            crate::netlink::route_add_default_ipv6(gw6_for_ns, "eth0")
+        });
+        if let Err(e) = res {
+            log::warn!("IPv6 addr/route failed for {} — IPv4-only: {}", ns_name, e);
+            return None;
+        }
     }
 
     // Pre-seed the NDP neighbor entry for the gateway with state `stale`.
@@ -1189,22 +1196,37 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
     // recreated), so the entry is virtually always correct.  If it is ever
     // wrong the kernel self-corrects after the first NDP response.
     let bridge_mac_path = format!("/sys/class/net/{}/address", net.bridge_name);
-    if let Ok(mac) = std::fs::read_to_string(&bridge_mac_path) {
-        let mac = mac.trim();
-        if let Err(e) = run(
-            "ip",
-            &[
-                "-n", ns_name, "-6", "neigh", "add", &gw6, "lladdr", mac, "dev", "eth0", "nud",
-                "stale",
-            ],
-        ) {
-            log::debug!("IPv6 NDP pre-seed failed (non-fatal): {}", e);
-        } else {
-            log::debug!("IPv6: pre-seeded NDP for {} lladdr {} (stale)", gw6, mac);
+    if let Ok(mac_str) = std::fs::read_to_string(&bridge_mac_path) {
+        let mac_str = mac_str.trim();
+        let mac = parse_mac(mac_str);
+        match mac {
+            Some(mac_bytes) => {
+                let gw6 = net.ipv6_gateway();
+                let res = crate::netlink::in_netns(&netns_path, move || {
+                    crate::netlink::neigh_add_ipv6("eth0", gw6, &mac_bytes)
+                });
+                if let Err(e) = res {
+                    log::debug!("IPv6 NDP pre-seed failed (non-fatal): {}", e);
+                } else {
+                    log::debug!(
+                        "IPv6: pre-seeded NDP for {} lladdr {} (stale)",
+                        gw6,
+                        mac_str
+                    );
+                }
+            }
+            None => {
+                log::debug!("IPv6 NDP pre-seed: could not parse MAC '{}'", mac_str);
+            }
         }
     }
 
-    log::debug!("IPv6: {} assigned {} (gw {})", ns_name, ip6, gw6);
+    log::debug!(
+        "IPv6: {} assigned {} (gw {})",
+        ns_name,
+        ip6,
+        net.ipv6_gateway()
+    );
     Some(ip6)
 }
 
@@ -1226,11 +1248,11 @@ fn setup_ipv6_secondary(net: &NetworkDef, ns_name: &str, iface: &str) -> Option<
             return None;
         }
     };
-    let ip6_cidr = format!("{}/64", ip6);
-    if let Err(e) = run(
-        "ip",
-        &["-n", ns_name, "addr", "add", &ip6_cidr, "dev", iface],
-    ) {
+    let netns_path = format!("/run/netns/{}", ns_name);
+    let iface_owned = iface.to_string();
+    if let Err(e) = crate::netlink::in_netns(&netns_path, move || {
+        crate::netlink::addr_add_ipv6(&iface_owned, ip6, 64, true)
+    }) {
         log::warn!(
             "IPv6 addr add failed for {} ({}) — IPv4-only: {}",
             ns_name,
@@ -1240,6 +1262,19 @@ fn setup_ipv6_secondary(net: &NetworkDef, ns_name: &str, iface: &str) -> Option<
         return None;
     }
     Some(ip6)
+}
+
+/// Parse a colon-separated MAC string (e.g. "aa:bb:cc:dd:ee:ff") into 6 bytes.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(out)
 }
 
 // ── N3: NAT / MASQUERADE ─────────────────────────────────────────────────────
@@ -1256,14 +1291,168 @@ fn build_nat_script(net: &NetworkDef) -> String {
     let table = net.nft_table_name();
     let cidr = net.subnet.cidr_string();
     let bridge = &net.bridge_name;
+    // Forward chain at priority -100 so it runs before any iptables chains
+    // (iptables is effectively priority 0).  This ensures our accept rules
+    // win on hosts with UFW/Docker/firewalld setting FORWARD policy to DROP.
     format!(
         "add table ip {table}\n\
          add chain ip {table} postrouting {{ type nat hook postrouting priority 100; }}\n\
          add rule ip {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade\n\
-         add chain ip {table} forward {{ type filter hook forward priority 0; }}\n\
+         add chain ip {table} forward {{ type filter hook forward priority -100; }}\n\
          add rule ip {table} forward ip saddr {cidr} accept\n\
          add rule ip {table} forward ip daddr {cidr} accept\n"
     )
+}
+
+/// Add DNS INPUT rules for a network so containers can reach the DNS daemon.
+///
+/// Two layers:
+/// 1. Per-network nft table INPUT chain at priority -100 — handles systems
+///    that have no iptables (pure nftables), where this is the only filter.
+/// 2. `ip filter INPUT` compat chain — handles iptables-nft systems where
+///    UFW/firewalld sets INPUT policy to DROP.  Silently skipped when the
+///    `ip filter` table does not exist (iptables not installed).
+///
+/// Idempotent: flushes our chain before re-adding the rule, so repeated
+/// calls on the same network are safe.
+pub fn add_dns_input_rule(net: &NetworkDef) -> io::Result<()> {
+    let table = net.nft_table_name();
+    let bridge = &net.bridge_name;
+    // Layer 1: per-network table at priority -100 (pure-nftables systems).
+    let script = format!(
+        "add table ip {table}\n\
+         add chain ip {table} input {{ type filter hook input priority -100; }}\n\
+         flush chain ip {table} input\n\
+         add rule ip {table} input iifname \"{bridge}\" udp dport 53 accept\n"
+    );
+    run_nft(&script)?;
+    // Layer 2: iptables-nft compat (best-effort; silently skipped on legacy/no iptables).
+    add_iptables_nft_dns_compat(net);
+    Ok(())
+}
+
+/// Remove the DNS INPUT rules installed by [`add_dns_input_rule`].
+///
+/// Cleans up both the per-network nft table INPUT chain and the iptables-nft
+/// compat chain in `ip filter INPUT`.  Both operations are best-effort.
+pub fn remove_dns_input_rule(net: &NetworkDef) {
+    let table = net.nft_table_name();
+    let script = format!(
+        "flush chain ip {table} input\n\
+         delete chain ip {table} input\n"
+    );
+    let _ = run_nft_quiet(&script);
+    // Layer 2 cleanup.
+    remove_iptables_nft_dns_compat(net);
+}
+
+// ── iptables-nft compatibility helpers ───────────────────────────────────────
+//
+// On systems using iptables-nft, iptables rules live in nftables tables
+// (`ip filter`).  Because nft `accept` in one base chain does not prevent
+// subsequent base chains (e.g. `ip filter FORWARD`) from running and applying
+// their DROP policy, we must also write rules directly into `ip filter`.
+//
+// Approach: create a dedicated named chain (pelagos-<net>-fwd / -dns) inside
+// `ip filter` and add a single jump rule from the relevant base chain.  Named
+// chains make cleanup deterministic — find the jump handle, delete it, then
+// flush and delete the named chain.
+//
+// All operations use `run_nft_quiet`: if `ip filter` does not exist (no
+// iptables on the system) the call silently succeeds without doing anything.
+
+/// Find all handles of "jump <target>" rules in a given nft chain.
+/// Returns an empty vec when the chain or table does not exist.
+fn find_jump_rule_handles(family: &str, table: &str, chain: &str, target: &str) -> Vec<u64> {
+    use std::process::Stdio as ProcStdio;
+    let output = match SysCmd::new("nft")
+        .args(["-a", "list", "chain", family, table, chain])
+        .stdout(ProcStdio::piped())
+        .stderr(ProcStdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!("jump {}", target);
+    let mut handles = Vec::new();
+    for line in text.lines() {
+        if line.contains(&needle) {
+            if let Some(pos) = line.rfind("handle ") {
+                let s = line[pos + 7..].trim();
+                if let Ok(h) = s.parse::<u64>() {
+                    handles.push(h);
+                }
+            }
+        }
+    }
+    handles
+}
+
+/// Delete all "jump <chain>" rules from a given nft base chain (idempotent).
+fn delete_jump_rules(family: &str, table: &str, base_chain: &str, target: &str) {
+    for handle in find_jump_rule_handles(family, table, base_chain, target) {
+        let script = format!("delete rule {family} {table} {base_chain} handle {handle}\n");
+        let _ = run_nft_quiet(&script);
+    }
+}
+
+/// Add iptables-nft compat FORWARD rules so container traffic is not blocked
+/// by `ip filter FORWARD`'s DROP policy (UFW, Docker, firewalld hosts).
+///
+/// Creates `ip filter pelagos-<net>-fwd`, adds src/dst CIDR accept rules,
+/// then jumps from `ip filter FORWARD`.  Idempotent: existing jump removed
+/// first, chain flushed before re-adding rules.
+fn add_iptables_nft_forward_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-fwd", net.name);
+    let cidr = net.subnet.cidr_string();
+    // Remove stale jump rule and flush the chain before re-adding.
+    delete_jump_rules("ip", "filter", "FORWARD", &chain);
+    let script = format!(
+        "add chain ip filter {chain}\n\
+         flush chain ip filter {chain}\n\
+         add rule ip filter {chain} ip saddr {cidr} accept\n\
+         add rule ip filter {chain} ip daddr {cidr} accept\n\
+         add rule ip filter FORWARD jump {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
+}
+
+/// Remove the iptables-nft compat FORWARD rules for a network.
+fn remove_iptables_nft_forward_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-fwd", net.name);
+    delete_jump_rules("ip", "filter", "FORWARD", &chain);
+    let script = format!(
+        "flush chain ip filter {chain}\n\
+         delete chain ip filter {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
+}
+
+/// Add iptables-nft compat INPUT rule for DNS on a network's bridge.
+fn add_iptables_nft_dns_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-dns", net.name);
+    let bridge = &net.bridge_name;
+    delete_jump_rules("ip", "filter", "INPUT", &chain);
+    let script = format!(
+        "add chain ip filter {chain}\n\
+         flush chain ip filter {chain}\n\
+         add rule ip filter {chain} iifname \"{bridge}\" udp dport 53 accept\n\
+         add rule ip filter INPUT jump {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
+}
+
+/// Remove the iptables-nft compat INPUT rule for DNS on a network's bridge.
+fn remove_iptables_nft_dns_compat(net: &NetworkDef) {
+    let chain = format!("pelagos-{}-dns", net.name);
+    delete_jump_rules("ip", "filter", "INPUT", &chain);
+    let script = format!(
+        "flush chain ip filter {chain}\n\
+         delete chain ip filter {chain}\n"
+    );
+    let _ = run_nft_quiet(&script);
 }
 
 /// Pipe an nft script to `nft -f -`, returning an error on non-zero exit.
@@ -1420,17 +1609,12 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         let script = build_nat_script(net);
         run_nft(&script)?;
 
-        // Also insert iptables FORWARD rules for compatibility with hosts
-        // running UFW, Docker, or other iptables-based firewalls that set
-        // the FORWARD chain policy to DROP.
-        //
-        // Purge any stale duplicates first (from previous crashes where the
-        // active set was lost but the kernel rules survived).
-        let cidr = net.subnet.cidr_string();
-        while run_quiet("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]).is_ok() {}
-        while run_quiet("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).is_ok() {}
-        let _ = run("iptables", &["-I", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
-        let _ = run("iptables", &["-I", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
+        // On iptables-nft hosts (UFW, Docker, firewalld), the ip filter FORWARD
+        // chain has policy DROP.  nft accept in our chain does not prevent that
+        // subsequent chain from dropping the packet, so we also add accept rules
+        // directly into ip filter FORWARD.  Silently skipped on pure-nftables or
+        // iptables-legacy systems where ip filter doesn't exist.
+        add_iptables_nft_forward_compat(net);
     }
 
     active.push(ns_name.to_string());
@@ -1494,7 +1678,6 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         .collect();
 
     let table = net.nft_table_name();
-    let cidr = net.subnet.cidr_string();
 
     if let Err(e) = file
         .seek(SeekFrom::Start(0))
@@ -1514,9 +1697,8 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         ns_name, net.name, remaining.len(), remaining
     );
     if remaining.is_empty() {
-        // Remove the iptables FORWARD rules added by enable_nat().
-        let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
-        let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
+        // Remove the iptables-nft compat FORWARD rules (no-op on non-iptables systems).
+        remove_iptables_nft_forward_compat(net);
 
         if read_port_forwards_count(&net.name) == 0 {
             // No active port forwards either — remove the entire ip table.
@@ -2496,33 +2678,53 @@ pub fn setup_pasta_network(
         let ns_dir = std::path::Path::new("/run/pelagos/pasta-ns");
         std::fs::create_dir_all(ns_dir)?;
         let mount_path = ns_dir.join(format!("{}", child_pid));
-        // Create an empty regular file as the bind-mount target.
-        std::fs::write(&mount_path, b"")
-            .map_err(|e| io::Error::new(e.kind(), format!("create netns mount point: {}", e)))?;
-        let src = std::ffi::CString::new(format!("/proc/{}/ns/net", child_pid)).unwrap();
-        let dst = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
-        let fstype = std::ffi::CString::new("").unwrap();
-        // SAFETY: all pointers are valid CStrings; MS_BIND is a safe mount flag.
-        let rc = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                fstype.as_ptr(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            )
+
+        // The container pre_exec (step 1.61) bind-mounts its own netns here
+        // before exec so the mount survives fast-exiting commands.  Detect that
+        // case by checking whether the file is already an nsfs bind-mount
+        // (f_type == NSFS_MAGIC = 0x6e736673).  If not, do the mount ourselves
+        // using /proc/{child_pid}/ns/net (works as long as the process is alive).
+        const NSFS_MAGIC: libc::__fsword_t = 0x6e736673;
+        let already_mounted = if mount_path.exists() {
+            let cpath = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
+            let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: cpath is valid, sfs is zeroed.
+            let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut sfs) };
+            rc == 0 && sfs.f_type == NSFS_MAGIC
+        } else {
+            false
         };
-        if rc == -1 {
-            let _ = std::fs::remove_file(&mount_path);
-            return Err(io::Error::new(
-                io::Error::last_os_error().kind(),
-                format!(
-                    "mount --bind /proc/{}/ns/net {}: {}",
-                    child_pid,
-                    mount_path.display(),
-                    io::Error::last_os_error()
-                ),
-            ));
+
+        if !already_mounted {
+            // Create an empty regular file as the bind-mount target.
+            std::fs::write(&mount_path, b"").map_err(|e| {
+                io::Error::new(e.kind(), format!("create netns mount point: {}", e))
+            })?;
+            let src = std::ffi::CString::new(format!("/proc/{}/ns/net", child_pid)).unwrap();
+            let dst = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
+            let fstype = std::ffi::CString::new("").unwrap();
+            // SAFETY: all pointers are valid CStrings; MS_BIND is a safe mount flag.
+            let rc = unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    fstype.as_ptr(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            if rc == -1 {
+                let _ = std::fs::remove_file(&mount_path);
+                return Err(io::Error::new(
+                    io::Error::last_os_error().kind(),
+                    format!(
+                        "mount --bind /proc/{}/ns/net {}: {}",
+                        child_pid,
+                        mount_path.display(),
+                        io::Error::last_os_error()
+                    ),
+                ));
+            }
         }
         args.push("--netns".to_string());
         args.push(mount_path.to_string_lossy().into_owned());
@@ -2857,41 +3059,6 @@ pub fn is_pasta_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn run(cmd: &str, args: &[&str]) -> io::Result<()> {
-    let status = SysCmd::new(cmd).args(args).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "`{} {}` exited with {}",
-            cmd,
-            args.join(" "),
-            status
-        )))
-    }
-}
-
-/// Like `run` but suppresses stderr (for best-effort cleanup loops).
-fn run_quiet(cmd: &str, args: &[&str]) -> io::Result<()> {
-    use std::process::Stdio as ProcStdio;
-    let status = SysCmd::new(cmd)
-        .args(args)
-        .stderr(ProcStdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "`{} {}` exited with {}",
-            cmd,
-            args.join(" "),
-            status
-        )))
-    }
 }
 
 #[cfg(test)]

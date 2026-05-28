@@ -640,19 +640,21 @@ runs) or not decrementing at all (table present after both exit).
 
 ### `test_nat_iptables_forward_rules` — N3
 **Requires:** root, rootfs
+**Skipped on:** systems without `ip filter` table (no iptables-nft installed)
 
-Spawns a bridge+NAT container running `sleep 3`. While it sleeps, runs
-`iptables -C FORWARD -s 172.19.0.0/24 -j ACCEPT` and
-`iptables -C FORWARD -d 172.19.0.0/24 -j ACCEPT` on the host, asserting both
-exit 0. After `wait()`, asserts the source rule is gone (exit non-zero).
+Spawns a bridge+NAT container running `sleep 3`. While it sleeps, asserts that
+the nft compat chain `ip filter pelagos-pelagos0-fwd` exists and that a jump
+rule for it is present in `ip filter FORWARD`. After `wait()`, asserts the
+chain is gone.
 
-These iptables rules are critical on hosts with UFW or Docker, which set
-`iptables FORWARD policy DROP`. Without them, nftables MASQUERADE works for
-ICMP but TCP/UDP is silently dropped — DNS resolution, HTTP requests, and
-`apk add` all fail while ping succeeds. This was a real production bug.
+On hosts with UFW or Docker, the iptables-nft chain `ip filter FORWARD` has
+`policy drop`. An nft `accept` verdict in one base chain does not prevent
+subsequent base chains from running, so pelagos writes accept rules directly
+into `ip filter FORWARD` via a named jump chain (`pelagos-<net>-fwd`). This
+ensures TCP/UDP flows when ICMP would work without the fix.
 
-Failure indicates `enable_nat()` is not adding the iptables FORWARD rules,
-or `disable_nat()` is not cleaning them up.
+Failure indicates `enable_nat()` is not adding the compat rules, or
+`disable_nat()` is not cleaning them up.
 
 ---
 
@@ -772,9 +774,10 @@ causing the test to fail.
 **Requires:** root, rootfs
 
 Spawns a bridge+NAT container (`sleep 60`), records veth name, netns name, and
-verifies iptables FORWARD rules exist. Then SIGKILLs the container and calls
-`wait()`. Asserts all four resource types are cleaned up: veth pair, named netns,
-nftables table, and iptables FORWARD rules.
+(on iptables-nft systems) verifies the nft compat chain `pelagos-pelagos0-fwd`
+exists in `ip filter`. Then SIGKILLs the container and calls `wait()`. Asserts
+all resource types are cleaned up: veth pair, named netns, nftables table, and
+the iptables-nft compat chain.
 
 All other cleanup tests use normal container exit. This catches teardown bugs that
 only manifest when the container process dies unexpectedly — e.g. if `wait()` skips

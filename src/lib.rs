@@ -20,6 +20,7 @@ pub mod image;
 pub mod landlock;
 pub mod lisp;
 pub mod mac;
+pub mod netlink;
 pub mod network;
 pub mod notif;
 pub mod oci;
