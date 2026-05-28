@@ -255,7 +255,68 @@ pub async fn remove(
 // ── Wait ──────────────────────────────────────────────────────────────────────
 
 pub async fn wait(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
-    // Poll until container exits
+    use futures_util::StreamExt;
+    use inotify::{EventMask, Inotify, WatchMask};
+
+    let state_path = format!("/run/pelagos/containers/{}/state.json", id);
+
+    // Try inotify-based wait first; fall back to polling on init failure.
+    'inotify: {
+        let Ok(inotify) = Inotify::init() else {
+            break 'inotify;
+        };
+        if inotify
+            .watches()
+            .add(&state_path, WatchMask::MODIFY | WatchMask::DELETE_SELF)
+            .is_err()
+        {
+            break 'inotify;
+        }
+        // Check state AFTER watch is installed to close the TOCTOU window.
+        match pelagos_state::read_state(&id) {
+            Ok(c) if !c.is_running() => {
+                return (
+                    StatusCode::OK,
+                    Json(json!({"StatusCode": c.exit_code.unwrap_or(0)})),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"message": format!("container '{}' not found", id)})),
+                );
+            }
+            _ => {}
+        }
+        let Ok(mut stream) = inotify.into_event_stream(vec![0u8; 512]) else {
+            break 'inotify;
+        };
+        while let Some(Ok(ev)) = stream.next().await {
+            if ev.mask.contains(EventMask::DELETE_SELF) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"message": format!("container '{}' not found", id)})),
+                );
+            }
+            match pelagos_state::read_state(&id) {
+                Ok(c) if !c.is_running() => {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({"StatusCode": c.exit_code.unwrap_or(0)})),
+                    );
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"message": format!("container '{}' not found", id)})),
+                    );
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    // Fallback: polling (used when inotify init fails or stream ends unexpectedly).
     loop {
         match pelagos_state::read_state(&id) {
             Ok(c) if !c.is_running() => {
@@ -336,42 +397,182 @@ pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Respons
             .unwrap();
     }
 
-    // follow=true: stream lines as they arrive until the container exits.
-    let stream = futures_util::stream::unfold(
-        (log_path, container_name, 0u64),
-        move |(path, name, offset)| async move {
-            loop {
-                let data = tokio::fs::read(&path).await.unwrap_or_default();
-                if data.len() as u64 > offset {
-                    let new_bytes = &data[offset as usize..];
-                    let new_offset = data.len() as u64;
-                    let mut body: Vec<u8> = Vec::new();
-                    for line in std::str::from_utf8(new_bytes).unwrap_or("").lines() {
-                        let mut payload = line.as_bytes().to_vec();
-                        payload.push(b'\n');
-                        body.extend_from_slice(&docker_frame_header(1, payload.len() as u32));
-                        body.extend_from_slice(&payload);
-                    }
-                    if !body.is_empty() {
-                        return Some((Ok::<_, std::io::Error>(body), (path, name, new_offset)));
-                    }
-                }
-                let still_running = pelagos_state::read_state(&name)
-                    .map(|s| s.is_running())
-                    .unwrap_or(false);
-                if !still_running {
-                    return None;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // follow=true: stream lines as they arrive via inotify until the container exits.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
+
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        use inotify::{EventMask, Inotify, WatchMask};
+        use tokio::io::AsyncReadExt;
+
+        let inotify = match Inotify::init() {
+            Ok(i) => i,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
             }
-        },
-    );
+        };
+
+        let log_wd = match inotify.watches().add(
+            &log_path,
+            WatchMask::MODIFY
+                | WatchMask::CLOSE_WRITE
+                | WatchMask::DELETE_SELF
+                | WatchMask::MOVE_SELF,
+        ) {
+            Ok(wd) => wd,
+            Err(_) => return,
+        };
+
+        let state_path = format!("/run/pelagos/containers/{}/state.json", container_name);
+        let _ = inotify
+            .watches()
+            .add(&state_path, WatchMask::MODIFY | WatchMask::DELETE_SELF);
+
+        let mut file = match tokio::fs::File::open(&log_path).await {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let mut read_buf = vec![0u8; 65536];
+        let mut line_buf: Vec<u8> = Vec::new();
+
+        // Drain any content already in the log file before entering the event loop.
+        loop {
+            match file.read(&mut read_buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = frames_from_bytes(&mut line_buf, &read_buf[..n]);
+                    if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut event_stream = match inotify.into_event_stream(vec![0u8; 4096]) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+
+        loop {
+            // Wait for an inotify event or a 1-second fallback tick.
+            let ev_opt = tokio::select! {
+                ev = event_stream.next() => match ev {
+                    Some(Ok(e)) => Some(e),
+                    Some(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
+                    None => break,
+                },
+                // Safety-net: if inotify misses an event (e.g. state.json
+                // written via rename on some kernels), poll at most once per
+                // second so we don't hang indefinitely.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => None,
+            };
+
+            let mut log_closed = false;
+
+            if let Some(ev) = ev_opt {
+                if ev.wd == log_wd
+                    && (ev.mask.contains(EventMask::DELETE_SELF)
+                        || ev.mask.contains(EventMask::MOVE_SELF))
+                {
+                    break;
+                }
+
+                // CLOSE_WRITE on the log: the watcher relay closed the file,
+                // meaning the container has exited. Drain then stop.
+                if ev.wd == log_wd && ev.mask.contains(EventMask::CLOSE_WRITE) {
+                    log_closed = true;
+                }
+
+                // Read any new bytes from the log file (MODIFY on log or Q_OVERFLOW).
+                if ev.mask.contains(EventMask::Q_OVERFLOW)
+                    || (ev.mask.contains(EventMask::MODIFY) && ev.wd == log_wd)
+                    || log_closed
+                {
+                    loop {
+                        match file.read(&mut read_buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let chunk = frames_from_bytes(&mut line_buf, &read_buf[..n]);
+                                if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+
+            if log_closed {
+                break;
+            }
+
+            let still_running = pelagos_state::read_state(&container_name)
+                .map(|s| s.is_running())
+                .unwrap_or(false);
+            if !still_running {
+                // Drain any tail that arrived between the last MODIFY and state write.
+                loop {
+                    match file.read(&mut read_buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let chunk = frames_from_bytes(&mut line_buf, &read_buf[..n]);
+                            if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                break;
+            }
+        }
+
+        // Flush any partial line that never received its newline.
+        if !line_buf.is_empty() {
+            let mut out = Vec::with_capacity(8 + line_buf.len());
+            out.extend_from_slice(&docker_frame_header(1, line_buf.len() as u32));
+            out.extend_from_slice(&line_buf);
+            let _ = tx.send(Ok(out)).await;
+        }
+    });
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
 
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// Split `data` into newline-terminated docker-multiplexed frames.
+/// Bytes that don't end with `\n` are appended to `line_buf` for the next call.
+fn frames_from_bytes(line_buf: &mut Vec<u8>, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        if let Some(nl) = data[pos..].iter().position(|&b| b == b'\n') {
+            let end = pos + nl + 1;
+            line_buf.extend_from_slice(&data[pos..end]);
+            out.extend_from_slice(&docker_frame_header(1, line_buf.len() as u32));
+            out.extend_from_slice(line_buf);
+            line_buf.clear();
+            pos = end;
+        } else {
+            line_buf.extend_from_slice(&data[pos..]);
+            break;
+        }
+    }
+    out
 }
 
 fn docker_frame_header(stream_type: u8, len: u32) -> Vec<u8> {

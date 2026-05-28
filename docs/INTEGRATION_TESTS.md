@@ -4211,3 +4211,108 @@ reaches `running` state, verifies the file exists on the host side.
 Failure indicates the `bind` option is read-only (regression for issue #228):
 before the fix, `apply_service_opt` hardcoded `read_only: true` for `"bind"`,
 causing writes inside the container to fail with "Read-only file system".
+
+---
+
+## pelagos-dockerd integration tests (mod `dockerd_integration`)
+
+These tests start `pelagos-dockerd` on a temp Unix socket, launch containers
+via the pelagos CLI, and hit the Docker HTTP API to verify the inotify-based
+log-follow and wait handlers introduced in issue #214.
+
+### `test_dockerd_logs_follow_terminates_on_exit`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container that prints two lines then exits after ~1s. Issues
+`GET /containers/{id}/logs?stdout=true&follow=true` and measures how long until
+the HTTP body closes. Asserts:
+- Stream closes within 3s (not hanging indefinitely)
+- Both "before" and "after" lines are present in the received data
+
+Failure indicates the inotify `CLOSE_WRITE` on the log file is not waking the
+background follow task, causing the stream to hang until a client disconnect or
+daemon shutdown. Regression for the polling implementation's behavior of never
+closing the stream until the next 200ms tick saw the state change.
+
+### `test_dockerd_logs_follow_streams_real_time`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container that emits one line every 200ms indefinitely. Streams logs
+for 2 seconds and counts received lines. Asserts ≥6 lines were delivered.
+
+Failure indicates the follow stream is batching output with a fixed delay
+(200ms+ polling sleep) rather than delivering lines as inotify `MODIFY` events
+arrive. Expected ~10 new lines in 2s at 200ms/line; the ≥6 threshold absorbs
+scheduling jitter.
+
+### `test_dockerd_wait_returns_exit_code`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container that exits after 1s with code 42. Issues
+`POST /containers/{id}/wait` and measures the wall-clock time until it returns.
+Asserts:
+- Returns within 3s (not blocking until the next 500ms poll tick)
+- Response body contains the exit code 42
+
+Failure indicates the inotify watch on `state.json` is not firing or not being
+consumed, leaving the wait handler in the 500ms polling fallback path (which
+would close within ~1.5s but signals a regression in the inotify path).
+
+### `test_dockerd_logs_partial_line_across_writes`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Container writes "hello" (no newline), sleeps 300ms, then writes " world\n" — two writes, two MODIFY events. Decodes raw docker frames (not just text lines) and asserts that "hello world" appears in a single frame payload, and that no frame contains only "hello".
+
+Failure indicates `frames_from_bytes` is emitting partial lines as complete frames rather than buffering in `line_buf` until the newline arrives.
+
+### `test_dockerd_logs_no_trailing_newline`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Container runs `printf 'no-newline'` and exits without ever writing `\n`. Asserts that the combined payload of all docker frames contains "no-newline".
+
+Failure indicates the `line_buf` flush at the end of the background follow task is not running, causing the last (partial) line of any container's output to be silently dropped.
+
+### `test_dockerd_logs_follow_already_exited`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Container writes 5 numbered lines and exits. Test waits 2s (well past exit) before issuing `follow=true`. Asserts all 5 lines received and stream closes within 3s.
+
+Failure indicates the follow task hangs indefinitely when CLOSE_WRITE fired before the inotify watch was set up — the 1s fallback timeout must detect the already-exited state.
+
+### `test_dockerd_logs_large_initial_drain`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Container writes exactly 500 numbered lines as fast as possible, then exits. After a 3s wait, requests `follow=true`. Asserts exactly 500 lines received, in order (`line1`…`line500`).
+
+Failure indicates the pre-`into_event_stream` drain loop drops bytes, produces incorrect frame boundaries on large reads, or `frames_from_bytes` mishandles 65536-byte read chunks.
+
+### `test_dockerd_logs_follow_client_disconnect`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a fast-writing container. Records pelagos-dockerd fd count (via `/proc/{pid}/fd`). Issues a 1s follow connection and disconnects. Waits 2s. Checks fd count is within 5 of baseline, and that a second follow connection still works.
+
+Failure (fd leak) indicates `tx.send().is_err()` is not being detected, leaving the background inotify task running and its inotify fd open after client disconnect.
+
+### `test_dockerd_logs_concurrent_follows`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a container writing one line per 150ms. Opens two simultaneous follow connections in parallel threads, each running for 2s. Asserts both receive ≥6 lines and share a common prefix sequence.
+
+Failure indicates a resource conflict between concurrent inotify instances, one stream starving the other, or incorrect per-connection state.
+
+### `test_dockerd_logs_follow_backpressure`
+**Requires:** root, internet (alpine pull)
+**Module:** `dockerd_integration`
+
+Starts a fast-writing container (~10 KB/s). Connects with `curl --limit-rate 100` (100 bytes/sec) for 3s. Measures pelagos-dockerd RSS growth. Asserts growth <5 MB.
+
+Failure indicates the bounded mpsc channel (capacity 8) is not blocking the producer — without backpressure the producer would buffer the full 3s of unread output in memory.

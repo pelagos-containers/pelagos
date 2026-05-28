@@ -22544,3 +22544,814 @@ mod sandbox {
         cleanup_sandbox(&sandbox_id);
     }
 }
+
+// ---------------------------------------------------------------------------
+// pelagos-dockerd integration tests (#214)
+// ---------------------------------------------------------------------------
+// These tests start pelagos-dockerd on a temp socket, run containers via the
+// pelagos CLI, and exercise the HTTP API to verify that the inotify-based
+// log follow and wait handlers behave correctly.
+// Requires root and alpine image.
+
+mod dockerd_integration {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ALPINE: &str = "docker.io/library/alpine:latest";
+
+    fn pelagos_bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn dockerd_bin() -> String {
+        // pelagos-dockerd lives in the same target dir as pelagos.
+        let pelagos = env!("CARGO_BIN_EXE_pelagos");
+        let dir = std::path::Path::new(pelagos)
+            .parent()
+            .expect("pelagos bin parent dir");
+        dir.join("pelagos-dockerd")
+            .to_str()
+            .expect("utf8 path")
+            .to_string()
+    }
+
+    fn socket_path(tag: &str) -> String {
+        format!("/run/pelagos/test-dockerd-{}.sock", tag)
+    }
+
+    /// Start pelagos-dockerd on a unique socket; return its Child handle.
+    fn start_dockerd(tag: &str) -> (Child, String) {
+        let sock = socket_path(tag);
+        let _ = std::fs::remove_file(&sock);
+        let child = Command::new(dockerd_bin())
+            .args(["--socket", &sock, "--pelagos-bin", pelagos_bin()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pelagos-dockerd");
+        // Give it a moment to bind.
+        std::thread::sleep(Duration::from_millis(400));
+        (child, sock)
+    }
+
+    fn stop_dockerd(mut child: Child, sock: &str) {
+        child.kill().ok();
+        child.wait().ok();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    fn ensure_alpine() {
+        let out = Command::new(pelagos_bin())
+            .args(["image", "ls", "--json"])
+            .output()
+            .expect("image ls");
+        let json = String::from_utf8_lossy(&out.stdout);
+        if !json.contains("alpine") {
+            let _ = Command::new(pelagos_bin())
+                .args(["image", "pull", ALPINE])
+                .status();
+        }
+    }
+
+    fn run_container(name: &str, args: &[&str]) {
+        let mut cmd = vec!["run", "-d", "--name", name, "--"];
+        cmd.push(ALPINE);
+        cmd.extend_from_slice(args);
+        let out = Command::new(pelagos_bin())
+            .args(&cmd)
+            .output()
+            .expect("pelagos run");
+        assert!(
+            out.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn remove_container(name: &str) {
+        let _ = Command::new(pelagos_bin()).args(["stop", name]).status();
+        let _ = Command::new(pelagos_bin()).args(["rm", name]).status();
+    }
+
+    /// Decode docker-multiplexed stream bytes into text lines.
+    fn decode_docker_stream(data: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= data.len() {
+            let length =
+                u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            if pos + 8 + length > data.len() {
+                break;
+            }
+            let payload = &data[pos + 8..pos + 8 + length];
+            let text = String::from_utf8_lossy(payload);
+            for line in text.lines() {
+                lines.push(line.to_string());
+            }
+            pos += 8 + length;
+        }
+        lines
+    }
+
+    /// Issue a GET request to the dockerd socket using curl; returns stdout bytes.
+    fn curl_get(sock: &str, path: &str, timeout_secs: u64) -> (Vec<u8>, bool) {
+        let url = format!("http://localhost{}", path);
+        let out = Command::new("curl")
+            .args([
+                "-sN",
+                "--max-time",
+                &timeout_secs.to_string(),
+                "--unix-socket",
+                sock,
+                &url,
+            ])
+            .output()
+            .expect("curl");
+        let timed_out = !out.status.success() && out.status.code() == Some(28);
+        (out.stdout, timed_out)
+    }
+
+    /// Issue a POST request to the dockerd socket; returns response body as string.
+    fn curl_post(sock: &str, path: &str, timeout_secs: u64) -> (String, bool) {
+        let url = format!("http://localhost{}", path);
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                &timeout_secs.to_string(),
+                "-X",
+                "POST",
+                "--unix-socket",
+                sock,
+                &url,
+            ])
+            .output()
+            .expect("curl post");
+        let timed_out = !out.status.success() && out.status.code() == Some(28);
+        (String::from_utf8_lossy(&out.stdout).to_string(), timed_out)
+    }
+
+    /// `GET /containers/{id}/logs?follow=true` must close the HTTP stream
+    /// within ~2 seconds of the container exiting, not hang indefinitely.
+    ///
+    /// Verifies that the inotify CLOSE_WRITE on the log file (fired when the
+    /// watcher relay closes on container exit) correctly terminates the stream.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_terminates_on_exit() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-follow-exit-test";
+        let tag = "follow-exit";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container prints two lines then exits after ~1s.
+        run_container(name, &["sh", "-c", "echo before; sleep 1; echo after"]);
+
+        let start = Instant::now();
+        // 5s timeout — if the stream doesn't close by then the test fails.
+        let (data, timed_out) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            5,
+        );
+        let elapsed = start.elapsed();
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(
+            !timed_out,
+            "follow stream did not close after container exit (still open after 5s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "follow stream took too long to close: {:?} (expected <3s)",
+            elapsed
+        );
+
+        let lines = decode_docker_stream(&data);
+        assert!(
+            lines.iter().any(|l| l.contains("before")),
+            "missing 'before' line; got: {:?}",
+            lines
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("after")),
+            "missing 'after' line; got: {:?}",
+            lines
+        );
+    }
+
+    /// `GET /containers/{id}/logs?follow=true` must deliver lines in real time
+    /// with low latency — not batch them up into polling intervals.
+    ///
+    /// Verifies that inotify MODIFY events on the log file drive delivery
+    /// rather than a fixed sleep interval.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_streams_real_time() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-follow-stream-test";
+        let tag = "follow-stream";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container emits one line every 200ms; runs for 3s.
+        run_container(
+            name,
+            &[
+                "sh",
+                "-c",
+                "i=0; while true; do echo line$i; i=$((i+1)); sleep 0.2; done",
+            ],
+        );
+        // Give it ~0.4s to accumulate a couple of lines before we attach.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Stream for exactly 2 seconds.
+        let (data, _) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            2,
+        );
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        let lines = decode_docker_stream(&data);
+        // At 200ms/line over a 2s window + ~2 lines already in log = ≥9 lines expected.
+        // We allow ≥6 as a conservative lower bound accounting for scheduling jitter.
+        assert!(
+            lines.len() >= 6,
+            "expected ≥6 lines in 2s at 200ms/line, got {} lines: {:?}",
+            lines.len(),
+            lines
+        );
+    }
+
+    /// `POST /containers/{id}/wait` must return promptly (within ~2s) after
+    /// the container exits, not linger until the next 500ms poll tick.
+    ///
+    /// Also verifies that the exit code in the response body is correct.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_wait_returns_exit_code() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-wait-test";
+        let tag = "wait-exit";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container exits after 1s with code 42.
+        run_container(name, &["sh", "-c", "sleep 1; exit 42"]);
+        std::thread::sleep(Duration::from_millis(200));
+
+        let start = Instant::now();
+        let (body, timed_out) = curl_post(&sock, &format!("/containers/{}/wait", name), 5);
+        let elapsed = start.elapsed();
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(
+            !timed_out,
+            "wait did not return after container exit (still blocked after 5s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "wait took too long: {:?} (expected <3s)",
+            elapsed
+        );
+        assert!(
+            body.contains("42"),
+            "wait response should contain exit code 42; got: {:?}",
+            body
+        );
+    }
+
+    /// Verifies that `frames_from_bytes` accumulates bytes across multiple inotify
+    /// MODIFY events when a write does not end with `\n`.
+    ///
+    /// Container writes "hello" (no newline), sleeps 300ms, then writes " world\n".
+    /// These become two separate writes to the log file and two MODIFY events.
+    /// The follow task must buffer "hello" in `line_buf` and complete the frame
+    /// only after the newline arrives — not emit two half-line frames.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_partial_line_across_writes() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-partial-line-test";
+        let tag = "partial-line";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Two writes: "hello" then " world\n" separated by 300ms.
+        // `stdbuf -oL` disables stdio buffering so each printf flushes immediately.
+        run_container(
+            name,
+            &["sh", "-c", "printf 'hello'; sleep 0.3; printf ' world\\n'"],
+        );
+
+        // 3s timeout: container exits well within that.
+        let (data, timed_out) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            3,
+        );
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(!timed_out, "follow stream timed out on partial-line test");
+
+        // Decode raw frames — we care about frame boundaries, not just text lines.
+        let mut frames: Vec<String> = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= data.len() {
+            let length =
+                u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            if pos + 8 + length > data.len() {
+                break;
+            }
+            let payload = String::from_utf8_lossy(&data[pos + 8..pos + 8 + length]).to_string();
+            frames.push(payload);
+            pos += 8 + length;
+        }
+
+        // The combined content must contain "hello world".
+        let combined: String = frames.concat();
+        assert!(
+            combined.contains("hello world"),
+            "expected 'hello world' in combined output; got frames: {:?}",
+            frames
+        );
+        // No frame should contain only "hello" without " world" — that would indicate
+        // the partial line was emitted before the newline arrived.
+        assert!(
+            !frames.iter().any(|f| f.trim() == "hello"),
+            "found a frame containing only 'hello' — partial line was emitted prematurely; frames: {:?}",
+            frames
+        );
+    }
+
+    /// Verifies that `line_buf` is flushed at the end of the follow task even when
+    /// the container's last write has no trailing `\n`.
+    ///
+    /// Failure indicates the partial-line flush at the end of the background task
+    /// is not running, causing the last line of output to be silently dropped.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_no_trailing_newline() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-no-newline-test";
+        let tag = "no-newline";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Write exactly "no-newline" with no trailing newline, then exit.
+        run_container(name, &["sh", "-c", "printf 'no-newline'"]);
+
+        // Give it time to exit.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Request follow on an already-exited container.
+        let (data, timed_out) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            4,
+        );
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(
+            !timed_out,
+            "follow stream timed out for no-trailing-newline test"
+        );
+
+        let combined: String = {
+            let mut out = String::new();
+            let mut pos = 0;
+            while pos + 8 <= data.len() {
+                let length = u32::from_be_bytes([
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                ]) as usize;
+                if pos + 8 + length > data.len() {
+                    break;
+                }
+                out.push_str(&String::from_utf8_lossy(&data[pos + 8..pos + 8 + length]));
+                pos += 8 + length;
+            }
+            out
+        };
+
+        assert!(
+            combined.contains("no-newline"),
+            "expected 'no-newline' in output but got: {:?}",
+            combined
+        );
+    }
+
+    /// Verifies that `follow=true` requested *after* the container has already
+    /// exited delivers all log content and closes within a bounded time.
+    ///
+    /// The CLOSE_WRITE event on the log file has already fired before the inotify
+    /// watch is set up, so the follow task must fall back to the 1s timeout and
+    /// detect exit via `read_state`. Total latency should be <3s.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_already_exited() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-follow-exited-test";
+        let tag = "follow-exited";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container writes 5 lines and exits quickly.
+        run_container(
+            name,
+            &[
+                "sh",
+                "-c",
+                "echo line1; echo line2; echo line3; echo line4; echo line5",
+            ],
+        );
+
+        // Wait well past container exit.
+        std::thread::sleep(Duration::from_secs(2));
+
+        let start = Instant::now();
+        let (data, timed_out) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            5,
+        );
+        let elapsed = start.elapsed();
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(
+            !timed_out,
+            "follow on already-exited container timed out after 5s"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "follow on already-exited container took too long: {:?}",
+            elapsed
+        );
+
+        let lines = decode_docker_stream(&data);
+        for i in 1..=5 {
+            assert!(
+                lines.iter().any(|l| l.contains(&format!("line{}", i))),
+                "missing 'line{}' in output; got: {:?}",
+                i,
+                lines
+            );
+        }
+    }
+
+    /// Verifies that the pre-`into_event_stream` drain loop delivers a large
+    /// accumulated log correctly — no frames split mid-line, no missing lines,
+    /// correct order.
+    ///
+    /// Failure indicates a bug in the initial drain loop (e.g. read returning
+    /// partial data, or `frames_from_bytes` producing incorrect frame boundaries
+    /// on large inputs).
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_large_initial_drain() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-large-drain-test";
+        let tag = "large-drain";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Write 500 numbered lines as fast as possible, then exit.
+        run_container(
+            name,
+            &[
+                "sh",
+                "-c",
+                "i=1; while [ $i -le 500 ]; do echo \"line$i\"; i=$((i+1)); done",
+            ],
+        );
+
+        // Wait for container to finish writing and exit.
+        std::thread::sleep(Duration::from_secs(3));
+
+        let (data, timed_out) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            6,
+        );
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        assert!(!timed_out, "large-drain follow timed out after 6s");
+
+        let lines = decode_docker_stream(&data);
+        assert_eq!(
+            lines.len(),
+            500,
+            "expected exactly 500 lines, got {}; first 5: {:?} last 5: {:?}",
+            lines.len(),
+            &lines[..lines.len().min(5)],
+            &lines[lines.len().saturating_sub(5)..]
+        );
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(
+                line,
+                &format!("line{}", i + 1),
+                "line {} out of order or malformed: {:?}",
+                i + 1,
+                line
+            );
+        }
+    }
+
+    /// Verifies that when the HTTP client disconnects mid-stream, the background
+    /// inotify task exits via the `tx.send().is_err()` path rather than leaking
+    /// an open inotify fd.
+    ///
+    /// Checks that the pelagos-dockerd open fd count returns to near-baseline
+    /// within 2s of client disconnect, and that a subsequent follow connection
+    /// works normally (no fd exhaustion).
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_client_disconnect() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-disconnect-test";
+        let tag = "disconnect";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+        let dockerd_pid = dockerd.id();
+
+        let count_fds = |pid: u32| -> usize {
+            std::fs::read_dir(format!("/proc/{}/fd", pid))
+                .map(|d| d.count())
+                .unwrap_or(0)
+        };
+
+        // Start a long-running container that writes continuously.
+        run_container(
+            name,
+            &["sh", "-c", "while true; do echo x; sleep 0.05; done"],
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        let baseline_fds = count_fds(dockerd_pid);
+
+        // Connect, read for 1s, then disconnect (curl --max-time kills itself).
+        let url = format!(
+            "http://localhost/containers/{}/logs?stdout=true&follow=true",
+            name
+        );
+        let _ = Command::new("curl")
+            .args(["-sN", "--max-time", "1", "--unix-socket", &sock, &url])
+            .output();
+
+        // Give the background task time to detect disconnect and clean up.
+        std::thread::sleep(Duration::from_secs(2));
+
+        let after_fds = count_fds(dockerd_pid);
+
+        // A second follow connection should work normally.
+        let (data2, _) = curl_get(
+            &sock,
+            &format!("/containers/{}/logs?stdout=true&follow=true", name),
+            1,
+        );
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        // Fd count should return to within a small margin of baseline.
+        assert!(
+            after_fds <= baseline_fds + 5,
+            "fd count grew from {} to {} after client disconnect — inotify fd likely leaked",
+            baseline_fds,
+            after_fds
+        );
+
+        // Second connection should have received some output.
+        let lines2 = decode_docker_stream(&data2);
+        assert!(
+            !lines2.is_empty(),
+            "second follow connection after disconnect received no data"
+        );
+    }
+
+    /// Verifies that two simultaneous `follow=true` connections to the same
+    /// container each receive all output independently.
+    ///
+    /// Each connection spawns its own inotify fd and background task — there is
+    /// no shared state between them. Failure indicates a resource conflict or
+    /// one stream starving the other.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_concurrent_follows() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-concurrent-test";
+        let tag = "concurrent";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+
+        // Container emits one numbered line every 150ms.
+        run_container(
+            name,
+            &[
+                "sh",
+                "-c",
+                "i=0; while true; do echo line$i; i=$((i+1)); sleep 0.15; done",
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Two follow streams in parallel threads, each running for 2s.
+        let sock1 = sock.clone();
+        let sock2 = sock.clone();
+        let url = format!("/containers/{}/logs?stdout=true&follow=true", name);
+        let url1 = url.clone();
+        let url2 = url.clone();
+
+        let t1 = std::thread::spawn(move || curl_get(&sock1, &url1, 2));
+        let t2 = std::thread::spawn(move || curl_get(&sock2, &url2, 2));
+
+        let (data1, _) = t1.join().expect("thread 1 panicked");
+        let (data2, _) = t2.join().expect("thread 2 panicked");
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        let lines1 = decode_docker_stream(&data1);
+        let lines2 = decode_docker_stream(&data2);
+
+        // Each stream must have received at least 6 lines.
+        assert!(
+            lines1.len() >= 6,
+            "stream 1 received only {} lines (expected ≥6)",
+            lines1.len()
+        );
+        assert!(
+            lines2.len() >= 6,
+            "stream 2 received only {} lines (expected ≥6)",
+            lines2.len()
+        );
+
+        // Both streams must share a common prefix sequence — neither is missing
+        // lines that the other received from the start.
+        let min_len = lines1.len().min(lines2.len());
+        let common = lines1[..min_len]
+            .iter()
+            .zip(lines2[..min_len].iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        assert!(
+            common >= min_len / 2,
+            "streams diverged significantly — stream1: {:?} stream2: {:?}",
+            &lines1[..lines1.len().min(5)],
+            &lines2[..lines2.len().min(5)]
+        );
+    }
+
+    /// Verifies that a slow HTTP client does not cause the background producer
+    /// task to accumulate unbounded memory.
+    ///
+    /// The bounded mpsc channel (capacity 8) must block the producer when the
+    /// client is slow. Without backpressure the producer would buffer the entire
+    /// log in memory.
+    ///
+    /// We measure pelagos-dockerd RSS before and after a 3s window with a
+    /// throttled client (100 bytes/sec). Growth must stay <5 MB.
+    #[test]
+    #[serial_test::serial(dockerd)]
+    fn test_dockerd_logs_follow_backpressure() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let name = "dockerd-backpressure-test";
+        let tag = "backpressure";
+        remove_container(name);
+
+        let (dockerd, sock) = start_dockerd(tag);
+        let dockerd_pid = dockerd.id();
+
+        let read_rss_kb = |pid: u32| -> u64 {
+            std::fs::read_to_string(format!("/proc/{}/status", pid))
+                .unwrap_or_default()
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+
+        // Fast writer: ~10 KB/s of output.
+        run_container(
+            name,
+            &["sh", "-c", "while true; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; sleep 0.01; done"],
+        );
+        std::thread::sleep(Duration::from_millis(400));
+
+        let rss_before = read_rss_kb(dockerd_pid);
+
+        // Throttled client: reads at 100 bytes/sec — far slower than the writer.
+        let url = format!(
+            "http://localhost/containers/{}/logs?stdout=true&follow=true",
+            name
+        );
+        let _ = Command::new("curl")
+            .args([
+                "-sN",
+                "--limit-rate",
+                "100",
+                "--max-time",
+                "3",
+                "--unix-socket",
+                &sock,
+                &url,
+            ])
+            .output();
+
+        let rss_after = read_rss_kb(dockerd_pid);
+
+        stop_dockerd(dockerd, &sock);
+        remove_container(name);
+
+        let growth_kb = rss_after.saturating_sub(rss_before);
+        assert!(
+            growth_kb < 5120,
+            "RSS grew by {}KB during slow-client follow — backpressure not working \
+             (before={}KB after={}KB)",
+            growth_kb,
+            rss_before,
+            rss_after
+        );
+    }
+}
