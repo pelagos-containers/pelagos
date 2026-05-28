@@ -2678,33 +2678,53 @@ pub fn setup_pasta_network(
         let ns_dir = std::path::Path::new("/run/pelagos/pasta-ns");
         std::fs::create_dir_all(ns_dir)?;
         let mount_path = ns_dir.join(format!("{}", child_pid));
-        // Create an empty regular file as the bind-mount target.
-        std::fs::write(&mount_path, b"")
-            .map_err(|e| io::Error::new(e.kind(), format!("create netns mount point: {}", e)))?;
-        let src = std::ffi::CString::new(format!("/proc/{}/ns/net", child_pid)).unwrap();
-        let dst = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
-        let fstype = std::ffi::CString::new("").unwrap();
-        // SAFETY: all pointers are valid CStrings; MS_BIND is a safe mount flag.
-        let rc = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                fstype.as_ptr(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            )
+
+        // The container pre_exec (step 1.61) bind-mounts its own netns here
+        // before exec so the mount survives fast-exiting commands.  Detect that
+        // case by checking whether the file is already an nsfs bind-mount
+        // (f_type == NSFS_MAGIC = 0x6e736673).  If not, do the mount ourselves
+        // using /proc/{child_pid}/ns/net (works as long as the process is alive).
+        const NSFS_MAGIC: libc::__fsword_t = 0x6e736673;
+        let already_mounted = if mount_path.exists() {
+            let cpath = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
+            let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: cpath is valid, sfs is zeroed.
+            let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut sfs) };
+            rc == 0 && sfs.f_type == NSFS_MAGIC
+        } else {
+            false
         };
-        if rc == -1 {
-            let _ = std::fs::remove_file(&mount_path);
-            return Err(io::Error::new(
-                io::Error::last_os_error().kind(),
-                format!(
-                    "mount --bind /proc/{}/ns/net {}: {}",
-                    child_pid,
-                    mount_path.display(),
-                    io::Error::last_os_error()
-                ),
-            ));
+
+        if !already_mounted {
+            // Create an empty regular file as the bind-mount target.
+            std::fs::write(&mount_path, b"").map_err(|e| {
+                io::Error::new(e.kind(), format!("create netns mount point: {}", e))
+            })?;
+            let src = std::ffi::CString::new(format!("/proc/{}/ns/net", child_pid)).unwrap();
+            let dst = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
+            let fstype = std::ffi::CString::new("").unwrap();
+            // SAFETY: all pointers are valid CStrings; MS_BIND is a safe mount flag.
+            let rc = unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    fstype.as_ptr(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            if rc == -1 {
+                let _ = std::fs::remove_file(&mount_path);
+                return Err(io::Error::new(
+                    io::Error::last_os_error().kind(),
+                    format!(
+                        "mount --bind /proc/{}/ns/net {}: {}",
+                        child_pid,
+                        mount_path.display(),
+                        io::Error::last_os_error()
+                    ),
+                ));
+            }
         }
         args.push("--netns".to_string());
         args.push(mount_path.to_string_lossy().into_owned());
