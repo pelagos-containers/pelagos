@@ -36,9 +36,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nftables iproute2 passt
       - name: Build
-        run: cargo build
-      - name: Add built binaries to PATH
-        run: echo "$GITHUB_WORKSPACE/target/debug" >> $GITHUB_PATH
+        run: cargo build --workspace
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
       - name: Reset test environment
