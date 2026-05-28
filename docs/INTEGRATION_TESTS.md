@@ -1957,6 +1957,17 @@ Failure indicates `setup_pasta_network` is not checking port availability before
 pasta, meaning pasta's port-bind failure ("Couldn't listen on requested ports", exit 1) is
 silently swallowed and the container starts with no working port forwarding.
 
+### `test_bridge_duplicate_host_port_rejected_cli`
+**Requires:** root, alpine-rootfs
+
+Same conflict scenario as `test_bridge_duplicate_host_port_rejected` but exercises the
+`pelagos run -d` CLI path (watcher process) rather than the library API. Verifies that the
+spawn error is propagated from the watcher back to the CLI parent via the sync pipe and
+appears in stderr — not the generic "watcher exited before writing state" message.
+
+Failure indicates the watcher exits silently on spawn failure without writing the error to
+the sync pipe, so the parent cannot surface the actual cause.
+
 ---
 
 ## Multi-Network Tests
