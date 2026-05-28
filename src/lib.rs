@@ -22,6 +22,7 @@ pub mod lisp;
 pub mod mac;
 pub mod netlink;
 pub mod network;
+pub mod nfnetlink;
 pub mod notif;
 pub mod oci;
 pub mod paths;

@@ -4319,3 +4319,37 @@ Failure indicates a resource conflict between concurrent inotify instances, one 
 Starts a fast-writing container (~10 KB/s). Connects with `curl --limit-rate 100` (100 bytes/sec) for 3s. Measures pelagos-dockerd RSS growth. Asserts growth <5 MB.
 
 Failure indicates the bounded mpsc channel (capacity 8) is not blocking the producer — without backpressure the producer would buffer the full 3s of unread output in memory.
+
+## nfnetlink_native
+
+### `test_nft_nat_create_delete`
+**Requires:** root
+**Module:** `nfnetlink_native`
+
+Calls `nft_create_nat_masquerade` to install a NAT masquerade table and chains natively via nfnetlink (no `nft` binary). Verifies via `nft list` that the table exists, the postrouting chain has a masquerade rule, and the forward chain has accept rules. Then calls `nft_delete_ip_table` and verifies the table is gone.
+
+Failure indicates the nfnetlink message encoding for NEWTABLE/NEWCHAIN/NEWRULE (masquerade or forward accept) is wrong, or that `nft_delete_ip_table` (DELTABLE) fails silently when it shouldn't.
+
+### `test_nft_dns_input_rule`
+**Requires:** root
+**Module:** `nfnetlink_native`
+
+Calls `nft_add_dns_input_chain` to install a DNS INPUT chain that accepts UDP port 53 on a named bridge. Verifies via `nft list chain` that the chain contains a port 53 accept rule. Calls `nft_remove_dns_input_chain` and verifies the input chain no longer exists.
+
+Failure indicates the iifname match, UDP dport match, or verdict accept expression encoding is wrong, or that flush/delete-chain operations fail.
+
+### `test_nft_dnat_rules`
+**Requires:** root
+**Module:** `nfnetlink_native`
+
+Calls `nft_install_dnat` to install a DNAT port-forward rule (TCP host:18080 → container:80) natively. Verifies via `nft list chain` that the prerouting chain contains the expected DNAT rule. Calls `nft_flush_prerouting` and verifies no rules remain. Cleans up with `nft_delete_ip_table`.
+
+Failure indicates the DNAT expression encoding (proto match, dport match, immediate IP/port load, nat DNAT) is wrong, or that flush-chain (DELRULE without handle) fails.
+
+### `test_nft_iptables_filter_compat`
+**Requires:** root, iptables-nft `ip filter` table present
+**Module:** `nfnetlink_native`
+
+Guards on `ip filter` table existence (iptables-nft must be active). Calls `nft_add_filter_forward_compat` to add a CIDR-scoped chain to `ip filter` with a jump rule in FORWARD. Verifies the jump exists via `nft list chain` or `nft_find_jump_handles`. Calls `nft_remove_filter_forward_compat` and verifies the jump handles are empty.
+
+Failure indicates GETRULE DUMP parsing or DELRULE-by-handle encoding is wrong, or that the iptables-nft forward chain add/remove sequence leaves stale rules.

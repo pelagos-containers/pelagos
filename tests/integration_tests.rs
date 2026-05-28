@@ -23384,3 +23384,226 @@ mod dockerd_integration {
         );
     }
 }
+
+mod nfnetlink_native {
+    use serial_test::serial;
+
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    fn nft_table_exists(family: &str, table: &str) -> bool {
+        std::process::Command::new("nft")
+            .args(["list", "table", family, table])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn nft_chain_output(family: &str, table: &str, chain: &str) -> String {
+        std::process::Command::new("nft")
+            .args(["list", "chain", family, table, chain])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    /// Create a NAT masquerade table/chain/rules via native nfnetlink, verify
+    /// with `nft list`, then delete and verify gone.
+    #[test]
+    #[serial(nat)]
+    fn test_nft_nat_create_delete() {
+        if !is_root() {
+            eprintln!("Skipping test_nft_nat_create_delete: requires root");
+            return;
+        }
+
+        let table = "pelagos-nfnl-test-nat";
+        let bridge = "nfnl-br0";
+        let net: std::net::Ipv4Addr = "10.99.0.0".parse().unwrap();
+
+        // Cleanup any leftover state.
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "ip", table])
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        pelagos::nfnetlink::nft_create_nat_masquerade(table, bridge, net, 24)
+            .expect("nft_create_nat_masquerade failed");
+
+        assert!(
+            nft_table_exists("ip", table),
+            "table ip {table} should exist after nft_create_nat_masquerade"
+        );
+
+        let postrouting = nft_chain_output("ip", table, "postrouting");
+        assert!(
+            postrouting.contains("masquerade"),
+            "postrouting chain should have masquerade rule, got: {postrouting}"
+        );
+
+        let forward = nft_chain_output("ip", table, "forward");
+        assert!(
+            forward.contains("accept"),
+            "forward chain should have accept rules, got: {forward}"
+        );
+
+        pelagos::nfnetlink::nft_delete_ip_table(table);
+        assert!(
+            !nft_table_exists("ip", table),
+            "table ip {table} should be gone after nft_delete_ip_table"
+        );
+    }
+
+    /// Add a DNS INPUT chain via native nfnetlink, verify rule content, then remove.
+    #[test]
+    #[serial(nat)]
+    fn test_nft_dns_input_rule() {
+        if !is_root() {
+            eprintln!("Skipping test_nft_dns_input_rule: requires root");
+            return;
+        }
+
+        let table = "pelagos-nfnl-test-dns";
+        let bridge = "nfnl-dns-br0";
+
+        // Cleanup.
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "ip", table])
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        pelagos::nfnetlink::nft_add_dns_input_chain(table, bridge)
+            .expect("nft_add_dns_input_chain failed");
+
+        assert!(
+            nft_table_exists("ip", table),
+            "table ip {table} should exist after nft_add_dns_input_chain"
+        );
+
+        let input = nft_chain_output("ip", table, "input");
+        assert!(
+            input.contains("53"),
+            "input chain should have dns port 53 rule, got: {input}"
+        );
+
+        pelagos::nfnetlink::nft_remove_dns_input_chain(table);
+        // remove_dns_input_chain flushes and deletes the input chain but leaves the table.
+        let input_after = nft_chain_output("ip", table, "input");
+        assert!(
+            input_after.is_empty(),
+            "input chain should be gone after nft_remove_dns_input_chain, got: {input_after}"
+        );
+
+        // Clean up the table.
+        pelagos::nfnetlink::nft_delete_ip_table(table);
+    }
+
+    /// Install DNAT port-forward rules via native nfnetlink, verify they appear
+    /// in prerouting, then flush and verify cleaned up.
+    #[test]
+    #[serial(nat)]
+    fn test_nft_dnat_rules() {
+        if !is_root() {
+            eprintln!("Skipping test_nft_dnat_rules: requires root");
+            return;
+        }
+
+        use pelagos::network::PortProto;
+
+        let table = "pelagos-nfnl-test-dnat";
+        let entries: Vec<(std::net::Ipv4Addr, u16, u16, PortProto)> =
+            vec![("10.99.0.2".parse().unwrap(), 18080, 80, PortProto::Tcp)];
+
+        // Cleanup.
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "ip", table])
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        pelagos::nfnetlink::nft_install_dnat(table, &entries).expect("nft_install_dnat failed");
+
+        assert!(
+            nft_table_exists("ip", table),
+            "table ip {table} should exist after nft_install_dnat"
+        );
+
+        let prerouting = nft_chain_output("ip", table, "prerouting");
+        assert!(
+            prerouting.contains("18080") || prerouting.contains("dnat"),
+            "prerouting chain should have DNAT rule for port 18080, got: {prerouting}"
+        );
+
+        pelagos::nfnetlink::nft_flush_prerouting(table).expect("nft_flush_prerouting failed");
+
+        let prerouting_after = nft_chain_output("ip", table, "prerouting");
+        assert!(
+            !prerouting_after.contains("18080"),
+            "prerouting should have no rules after flush, got: {prerouting_after}"
+        );
+
+        pelagos::nfnetlink::nft_delete_ip_table(table);
+        assert!(
+            !nft_table_exists("ip", table),
+            "table ip {table} should be gone after nft_delete_ip_table"
+        );
+    }
+
+    /// Add iptables-nft forward compat chain via native nfnetlink, verify jump
+    /// rule in FORWARD, then remove.
+    #[test]
+    #[serial(nat)]
+    fn test_nft_iptables_filter_compat() {
+        if !is_root() {
+            eprintln!("Skipping test_nft_iptables_filter_compat: requires root");
+            return;
+        }
+
+        // Guard: iptables-nft ip filter table must exist.
+        if !nft_table_exists("ip", "filter") {
+            eprintln!("Skipping test_nft_iptables_filter_compat: ip filter table not present");
+            return;
+        }
+
+        let chain = "pelagos-nfnl-test-fwd";
+        let net: std::net::Ipv4Addr = "10.99.1.0".parse().unwrap();
+
+        // Cleanup any leftover chain.
+        pelagos::nfnetlink::nft_remove_filter_forward_compat(chain);
+
+        pelagos::nfnetlink::nft_add_filter_forward_compat(chain, net, 24);
+
+        // Verify the jump rule exists in FORWARD.
+        let forward = nft_chain_output("ip", "filter", "FORWARD");
+        let has_jump = forward.contains(chain) || {
+            // Older strace shows chain name as hex — also check via find_jump_handles.
+            !pelagos::nfnetlink::nft_find_jump_handles(
+                libc::AF_INET as u8,
+                "filter",
+                "FORWARD",
+                chain,
+            )
+            .is_empty()
+        };
+        assert!(
+            has_jump,
+            "FORWARD chain should have a jump to {chain}, nft output: {forward}"
+        );
+
+        pelagos::nfnetlink::nft_remove_filter_forward_compat(chain);
+
+        // Jump handle should be gone.
+        let handles = pelagos::nfnetlink::nft_find_jump_handles(
+            libc::AF_INET as u8,
+            "filter",
+            "FORWARD",
+            chain,
+        );
+        assert!(
+            handles.is_empty(),
+            "FORWARD should have no jump to {chain} after remove, handles: {handles:?}"
+        );
+    }
+}
