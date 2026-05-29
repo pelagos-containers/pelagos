@@ -24326,4 +24326,136 @@ mod native_netlink_teardown {
             "netns path should be gone after del"
         );
     }
+
+    /// `pelagos cleanup` must remove stale `/run/netns/rem-{pid}-{n}` entries whose
+    /// owning PID is dead.  We create a netns named `rem-0-tcln` (PID=0, which
+    /// `pid_alive` always treats as dead), run `pelagos cleanup`, and assert the
+    /// entry is gone.
+    ///
+    /// Requires root (netns_create needs CAP_SYS_ADMIN).
+    /// Serial under `nat` to avoid concurrent netns manipulation.
+    #[test]
+    #[serial(nat)]
+    fn test_cleanup_removes_stale_netns() {
+        if !is_root() {
+            eprintln!("Skipping test_cleanup_removes_stale_netns: requires root");
+            return;
+        }
+        // PID 0 is always considered dead by pid_alive (pid <= 0 → false).
+        let name = "rem-0-tcln";
+        let path = format!("/run/netns/{}", name);
+
+        // Pre-clean any leftover from a prior failed run.
+        let _ = pelagos::netlink::netns_del(name);
+
+        pelagos::netlink::netns_create(name).expect("netns_create stale entry");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "stale netns must exist before running cleanup"
+        );
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .arg("cleanup")
+            .output()
+            .expect("pelagos cleanup");
+        // Belt-and-suspenders: remove the netns even if the assertion below fails.
+        let _ = pelagos::netlink::netns_del(name);
+        assert!(
+            out.status.success(),
+            "cleanup exited non-zero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "`pelagos cleanup` must remove stale rem-0-* netns entries"
+        );
+    }
+
+    /// `pelagos network rm` must delete the bridge interface when it actually exists
+    /// (i.e. after a container has run on the network and instantiated the bridge).
+    ///
+    /// Flow: create named network → run container (creates bridge) → wait for exit →
+    /// assert bridge still present → `pelagos network rm` → assert bridge gone.
+    ///
+    /// This directly exercises the `link_del(&net.bridge_name)` call in `cmd_network_rm`
+    /// against a live kernel interface, not just a non-existent one.
+    ///
+    /// Requires root + rootfs.  Serial under `nat`.
+    #[test]
+    #[serial(nat)]
+    fn test_network_rm_deletes_live_bridge() {
+        if !is_root() {
+            eprintln!("Skipping test_network_rm_deletes_live_bridge: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_network_rm_deletes_live_bridge: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        use pelagos::network::{Ipv4Net, NetworkDef};
+
+        let name = "brdel";
+        let bridge = "rm-brdel";
+        let bridge_path = format!("/sys/class/net/{}", bridge);
+        let config_dir = pelagos::paths::network_config_dir(name);
+
+        // Pre-clean any leftover state from a prior failed run.
+        let _ = pelagos::netlink::link_del(bridge);
+        let _ = std::fs::remove_dir_all(&config_dir);
+
+        // Create the network via library API.
+        let subnet = Ipv4Net::from_cidr("10.239.9.0/24").unwrap();
+        NetworkDef {
+            name: name.to_string(),
+            subnet: subnet.clone(),
+            gateway: subnet.gateway(),
+            bridge_name: bridge.to_string(),
+        }
+        .save()
+        .expect("save test network");
+
+        // Run a short-lived container on the named network — this instantiates the bridge.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(name.to_string()))
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container on named network");
+        child.wait().expect("wait for container");
+
+        // Veth is torn down by wait(), but the bridge must survive container exit.
+        assert!(
+            std::path::Path::new(&bridge_path).exists(),
+            "bridge {} must persist after container exit; only `network rm` should delete it",
+            bridge
+        );
+
+        // Remove the network via CLI — exercises link_del on a live bridge interface.
+        let rm = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["network", "rm", name])
+            .output()
+            .expect("pelagos network rm");
+        // Belt-and-suspenders: clean up even if assertions fail.
+        let _ = pelagos::netlink::link_del(bridge);
+        let _ = std::fs::remove_dir_all(&config_dir);
+        assert!(
+            rm.status.success(),
+            "network rm failed: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+        assert!(
+            !std::path::Path::new(&bridge_path).exists(),
+            "bridge {} must be deleted by `pelagos network rm`",
+            bridge
+        );
+    }
 }

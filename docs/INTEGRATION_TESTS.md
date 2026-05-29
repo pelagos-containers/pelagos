@@ -4437,3 +4437,25 @@ bind-mount is present after create and absent after del.
 
 Failure indicates `netns_del`'s `umount2(MNT_DETACH)` or `unlink` is broken, or the path
 construction is wrong.
+
+### `test_cleanup_removes_stale_netns`
+**Requires:** root
+**Module:** `native_netlink_teardown`
+
+Creates a `/run/netns/rem-0-tcln` entry (PID=0 is always dead per `pid_alive`'s `pid <= 0`
+guard), runs `pelagos cleanup`, and asserts the entry is gone.
+
+Failure indicates `cli/cleanup.rs::cleanup_netns` is not calling `netlink::netns_del`
+correctly, or the stale-PID detection logic is broken.
+
+### `test_network_rm_deletes_live_bridge`
+**Requires:** root + rootfs
+**Module:** `native_netlink_teardown`
+
+Creates a named network, runs a short-lived container on it (which instantiates the kernel
+bridge interface `rm-brdel`), waits for the container to exit, verifies the bridge still
+exists (teardown only removes the veth, not the bridge), then calls `pelagos network rm` and
+asserts the bridge interface is gone.
+
+Failure indicates `cmd_network_rm`'s `link_del(&net.bridge_name)` call is not deleting a
+live bridge, which would leave orphaned bridge interfaces after network removal.
