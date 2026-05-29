@@ -15624,7 +15624,8 @@ mod wasm_embedded_tests {
             (func $_start i32.const 7 call $proc_exit)
             (export "_start" (func $_start)))"#;
         let module = Module::new(&engine, wat.as_bytes()).unwrap();
-        let code = run_embedded_module(&engine, &module, &[], &WasiConfig::default()).unwrap();
+        let code =
+            run_embedded_module(&engine, &module, &[], &WasiConfig::default(), None, None).unwrap();
         assert_eq!(code, 7, "embedded wasm should return exit code 7");
     }
 
@@ -15718,8 +15719,74 @@ mod wasm_embedded_tests {
         let engine = Engine::new(&config).unwrap();
         let component = Component::from_file(&engine, &wasm_path).unwrap();
         let code =
-            run_embedded_component(&engine, &component, &[], &WasiConfig::default()).unwrap();
+            run_embedded_component(&engine, &component, &[], &WasiConfig::default(), None, None)
+                .unwrap();
         assert_eq!(code, 0, "component should exit with code 0");
+    }
+
+    /// test_wasm_embedded_piped_stdout
+    ///
+    /// Requires: --features embedded-wasm
+    /// Root: no   Rootfs: no
+    ///
+    /// Verifies that `run_embedded_module` routes stdout to the supplied
+    /// `std::fs::File` (write-end of an OS pipe) rather than inheriting the
+    /// process's fd 1.  Creates a pipe, passes the write-end as `stdout`, reads
+    /// from the read-end, and asserts that the module's `fd_write` output arrives.
+    ///
+    /// Failure means the `OutputFile` redirection path is broken — embedded Wasm
+    /// output would be lost when containers run in `--detach` mode (issue #153).
+    #[test]
+    fn test_wasm_embedded_piped_stdout() {
+        use std::io::Read as _;
+        use std::os::unix::io::FromRawFd;
+
+        let engine = wasmtime::Engine::default();
+        // Minimal WAT: writes "hello wasm\n" to stdout (fd 1) then exits 0.
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "proc_exit"
+                (func $proc_exit (param i32)))
+            (memory 1)
+            (export "memory" (memory 0))
+            (data (i32.const 16) "hello wasm\n")
+            (func $_start
+                ;; iovec at offset 0: ptr=16, len=11
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 11))
+                ;; fd_write(1, iovec_ptr=0, iovec_count=1, nwritten_ptr=8)
+                (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+                (call $proc_exit (i32.const 0)))
+            (export "_start" (func $_start)))"#;
+        let module = wasmtime::Module::new(&engine, wat.as_bytes()).unwrap();
+
+        // Create an OS pipe; give the write-end to the module.
+        let mut pipe_fds = [-1i32; 2];
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2 failed");
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+        let write_file = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
+        let code = run_embedded_module(
+            &engine,
+            &module,
+            &[],
+            &WasiConfig::default(),
+            Some(write_file),
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0, "module should exit 0");
+
+        // Read-end: close write half (already moved) then drain.
+        let mut read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let mut got = String::new();
+        read_file.read_to_string(&mut got).unwrap();
+        assert_eq!(
+            got, "hello wasm\n",
+            "module stdout should be captured via pipe"
+        );
     }
 }
 

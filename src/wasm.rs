@@ -242,6 +242,10 @@ fn build_wasmedge_cmd(
 /// Only available with `--features embedded-wasm`. Runs synchronously — call
 /// from a dedicated thread when a non-blocking `Child` handle is needed.
 ///
+/// When `stdout`/`stderr` are `Some`, the Wasm module's output is directed to
+/// those files (e.g. the write end of an OS pipe).  When `None`, the module
+/// inherits the process's fd 1/2 directly.
+///
 /// Returns the WASI exit code (0 = success). Panics from the Wasm module are
 /// logged and mapped to exit code 1.
 #[cfg(feature = "embedded-wasm")]
@@ -249,8 +253,10 @@ pub fn run_wasm_embedded(
     program: &Path,
     extra_args: &[std::ffi::OsString],
     wasi: &WasiConfig,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
 ) -> i32 {
-    match run_embedded_inner(program, extra_args, wasi) {
+    match run_embedded_inner(program, extra_args, wasi, stdout, stderr) {
         Ok(code) => code,
         Err(e) => {
             log::error!("embedded wasm: {}", e);
@@ -264,18 +270,20 @@ fn run_embedded_inner(
     program: &Path,
     extra_args: &[std::ffi::OsString],
     wasi: &WasiConfig,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     if is_wasm_component_binary(program).unwrap_or(false) {
         log::info!(
             "embedded wasm: '{}' is a component — using P2 path",
             program.display()
         );
-        run_embedded_component_file(program, extra_args, wasi)
+        run_embedded_component_file(program, extra_args, wasi, stdout, stderr)
     } else {
         use wasmtime::{Engine, Module};
         let engine = Engine::default();
         let module = Module::from_file(&engine, program)?;
-        run_embedded_module(&engine, &module, extra_args, wasi)
+        run_embedded_module(&engine, &module, extra_args, wasi, stdout, stderr)
     }
 }
 
@@ -285,6 +293,8 @@ fn run_embedded_component_file(
     program: &Path,
     extra_args: &[std::ffi::OsString],
     wasi: &WasiConfig,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     use wasmtime::component::Component;
     use wasmtime::{Config, Engine};
@@ -292,26 +302,48 @@ fn run_embedded_component_file(
     config.wasm_component_model(true);
     let engine = Engine::new(&config)?;
     let component = Component::from_file(&engine, program)?;
-    run_embedded_component(&engine, &component, extra_args, wasi)
+    run_embedded_component(&engine, &component, extra_args, wasi, stdout, stderr)
 }
 
 /// Execute a pre-compiled Wasm module synchronously via embedded wasmtime.
 ///
 /// Exposed as `pub` so integration tests in `tests/` can pass WAT-compiled modules
 /// without going through the filesystem.
+///
+/// When `stdout`/`stderr` are `Some`, the module's output is directed to those
+/// files instead of inheriting the process's fd 1/2.
 #[cfg(feature = "embedded-wasm")]
 pub fn run_embedded_module(
     engine: &wasmtime::Engine,
     module: &wasmtime::Module,
     extra_args: &[std::ffi::OsString],
     wasi: &WasiConfig,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     use wasmtime::{Linker, Store};
+    use wasmtime_wasi::cli::OutputFile;
     use wasmtime_wasi::p1::{self, WasiP1Ctx};
     use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
     let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdin().inherit_stdout().inherit_stderr();
+    builder.inherit_stdin();
+    match stdout {
+        Some(f) => {
+            builder.stdout(OutputFile::new(f));
+        }
+        None => {
+            builder.inherit_stdout();
+        }
+    }
+    match stderr {
+        Some(f) => {
+            builder.stderr(OutputFile::new(f));
+        }
+        None => {
+            builder.inherit_stderr();
+        }
+    }
 
     for (k, v) in &wasi.env {
         builder.env(k, v);
@@ -365,15 +397,21 @@ pub fn run_embedded_module(
 ///
 /// Exposed as `pub` so integration tests can pass pre-loaded components without
 /// going through the filesystem.
+///
+/// When `stdout`/`stderr` are `Some`, the component's output is directed to those
+/// files instead of inheriting the process's fd 1/2.
 #[cfg(feature = "embedded-wasm")]
 pub fn run_embedded_component(
     engine: &wasmtime::Engine,
     component: &wasmtime::component::Component,
     extra_args: &[std::ffi::OsString],
     wasi: &WasiConfig,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     use wasmtime::component::Linker;
     use wasmtime::Store;
+    use wasmtime_wasi::cli::OutputFile;
     use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
     struct WasiState {
@@ -391,7 +429,23 @@ pub fn run_embedded_component(
     }
 
     let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdin().inherit_stdout().inherit_stderr();
+    builder.inherit_stdin();
+    match stdout {
+        Some(f) => {
+            builder.stdout(OutputFile::new(f));
+        }
+        None => {
+            builder.inherit_stdout();
+        }
+    }
+    match stderr {
+        Some(f) => {
+            builder.stderr(OutputFile::new(f));
+        }
+        None => {
+            builder.inherit_stderr();
+        }
+    }
 
     // argv[0] = "module.wasm", then caller-supplied args.
     builder.arg("module.wasm");
@@ -449,7 +503,7 @@ mod embedded_tests {
     fn run_wat(wat: &str) -> i32 {
         let engine = Engine::default();
         let module = Module::new(&engine, wat.as_bytes()).unwrap();
-        run_embedded_module(&engine, &module, &[], &WasiConfig::default()).unwrap()
+        run_embedded_module(&engine, &module, &[], &WasiConfig::default(), None, None).unwrap()
     }
 
     // WASI P1 requires modules to export a `memory` (used by many WASI syscalls).

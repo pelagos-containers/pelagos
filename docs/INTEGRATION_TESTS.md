@@ -2971,6 +2971,20 @@ Failure indicates the P2 / Component Model execution path is broken: the
 functioning correctly.  This test verifies the full component execution round-trip
 (component detection → P2 linker → WASI Command world → exit code 0).
 
+### `wasm_embedded_tests::test_wasm_embedded_piped_stdout`
+**Type:** Unit, requires `--features embedded-wasm`
+**Root:** no  **Rootfs:** no
+
+Creates an OS pipe with `libc::pipe2`, passes the write-end as the `stdout`
+`Option<std::fs::File>` to `run_embedded_module`, and reads the read-end after
+the module exits.  The WAT module writes `"hello wasm\n"` to WASI fd 1 via
+`fd_write`, so the captured bytes must match exactly.
+
+Failure indicates the `OutputFile` redirection path in `run_embedded_module` is
+broken: embedded Wasm stdout is inherited from fd 1 instead of being routed to
+the supplied file.  In `--detach` mode fd 1 is `/dev/null`, so all Wasm output
+would be silently discarded.  This is the regression guard for issue #153.
+
 ---
 
 ## Build Regression Tests (`build_regression_tests`)
