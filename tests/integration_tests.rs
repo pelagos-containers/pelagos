@@ -24250,3 +24250,80 @@ mod nfnetlink_native {
         );
     }
 }
+
+mod native_netlink_teardown {
+    use super::*;
+
+    /// `pelagos network rm` must remove the network config dir via `cmd_network_rm`,
+    /// which now calls `netlink::link_del` + `nfnetlink::nft_delete_ip_table` instead
+    /// of shelling out to `ip` / `nft`.
+    ///
+    /// Requires root (writes to /var/lib/pelagos/networks/).
+    /// Creates a named network config (no bridge/nft rules, since no container ran on it),
+    /// then calls `pelagos network rm` via the CLI binary and asserts the config dir is gone.
+    /// Both `link_del` and `nft_delete_ip_table` are expected to return non-fatal "not found"
+    /// errors for a network that was never activated; the test verifies the command still
+    /// exits 0 and cleans up the config directory.
+    #[test]
+    #[serial(nat)]
+    fn test_network_rm_uses_native_netlink() {
+        if !is_root() {
+            eprintln!("Skipping test_network_rm_uses_native_netlink: requires root");
+            return;
+        }
+        let name = "nl-rm-test";
+        let config_dir = pelagos::paths::network_config_dir(name);
+        // Clean up any leftover state.
+        let _ = std::fs::remove_dir_all(&config_dir);
+
+        // Create the network via CLI.
+        let create = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["network", "create", name, "--subnet", "10.239.7.0/24"])
+            .output()
+            .expect("pelagos network create");
+        assert!(
+            create.status.success(),
+            "network create failed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+        assert!(config_dir.exists(), "config dir should exist after create");
+
+        // Remove via CLI — exercises link_del + nft_delete_ip_table.
+        let rm = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["network", "rm", name])
+            .output()
+            .expect("pelagos network rm");
+        assert!(
+            rm.status.success(),
+            "network rm failed: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+        assert!(
+            !config_dir.exists(),
+            "config dir should be gone after network rm"
+        );
+    }
+
+    /// `netlink::netns_del` round-trip via the library: create a named netns with
+    /// `netns_create`, verify the bind-mount exists, call `netns_del`, verify it is gone.
+    ///
+    /// Requires root (bind-mount needs CAP_SYS_ADMIN).
+    #[test]
+    fn test_netns_del_roundtrip() {
+        if !is_root() {
+            eprintln!("Skipping test_netns_del_roundtrip: requires root");
+            return;
+        }
+        let name = format!("pelagos-itns-{}", std::process::id());
+        pelagos::netlink::netns_create(&name).expect("netns_create");
+        assert!(
+            std::path::Path::new(&format!("/run/netns/{name}")).exists(),
+            "netns path should exist after create"
+        );
+        pelagos::netlink::netns_del(&name).expect("netns_del");
+        assert!(
+            !std::path::Path::new(&format!("/run/netns/{name}")).exists(),
+            "netns path should be gone after del"
+        );
+    }
+}

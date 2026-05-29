@@ -271,12 +271,8 @@ pub fn remove_sandbox(id: &str) -> io::Result<()> {
     // Tear down the network namespace.
     let veth_host = state.veth_host.clone();
     // Best-effort: ignore errors (veth may already be gone if container died).
-    let _ = std::process::Command::new("ip")
-        .args(["link", "del", &veth_host])
-        .status();
-    let _ = std::process::Command::new("ip")
-        .args(["netns", "del", &state.ns_name])
-        .status();
+    let _ = crate::netlink::link_del(&veth_host);
+    let _ = crate::netlink::netns_del(&state.ns_name);
 
     // Remove the state directory.
     let dir = crate::paths::sandbox_dir(id);

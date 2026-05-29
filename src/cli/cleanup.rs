@@ -50,27 +50,12 @@ fn cleanup_netns() -> Result<u32, Box<dyn std::error::Error>> {
         if pid_alive(pid) {
             continue;
         }
-        // Use `ip netns del` to properly unmount + remove the entry.
         log::info!("removing stale netns: {}", name);
-        let status = std::process::Command::new("ip")
-            .args(["netns", "del", &name])
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                count += 1;
-                println!("  removed netns {}", name);
-            }
-            _ => {
-                // Fallback: try direct unmount + unlink.
-                let path = netns_dir.join(&*name);
-                let _ = nix::mount::umount2(&path, nix::mount::MntFlags::MNT_DETACH);
-                if std::fs::remove_file(&path).is_ok() {
-                    count += 1;
-                    println!("  removed netns {} (fallback)", name);
-                } else {
-                    log::warn!("failed to remove stale netns {}", name);
-                }
-            }
+        if pelagos::netlink::netns_del(&name).is_ok() {
+            count += 1;
+            println!("  removed netns {}", name);
+        } else {
+            log::warn!("failed to remove stale netns {}", name);
         }
     }
     Ok(count)
