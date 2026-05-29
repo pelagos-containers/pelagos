@@ -35,6 +35,7 @@ pub mod rootfs;
 pub mod run;
 pub mod sandbox;
 pub mod start;
+pub mod stats;
 pub mod stop;
 pub mod subscribe;
 pub mod system;
