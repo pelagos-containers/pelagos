@@ -459,10 +459,14 @@ pub fn minimal_filter() -> Result<BpfProgram, io::Error> {
 pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io::Error> {
     use std::convert::TryInto;
 
-    fn oci_action_to_seccomp(action: &str) -> Option<SeccompAction> {
+    fn oci_action_to_seccomp(action: &str, errno_ret: Option<u32>) -> Option<SeccompAction> {
         match action {
             "SCMP_ACT_ALLOW" => Some(SeccompAction::Allow),
-            "SCMP_ACT_ERRNO" | "SCMP_ACT_ENOSYS" => Some(SeccompAction::Errno(libc::EPERM as u32)),
+            "SCMP_ACT_ERRNO" => Some(SeccompAction::Errno(
+                errno_ret.unwrap_or(libc::EPERM as u32),
+            )),
+            // SCMP_ACT_ENOSYS always returns ENOSYS (38), regardless of errnoRet.
+            "SCMP_ACT_ENOSYS" => Some(SeccompAction::Errno(libc::ENOSYS as u32)),
             "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" => Some(SeccompAction::KillThread),
             "SCMP_ACT_KILL_PROCESS" => Some(SeccompAction::KillProcess),
             "SCMP_ACT_LOG" => Some(SeccompAction::Log),
@@ -486,12 +490,13 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         SeccompCondition::new(arg.index as u8, SeccompCmpArgLen::Qword, op, value).ok()
     }
 
-    let default_action = oci_action_to_seccomp(&config.default_action).ok_or_else(|| {
-        io::Error::other(format!(
-            "unknown seccomp defaultAction: {}",
-            config.default_action
-        ))
-    })?;
+    let default_action = oci_action_to_seccomp(&config.default_action, config.default_errno_ret)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "unknown seccomp defaultAction: {}",
+                config.default_action
+            ))
+        })?;
 
     // seccompiler supports a single match_action per filter. Collect all rules
     // whose action differs from the default; warn and drop any that introduce a
@@ -500,7 +505,7 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
     let mut match_action: Option<SeccompAction> = None;
 
     for rule in &config.syscalls {
-        let action = match oci_action_to_seccomp(&rule.action) {
+        let action = match oci_action_to_seccomp(&rule.action, rule.errno_ret) {
             Some(a) => a,
             None => continue,
         };
@@ -1229,6 +1234,43 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_from_oci_errno_ret() {
+        // SCMP_ACT_ERRNO with errnoRet:38 should produce Errno(38), not Errno(EPERM).
+        let config_enosys = crate::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![crate::oci::OciSyscallRule {
+                names: vec!["personality".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: Some(libc::ENOSYS as u32),
+                args: vec![],
+            }],
+        };
+        assert!(
+            filter_from_oci(&config_enosys).is_ok(),
+            "errnoRet=ENOSYS should compile"
+        );
+
+        // SCMP_ACT_ENOSYS (no errnoRet field) should also compile.
+        let config_act_enosys = crate::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![crate::oci::OciSyscallRule {
+                names: vec!["personality".to_string()],
+                action: "SCMP_ACT_ENOSYS".to_string(),
+                errno_ret: None,
+                args: vec![],
+            }],
+        };
+        assert!(
+            filter_from_oci(&config_act_enosys).is_ok(),
+            "SCMP_ACT_ENOSYS should compile"
+        );
+    }
+
+    #[test]
     fn test_docker_filter_blocks_io_uring_syscalls() {
         // docker_default_filter must include io_uring in its blocked list.
         // We verify this by checking that syscall_number succeeds for all three
@@ -1246,10 +1288,12 @@ mod tests {
         // AF_NETLINK = 16.
         let config = crate::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![crate::oci::OciSyscallRule {
                 names: vec!["socket".to_string()],
                 action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
                 args: vec![crate::oci::OciSyscallArg {
                     index: 0,
                     value: 16, // AF_NETLINK
@@ -1271,10 +1315,12 @@ mod tests {
         // Verify SCMP_CMP_MASKED_EQ compiles: value=mask, value_two=expected result.
         let config = crate::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![crate::oci::OciSyscallRule {
                 names: vec!["mmap".to_string()],
                 action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
                 args: vec![crate::oci::OciSyscallArg {
                     index: 3,
                     value: 0x0f, // mask: lower 4 bits

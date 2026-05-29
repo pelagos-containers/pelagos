@@ -5766,10 +5766,12 @@ int main(void) {
         // Build seccomp filter: allow everything except socket(AF_NETLINK=16, ...).
         let oci_seccomp = pelagos::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![pelagos::oci::OciSyscallRule {
                 names: vec!["socket".to_string()],
                 action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
                 args: vec![pelagos::oci::OciSyscallArg {
                     index: 0,
                     value: 16, // AF_NETLINK
@@ -5940,10 +5942,12 @@ int main(void) {
         // Block socket when arg[0] != AF_INET(2): INET allowed, INET6/NETLINK blocked.
         let ne_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![pelagos::oci::OciSyscallRule {
                 names: vec!["socket".to_string()],
                 action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
                 args: vec![pelagos::oci::OciSyscallArg {
                     index: 0,
                     value: 2,
@@ -5977,10 +5981,12 @@ int main(void) {
         // SOCK_STREAM|SOCK_NONBLOCK(0x801) → 0x801&0x800=0x800 == 0x800 → blocked.
         let meq_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![pelagos::oci::OciSyscallRule {
                 names: vec!["socket".to_string()],
                 action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
                 args: vec![pelagos::oci::OciSyscallArg {
                     index: 1,
                     value: 0x800,
@@ -6013,10 +6019,12 @@ int main(void) {
         // Only exact {AF_INET, SOCK_STREAM} is blocked; SOCK_NONBLOCK variant and INET6 pass.
         let and_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![pelagos::oci::OciSyscallRule {
                 names: vec!["socket".to_string()],
                 action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
                 args: vec![
                     pelagos::oci::OciSyscallArg {
                         index: 0,
@@ -6057,11 +6065,13 @@ int main(void) {
         // AF_INET(2) matches neither rule → allowed.
         let or_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: vec![],
             syscalls: vec![
                 pelagos::oci::OciSyscallRule {
                     names: vec!["socket".to_string()],
                     action: "SCMP_ACT_ERRNO".to_string(),
+                    errno_ret: None,
                     args: vec![pelagos::oci::OciSyscallArg {
                         index: 0,
                         value: 16,
@@ -6072,6 +6082,7 @@ int main(void) {
                 pelagos::oci::OciSyscallRule {
                     names: vec!["socket".to_string()],
                     action: "SCMP_ACT_ERRNO".to_string(),
+                    errno_ret: None,
                     args: vec![pelagos::oci::OciSyscallArg {
                         index: 0,
                         value: 10,
@@ -6095,6 +6106,138 @@ int main(void) {
         assert!(
             or.contains("NETLINK_RAW_FAIL"),
             "OR: NETLINK blocked by rule 1: {or:?}"
+        );
+    }
+
+    /// test_oci_seccomp_errno_ret
+    ///
+    /// Requires: root (no rootfs required — compiles a static binary at test time).
+    ///
+    /// Verifies that `errnoRet` and `SCMP_ACT_ENOSYS` are honoured at the kernel level:
+    ///
+    /// - `SCMP_ACT_ERRNO` with `errnoRet: 38` (ENOSYS) → container gets errno 38, not 1 (EPERM)
+    /// - `SCMP_ACT_ERRNO` without `errnoRet` → container gets errno 1 (EPERM, the default)
+    /// - `SCMP_ACT_ENOSYS` → container gets errno 38 regardless of errnoRet field
+    ///
+    /// Uses `personality(0xffffffff)` as the probe syscall — it's in Docker's blocked list,
+    /// takes a single argument, and requires no special privileges or setup.
+    ///
+    /// Failure indicates that `errnoRet` or `SCMP_ACT_ENOSYS` translation in
+    /// `filter_from_oci` / `oci_action_to_seccomp` is wrong.
+    #[test]
+    fn test_oci_seccomp_errno_ret() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_seccomp_errno_ret: requires root");
+            return;
+        }
+
+        // Probe: call personality(0xffffffff) and print the errno value.
+        // personality() with 0xffffffff queries the current domain without changing it;
+        // when blocked by seccomp it returns -1 with the configured errno.
+        let src = r#"
+#include <sys/personality.h>
+#include <errno.h>
+#include <stdio.h>
+int main(void) {
+    int r = personality(0xffffffffUL);
+    if (r == -1) printf("ERRNO:%d\n", errno);
+    else         printf("OK:%d\n", r);
+    return 0;
+}
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir for seccomp_errno_ret");
+        let src_path = tmp.path().join("probe.c");
+        let bin_path = tmp.path().join("probe");
+        std::fs::write(&src_path, src).expect("write probe.c");
+        let cc_out = std::process::Command::new("cc")
+            .args([
+                "-static",
+                "-o",
+                bin_path.to_str().unwrap(),
+                src_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("cc");
+        assert!(
+            cc_out.status.success(),
+            "compile: {}",
+            String::from_utf8_lossy(&cc_out.stderr)
+        );
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir(&rootfs).expect("mkdir rootfs");
+        std::fs::copy(&bin_path, rootfs.join("probe")).expect("cp probe");
+
+        let run_probe = |prog: seccompiler::BpfProgram| -> String {
+            let mut child = Command::new("/probe")
+                .with_chroot(&rootfs)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Null)
+                .with_seccomp_program(prog)
+                .spawn()
+                .expect("spawn");
+            let (_, out, _) = child.wait_with_output().expect("wait");
+            String::from_utf8_lossy(&out).into_owned()
+        };
+
+        // SCMP_ACT_ERRNO with errnoRet:38 → should return ENOSYS (38).
+        let prog_enosys_ret = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["personality".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: Some(38), // ENOSYS
+                args: vec![],
+            }],
+        })
+        .expect("filter with errnoRet");
+        let out = run_probe(prog_enosys_ret);
+        assert_eq!(
+            out.trim(),
+            "ERRNO:38",
+            "errnoRet:38 should return ENOSYS: got {out:?}"
+        );
+
+        // SCMP_ACT_ERRNO without errnoRet → should return EPERM (1).
+        let prog_eperm = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["personality".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                errno_ret: None,
+                args: vec![],
+            }],
+        })
+        .expect("filter without errnoRet");
+        let out = run_probe(prog_eperm);
+        assert_eq!(
+            out.trim(),
+            "ERRNO:1",
+            "no errnoRet should return EPERM(1): got {out:?}"
+        );
+
+        // SCMP_ACT_ENOSYS → should return ENOSYS (38) without errnoRet field.
+        let prog_act_enosys = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["personality".to_string()],
+                action: "SCMP_ACT_ENOSYS".to_string(),
+                errno_ret: None,
+                args: vec![],
+            }],
+        })
+        .expect("SCMP_ACT_ENOSYS filter");
+        let out = run_probe(prog_act_enosys);
+        assert_eq!(
+            out.trim(),
+            "ERRNO:38",
+            "SCMP_ACT_ENOSYS should return ENOSYS(38): got {out:?}"
         );
     }
 

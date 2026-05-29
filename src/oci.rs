@@ -296,6 +296,9 @@ fn default_file_mode() -> u32 {
 #[serde(rename_all = "camelCase")]
 pub struct OciSeccomp {
     pub default_action: String,
+    /// Errno returned when the default action is `SCMP_ACT_ERRNO`. Defaults to EPERM.
+    #[serde(default)]
+    pub default_errno_ret: Option<u32>,
     #[serde(default)]
     pub architectures: Vec<String>,
     #[serde(default)]
@@ -307,6 +310,9 @@ pub struct OciSyscallRule {
     #[serde(default)]
     pub names: Vec<String>,
     pub action: String,
+    /// Per-rule errno override for `SCMP_ACT_ERRNO`. Defaults to EPERM when absent.
+    #[serde(default, rename = "errnoRet")]
+    pub errno_ret: Option<u32>,
     #[serde(default)]
     pub args: Vec<OciSyscallArg>,
 }
