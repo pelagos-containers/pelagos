@@ -1,6 +1,6 @@
 # Pelagos Development Roadmap
 
-**Last Updated:** 2026-02-20
+**Last Updated:** 2026-05-29
 **Current Status:** Image build complete — `pelagos build -t <tag> .`
 
 ---
@@ -131,11 +131,13 @@ as "created" state is written.
 
 **OCI Phase 2 (complete):** `process.capabilities` ✅, `linux.maskedPaths` ✅,
 `linux.readonlyPaths` ✅, `linux.resources` ✅, `process.rlimits` ✅,
-`linux.sysctl` ✅, `linux.devices` ✅, `hooks` (prestart/poststart/poststop) ✅,
-`linux.seccomp` ✅.
+`linux.sysctl` ✅, `linux.devices` ✅, `hooks` (all: prestart/createRuntime/createContainer/startContainer/poststart/poststop) ✅,
+`linux.seccomp` (including `args` argument conditions, `errnoRet`, `defaultErrnoRet`) ✅,
+`annotations` (config + state) ✅.
 
-Deferred to Phase 3: `linux.devices` fine-grained ACLs, `linux.seccomp` argument
-conditions (`args` field), `hooks.createRuntime` / `startContainer`, `annotations`.
+Remaining genuine gaps: `linux.devices` fine-grained ACLs (cgroup device controller, requires eBPF),
+AppArmor/SELinux MAC profiles, I/O bandwidth cgroups (`blkio`/`io` controller),
+CRIU checkpoint/restore.
 
 ---
 
@@ -263,5 +265,5 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 | Image build ✅ | ~80% | Remfile-based build (also not runc's job) |
 
 **Remaining runc gaps (~20%):** AppArmor/SELinux, CRIU checkpoint/restore,
-Intel RDT, seccomp arg-level conditions, I/O bandwidth cgroups, PID namespace
-in CLI foreground, createRuntime/startContainer hooks, some OCI config.json fields.
+Intel RDT, I/O bandwidth cgroups, PID namespace in CLI foreground,
+`linux.devices` cgroup device ACLs (eBPF).
