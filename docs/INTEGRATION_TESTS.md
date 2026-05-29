@@ -4413,3 +4413,27 @@ name on a data row. Cleans up the container after the assertions.
 
 Failure indicates the stats command cannot discover a running container via state files,
 crashes during cgroup probing, or produces output missing expected columns or the container name.
+
+### `test_network_rm_uses_native_netlink`
+**Requires:** root
+**Module:** `native_netlink_teardown`
+
+Creates a named network via `pelagos network create`, then removes it via `pelagos network rm`.
+Verifies the command exits 0 and the config directory is gone. Exercises the `netlink::link_del`
+and `nfnetlink::nft_delete_ip_table` paths that replaced the `ip`/`nft` shell-outs in
+`cmd_network_rm`. Both calls are expected to return non-fatal "not found" errors (no container
+ran on this network, so no bridge or nft table was created); the test confirms the command
+handles those gracefully and still removes the config.
+
+Failure indicates `cmd_network_rm` is crashing on non-fatal link_del/nft errors, or the
+config directory cleanup is broken.
+
+### `test_netns_del_roundtrip`
+**Requires:** root
+**Module:** `native_netlink_teardown`
+
+Calls `netlink::netns_create` then `netlink::netns_del` and asserts the `/run/netns/<name>`
+bind-mount is present after create and absent after del.
+
+Failure indicates `netns_del`'s `umount2(MNT_DETACH)` or `unlink` is broken, or the path
+construction is wrong.
