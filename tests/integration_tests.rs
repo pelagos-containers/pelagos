@@ -16404,6 +16404,7 @@ CMD [\"cat\", \"/chown-marker\"]\n";
 
 mod tutorial_e2e_p1 {
     use super::is_root;
+    use serial_test::serial;
 
     fn bin() -> &'static str {
         env!("CARGO_BIN_EXE_pelagos")
@@ -16459,6 +16460,7 @@ mod tutorial_e2e_p1 {
     /// possible tutorial smoke test: it confirms that image pull (if needed),
     /// rootless overlay, and basic exec all work end-to-end.
     #[test]
+    #[serial(nat)]
     fn test_tut_p1_echo() {
         ensure_alpine();
         let out = std::process::Command::new(bin())
@@ -16489,6 +16491,7 @@ mod tutorial_e2e_p1 {
     ///
     /// Failure indicates namespace setup, image layers, or Alpine config is broken.
     #[test]
+    #[serial(nat)]
     fn test_tut_p1_hostname_whoami() {
         ensure_alpine();
         let out = std::process::Command::new(bin())
@@ -16530,7 +16533,7 @@ mod tutorial_e2e_p1 {
     ///
     /// Failure indicates detach, watcher, ps listing, logs retrieval, or stop are broken.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_tut_p1_ps_logs_stop() {
         if !is_root() {
             eprintln!("SKIP test_tut_p1_ps_logs_stop: requires root");
@@ -16598,7 +16601,7 @@ mod tutorial_e2e_p1 {
     ///
     /// Failure indicates exec namespace-join or Alpine's /etc/hostname is broken.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_tut_p1_exec_noninteractive() {
         if !is_root() {
             eprintln!("SKIP test_tut_p1_exec_noninteractive: requires root");
@@ -16658,7 +16661,7 @@ mod tutorial_e2e_p1 {
     /// joined first (to acquire caps), then MOUNT, then remaining ns (UTS/IPC/NET).
     /// Failure indicates a regression in exec.rs namespace-join ordering.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_rootless_exec_noninteractive() {
         ensure_alpine();
         let name = "rootless-exec-test";
@@ -16714,7 +16717,7 @@ mod tutorial_e2e_p1 {
     /// (including its overlay-backed /tmp), not the host mount namespace.
     /// Failure indicates MOUNT namespace join is broken in rootless exec.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_rootless_exec_sees_container_filesystem() {
         ensure_alpine();
         let name = "rootless-exec-fs-test";
@@ -16777,7 +16780,7 @@ mod tutorial_e2e_p1 {
     ///
     /// Failure indicates env var inheritance or -e override in exec is broken.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_rootless_exec_environment() {
         ensure_alpine();
         let name = "rootless-exec-env-test";
@@ -16858,7 +16861,7 @@ mod tutorial_e2e_p1 {
     /// Failure indicates the liveness check in cmd_exec is not rejecting exited
     /// containers.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_rootless_exec_nonrunning_fails() {
         ensure_alpine();
         let name = "rootless-exec-dead-test";
@@ -16919,7 +16922,7 @@ mod tutorial_e2e_p1 {
     /// Failure indicates that fuse-overlayfs `allow_other` is not set (UID != mount
     /// owner gets EACCES), or that the `--user`/`--workdir` flags are broken in exec.rs.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_rootless_exec_user_workdir() {
         ensure_alpine();
         let name = "rootless-exec-userwd-test";
@@ -17039,6 +17042,7 @@ mod tutorial_e2e_p1 {
     ///
     /// Failure indicates the --rm flag is not cleaning up container state on exit.
     #[test]
+    #[serial(nat)]
     fn test_tut_p1_auto_rm() {
         let name = "tut-p1-rm";
         let state_dir = std::path::Path::new("/run/pelagos/containers").join(name);
@@ -17124,7 +17128,7 @@ mod tutorial_e2e_p2 {
     ///
     /// Failure indicates the build engine (COPY, RUN chmod, CMD) or image run is broken.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_tut_p2_simple_build() {
         let ctx = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -17179,7 +17183,7 @@ mod tutorial_e2e_p2 {
     /// Failure indicates the save/load round-trip is broken — either the OCI
     /// archive format is corrupt or the image store is not updated correctly on load.
     #[test]
-    #[serial_test::serial]
+    #[serial(nat)]
     fn test_tut_p2_image_save_load() {
         let ctx = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -17265,7 +17269,7 @@ mod tutorial_e2e_p2 {
     /// a container, or static binary execution in the final Alpine stage is broken.
     #[test]
     #[ignore]
-    #[serial]
+    #[serial(nat)]
     fn test_tut_p2_multistage_go_build() {
         let ctx = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/tutorial-e2e/p2-go");
         let tag = "tut-p2-go:latest";
@@ -17323,6 +17327,7 @@ mod tutorial_e2e_p2 {
 
 mod tutorial_e2e_p3 {
     use super::is_root;
+    use serial_test::serial;
 
     fn bin() -> &'static str {
         env!("CARGO_BIN_EXE_pelagos")
@@ -17374,6 +17379,7 @@ mod tutorial_e2e_p3 {
     ///
     /// Failure indicates --read-only is not applied or the overlayfs mount is writable.
     #[test]
+    #[serial(nat)]
     fn test_tut_p3_read_only() {
         if !is_root() {
             eprintln!("SKIP test_tut_p3_read_only: requires root");
@@ -17406,6 +17412,7 @@ mod tutorial_e2e_p3 {
     ///
     /// Failure indicates the --memory cgroup limit is not enforced.
     #[test]
+    #[serial(nat)]
     fn test_tut_p3_memory_oom() {
         if !is_root() {
             eprintln!("SKIP test_tut_p3_memory_oom: requires root");
@@ -17443,6 +17450,7 @@ mod tutorial_e2e_p3 {
     ///
     /// Failure indicates capability dropping is not applied correctly.
     #[test]
+    #[serial(nat)]
     fn test_tut_p3_cap_drop() {
         if !is_root() {
             eprintln!("SKIP test_tut_p3_cap_drop: requires root");
@@ -17483,6 +17491,7 @@ mod tutorial_e2e_p3 {
     /// Failure indicates the default seccomp profile is not applied or unshare is not
     /// in the blocked syscall list.
     #[test]
+    #[serial(nat)]
     #[ignore = "hangs indefinitely on this host (2026-04-06); root cause TBD"]
     fn test_tut_p3_seccomp() {
         if !is_root() {
@@ -17521,6 +17530,7 @@ mod tutorial_e2e_p3 {
     /// Failure indicates the loopback network mode provides unintended external
     /// connectivity, violating isolation guarantees.
     #[test]
+    #[serial(nat)]
     fn test_tut_p3_network_loopback() {
         ensure_alpine();
         let out = std::process::Command::new(bin())
@@ -18448,7 +18458,7 @@ mod auto_resolv_conf {
     /// Failure indicates `pelagos start` cannot restart an exited container, or
     /// that SpawnConfig was not persisted in state.json on first run.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_restart_after_exit() {
         if !is_root() {
             eprintln!("SKIP: test_container_restart_after_exit requires root");
@@ -18552,7 +18562,7 @@ mod auto_resolv_conf {
     /// Failure indicates SpawnConfig did not preserve bind mounts or the command
     /// was not faithfully reproduced on restart.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_restart_runs_same_command() {
         if !is_root() {
             eprintln!("SKIP: test_container_restart_runs_same_command requires root");
@@ -18663,7 +18673,7 @@ mod auto_resolv_conf {
     /// non-zero exit code.  Failure indicates the "already running" guard in
     /// cmd_start is broken.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_start_running_fails() {
         if !is_root() {
             eprintln!("SKIP: test_container_start_running_fails requires root");
@@ -18748,7 +18758,7 @@ mod auto_resolv_conf {
     /// Failure indicates that `SpawnConfig.tmpfs` is not being saved by `build_spawn_config`
     /// or not being restored by `spawn_config_to_run_args`.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_restart_preserves_tmpfs() {
         if !is_root() {
             eprintln!("SKIP: test_container_restart_preserves_tmpfs requires root");
@@ -18863,7 +18873,7 @@ mod auto_resolv_conf {
     ///
     /// Failure indicates the multi-name dispatch in main.rs or cmd_start is broken.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_container_start_multiple_names() {
         if !is_root() {
             eprintln!("SKIP: test_container_start_multiple_names requires root");
@@ -18967,6 +18977,7 @@ mod auto_resolv_conf {
     /// `pelagos run -d` are persisted in state.json and visible via
     /// `pelagos container inspect`. Failure indicates label serialization is broken.
     #[test]
+    #[serial(nat)]
     fn test_run_with_labels_appear_in_inspect() {
         if !is_root() {
             eprintln!("SKIP: test_run_with_labels_appear_in_inspect requires root");
@@ -19054,6 +19065,7 @@ mod auto_resolv_conf {
     /// Requires root + rootfs. Verifies that `pelagos ps --filter label=KEY=VALUE`
     /// returns only containers with that label. Failure indicates filter logic is broken.
     #[test]
+    #[serial(nat)]
     fn test_ps_filter_label() {
         if !is_root() {
             eprintln!("SKIP: test_ps_filter_label requires root");
@@ -19551,6 +19563,7 @@ mod pasta_diagnostic_tests {
 // ---------------------------------------------------------------------------
 
 mod json_flag_tests {
+    use serial_test::serial;
     use std::process::Command;
 
     fn pelagos_bin() -> std::path::PathBuf {
@@ -19570,6 +19583,7 @@ mod json_flag_tests {
     /// Failure indicates: --json flag is not wired up, or cmd_ps does not
     /// emit JSON when the flag is set.
     #[test]
+    #[serial(nat)]
     fn test_ps_json_flag_produces_valid_json() {
         let bin = pelagos_bin();
         for args in &[vec!["ps", "--json"], vec!["ps", "--json", "--all"]] {
@@ -19602,23 +19616,79 @@ mod json_flag_tests {
     ///
     /// Failure indicates: the two flags take different code paths or one of
     /// them is broken.
+    ///
+    /// We run a known container inside the test so the result is deterministic
+    /// regardless of what other containers exist in the system.
     #[test]
+    #[serial(nat)]
     fn test_ps_json_and_format_json_identical() {
+        if !crate::is_root() {
+            eprintln!("Skipping test_ps_json_and_format_json_identical: requires root");
+            return;
+        }
         let bin = pelagos_bin();
-        let out_json = Command::new(&bin)
-            .args(["ps", "--json", "--all"])
+        // Pull alpine if not already present.
+        let ls = std::process::Command::new(&bin)
+            .args(["image", "ls"])
+            .output()
+            .unwrap();
+        if !String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            std::process::Command::new(&bin)
+                .args(["image", "pull", "alpine:3.21"])
+                .status()
+                .expect("alpine pull failed");
+        }
+        let name = "ps-flag-cmp";
+        let _ = std::process::Command::new(&bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        let run = std::process::Command::new(&bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine:3.21",
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run --detach");
+        assert!(
+            run.status.success(),
+            "failed to start test container: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let out_json = std::process::Command::new(&bin)
+            .args(["ps", "--json"])
             .output()
             .expect("pelagos ps --json");
-        let out_fmt = Command::new(&bin)
-            .args(["ps", "--format", "json", "--all"])
+        let out_fmt = std::process::Command::new(&bin)
+            .args(["ps", "--format", "json"])
             .output()
             .expect("pelagos ps --format json");
+
+        let _ = std::process::Command::new(&bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(&bin)
+            .args(["rm", "-f", name])
+            .output();
+
         assert!(out_json.status.success());
         assert!(out_fmt.status.success());
+        // Parse and compare as JSON values so that field-ordering differences
+        // between two CLI invocations don't cause spurious byte-level mismatches.
+        let j1: serde_json::Value =
+            serde_json::from_slice(&out_json.stdout).expect("--json output is not valid JSON");
+        let j2: serde_json::Value = serde_json::from_slice(&out_fmt.stdout)
+            .expect("--format json output is not valid JSON");
         assert_eq!(
-            String::from_utf8_lossy(&out_json.stdout),
-            String::from_utf8_lossy(&out_fmt.stdout),
-            "--json and --format json produced different output"
+            j1, j2,
+            "--json and --format json produced different JSON values"
         );
     }
 
@@ -20878,6 +20948,7 @@ mod issue_115_exec_applies_image_env {
 
 mod issue_117_attach_streams {
     use crate::{get_test_rootfs, is_root};
+    use serial_test::serial;
 
     fn bin() -> &'static str {
         env!("CARGO_BIN_EXE_pelagos")
@@ -20899,6 +20970,7 @@ mod issue_117_attach_streams {
     /// Failure indicates that `-a STDOUT` does not tee container stdout to the caller,
     /// or that the attach pipe is not being wired up in run_detached / relay.rs.
     #[test]
+    #[serial(nat)]
     fn test_detach_attach_stdout_streams_output() {
         if !is_root() {
             eprintln!("SKIP: test_detach_attach_stdout_streams_output requires root");
@@ -20967,6 +21039,7 @@ mod issue_117_attach_streams {
     ///
     /// Failure indicates that `-a STDERR` is not teeing container stderr to the caller.
     #[test]
+    #[serial(nat)]
     fn test_detach_attach_stderr_streams_output() {
         if !is_root() {
             eprintln!("SKIP: test_detach_attach_stderr_streams_output requires root");
@@ -21028,6 +21101,7 @@ mod issue_117_attach_streams {
     /// Failure indicates that `--sig-proxy` is not accepted (clap parse error), or
     /// that the combination of flags breaks the attach relay.
     #[test]
+    #[serial(nat)]
     fn test_detach_attach_sig_proxy_compat() {
         if !is_root() {
             eprintln!("SKIP: test_detach_attach_sig_proxy_compat requires root");
@@ -21090,6 +21164,7 @@ mod issue_117_attach_streams {
 
 mod issue_118_start_returns_promptly {
     use crate::is_root;
+    use serial_test::serial;
     use std::time::{Duration, Instant};
 
     fn bin() -> &'static str {
@@ -21118,6 +21193,7 @@ mod issue_118_start_returns_promptly {
     /// This test uses `Stdio::piped()` to reproduce the exact scenario that
     /// caused the hang in pelagos-mac's Docker shim (issue #118).
     #[test]
+    #[serial(nat)]
     fn test_start_returns_promptly() {
         use std::process::Stdio;
 
@@ -21251,6 +21327,7 @@ mod issue_118_start_returns_promptly {
 mod issue_120_etc_hosts {
     use crate::{get_test_rootfs, is_root, ALPINE_PATH};
     use pelagos::container::{Command, Namespace, Stdio};
+    use serial_test::serial;
 
     /// Verifies that /etc/hosts is always created in containers, containing at minimum
     /// `127.0.0.1 localhost` and the IPv6 localhost aliases.
@@ -21306,6 +21383,7 @@ mod issue_120_etc_hosts {
     /// Requires root + alpine rootfs. Failure indicates hostname resolution via
     /// `getaddrinfo(hostname)` would fail inside the container.
     #[test]
+    #[serial(nat)]
     fn test_etc_hosts_hostname_alias() {
         if !is_root() {
             eprintln!("SKIP: test_etc_hosts_hostname_alias requires root");
@@ -21345,6 +21423,7 @@ mod issue_120_etc_hosts {
 }
 
 mod issue_124_run_state_ordering {
+    use serial_test::serial;
     use std::io::BufRead;
     use std::time::Duration;
 
@@ -21377,6 +21456,7 @@ mod issue_124_run_state_ordering {
     /// The fix: switch stdout/stderr to Piped and write state with real PID
     /// before starting relay threads, so data only flows after state is written.
     #[test]
+    #[serial(nat)]
     fn test_run_foreground_state_written_before_output_issue_124() {
         use crate::is_root;
         use std::io::BufReader;
@@ -21450,6 +21530,7 @@ mod issue_124_run_state_ordering {
     /// The fix: a sync pipe causes the parent to block until the watcher writes
     /// state with the real PID, then returns.
     #[test]
+    #[serial(nat)]
     fn test_run_detached_state_ready_on_return_issue_124() {
         use crate::is_root;
 
@@ -21505,6 +21586,7 @@ mod issue_124_run_state_ordering {
 // ---------------------------------------------------------------------------
 
 mod compose_shutdown_fixes {
+    use serial_test::serial;
     use std::process::{Command, Stdio};
 
     fn bin() -> &'static str {
@@ -21556,6 +21638,7 @@ mod compose_shutdown_fixes {
     /// The test confirms that the sleep child has also exited after compose down.
     /// Failure indicates the pgid fix (setpgid + kill(-pid)) is broken.
     #[test]
+    #[serial(nat)]
     fn test_compose_down_kills_shell_entrypoint_descendants() {
         if !is_root() {
             eprintln!("SKIP test_compose_down_kills_shell_entrypoint_descendants: requires root");
@@ -21713,6 +21796,7 @@ mod compose_shutdown_fixes {
     /// Failure indicates the --no-pull flag is not wired up or the error message
     /// changed shape in a way that breaks user-visible output.
     #[test]
+    #[serial(nat)]
     fn test_compose_no_pull_fails_immediately() {
         if !is_root() {
             eprintln!("SKIP test_compose_no_pull_fails_immediately: requires root");
@@ -21790,6 +21874,7 @@ mod compose_shutdown_fixes {
     /// Failure indicates the stale state detection in cmd_compose_up_reml is broken
     /// or cleanup_stale_project is not properly removing containers.
     #[test]
+    #[serial(nat)]
     fn test_compose_up_detects_stale_supervisor() {
         if !is_root() {
             eprintln!("SKIP test_compose_up_detects_stale_supervisor: requires root");
@@ -22147,6 +22232,7 @@ mod config_subnet {
     ///
     /// Uses only the library API; does not spawn containers or require root.
     #[test]
+    #[serial(nat)]
     fn test_ensure_network_custom_alloc_pool() {
         let name1 = "cfg-test-n1";
         let name2 = "cfg-test-n2";
@@ -22616,6 +22702,7 @@ mod compose_bind_network {
 }
 
 mod issue_232_stop_idempotent {
+    use serial_test::serial;
     /// test_stop_on_exited_container_is_idempotent
     ///
     /// Requires: root.
@@ -22628,6 +22715,7 @@ mod issue_232_stop_idempotent {
     ///
     /// Both stop calls must succeed (exit 0).
     #[test]
+    #[serial(nat)]
     fn test_stop_on_exited_container_is_idempotent() {
         if !super::is_root() {
             eprintln!("SKIP test_stop_on_exited_container_is_idempotent: requires root");
@@ -22809,7 +22897,7 @@ mod sandbox {
     /// Verify that `pelagos sandbox create` starts a pause process and creates
     /// a named network namespace.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_sandbox_create_pause_and_netns() {
         if !super::is_root() {
             eprintln!("SKIP test_sandbox_create_pause_and_netns: requires root");
@@ -22893,7 +22981,7 @@ mod sandbox {
     /// Verify that `pelagos sandbox rm <id>` stops the pause process and removes
     /// the named network namespace.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_sandbox_rm_cleanup() {
         if !super::is_root() {
             eprintln!("SKIP test_sandbox_rm_cleanup: requires root");
@@ -22966,7 +23054,7 @@ mod sandbox {
     /// Verify that two containers started with `--sandbox <id>` share the same
     /// network namespace inode and report the same IP address.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_sandbox_containers_share_netns() {
         if !super::is_root() {
             eprintln!("SKIP test_sandbox_containers_share_netns: requires root");
@@ -23127,7 +23215,7 @@ mod sandbox {
     ///   - Client: foreground container that connects to 127.0.0.1:9876 and
     ///     captures stdout directly — avoids the exec-on-exited-container problem.
     #[test]
-    #[serial]
+    #[serial(nat)]
     fn test_sandbox_localhost_communication() {
         if !super::is_root() {
             eprintln!("SKIP test_sandbox_localhost_communication: requires root");
