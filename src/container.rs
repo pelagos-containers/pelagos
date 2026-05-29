@@ -5185,23 +5185,66 @@ impl Command {
     ) -> Result<Child, Error> {
         // ── Embedded path: in-process wasmtime (no subprocess) ──
         //
-        // wasmtime inherits the process stdio directly via inherit_stdout()/
-        // inherit_stderr() in the WasiCtxBuilder.  Output flows to the pelagos
-        // process's fd 1/2, which is correct: the test shell's $(...) or the
-        // terminal sees it without any relay thread.  take_stdout()/take_stderr()
-        // return None; relay threads in cli/run.rs gracefully no-op on None.
+        // When Stdio::Piped is requested we create OS pipes and pass the write
+        // ends to wasmtime via OutputFile, returning the read ends as
+        // ChildStdout/ChildStderr.  This ensures that in detached mode (where
+        // the watcher's fd 1/2 are redirected to /dev/null) the Wasm module's
+        // output still reaches the log relay threads.
+        //
+        // When Stdio::Inherit (the default), wasmtime inherits the process
+        // stdio directly — the old behaviour, correct for interactive use.
         #[cfg(feature = "embedded-wasm")]
         {
+            use std::os::unix::io::FromRawFd as _;
+
+            // Create a pipe for stdout if Piped was requested.
+            let (stdout_r_fd, stdout_w_file) = if self.stdio_out == Stdio::Piped {
+                let mut fds = [-1i32; 2];
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+                (
+                    Some(fds[0]),
+                    Some(unsafe { std::fs::File::from_raw_fd(fds[1]) }),
+                )
+            } else {
+                (None, None)
+            };
+
+            // Create a pipe for stderr if Piped was requested.
+            let (stderr_r_fd, stderr_w_file) = if self.stdio_err == Stdio::Piped {
+                let mut fds = [-1i32; 2];
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+                (
+                    Some(fds[0]),
+                    Some(unsafe { std::fs::File::from_raw_fd(fds[1]) }),
+                )
+            } else {
+                (None, None)
+            };
+
             let extra_args: Vec<std::ffi::OsString> =
                 self.inner.get_args().map(|a| a.to_owned()).collect();
             let handle = std::thread::spawn(move || {
-                crate::wasm::run_wasm_embedded(&prog_path, &extra_args, &wasi)
+                crate::wasm::run_wasm_embedded(
+                    &prog_path,
+                    &extra_args,
+                    &wasi,
+                    stdout_w_file,
+                    stderr_w_file,
+                )
             });
+
+            let child_stdout = stdout_r_fd.map(|fd| unsafe {
+                std::process::ChildStdout::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+            });
+            let child_stderr = stderr_r_fd.map(|fd| unsafe {
+                std::process::ChildStderr::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+            });
+
             return Ok(Child {
                 inner: ChildInner::Embedded {
                     handle: Some(handle),
-                    stdout: None,
-                    stderr: None,
+                    stdout: child_stdout,
+                    stderr: child_stderr,
                 },
                 cgroup: None,
                 network: None,
