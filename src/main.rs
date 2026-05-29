@@ -103,10 +103,11 @@ pub(crate) enum CliCommand {
         time: u64,
     },
 
-    /// Remove a container
+    /// Remove one or more containers
     Rm {
-        /// Container name
-        name: String,
+        /// Container names
+        #[clap(required = true)]
+        names: Vec<String>,
         /// Kill and remove even if running
         #[clap(long, short = 'f')]
         force: bool,
@@ -274,10 +275,11 @@ pub(crate) enum ContainerCmd {
         #[clap(long, short = 't', default_value = "10")]
         time: u64,
     },
-    /// Remove a container
+    /// Remove one or more containers
     Rm {
-        /// Container name
-        name: String,
+        /// Container names
+        #[clap(required = true)]
+        names: Vec<String>,
         /// Kill and remove even if running
         #[clap(long, short = 'f')]
         force: bool,
@@ -501,7 +503,19 @@ fn main() {
         } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
         CliCommand::Stop { name, time } => cli::stop::cmd_stop(&name, time),
         CliCommand::Restart { name, time } => cli::restart::cmd_restart(&name, time),
-        CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),
+        CliCommand::Rm { names, force } => {
+            let mut last_err: Option<Box<dyn std::error::Error>> = None;
+            for name in &names {
+                if let Err(e) = cli::rm::cmd_rm(name, force) {
+                    eprintln!("pelagos: {}", e);
+                    last_err = Some(e);
+                }
+            }
+            match last_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
         CliCommand::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
 
         // Container (noun subcommand)
@@ -514,7 +528,19 @@ fn main() {
             } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
             ContainerCmd::Inspect { name } => cli::ps::cmd_inspect(&name),
             ContainerCmd::Stop { name, time } => cli::stop::cmd_stop(&name, time),
-            ContainerCmd::Rm { name, force } => cli::rm::cmd_rm(&name, force),
+            ContainerCmd::Rm { names, force } => {
+                let mut last_err: Option<Box<dyn std::error::Error>> = None;
+                for name in &names {
+                    if let Err(e) = cli::rm::cmd_rm(name, force) {
+                        eprintln!("pelagos: {}", e);
+                        last_err = Some(e);
+                    }
+                }
+                match last_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
             ContainerCmd::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
             ContainerCmd::Stats(args) => cli::stats::cmd_stats(args),
         },
