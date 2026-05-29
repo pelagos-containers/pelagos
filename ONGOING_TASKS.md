@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Session 2026-05-29 — Issue #261 COMPLETE; v0.64.0 releasing
+## Session 2026-05-29 — Issue #261 COMPLETE; v0.64.0 RELEASED
 
 Issue #261 (replace all `nft` shell-outs with native NETLINK_NETFILTER client) is complete.
 PR #262 merged to main. Tag v0.64.0 pushed, release workflow in progress.
@@ -24,6 +24,15 @@ PR #262 merged to main. Tag v0.64.0 pushed, release workflow in progress.
   - `test_port_forward_independent_teardown` — race in parallel NAT cleanup, pre-dates #261
   - `auto_pull::test_run_auto_pulls_missing_image` — docker.io rate limiting)
 
+### Release fixes (same session)
+
+- `msghdr` struct literal init fails on aarch64-musl (private `__pad1`/`__pad2` fields);
+  fixed with `zeroed() + field-assign` at 4 call sites in `src/nfnetlink.rs`
+- ECR rate limit caused transient test failure in `ensure_alpine()`; added 3-attempt
+  retry with 30s/60s backoff in both ECR-based `ensure_alpine` functions
+
+Final tag: `b93d473` — release at https://github.com/pelagos-containers/pelagos/releases/tag/v0.64.0
+
 ### Next steps
 
-Nothing pending. v0.64.0 release in progress (tag 111d766).
+Nothing pending. v0.64.0 released successfully.
