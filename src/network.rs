@@ -1279,31 +1279,6 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 
 // ── N3: NAT / MASQUERADE ─────────────────────────────────────────────────────
 
-/// Build the nftables script that installs MASQUERADE + FORWARD rules for a network.
-///
-/// Uses `add` so the commands are idempotent if the table already exists
-/// (e.g. if a previous run crashed with the refcount > 0).
-///
-/// The forward chain is required because the host's default FORWARD policy may
-/// be DROP (common on systems with a firewall). Without it, ICMP (ping) may
-/// work but TCP/UDP traffic is silently dropped.
-fn build_nat_script(net: &NetworkDef) -> String {
-    let table = net.nft_table_name();
-    let cidr = net.subnet.cidr_string();
-    let bridge = &net.bridge_name;
-    // Forward chain at priority -100 so it runs before any iptables chains
-    // (iptables is effectively priority 0).  This ensures our accept rules
-    // win on hosts with UFW/Docker/firewalld setting FORWARD policy to DROP.
-    format!(
-        "add table ip {table}\n\
-         add chain ip {table} postrouting {{ type nat hook postrouting priority 100; }}\n\
-         add rule ip {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade\n\
-         add chain ip {table} forward {{ type filter hook forward priority -100; }}\n\
-         add rule ip {table} forward ip saddr {cidr} accept\n\
-         add rule ip {table} forward ip daddr {cidr} accept\n"
-    )
-}
-
 /// Add DNS INPUT rules for a network so containers can reach the DNS daemon.
 ///
 /// Two layers:
@@ -1317,17 +1292,10 @@ fn build_nat_script(net: &NetworkDef) -> String {
 /// calls on the same network are safe.
 pub fn add_dns_input_rule(net: &NetworkDef) -> io::Result<()> {
     let table = net.nft_table_name();
-    let bridge = &net.bridge_name;
-    // Layer 1: per-network table at priority -100 (pure-nftables systems).
-    let script = format!(
-        "add table ip {table}\n\
-         add chain ip {table} input {{ type filter hook input priority -100; }}\n\
-         flush chain ip {table} input\n\
-         add rule ip {table} input iifname \"{bridge}\" udp dport 53 accept\n"
-    );
-    run_nft(&script)?;
+    crate::nfnetlink::nft_add_dns_input_chain(&table, &net.bridge_name)?;
     // Layer 2: iptables-nft compat (best-effort; silently skipped on legacy/no iptables).
-    add_iptables_nft_dns_compat(net);
+    let dns_chain = format!("pelagos-{}-dns", net.name);
+    crate::nfnetlink::nft_add_filter_input_compat(&dns_chain, &net.bridge_name);
     Ok(())
 }
 
@@ -1337,13 +1305,9 @@ pub fn add_dns_input_rule(net: &NetworkDef) -> io::Result<()> {
 /// compat chain in `ip filter INPUT`.  Both operations are best-effort.
 pub fn remove_dns_input_rule(net: &NetworkDef) {
     let table = net.nft_table_name();
-    let script = format!(
-        "flush chain ip {table} input\n\
-         delete chain ip {table} input\n"
-    );
-    let _ = run_nft_quiet(&script);
-    // Layer 2 cleanup.
-    remove_iptables_nft_dns_compat(net);
+    crate::nfnetlink::nft_remove_dns_input_chain(&table);
+    let dns_chain = format!("pelagos-{}-dns", net.name);
+    crate::nfnetlink::nft_remove_filter_input_compat(&dns_chain);
 }
 
 // ── iptables-nft compatibility helpers ───────────────────────────────────────
@@ -1353,150 +1317,19 @@ pub fn remove_dns_input_rule(net: &NetworkDef) {
 // subsequent base chains (e.g. `ip filter FORWARD`) from running and applying
 // their DROP policy, we must also write rules directly into `ip filter`.
 //
-// Approach: create a dedicated named chain (pelagos-<net>-fwd / -dns) inside
-// `ip filter` and add a single jump rule from the relevant base chain.  Named
-// chains make cleanup deterministic — find the jump handle, delete it, then
-// flush and delete the named chain.
-//
-// All operations use `run_nft_quiet`: if `ip filter` does not exist (no
-// iptables on the system) the call silently succeeds without doing anything.
+// Named chains (pelagos-<net>-fwd / -dns) inside `ip filter` make cleanup
+// deterministic: find the jump handle via nfnetlink GETRULE, delete it, then
+// flush and delete the named chain.  All operations are non-fatal (silently
+// skipped when `ip filter` does not exist on pure-nftables systems).
 
-/// Find all handles of "jump <target>" rules in a given nft chain.
-/// Returns an empty vec when the chain or table does not exist.
-fn find_jump_rule_handles(family: &str, table: &str, chain: &str, target: &str) -> Vec<u64> {
-    use std::process::Stdio as ProcStdio;
-    let output = match SysCmd::new("nft")
-        .args(["-a", "list", "chain", family, table, chain])
-        .stdout(ProcStdio::piped())
-        .stderr(ProcStdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return vec![],
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let needle = format!("jump {}", target);
-    let mut handles = Vec::new();
-    for line in text.lines() {
-        if line.contains(&needle) {
-            if let Some(pos) = line.rfind("handle ") {
-                let s = line[pos + 7..].trim();
-                if let Ok(h) = s.parse::<u64>() {
-                    handles.push(h);
-                }
-            }
-        }
-    }
-    handles
-}
-
-/// Delete all "jump <chain>" rules from a given nft base chain (idempotent).
-fn delete_jump_rules(family: &str, table: &str, base_chain: &str, target: &str) {
-    for handle in find_jump_rule_handles(family, table, base_chain, target) {
-        let script = format!("delete rule {family} {table} {base_chain} handle {handle}\n");
-        let _ = run_nft_quiet(&script);
-    }
-}
-
-/// Add iptables-nft compat FORWARD rules so container traffic is not blocked
-/// by `ip filter FORWARD`'s DROP policy (UFW, Docker, firewalld hosts).
-///
-/// Creates `ip filter pelagos-<net>-fwd`, adds src/dst CIDR accept rules,
-/// then jumps from `ip filter FORWARD`.  Idempotent: existing jump removed
-/// first, chain flushed before re-adding rules.
 fn add_iptables_nft_forward_compat(net: &NetworkDef) {
     let chain = format!("pelagos-{}-fwd", net.name);
-    let cidr = net.subnet.cidr_string();
-    // Remove stale jump rule and flush the chain before re-adding.
-    delete_jump_rules("ip", "filter", "FORWARD", &chain);
-    let script = format!(
-        "add chain ip filter {chain}\n\
-         flush chain ip filter {chain}\n\
-         add rule ip filter {chain} ip saddr {cidr} accept\n\
-         add rule ip filter {chain} ip daddr {cidr} accept\n\
-         add rule ip filter FORWARD jump {chain}\n"
-    );
-    let _ = run_nft_quiet(&script);
+    crate::nfnetlink::nft_add_filter_forward_compat(&chain, net.subnet.addr, net.subnet.prefix_len);
 }
 
-/// Remove the iptables-nft compat FORWARD rules for a network.
 fn remove_iptables_nft_forward_compat(net: &NetworkDef) {
     let chain = format!("pelagos-{}-fwd", net.name);
-    delete_jump_rules("ip", "filter", "FORWARD", &chain);
-    let script = format!(
-        "flush chain ip filter {chain}\n\
-         delete chain ip filter {chain}\n"
-    );
-    let _ = run_nft_quiet(&script);
-}
-
-/// Add iptables-nft compat INPUT rule for DNS on a network's bridge.
-fn add_iptables_nft_dns_compat(net: &NetworkDef) {
-    let chain = format!("pelagos-{}-dns", net.name);
-    let bridge = &net.bridge_name;
-    delete_jump_rules("ip", "filter", "INPUT", &chain);
-    let script = format!(
-        "add chain ip filter {chain}\n\
-         flush chain ip filter {chain}\n\
-         add rule ip filter {chain} iifname \"{bridge}\" udp dport 53 accept\n\
-         add rule ip filter INPUT jump {chain}\n"
-    );
-    let _ = run_nft_quiet(&script);
-}
-
-/// Remove the iptables-nft compat INPUT rule for DNS on a network's bridge.
-fn remove_iptables_nft_dns_compat(net: &NetworkDef) {
-    let chain = format!("pelagos-{}-dns", net.name);
-    delete_jump_rules("ip", "filter", "INPUT", &chain);
-    let script = format!(
-        "flush chain ip filter {chain}\n\
-         delete chain ip filter {chain}\n"
-    );
-    let _ = run_nft_quiet(&script);
-}
-
-/// Pipe an nft script to `nft -f -`, returning an error on non-zero exit.
-fn run_nft(script: &str) -> io::Result<()> {
-    use std::io::Write as IoWriteLocal;
-    use std::process::Stdio as ProcStdio;
-
-    let mut child = SysCmd::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(ProcStdio::piped())
-        .stdout(ProcStdio::null())
-        .stderr(ProcStdio::inherit())
-        .spawn()?;
-
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes())?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("nft -f - exited with {}", status)))
-    }
-}
-
-/// Like [`run_nft`] but suppresses stderr (for best-effort / migration commands).
-fn run_nft_quiet(script: &str) -> io::Result<()> {
-    use std::io::Write as IoWriteLocal;
-    use std::process::Stdio as ProcStdio;
-
-    let mut child = SysCmd::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(ProcStdio::piped())
-        .stdout(ProcStdio::null())
-        .stderr(ProcStdio::null())
-        .spawn()?;
-
-    child.stdin.as_mut().unwrap().write_all(script.as_bytes())?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("nft -f - exited with {}", status)))
-    }
+    crate::nfnetlink::nft_remove_filter_forward_compat(&chain);
 }
 
 /// Increment the NAT refcount; install nftables rules when going 0 → 1.
@@ -1599,19 +1432,22 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         // Enable IP forwarding.
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
 
-        // Migration: if this is the default network, remove the old global
-        // `ip pelagos` table that previous versions created.
+        // Migration: remove the old global `ip pelagos` table from previous versions.
         if net.name == "pelagos0" {
-            let _ = run_nft_quiet("delete table ip pelagos\n");
+            crate::nfnetlink::nft_delete_ip_table("pelagos");
         }
 
-        // Install the nftables MASQUERADE rule set.
-        let script = build_nat_script(net);
-        run_nft(&script)?;
+        // Install the MASQUERADE + FORWARD rules natively.
+        crate::nfnetlink::nft_create_nat_masquerade(
+            &net.nft_table_name(),
+            &net.bridge_name,
+            net.subnet.addr,
+            net.subnet.prefix_len,
+        )?;
 
         // On iptables-nft hosts (UFW, Docker, firewalld), the ip filter FORWARD
-        // chain has policy DROP.  nft accept in our chain does not prevent that
-        // subsequent chain from dropping the packet, so we also add accept rules
+        // chain has policy DROP.  Our chain's accept does not prevent a subsequent
+        // ip filter FORWARD chain from dropping the packet, so add accept rules
         // directly into ip filter FORWARD.  Silently skipped on pure-nftables or
         // iptables-legacy systems where ip filter doesn't exist.
         add_iptables_nft_forward_compat(net);
@@ -1702,15 +1538,13 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
 
         if read_port_forwards_count(&net.name) == 0 {
             // No active port forwards either — remove the entire ip table.
-            // Use run_nft_quiet: deletion is non-fatal and the table may have
-            // already been removed by a concurrent disable_port_forwards().
-            if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
-                log::warn!("nft delete table {} (non-fatal): {}", table, e);
-            }
+            crate::nfnetlink::nft_delete_ip_table(&table);
             log::info!(target: "pelagos::teardown", "NAT_TABLE_DELETED network={} table={}", net.name, table);
         } else {
             // Port forwards still active — remove MASQUERADE but keep the ip table.
-            let _ = run_nft(&format!("flush chain ip {} postrouting\n", table));
+            if let Err(e) = crate::nfnetlink::nft_flush_postrouting(&table) {
+                log::warn!("nft flush postrouting {} (non-fatal): {}", table, e);
+            }
             log::info!(
                 target: "pelagos::teardown",
                 "NAT_TABLE_KEPT network={} table={} reason=active_port_forwards count={}",
@@ -1828,70 +1662,6 @@ fn read_nat_refcount(network_name: &str) -> u32 {
         .count() as u32
 }
 
-/// Build the nftables script that (re)installs all current DNAT rules.
-///
-/// Uses `add table` / `add chain` (idempotent) so it is safe to call even
-/// when the table already exists (e.g. because NAT/MASQUERADE is active).
-/// `flush chain prerouting` wipes the old rules before rewriting — this is
-/// the flush-and-rebuild strategy that avoids needing to track rule handles.
-fn build_prerouting_script(
-    net: &NetworkDef,
-    entries: &[(Ipv4Addr, u16, u16, PortProto)],
-) -> String {
-    let table = net.nft_table_name();
-    let mut s = format!(
-        "add table ip {table}\n\
-         add chain ip {table} prerouting {{ type nat hook prerouting priority -100; }}\n\
-         flush chain ip {table} prerouting\n",
-    );
-    for (ip, host_port, container_port, proto) in entries {
-        if matches!(proto, PortProto::Tcp | PortProto::Both) {
-            s.push_str(&format!(
-                "add rule ip {} prerouting tcp dport {} dnat to {}:{}\n",
-                table, host_port, ip, container_port
-            ));
-        }
-        if matches!(proto, PortProto::Udp | PortProto::Both) {
-            s.push_str(&format!(
-                "add rule ip {} prerouting udp dport {} dnat to {}:{}\n",
-                table, host_port, ip, container_port
-            ));
-        }
-    }
-    s
-}
-
-/// Build the nftables script that (re)installs all current IPv6 DNAT rules.
-///
-/// Mirrors [`build_prerouting_script`] but uses the `ip6` address family.
-/// The nftables `ip6 table` coexists with the `ip` table of the same name.
-fn build_prerouting6_script(
-    net: &NetworkDef,
-    entries6: &[(Ipv6Addr, u16, u16, PortProto)],
-) -> String {
-    let table = net.nft_table_name();
-    let mut s = format!(
-        "add table ip6 {table}\n\
-         add chain ip6 {table} prerouting {{ type nat hook prerouting priority -100; }}\n\
-         flush chain ip6 {table} prerouting\n",
-    );
-    for (ip6, host_port, container_port, proto) in entries6 {
-        if matches!(proto, PortProto::Tcp | PortProto::Both) {
-            s.push_str(&format!(
-                "add rule ip6 {} prerouting tcp dport {} dnat to [{}]:{}\n",
-                table, host_port, ip6, container_port
-            ));
-        }
-        if matches!(proto, PortProto::Udp | PortProto::Both) {
-            s.push_str(&format!(
-                "add rule ip6 {} prerouting udp dport {} dnat to [{}]:{}\n",
-                table, host_port, ip6, container_port
-            ));
-        }
-    }
-    s
-}
-
 /// Add port-forward entries to the state file and install nftables DNAT rules.
 ///
 /// Uses `flock(LOCK_EX)` on the per-network port-forwards file to serialise
@@ -1987,8 +1757,7 @@ fn enable_port_forwards(
         .iter()
         .map(|(_, ip, hp, cp, proto, _)| (*ip, *hp, *cp, *proto))
         .collect();
-    let script = build_prerouting_script(net, &nft_entries);
-    run_nft(&script)?;
+    crate::nfnetlink::nft_install_dnat(&net.nft_table_name(), &nft_entries)?;
 
     // Install IPv6 nftables DNAT rules (non-fatal — host may lack IPv6 NAT).
     let nft6_entries: Vec<(Ipv6Addr, u16, u16, PortProto)> = live
@@ -1996,8 +1765,7 @@ fn enable_port_forwards(
         .filter_map(|(_, _, hp, cp, proto, ip6)| ip6.map(|a| (a, *hp, *cp, *proto)))
         .collect();
     if !nft6_entries.is_empty() {
-        let script6 = build_prerouting6_script(net, &nft6_entries);
-        if let Err(e) = run_nft(&script6) {
+        if let Err(e) = crate::nfnetlink::nft_install_dnat6(&net.nft_table_name(), &nft6_entries) {
             log::warn!("IPv6 port-forward DNAT setup failed (non-fatal): {}", e);
         }
     }
@@ -2090,29 +1858,27 @@ fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
         // No more IPv4 port forwards — check if NAT is also gone.
         if read_nat_refcount(&net.name) == 0 {
             // Nothing using the tables — remove both ip and ip6 tables entirely.
-            if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
-                log::warn!("nft delete table ip {} (non-fatal): {}", table, e);
-            }
-            let _ = run_nft_quiet(&format!("delete table ip6 {}\n", table));
+            crate::nfnetlink::nft_delete_ip_table(&table);
+            crate::nfnetlink::nft_delete_ip6_table(&table);
         } else {
             // NAT still active — flush prerouting chains only.
-            let _ = run_nft(&format!("flush chain ip {} prerouting\n", table));
-            let _ = run_nft_quiet(&format!("flush chain ip6 {} prerouting\n", table));
+            if let Err(e) = crate::nfnetlink::nft_flush_prerouting(&table) {
+                log::warn!("nft flush prerouting {} (non-fatal): {}", table, e);
+            }
+            crate::nfnetlink::nft_flush_prerouting6(&table);
         }
     } else {
         // Rebuild IPv4 prerouting chain from the surviving entries.
-        let script = build_prerouting_script(net, &nft_remaining);
-        if let Err(e) = run_nft(&script) {
+        if let Err(e) = crate::nfnetlink::nft_install_dnat(&table, &nft_remaining) {
             log::warn!("nft rebuild prerouting (non-fatal): {}", e);
         }
         // Rebuild or flush the IPv6 prerouting chain.
         if !nft6_remaining.is_empty() {
-            let script6 = build_prerouting6_script(net, &nft6_remaining);
-            if let Err(e) = run_nft(&script6) {
+            if let Err(e) = crate::nfnetlink::nft_install_dnat6(&table, &nft6_remaining) {
                 log::warn!("nft rebuild ip6 prerouting (non-fatal): {}", e);
             }
         } else {
-            let _ = run_nft_quiet(&format!("flush chain ip6 {} prerouting\n", table));
+            crate::nfnetlink::nft_flush_prerouting6(&table);
         }
     }
 }
@@ -3347,51 +3113,18 @@ mod tests {
     }
 
     #[test]
-    fn test_build_prerouting_script_tcp_only() {
-        use std::net::Ipv4Addr;
-        let net = NetworkDef {
-            name: "test".to_string(),
-            subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
-            gateway: Ipv4Addr::new(172, 19, 0, 1),
-            bridge_name: "pelagos0".to_string(),
-        };
-        let ip = Ipv4Addr::new(172, 19, 0, 2);
-        let entries = vec![(ip, 8080u16, 80u16, PortProto::Tcp)];
-        let script = build_prerouting_script(&net, &entries);
-        assert!(script.contains("tcp dport 8080 dnat to 172.19.0.2:80"));
-        assert!(!script.contains("udp"));
+    fn test_port_proto_as_str_tcp() {
+        assert_eq!(PortProto::Tcp.as_str(), "tcp");
     }
 
     #[test]
-    fn test_build_prerouting_script_udp_only() {
-        use std::net::Ipv4Addr;
-        let net = NetworkDef {
-            name: "test".to_string(),
-            subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
-            gateway: Ipv4Addr::new(172, 19, 0, 1),
-            bridge_name: "pelagos0".to_string(),
-        };
-        let ip = Ipv4Addr::new(172, 19, 0, 2);
-        let entries = vec![(ip, 5353u16, 53u16, PortProto::Udp)];
-        let script = build_prerouting_script(&net, &entries);
-        assert!(script.contains("udp dport 5353 dnat to 172.19.0.2:53"));
-        assert!(!script.contains("tcp dport"));
+    fn test_port_proto_as_str_udp() {
+        assert_eq!(PortProto::Udp.as_str(), "udp");
     }
 
     #[test]
-    fn test_build_prerouting_script_both() {
-        use std::net::Ipv4Addr;
-        let net = NetworkDef {
-            name: "test".to_string(),
-            subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
-            gateway: Ipv4Addr::new(172, 19, 0, 1),
-            bridge_name: "pelagos0".to_string(),
-        };
-        let ip = Ipv4Addr::new(172, 19, 0, 2);
-        let entries = vec![(ip, 53u16, 53u16, PortProto::Both)];
-        let script = build_prerouting_script(&net, &entries);
-        assert!(script.contains("tcp dport 53 dnat to 172.19.0.2:53"));
-        assert!(script.contains("udp dport 53 dnat to 172.19.0.2:53"));
+    fn test_port_proto_as_str_both() {
+        assert_eq!(PortProto::Both.as_str(), "both");
     }
 
     #[test]
