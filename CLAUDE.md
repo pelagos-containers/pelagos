@@ -13,7 +13,6 @@ artifacts belong in the repository:
 
 - **Scripts** → `scripts/` (with a descriptive name, e.g. `scripts/test-healthcheck.sh`)
 - **Documentation / design docs** → `docs/`
-- **Plans and task notes** → `ONGOING_TASKS.md` (with references to relevant `docs/` files)
 - **Test build contexts** → `scripts/<feature>-context/` (e.g. `scripts/hc-test-context/Remfile`)
 
 Files dropped in `/tmp` are lost on reboot and never committed — they provide no regression
@@ -21,14 +20,13 @@ value and violate the principle that every artifact ships with the code.
 
 ---
 
-### Write Plans to ONGOING_TASKS.md
-**Before presenting any implementation plan to the user, write the full plan to
-`ONGOING_TASKS.md` in the project root.** This ensures plans survive context resets.
+### Planning and Task Tracking
+**GitHub issues are the single source of truth for plans and work items.**
 
-- `ONGOING_TASKS.md` always reflects the current task and its full implementation detail
-- After completing a task, update it with the next planned task
-- The file includes: context, API design, pre_exec sequence changes, exact file changes,
-  test descriptions, verification steps, and notes/risks
+- Before starting any non-trivial task, confirm the GitHub issue exists (or create one).
+- Implementation plans live in the issue body and comments — not in files.
+- `ONGOING_TASKS.md` has been removed; do not recreate it.
+- Use `git log`, `gh issue view <n>`, and `gh pr list` to reconstruct context after a reset.
 
 ### `pelagos image pull` Does NOT Require Root
 **`pelagos image pull` works without sudo** for users in the `pelagos` group.
@@ -127,23 +125,19 @@ This is a hard requirement, not optional cleanup.
 **"So Long and Thanks for all the Fish"** — Wrap up session, document state, commit, and push:
 1. Remove any ephemeral session files (temp scripts, test output, session resume files)
 2. Commit any untracked config or doc files in both `pelagos` and `home-monitoring` repos
-3. Update `ONGOING_TASKS.md` with:
-   - Current date and git SHA for both repos
-   - What was completed this session
-   - What remains pending, with enough detail to resume cold
-4. Commit the `ONGOING_TASKS.md` update
-5. Push both repos to remote
-6. Confirm both repos are clean and up to date with remote
+3. Close or update any GitHub issues that were completed this session
+4. Push both repos to remote
+5. Confirm both repos are clean and up to date with remote
+6. Report: current SHA, what was completed, open issues that remain
 
 **"Once more into the breach!"** — Create issue, branch, plan, implement, test, report:
-1. Create a GitHub issue describing the work
+1. Create a GitHub issue describing the work (plan lives in the issue body)
 2. Create a feature branch named after the issue (e.g. `feat/description-NNN`)
 3. Move to that branch
-4. Write the full implementation plan to `ONGOING_TASKS.md`
-5. Present the plan to the user
-6. Quietly implement — no step-by-step narration
-7. Create integration tests and run them to success
-8. Report back with what was done and test results
+4. Present the plan to the user (from the issue body)
+5. Quietly implement — no step-by-step narration
+6. Create integration tests and run them to success
+7. Report back with what was done and test results
 
 **"Engage!"** — Tag, release, and monitor:
 1. Create a git tag (ask user for version if unclear)
