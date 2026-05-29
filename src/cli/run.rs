@@ -1392,6 +1392,9 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
+                    // Remove the state directory so a failed spawn doesn't leave a ghost
+                    // container showing as "running" in `pelagos ps`.
+                    let _ = std::fs::remove_dir_all(&dir);
                     // Write the error message to the sync pipe so the parent can surface it,
                     // then close the pipe and exit.  The parent distinguishes success (\x00)
                     // from error (any other bytes) by reading more than 1 byte.

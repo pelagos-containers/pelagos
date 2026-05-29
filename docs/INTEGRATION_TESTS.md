@@ -4459,3 +4459,27 @@ asserts the bridge interface is gone.
 
 Failure indicates `cmd_network_rm`'s `link_del(&net.bridge_name)` call is not deleting a
 live bridge, which would leave orphaned bridge interfaces after network removal.
+
+## `rm_multi_name_and_stale_state` module
+
+### `test_rm_accepts_multiple_names`
+**Requires:** root
+**Module:** `rm_multi_name_and_stale_state`
+
+Starts two containers, then calls `pelagos rm -f name1 name2` in a single invocation.
+Asserts that both containers are gone from `pelagos ps` after the command succeeds.
+
+Failure indicates that `pelagos rm` is not accepting multiple names (like `docker rm` does),
+so users who pass more than one name will silently fail to remove all but the first.
+
+### `test_failed_spawn_no_ghost_state`
+**Requires:** root
+**Module:** `rm_multi_name_and_stale_state`
+
+Starts a container on host port 19801, then attempts to start a second container binding
+the same host port (which should fail). Asserts that the failed-spawn container has no
+`state.json` leftover and does not appear in `pelagos ps`.
+
+Failure indicates the watcher is not cleaning up the state directory on `cmd.spawn()` error,
+leaving ghost containers with `status=running, pid=0` visible in `pelagos ps` until manually
+removed.

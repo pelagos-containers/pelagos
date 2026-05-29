@@ -24547,3 +24547,198 @@ mod native_netlink_teardown {
         );
     }
 }
+
+// ─── Issue #273/#274: multi-name rm + stale-state cleanup ────────────────────
+mod rm_multi_name_and_stale_state {
+    use serial_test::serial;
+
+    fn pelagos_bin() -> String {
+        env!("CARGO_BIN_EXE_pelagos").to_string()
+    }
+
+    fn ensure_alpine() {
+        let bin = pelagos_bin();
+        let ls = std::process::Command::new(&bin)
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
+        let _ = std::process::Command::new(&bin)
+            .args(["image", "pull", "alpine:3.21"])
+            .status();
+    }
+
+    /// `pelagos rm -f name1 name2` removes both containers in one invocation.
+    ///
+    /// Requires root (spawns real containers with pasta networking).
+    /// Failure indicates multi-name rm is broken — users must remove containers
+    /// one at a time, and test cleanup scripts that pass multiple names silently fail.
+    #[test]
+    #[serial(nat)]
+    fn test_rm_accepts_multiple_names() {
+        if !crate::is_root() {
+            eprintln!("skipped: requires root");
+            return;
+        }
+        ensure_alpine();
+        let bin = pelagos_bin();
+        let names = ["rm-multi-a", "rm-multi-b"];
+
+        // Pre-clean.
+        for n in &names {
+            let _ = std::process::Command::new(&bin)
+                .args(["rm", "-f", n])
+                .output();
+        }
+
+        // Start two containers.
+        for n in &names {
+            let run = std::process::Command::new(&bin)
+                .args([
+                    "run",
+                    "--detach",
+                    "--name",
+                    n,
+                    "alpine:3.21",
+                    "/bin/sleep",
+                    "30",
+                ])
+                .output()
+                .expect("pelagos run --detach");
+            assert!(
+                run.status.success(),
+                "run {} failed: {}",
+                n,
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Remove both in a single invocation.
+        let rm = std::process::Command::new(&bin)
+            .args(["rm", "-f", names[0], names[1]])
+            .output()
+            .expect("pelagos rm -f multi");
+        assert!(
+            rm.status.success(),
+            "multi-name rm failed: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Neither container should appear in ps.
+        let ps = std::process::Command::new(&bin)
+            .args(["ps", "--all"])
+            .output()
+            .expect("pelagos ps");
+        let out = String::from_utf8_lossy(&ps.stdout);
+        for n in &names {
+            assert!(
+                !out.contains(n),
+                "container {} still visible after multi-name rm: {}",
+                n,
+                out
+            );
+        }
+    }
+
+    /// When `pelagos run -d -p HOST:CONT` fails because the host port is already
+    /// in use, the watcher must not leave a ghost `state.json` behind.
+    ///
+    /// Requires root (spawns a real container with pasta port forwarding).
+    /// Failure means the watcher leaves `status=running, pid=0` in the state store
+    /// after an error, causing the container to appear as running in `pelagos ps`
+    /// until the user manually removes it.
+    #[test]
+    #[serial(nat)]
+    fn test_failed_spawn_no_ghost_state() {
+        if !crate::is_root() {
+            eprintln!("skipped: requires root");
+            return;
+        }
+        ensure_alpine();
+        let bin = pelagos_bin();
+
+        // Pre-clean.
+        for n in &["ghost-first", "ghost-conflict"] {
+            let _ = std::process::Command::new(&bin)
+                .args(["rm", "-f", n])
+                .output();
+        }
+
+        // Start first container on port 19801.
+        let run1 = std::process::Command::new(&bin)
+            .args([
+                "run",
+                "--detach",
+                "-p",
+                "19801:80",
+                "--name",
+                "ghost-first",
+                "alpine:3.21",
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run first");
+        assert!(
+            run1.status.success(),
+            "first run failed: {}",
+            String::from_utf8_lossy(&run1.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // Attempt to bind the same host port — must fail.
+        let run2 = std::process::Command::new(&bin)
+            .args([
+                "run",
+                "--detach",
+                "-p",
+                "19801:80",
+                "--name",
+                "ghost-conflict",
+                "alpine:3.21",
+                "/bin/sh",
+                "-c",
+                "echo hello",
+            ])
+            .output()
+            .expect("pelagos run conflict");
+        assert!(
+            !run2.status.success(),
+            "expected failure when host port already in use"
+        );
+        let err_msg = String::from_utf8_lossy(&run2.stderr);
+        assert!(
+            err_msg.contains("already in use") || err_msg.contains("19801"),
+            "unexpected error: {}",
+            err_msg
+        );
+
+        // Ghost state must NOT exist.
+        let state_path = std::path::Path::new("/run/pelagos/containers/ghost-conflict/state.json");
+        assert!(
+            !state_path.exists(),
+            "ghost state.json left behind after failed spawn"
+        );
+
+        // `ghost-conflict` must not appear in ps.
+        let ps = std::process::Command::new(&bin)
+            .args(["ps", "--all"])
+            .output()
+            .expect("pelagos ps");
+        assert!(
+            !String::from_utf8_lossy(&ps.stdout).contains("ghost-conflict"),
+            "ghost container visible in ps after failed spawn"
+        );
+
+        // Clean up.
+        let _ = std::process::Command::new(&bin)
+            .args(["rm", "-f", "ghost-first"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
