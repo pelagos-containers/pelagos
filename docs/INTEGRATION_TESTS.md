@@ -1110,6 +1110,18 @@ Creates a `config.json` with `linux.seccomp` using a default-allow policy that d
 Failure indicates that `linux.seccomp` parsing from OCI config, the `filter_from_oci()`
 function in `src/seccomp.rs`, or the `with_seccomp_program()` wiring is broken.
 
+### `test_oci_seccomp_args`
+**Requires:** root (no rootfs required — compiles a static binary at test time)
+
+Builds a seccomp filter via `filter_from_oci` with an argument condition: `defaultAction=ALLOW`,
+but block `socket` when `arg[0] == 16` (AF_NETLINK). Compiles a tiny static C binary at test
+time that calls both `socket(AF_INET, ...)` and `socket(AF_NETLINK, ...)` and prints
+`INET_OK`/`NETLINK_OK` or `INET_FAIL`/`NETLINK_FAIL`. Runs the binary in two containers:
+one without any seccomp (both sockets must succeed), one with the arg-filtered filter
+(AF_INET must succeed, AF_NETLINK must be blocked). Failure indicates that `OciSyscallArg`
+→ `SeccompCondition` translation in `filter_from_oci` is broken or seccompiler arg
+conditions are mis-wired.
+
 ### `test_oci_cap_all_known_names_round_trip` (unit)
 **Requires:** nothing (unit test in `src/oci.rs`)
 

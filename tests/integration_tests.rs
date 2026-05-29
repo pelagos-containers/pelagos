@@ -5701,6 +5701,130 @@ mod oci_lifecycle {
         oci_run_to_completion(&id, bundle_dir.path(), 5);
     }
 
+    /// test_oci_seccomp_args
+    ///
+    /// Requires: root.
+    ///
+    /// Builds a seccomp filter via `filter_from_oci` with an argument condition:
+    /// default=ALLOW, but block `socket` when arg[0] == 16 (AF_NETLINK). Compiles a
+    /// small static C binary at test time that calls both socket(AF_INET) and
+    /// socket(AF_NETLINK) and prints INET_OK/NETLINK_OK or INET_FAIL/NETLINK_FAIL.
+    ///
+    /// Runs two containers using the library API:
+    /// 1. Without seccomp: both sockets succeed (INET_OK, NETLINK_OK).
+    /// 2. With the arg-filtered filter: AF_INET succeeds, AF_NETLINK is blocked (NETLINK_FAIL).
+    ///
+    /// Failure indicates that `OciSyscallArg` → `SeccompCondition` translation in
+    /// `filter_from_oci` is broken, or seccompiler arg conditions are mis-wired.
+    #[test]
+    fn test_oci_seccomp_args() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_seccomp_args: requires root");
+            return;
+        }
+
+        // Compile a tiny static binary that probes AF_INET and AF_NETLINK sockets.
+        // Static linking avoids any dependency on dynamic libraries in the rootfs.
+        let src = r#"
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) { close(fd); puts("INET_OK"); } else { puts("INET_FAIL"); }
+    fd = socket(AF_NETLINK, SOCK_RAW, 0);
+    if (fd >= 0) { close(fd); puts("NETLINK_OK"); } else { puts("NETLINK_FAIL"); }
+    return 0;
+}
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir for seccomp_args test");
+        let src_path = tmp.path().join("probe.c");
+        let bin_path = tmp.path().join("probe");
+        std::fs::write(&src_path, src).expect("write probe.c");
+        let cc_out = std::process::Command::new("cc")
+            .args([
+                "-static",
+                "-o",
+                bin_path.to_str().unwrap(),
+                src_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("cc");
+        assert!(
+            cc_out.status.success(),
+            "failed to compile probe: {}",
+            String::from_utf8_lossy(&cc_out.stderr)
+        );
+
+        // Minimal rootfs: just the probe binary at /probe. Static binary needs nothing else.
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir(&rootfs).expect("mkdir rootfs");
+        std::fs::copy(&bin_path, rootfs.join("probe")).expect("cp probe");
+
+        // Build seccomp filter: allow everything except socket(AF_NETLINK=16, ...).
+        let oci_seccomp = pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["socket".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: vec![pelagos::oci::OciSyscallArg {
+                    index: 0,
+                    value: 16, // AF_NETLINK
+                    value_two: 0,
+                    op: "SCMP_CMP_EQ".to_string(),
+                }],
+            }],
+        };
+        let prog =
+            pelagos::seccomp::filter_from_oci(&oci_seccomp).expect("filter_from_oci should work");
+
+        // Baseline: no seccomp — both sockets should open.
+        let mut child_plain = Command::new("/probe")
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn plain");
+        let (_, stdout_plain_bytes, _) = child_plain
+            .wait_with_output()
+            .expect("wait_with_output plain");
+        let stdout_plain = String::from_utf8_lossy(&stdout_plain_bytes).into_owned();
+
+        // With arg-filtered seccomp: AF_INET allowed, AF_NETLINK blocked.
+        let mut child_filtered = Command::new("/probe")
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .with_seccomp_program(prog)
+            .spawn()
+            .expect("spawn with arg-filtered seccomp");
+        let (_, stdout_filtered_bytes, _) = child_filtered
+            .wait_with_output()
+            .expect("wait_with_output filtered");
+        let stdout_filtered = String::from_utf8_lossy(&stdout_filtered_bytes).into_owned();
+
+        assert!(
+            stdout_plain.contains("INET_OK") && stdout_plain.contains("NETLINK_OK"),
+            "baseline should allow both sockets: got {:?}",
+            stdout_plain
+        );
+        assert!(
+            stdout_filtered.contains("INET_OK"),
+            "arg-filtered seccomp should allow AF_INET: got {:?}",
+            stdout_filtered
+        );
+        assert!(
+            stdout_filtered.contains("NETLINK_FAIL"),
+            "arg-filtered seccomp should block socket(AF_NETLINK=16): got {:?}",
+            stdout_filtered
+        );
+    }
+
     /// test_oci_kernel_mounts
     ///
     /// Requires: root, alpine-rootfs.
