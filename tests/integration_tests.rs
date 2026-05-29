@@ -20901,11 +20901,20 @@ mod compose_shutdown_fixes {
         if String::from_utf8_lossy(&ls.stdout).contains(ALPINE_ECR) {
             return;
         }
-        let status = Command::new(bin())
-            .args(["image", "pull", ALPINE_ECR])
-            .status()
-            .expect("pelagos image pull alpine");
-        assert!(status.success(), "pre-test alpine pull from ECR failed");
+        // Retry up to 3 times with backoff to ride out transient ECR rate limits.
+        for attempt in 1..=3u32 {
+            let status = Command::new(bin())
+                .args(["image", "pull", ALPINE_ECR])
+                .status()
+                .expect("pelagos image pull alpine");
+            if status.success() {
+                return;
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_secs(30 * attempt as u64));
+            }
+        }
+        panic!("pre-test alpine pull from ECR failed after 3 attempts");
     }
 
     /// test_compose_down_kills_shell_entrypoint_descendants
@@ -21781,11 +21790,20 @@ mod compose_bind_network {
         if String::from_utf8_lossy(&ls.stdout).contains(ALPINE_ECR) {
             return;
         }
-        let status = Command::new(bin())
-            .args(["image", "pull", ALPINE_ECR])
-            .status()
-            .expect("pelagos image pull alpine");
-        assert!(status.success(), "pre-test alpine pull from ECR failed");
+        // Retry up to 3 times with backoff to ride out transient ECR rate limits.
+        for attempt in 1..=3u32 {
+            let status = Command::new(bin())
+                .args(["image", "pull", ALPINE_ECR])
+                .status()
+                .expect("pelagos image pull alpine");
+            if status.success() {
+                return;
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_secs(30 * attempt as u64));
+            }
+        }
+        panic!("pre-test alpine pull from ECR failed after 3 attempts");
     }
 
     fn compose_down_project(project: &str, compose_file: &str) {
