@@ -2926,6 +2926,59 @@ the identity form.
 Constructs a `WasiConfig` with two env vars and asserts both appear as
 `--env KEY=val` in the wasmtime command args.
 
+## E2E Embedded Wasm Tests (`scripts/test-wasm-embedded-e2e.sh`)
+
+Shell-level end-to-end tests that drive the `pelagos` CLI with a real embedded
+Wasm module (no external wasmtime/wasmedge in PATH). Require root and the
+`wasm32-wasip1` Rust target; skip automatically if either is absent.
+
+Run with:
+```
+sudo -E scripts/test-wasm-embedded-e2e.sh
+```
+
+### `1. run — basic output (embedded path)`
+**Type:** E2E, requires root + `--features embedded-wasm` + `wasm32-wasip1`
+
+Builds a Wasm image from `scripts/wasm-embedded-context/hello.rs`, strips
+wasmtime/wasmedge from PATH, and runs `pelagos run <image>`.  Asserts output
+contains `hello embedded wasm`.  Failure means the embedded execution path isn't
+activating or the module is silently erroring.
+
+### `2. run — env passthrough`
+**Type:** E2E, requires root + embedded-wasm
+
+Runs the same image with `--env EMBED_VAR=hello42`.  Asserts `env:EMBED_VAR=hello42`
+appears in output.  Failure means `WasiConfig.env` is not wired into the
+embedded `WasiCtxBuilder`.
+
+### `3. run — preopened directory (--bind)`
+**Type:** E2E, requires root + embedded-wasm
+
+Creates a host directory with `test.txt` and runs with `--bind <host>:/data`.
+Asserts `file:embed test` in output.  Failure means `WasiCtxBuilder`
+preopened-dir setup is broken for the embedded path.
+
+### `4–6. Component Model (wasm32-wasip2) — basic output, env, bind`
+**Type:** E2E, requires root + embedded-wasm + `wasm32-wasip2` (skipped if absent)
+
+Same three checks for a P2 Component Model binary compiled to `wasm32-wasip2`.
+Verifies the `run_embedded_component` P2 path works end-to-end.
+
+### `7. run --detach — stdout captured via pelagos logs (issue #153)`
+**Type:** E2E, requires root + embedded-wasm
+
+Runs the Wasm image with `--detach`, polls until the container exits, then
+reads output via `pelagos logs`.  Asserts `hello embedded wasm` is present.
+
+This is the direct regression guard for issue #153: in `--detach` mode the
+watcher process inherits fd 1/2 pointing at `/dev/null`, so without the fix
+all Wasm module output is silently discarded.  The fix pipes wasmtime stdout
+through an OS pipe to the container log file; this test confirms it works
+end-to-end through the CLI.
+
+---
+
 ### `wasm_embedded_tests::test_wasm_embedded_exit_code`
 **Type:** Unit, requires `--features embedded-wasm`
 **Root:** no  **Rootfs:** no

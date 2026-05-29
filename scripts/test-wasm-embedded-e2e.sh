@@ -325,6 +325,38 @@ REMEOF
     fi
 fi
 
+# ── Test 7: --detach stdout captured via pelagos logs (issue #153) ───────────
+#
+# In --detach mode the watcher's fd 1/2 are /dev/null; without the fix the
+# embedded Wasm module's output would be silently discarded.  The fix pipes
+# wasmtime's stdout through an OS pipe → log file so `pelagos logs` retrieves it.
+
+echo ""
+echo "--- 7. pelagos run --detach — stdout captured via pelagos logs (issue #153) ---"
+
+DETACH_NAME="wasm-e2e-detach-$$"
+"$BINARY" rm -f "$DETACH_NAME" 2>/dev/null || true
+
+"$BINARY" run --detach --name "$DETACH_NAME" "$TEST_IMAGE_REF" >/dev/null 2>&1
+DETACH_RC=$?
+
+if [ "$DETACH_RC" -ne 0 ]; then
+    fail "run --detach: pelagos exited with code $DETACH_RC"
+else
+    # Poll until the container is no longer running (embedded Wasm exits fast).
+    for _i in $(seq 1 40); do
+        STATUS=$("$BINARY" ps 2>/dev/null | awk -v n="$DETACH_NAME" '$1==n {print $2}')
+        [ "$STATUS" = "running" ] || break
+        sleep 0.25
+    done
+
+    DETACH_LOGS=$("$BINARY" logs "$DETACH_NAME" 2>&1)
+    check_contains "$DETACH_LOGS" "hello embedded wasm" \
+        "run --detach: Wasm stdout captured in log file (issue #153)"
+
+    "$BINARY" rm -f "$DETACH_NAME" 2>/dev/null || true
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 export PATH="$ORIG_PATH"
