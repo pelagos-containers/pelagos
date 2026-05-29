@@ -1,6 +1,57 @@
 # Ongoing Tasks
 
-## Session 2026-05-29 — Issue #267: fix errnoRet in OCI seccomp (fix/seccomp-errno-ret-267)
+## Session 2026-05-29 — Issue #269: pelagos stats (feat/stats-269)
+
+### Goal
+
+Add `pelagos stats [--no-stream] [name...]` — Docker-compatible container
+resource snapshot / live stream (CPU%, memory, PIDs).
+
+### Design
+
+- `StatsArgs { no_stream: bool, names: Vec<String> }`
+- No `names` → all running containers
+- `--no-stream`: one sample after a 500 ms warmup, print, exit
+- Streaming: loop every 1 s, `\x1b[2J\x1b[H` to clear, print header + rows
+- Columns: `NAME | CPU% | MEM USAGE / LIMIT | MEM% | PIDS`
+
+### CPU% formula
+
+```
+delta_cpu_usec / (delta_wall_us * nprocs) * 100
+```
+
+Use `libc::sysconf(_SC_NPROCESSORS_ONLN)` for nprocs.
+
+### Files to change
+
+1. `src/cgroup.rs`
+   - Add `memory_limit_bytes: Option<u64>` to `ResourceStats`
+   - Add `pub fn open_cgroup(name: &str) -> Option<Cgroup>` — `Cgroup::load` on existing path
+   - Update `read_stats` to also populate `memory_limit_bytes` from `memory.max`
+
+2. `src/cli/stats.rs` — new module: `StatsArgs`, `cmd_stats()`
+
+3. `src/main.rs`
+   - Add `Stats(cli::stats::StatsArgs)` variant to `CliCommand`
+   - Dispatch to `cli::stats::cmd_stats(args)`
+   - Also add to `ContainerCmd`
+
+4. `src/cli/mod.rs` — add `pub mod stats;`
+
+5. `tests/integration_tests.rs` — `test_stats_no_stream`: start container, run
+   `cargo run -- stats --no-stream <name>`, verify output parses and MEM > 0
+
+6. `docs/INTEGRATION_TESTS.md` — document `test_stats_no_stream`
+
+---
+
+## Previous: Issue #267: fix errnoRet in OCI seccomp — COMPLETE
+## Previous: Issue #265: OCI seccomp args — COMPLETE
+
+---
+
+## Previous: Issue #267: fix errnoRet in OCI seccomp (fix/seccomp-errno-ret-267)
 
 ### Problem
 

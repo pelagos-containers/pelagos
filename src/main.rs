@@ -181,6 +181,10 @@ pub(crate) enum CliCommand {
         cmd: cli::system::SystemCmd,
     },
 
+    // ── Stats ──────────────────────────────────────────────────────────────
+    /// Show live resource usage statistics for running containers
+    Stats(cli::stats::StatsArgs),
+
     // ── Subscribe ─────────────────────────────────────────────────────────
     /// Stream container state events as NDJSON (for TUI clients)
     Subscribe,
@@ -286,6 +290,8 @@ pub(crate) enum ContainerCmd {
         #[clap(long, short = 'f')]
         follow: bool,
     },
+    /// Show live resource usage statistics
+    Stats(cli::stats::StatsArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -510,6 +516,7 @@ fn main() {
             ContainerCmd::Stop { name, time } => cli::stop::cmd_stop(&name, time),
             ContainerCmd::Rm { name, force } => cli::rm::cmd_rm(&name, force),
             ContainerCmd::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
+            ContainerCmd::Stats(args) => cli::stats::cmd_stats(args),
         },
 
         // Rootfs
@@ -599,6 +606,9 @@ fn main() {
 
         // System
         CliCommand::System { cmd } => cli::system::cmd_system(cmd),
+
+        // Stats
+        CliCommand::Stats(args) => cli::stats::cmd_stats(args),
 
         // Subscribe
         CliCommand::Subscribe => cli::subscribe::cmd_subscribe(),

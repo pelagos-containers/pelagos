@@ -4402,3 +4402,14 @@ Failure indicates the DNAT expression encoding (proto match, dport match, immedi
 Guards on `ip filter` table existence (iptables-nft must be active). Calls `nft_add_filter_forward_compat` to add a CIDR-scoped chain to `ip filter` with a jump rule in FORWARD. Verifies the jump exists via `nft list chain` or `nft_find_jump_handles`. Calls `nft_remove_filter_forward_compat` and verifies the jump handles are empty.
 
 Failure indicates GETRULE DUMP parsing or DELRULE-by-handle encoding is wrong, or that the iptables-nft forward chain add/remove sequence leaves stale rules.
+
+### `test_stats_no_stream`
+**Requires:** root, alpine-rootfs
+**Module:** `stats`
+
+Starts a detached container (no cgroup limits), runs `pelagos stats --no-stream <name>`,
+and asserts the output contains the column header (NAME, CPU %, MEM) and the container
+name on a data row. Cleans up the container after the assertions.
+
+Failure indicates the stats command cannot discover a running container via state files,
+crashes during cgroup probing, or produces output missing expected columns or the container name.

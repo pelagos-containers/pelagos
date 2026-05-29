@@ -2739,6 +2739,91 @@ mod cgroups {
     }
 }
 
+mod stats {
+    use super::*;
+
+    /// Verify `pelagos stats --no-stream` lists a running container and exits cleanly.
+    ///
+    /// Requires root (spawns a real container).  Starts a long-lived container without
+    /// cgroup limits (so it runs successfully regardless of cgroup namespace quirks),
+    /// runs `pelagos stats --no-stream <name>`, and asserts the output contains the
+    /// container name and the column header.
+    ///
+    /// Failure indicates the stats command cannot discover the container via state files,
+    /// crashes during cgroup/proc probing, or emits malformed output.
+    #[test]
+    fn test_stats_no_stream() {
+        if !is_root() {
+            eprintln!("Skipping test_stats_no_stream: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_stats_no_stream: alpine-rootfs not found");
+            return;
+        };
+
+        let name = format!("test-stats-{}", std::process::id());
+
+        // Start a long-running container (no cgroup limits — avoids CGROUP ns restrictions).
+        let start = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                &name,
+                "--network",
+                "loopback",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/ash",
+                "-c",
+                "sleep 30",
+            ])
+            .output()
+            .expect("pelagos run");
+        assert!(
+            start.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let stats_out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["stats", "--no-stream", &name])
+            .output()
+            .expect("pelagos stats");
+        let stdout = String::from_utf8_lossy(&stats_out.stdout);
+
+        // Clean up regardless of assertions.
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["stop", &name])
+            .output();
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["rm", &name])
+            .output();
+
+        assert!(
+            stats_out.status.success(),
+            "pelagos stats exited non-zero: {}",
+            String::from_utf8_lossy(&stats_out.stderr)
+        );
+
+        // Header must be present.
+        assert!(
+            stdout.contains("NAME") && stdout.contains("CPU %") && stdout.contains("MEM"),
+            "stats output missing header: {stdout}"
+        );
+
+        // Container name must appear in the output.
+        assert!(
+            stdout.contains(&name),
+            "stats output missing container name '{}': {stdout}",
+            name
+        );
+    }
+}
+
 mod networking {
     use super::*;
 

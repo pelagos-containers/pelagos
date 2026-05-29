@@ -361,10 +361,23 @@ pub fn teardown_cgroup(cg: Cgroup) {
 pub struct ResourceStats {
     /// Current memory usage in bytes (`memory.current`).
     pub memory_current_bytes: u64,
+    /// Memory hard limit in bytes (`memory.max`); `None` means unlimited.
+    pub memory_limit_bytes: Option<u64>,
     /// Total CPU time consumed in nanoseconds (from `cpu.stat usage_usec * 1000`).
     pub cpu_usage_ns: u64,
     /// Current number of live processes/threads (`pids.current`).
     pub pids_current: u64,
+}
+
+/// Open an existing cgroup by name without creating or modifying it.
+///
+/// Returns `None` if the cgroup directory does not exist (container has exited).
+pub fn open_cgroup(name: &str) -> Option<Cgroup> {
+    let path = format!("/sys/fs/cgroup/{}", name);
+    if !std::path::Path::new(&path).exists() {
+        return None;
+    }
+    Some(Cgroup::load(hierarchies::auto(), name))
 }
 
 /// Read current resource usage from a container's cgroup.
@@ -376,7 +389,12 @@ pub fn read_stats(cg: &Cgroup) -> io::Result<ResourceStats> {
 
     // Memory: usage_in_bytes from memory.current (v2) or memory.usage_in_bytes (v1)
     if let Some(mem_ctrl) = cg.controller_of::<MemController>() {
-        stats.memory_current_bytes = mem_ctrl.memory_stat().usage_in_bytes;
+        let ms = mem_ctrl.memory_stat();
+        stats.memory_current_bytes = ms.usage_in_bytes;
+        // limit_in_bytes == -1 means "max" (unlimited)
+        if ms.limit_in_bytes > 0 {
+            stats.memory_limit_bytes = Some(ms.limit_in_bytes as u64);
+        }
     }
 
     // CPU: parse "usage_usec N" from the raw cpu.stat string
