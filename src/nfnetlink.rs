@@ -698,15 +698,12 @@ fn send_batch(fd: RawFd, ops: &[u8], num_ack_expected: usize) -> io::Result<()> 
         iov_base: batch.as_ptr() as *mut _,
         iov_len: batch.len(),
     };
-    let msg = libc::msghdr {
-        msg_name: &sa as *const _ as *mut _,
-        msg_namelen: std::mem::size_of::<libc::sockaddr_nl>() as u32,
-        msg_iov: &iov as *const _ as *mut _,
-        msg_iovlen: 1,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    };
+    // msghdr has private padding on some targets (e.g. aarch64-musl); use zeroed init.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &sa as *const _ as *mut _;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+    msg.msg_iov = &iov as *const _ as *mut _;
+    msg.msg_iovlen = 1;
     let sent = unsafe { libc::sendmsg(fd, &msg, 0) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -716,24 +713,14 @@ fn send_batch(fd: RawFd, ops: &[u8], num_ack_expected: usize) -> io::Result<()> 
     let mut recv_buf = vec![0u8; 32768];
     let mut remaining = num_ack_expected;
     while remaining > 0 {
-        let n = unsafe {
-            libc::recvmsg(
-                fd,
-                &mut libc::msghdr {
-                    msg_name: std::ptr::null_mut(),
-                    msg_namelen: 0,
-                    msg_iov: &libc::iovec {
-                        iov_base: recv_buf.as_mut_ptr() as *mut _,
-                        iov_len: recv_buf.len(),
-                    } as *const _ as *mut _,
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                0,
-            )
+        let iov_recv = libc::iovec {
+            iov_base: recv_buf.as_mut_ptr() as *mut _,
+            iov_len: recv_buf.len(),
         };
+        let mut rmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+        rmsg.msg_iov = &iov_recv as *const _ as *mut _;
+        rmsg.msg_iovlen = 1;
+        let n = unsafe { libc::recvmsg(fd, &mut rmsg, 0) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EINTR) {
@@ -1215,15 +1202,12 @@ fn nft_find_jump_handles_fd(
             iov_base: req.as_ptr() as *mut _,
             iov_len: req.len(),
         };
-        let msg = libc::msghdr {
-            msg_name: &sa as *const _ as *mut _,
-            msg_namelen: std::mem::size_of::<libc::sockaddr_nl>() as u32,
-            msg_iov: &iov as *const _ as *mut _,
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
+        // msghdr has private padding on some targets; use zeroed init.
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = &sa as *const _ as *mut _;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+        msg.msg_iov = &iov as *const _ as *mut _;
+        msg.msg_iovlen = 1;
         libc::sendmsg(fd, &msg, 0)
     };
     if sent < 0 {
@@ -1240,24 +1224,14 @@ fn nft_find_jump_handles_fd(
     let mut recv_buf = vec![0u8; 65536];
 
     'outer: loop {
-        let n = unsafe {
-            libc::recvmsg(
-                fd,
-                &mut libc::msghdr {
-                    msg_name: std::ptr::null_mut(),
-                    msg_namelen: 0,
-                    msg_iov: &libc::iovec {
-                        iov_base: recv_buf.as_mut_ptr() as *mut _,
-                        iov_len: recv_buf.len(),
-                    } as *const _ as *mut _,
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                0,
-            )
+        let iov_recv = libc::iovec {
+            iov_base: recv_buf.as_mut_ptr() as *mut _,
+            iov_len: recv_buf.len(),
         };
+        let mut rmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+        rmsg.msg_iov = &iov_recv as *const _ as *mut _;
+        rmsg.msg_iovlen = 1;
+        let n = unsafe { libc::recvmsg(fd, &mut rmsg, 0) };
         if n <= 0 {
             break;
         }
