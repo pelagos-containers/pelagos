@@ -1,6 +1,54 @@
 # Ongoing Tasks
 
-## Session 2026-05-29 — Issue #269: pelagos stats (feat/stats-269)
+## Session 2026-05-29 — Issue #271: replace remaining ip/nft shell-outs (refactor/native-netlink-271)
+
+### Goal
+
+Eliminate the last four `ip` and one `nft` shell-outs. All are in teardown/cleanup paths.
+
+### Changes
+
+#### `src/netlink.rs`
+
+Add `pub fn netns_del(name: &str) -> io::Result<()>`:
+- `umount2("/run/netns/<name>", MNT_DETACH)` — detach the bind mount
+- `unlink("/run/netns/<name>")` — remove the file
+- Both errors are non-fatal (best-effort); return last error if both fail
+
+#### `src/sandbox.rs`
+
+Replace:
+- `ip link del <veth_host>` → `crate::netlink::link_del(&veth_host)`
+- `ip netns del <ns_name>` → `crate::netlink::netns_del(&state.ns_name)`
+
+#### `src/cli/cleanup.rs`
+
+Replace:
+- `ip netns del <name>` → `pelagos::netlink::netns_del(&name)`
+
+#### `src/cli/network.rs`
+
+Replace:
+- `ip link del <bridge>` → `pelagos::netlink::link_del(&net.bridge_name)`
+- `nft delete table ip <table>` → `pelagos::nfnetlink::nft_delete_ip_table(&table)`
+
+### Test plan
+
+`test_netns_del` unit test: create a netns with `netns_create`, verify the path exists,
+call `netns_del`, verify the path is gone.
+
+Also run the full bridge/NAT integration tests to confirm teardown still works.
+
+### Files to change
+
+1. `src/netlink.rs` — add `netns_del`
+2. `src/sandbox.rs` — 2 replacements
+3. `src/cli/cleanup.rs` — 1 replacement
+4. `src/cli/network.rs` — 2 replacements
+
+---
+
+## Previous: Issue #269: pelagos stats (feat/stats-269)
 
 ### Goal
 

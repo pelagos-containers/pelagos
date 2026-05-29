@@ -183,25 +183,10 @@ pub fn cmd_network_rm(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let net = NetworkDef::load(name)?;
 
     // Delete the bridge interface if it exists (non-fatal).
-    let _ = std::process::Command::new("ip")
-        .args(["link", "del", &net.bridge_name])
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = pelagos::netlink::link_del(&net.bridge_name);
 
     // Delete the nft table if it exists (non-fatal).
-    let table = net.nft_table_name();
-    let script = format!("delete table ip {}\n", table);
-    let _ = std::process::Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.as_mut().unwrap().write_all(script.as_bytes())?;
-            child.wait()
-        });
+    pelagos::nfnetlink::nft_delete_ip_table(&net.nft_table_name());
 
     // Remove config dir.
     std::fs::remove_dir_all(&config_dir)?;

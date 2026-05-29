@@ -545,6 +545,41 @@ pub fn neigh_add_ipv6(dev: &str, ip: Ipv6Addr, mac: &[u8; 6]) -> io::Result<()> 
 /// Spawns a thread that calls `unshare(CLONE_NEWNET)` and then bind-mounts
 /// `/proc/thread-self/ns/net` onto the file.  Returns Ok if the namespace
 /// already exists.
+/// Delete a named network namespace created by [`netns_create`].
+///
+/// Detaches the bind mount at `/run/netns/<name>` and removes the file.
+/// Both steps are attempted; the first error encountered is returned if
+/// neither succeeds (best-effort teardown).
+pub fn netns_del(name: &str) -> io::Result<()> {
+    let path = format!("/run/netns/{name}");
+    let cpath = CString::new(path.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "netns name contains NUL"))?;
+
+    let umount_err = unsafe {
+        let ret = libc::umount2(cpath.as_ptr(), libc::MNT_DETACH);
+        if ret < 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        }
+    };
+
+    let unlink_err = unsafe {
+        let ret = libc::unlink(cpath.as_ptr());
+        if ret < 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        }
+    };
+
+    match (umount_err, unlink_err) {
+        (_, None) => Ok(()),
+        (None, Some(e)) => Err(e),
+        (Some(e), Some(_)) => Err(e),
+    }
+}
+
 pub fn netns_create(name: &str) -> io::Result<()> {
     let path = format!("/run/netns/{name}");
     std::fs::create_dir_all("/run/netns")?;
@@ -658,6 +693,26 @@ mod tests {
         assert_eq!(&b.0[16..18], &(8u16).to_le_bytes());
         assert_eq!(&b.0[18..20], &IFA_LOCAL.to_le_bytes());
         assert_eq!(&b.0[20..24], &data);
+    }
+
+    /// Verify netns_create + netns_del round-trip: path must exist after create,
+    /// be gone after del.  Requires root (bind-mount needs CAP_SYS_ADMIN).
+    #[test]
+    fn test_netns_create_del_roundtrip() {
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+        let name = format!("pelagos-test-ns-{}", unsafe { libc::getpid() });
+        netns_create(&name).expect("netns_create");
+        assert!(
+            std::path::Path::new(&format!("/run/netns/{name}")).exists(),
+            "netns path must exist after create"
+        );
+        netns_del(&name).expect("netns_del");
+        assert!(
+            !std::path::Path::new(&format!("/run/netns/{name}")).exists(),
+            "netns path must be gone after del"
+        );
     }
 
     #[test]
