@@ -1122,6 +1122,20 @@ one without any seccomp (both sockets must succeed), one with the arg-filtered f
 → `SeccompCondition` translation in `filter_from_oci` is broken or seccompiler arg
 conditions are mis-wired.
 
+### `test_oci_seccomp_errno_ret`
+**Requires:** root (no rootfs required — compiles a static binary at test time)
+
+Verifies that `errnoRet` and `SCMP_ACT_ENOSYS` are honoured at the kernel level. Compiles
+a static binary that calls `personality(0xffffffff)` and prints `ERRNO:<n>`. Runs it under
+three seccomp policies:
+
+- `SCMP_ACT_ERRNO` with `errnoRet: 38` → must return errno 38 (ENOSYS), not 1 (EPERM)
+- `SCMP_ACT_ERRNO` without `errnoRet` → must return errno 1 (EPERM, default)
+- `SCMP_ACT_ENOSYS` action → must return errno 38 regardless of `errnoRet` field
+
+Failure indicates `oci_action_to_seccomp` is ignoring the `errno_ret` parameter or
+`SCMP_ACT_ENOSYS` is incorrectly mapped to EPERM instead of ENOSYS.
+
 ### `test_oci_seccomp_args_operators`
 **Requires:** root (no rootfs required — compiles a static binary at test time)
 
