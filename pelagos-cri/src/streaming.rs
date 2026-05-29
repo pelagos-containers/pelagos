@@ -93,12 +93,52 @@ pub async fn serve(listener: TcpListener, registry: Registry, pelagos_bin: Strin
     }
 }
 
+// Select the X-Stream-Protocol-Version to echo back in the 101 response.
+// exec/attach: confirm the highest channel version the client advertises (v4 preferred).
+// portforward: always confirm portforward.k8s.io/v1.
+fn negotiate_protocol(kind: &str, headers: &http::HeaderMap) -> Option<String> {
+    const EXEC_VERSIONS: &[&str] = &[
+        "v4.channel.k8s.io",
+        "v3.channel.k8s.io",
+        "v2.channel.k8s.io",
+        "v1.channel.k8s.io",
+    ];
+    const PF_VERSION: &str = "portforward.k8s.io/v1";
+
+    match kind {
+        "exec" | "attach" => {
+            let offered: Vec<&str> = headers
+                .get_all("x-stream-protocol-version")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            for &ver in EXEC_VERSIONS {
+                if offered.contains(&ver) {
+                    return Some(ver.to_string());
+                }
+            }
+            // Client didn't advertise a known version; echo none and fall back.
+            None
+        }
+        "portforward" => {
+            // Echo back whatever the client offered — kubectl sends "portforward.k8s.io"
+            // (not "/v1"), so don't hardcode; just reflect the first offered value.
+            headers
+                .get("x-stream-protocol-version")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| Some(PF_VERSION.to_string()))
+        }
+        _ => None,
+    }
+}
+
 async fn handle_connection(
     mut tcp: TcpStream,
     registry: Registry,
     pelagos_bin: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use spdystream_rs::server::{parse_upgrade_request, send_upgrade_response};
+    use spdystream_rs::server::{parse_upgrade_request, send_upgrade_response_with_protocol};
 
     let req = parse_upgrade_request(&mut tcp).await?;
     log::debug!("streaming request: {} {}", req.method, req.path);
@@ -121,7 +161,13 @@ async fn handle_connection(
         }
     };
 
-    send_upgrade_response(&mut tcp).await?;
+    // Negotiate the subprotocol by echoing X-Stream-Protocol-Version back to the client.
+    // kubectl rejects the upgrade if the server doesn't confirm the version it offered.
+    // For exec/attach we confirm v4 (supports exit-code propagation via the error stream).
+    // For port-forward we confirm portforward.k8s.io/v1.
+    let protocol = negotiate_protocol(kind, &req.headers);
+    log::debug!("streaming: negotiated protocol {:?}", protocol);
+    send_upgrade_response_with_protocol(&mut tcp, protocol.as_deref()).await?;
 
     match (kind, pending) {
         ("exec" | "attach", Pending::Exec(p)) => {
