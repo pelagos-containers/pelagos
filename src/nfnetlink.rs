@@ -888,11 +888,15 @@ pub fn nft_flush_postrouting(table: &str) -> io::Result<()> {
 
 /// Delete an ip-family table entirely (non-fatal if not found).
 pub fn nft_delete_ip_table(table: &str) {
-    with_nfnl_quiet(|fd| {
+    if let Err(e) = with_nfnl(|fd| {
         let mut ops = Vec::new();
         msg_del_table(&mut ops, NFPROTO_IPV4, table, 1);
         send_batch(fd, &ops, 1)
-    });
+    }) {
+        if e.raw_os_error() != Some(libc::ENOENT) {
+            log::warn!("nft delete table ip {} (non-fatal): {}", table, e);
+        }
+    }
 }
 
 /// Delete an ip6-family table entirely (non-fatal if not found).
@@ -993,7 +997,7 @@ pub fn nft_add_filter_forward_compat(chain: &str, net: Ipv4Addr, prefix: u8) {
 
 /// Remove iptables-nft compat FORWARD chain (non-fatal).
 pub fn nft_remove_filter_forward_compat(chain: &str) {
-    with_nfnl_quiet(|fd| {
+    if let Err(e) = with_nfnl(|fd| {
         let handles = nft_find_jump_handles_fd(fd, NFPROTO_IPV4, "filter", "FORWARD", chain)?;
         let mut ops = Vec::new();
         let mut seq = 1u32;
@@ -1005,8 +1009,16 @@ pub fn nft_remove_filter_forward_compat(chain: &str) {
         seq += 1;
         msg_del_chain(&mut ops, NFPROTO_IPV4, "filter", chain, seq);
         seq += 1;
-        send_batch_quiet(fd, &ops, (seq - 1) as usize)
-    });
+        send_batch(fd, &ops, (seq - 1) as usize)
+    }) {
+        if e.raw_os_error() != Some(libc::ENOENT) {
+            log::warn!(
+                "nft remove filter forward compat {} (non-fatal): {}",
+                chain,
+                e
+            );
+        }
+    }
 }
 
 /// Add iptables-nft compat INPUT chain for DNS (non-fatal).

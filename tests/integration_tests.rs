@@ -22727,7 +22727,7 @@ mod dockerd_integration {
     /// Verifies that the inotify CLOSE_WRITE on the log file (fired when the
     /// watcher relay closes on container exit) correctly terminates the stream.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_follow_terminates_on_exit() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -22785,7 +22785,7 @@ mod dockerd_integration {
     /// Verifies that inotify MODIFY events on the log file drive delivery
     /// rather than a fixed sleep interval.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_follow_streams_real_time() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -22837,7 +22837,7 @@ mod dockerd_integration {
     ///
     /// Also verifies that the exit code in the response body is correct.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_wait_returns_exit_code() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -22886,7 +22886,7 @@ mod dockerd_integration {
     /// The follow task must buffer "hello" in `line_buf` and complete the frame
     /// only after the newline arrives — not emit two half-line frames.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_partial_line_across_writes() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -22956,7 +22956,7 @@ mod dockerd_integration {
     /// Failure indicates the partial-line flush at the end of the background task
     /// is not running, causing the last line of output to be silently dropped.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_no_trailing_newline() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -23024,7 +23024,7 @@ mod dockerd_integration {
     /// watch is set up, so the follow task must fall back to the 1s timeout and
     /// detect exit via `read_state`. Total latency should be <3s.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_follow_already_exited() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -23091,7 +23091,7 @@ mod dockerd_integration {
     /// partial data, or `frames_from_bytes` producing incorrect frame boundaries
     /// on large inputs).
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_large_initial_drain() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -23157,7 +23157,7 @@ mod dockerd_integration {
     /// within 2s of client disconnect, and that a subsequent follow connection
     /// works normally (no fd exhaustion).
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_follow_client_disconnect() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -23234,7 +23234,7 @@ mod dockerd_integration {
     /// no shared state between them. Failure indicates a resource conflict or
     /// one stream starving the other.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_concurrent_follows() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
@@ -23316,7 +23316,7 @@ mod dockerd_integration {
     /// We measure pelagos-dockerd RSS before and after a 3s window with a
     /// throttled client (100 bytes/sec). Growth must stay <5 MB.
     #[test]
-    #[serial_test::serial(dockerd)]
+    #[serial_test::serial(nat, dockerd)]
     fn test_dockerd_logs_follow_backpressure() {
         if unsafe { libc::getuid() } != 0 {
             eprintln!("SKIP: requires root");
