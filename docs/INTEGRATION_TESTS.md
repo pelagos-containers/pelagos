@@ -1122,6 +1122,29 @@ one without any seccomp (both sockets must succeed), one with the arg-filtered f
 → `SeccompCondition` translation in `filter_from_oci` is broken or seccompiler arg
 conditions are mis-wired.
 
+### `test_oci_seccomp_args_operators`
+**Requires:** root (no rootfs required — compiles a static binary at test time)
+
+Runtime-verifies the seccomp arg condition operators and combination semantics that
+`test_oci_seccomp_args` does not cover. Compiles one static C binary that calls
+`socket(AF_INET)`, `socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK)`, `socket(AF_INET6)`,
+and `socket(AF_NETLINK)`. Runs it four times with different seccomp policies:
+
+- **NE**: block `socket` when `arg[0] != AF_INET(2)` — verifies `SCMP_CMP_NE` BPF emission
+  allows AF_INET and blocks AF_INET6 and AF_NETLINK.
+- **MASKED_EQ**: block `socket` when `(arg[1] & 0x800) == 0x800` (SOCK_NONBLOCK bit) —
+  verifies `SCMP_CMP_MASKED_EQ` BPF emission allows plain SOCK_STREAM and blocks
+  SOCK_STREAM|SOCK_NONBLOCK.
+- **Multi-arg AND**: single rule with two conditions (`arg[0]==2 AND arg[1]==1`) — verifies
+  the kernel ANDs conditions: blocks exact `{AF_INET, SOCK_STREAM}`, allows
+  `{AF_INET, SOCK_STREAM|SOCK_NONBLOCK}` and `{AF_INET6, SOCK_STREAM}`.
+- **Multi-rule OR**: two `OciSyscallRule` entries for `socket` (`arg[0]==16` and `arg[0]==10`)
+  — verifies the kernel ORs rules: AF_INET allowed, AF_NETLINK blocked by rule 1,
+  AF_INET6 blocked by rule 2.
+
+Failure of any scenario indicates the corresponding seccompiler BPF emission path or
+OCI→SeccompCondition translation is wrong at the kernel level, not just at compile time.
+
 ### `test_oci_cap_all_known_names_round_trip` (unit)
 **Requires:** nothing (unit test in `src/oci.rs`)
 

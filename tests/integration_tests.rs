@@ -5825,6 +5825,279 @@ int main(void) {
         );
     }
 
+    /// test_oci_seccomp_args_operators
+    ///
+    /// Requires: root (no rootfs required — compiles a static binary at test time).
+    ///
+    /// Extends test_oci_seccomp_args to runtime-verify operators and combination
+    /// semantics that the unit tests only confirm at compile time:
+    ///
+    /// - SCMP_CMP_NE: block socket when arg[0] != AF_INET(2); AF_INET allowed,
+    ///   AF_NETLINK blocked.
+    /// - SCMP_CMP_MASKED_EQ: block socket when (arg[1] & SOCK_NONBLOCK) == SOCK_NONBLOCK;
+    ///   plain SOCK_STREAM allowed, SOCK_STREAM|SOCK_NONBLOCK blocked.
+    /// - Multi-arg AND: block socket when arg[0]==AF_INET AND arg[1]==SOCK_STREAM;
+    ///   exact match blocked, SOCK_STREAM|SOCK_NONBLOCK (arg[1]≠1) and AF_INET6
+    ///   (arg[0]≠2) allowed.
+    /// - Multi-rule OR: two rules for socket — block arg[0]==AF_NETLINK, block
+    ///   arg[0]==AF_INET6; AF_INET allowed, both AF_NETLINK and AF_INET6 blocked.
+    ///
+    /// Failure of any scenario indicates the corresponding seccompiler BPF emission
+    /// path or the OCI→SeccompCondition translation is wrong at the kernel level.
+    #[test]
+    fn test_oci_seccomp_args_operators() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_seccomp_args_operators: requires root");
+            return;
+        }
+
+        // Probe binary: calls several socket variants and prints a label per result.
+        // Uses numeric constants to avoid header portability issues with SOCK_NONBLOCK.
+        let src = r#"
+#include <sys/socket.h>
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static void probe(const char *label, int domain, int type, int protocol) {
+    int fd = socket(domain, type, protocol);
+    if (fd >= 0) { close(fd); printf("%s_OK\n", label); }
+    else          { printf("%s_FAIL\n", label); }
+}
+
+int main(void) {
+    probe("INET_STREAM",         2,      1,      0);  /* AF_INET, SOCK_STREAM */
+    probe("INET_STREAM_NB",      2,  0x801,      0);  /* AF_INET, SOCK_STREAM|SOCK_NONBLOCK */
+    probe("INET6_STREAM",       10,      1,      0);  /* AF_INET6, SOCK_STREAM */
+    probe("NETLINK_RAW",        16,      3,      0);  /* AF_NETLINK, SOCK_RAW */
+    return 0;
+}
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir for seccomp_args_operators");
+        let src_path = tmp.path().join("probe.c");
+        let bin_path = tmp.path().join("probe");
+        std::fs::write(&src_path, src).expect("write probe.c");
+        let cc_out = std::process::Command::new("cc")
+            .args([
+                "-static",
+                "-o",
+                bin_path.to_str().unwrap(),
+                src_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("cc");
+        assert!(
+            cc_out.status.success(),
+            "failed to compile probe: {}",
+            String::from_utf8_lossy(&cc_out.stderr)
+        );
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir(&rootfs).expect("mkdir rootfs");
+        std::fs::copy(&bin_path, rootfs.join("probe")).expect("cp probe");
+
+        // Helper: run /probe in a chroot with the given seccomp filter; return stdout.
+        let run_probe = |prog: seccompiler::BpfProgram| -> String {
+            let mut child = Command::new("/probe")
+                .with_chroot(&rootfs)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Null)
+                .with_seccomp_program(prog)
+                .spawn()
+                .expect("spawn");
+            let (_, out, _) = child.wait_with_output().expect("wait_with_output");
+            String::from_utf8_lossy(&out).into_owned()
+        };
+
+        // Baseline: no seccomp — all four sockets should open.
+        let mut baseline = Command::new("/probe")
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn baseline");
+        let (_, base_out, _) = baseline.wait_with_output().expect("wait baseline");
+        let base = String::from_utf8_lossy(&base_out).into_owned();
+        assert!(
+            base.contains("INET_STREAM_OK"),
+            "baseline INET_STREAM: {base:?}"
+        );
+        assert!(
+            base.contains("INET_STREAM_NB_OK"),
+            "baseline INET_STREAM_NB: {base:?}"
+        );
+        assert!(
+            base.contains("INET6_STREAM_OK"),
+            "baseline INET6_STREAM: {base:?}"
+        );
+        assert!(
+            base.contains("NETLINK_RAW_OK"),
+            "baseline NETLINK_RAW: {base:?}"
+        );
+
+        // ---- SCMP_CMP_NE ----
+        // Block socket when arg[0] != AF_INET(2): INET allowed, INET6/NETLINK blocked.
+        let ne_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["socket".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: vec![pelagos::oci::OciSyscallArg {
+                    index: 0,
+                    value: 2,
+                    value_two: 0,
+                    op: "SCMP_CMP_NE".to_string(),
+                }],
+            }],
+        })
+        .expect("ne filter");
+        let ne = run_probe(ne_filter);
+        assert!(
+            ne.contains("INET_STREAM_OK"),
+            "NE: INET_STREAM should be allowed: {ne:?}"
+        );
+        assert!(
+            ne.contains("INET_STREAM_NB_OK"),
+            "NE: INET_STREAM_NB should be allowed: {ne:?}"
+        );
+        assert!(
+            ne.contains("INET6_STREAM_FAIL"),
+            "NE: INET6 should be blocked: {ne:?}"
+        );
+        assert!(
+            ne.contains("NETLINK_RAW_FAIL"),
+            "NE: NETLINK should be blocked: {ne:?}"
+        );
+
+        // ---- SCMP_CMP_MASKED_EQ ----
+        // Block socket when (arg[1] & SOCK_NONBLOCK=0x800) == 0x800.
+        // SOCK_STREAM(1) → 1&0x800=0 ≠ 0x800 → allowed.
+        // SOCK_STREAM|SOCK_NONBLOCK(0x801) → 0x801&0x800=0x800 == 0x800 → blocked.
+        let meq_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["socket".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: vec![pelagos::oci::OciSyscallArg {
+                    index: 1,
+                    value: 0x800,
+                    value_two: 0x800,
+                    op: "SCMP_CMP_MASKED_EQ".to_string(),
+                }],
+            }],
+        })
+        .expect("masked_eq filter");
+        let meq = run_probe(meq_filter);
+        assert!(
+            meq.contains("INET_STREAM_OK"),
+            "MASKED_EQ: plain SOCK_STREAM allowed: {meq:?}"
+        );
+        assert!(
+            meq.contains("INET_STREAM_NB_FAIL"),
+            "MASKED_EQ: SOCK_NONBLOCK blocked: {meq:?}"
+        );
+        assert!(
+            meq.contains("INET6_STREAM_OK"),
+            "MASKED_EQ: INET6 allowed: {meq:?}"
+        );
+        assert!(
+            meq.contains("NETLINK_RAW_OK"),
+            "MASKED_EQ: NETLINK allowed: {meq:?}"
+        );
+
+        // ---- Multi-arg AND ----
+        // Block socket when arg[0]==AF_INET(2) AND arg[1]==SOCK_STREAM(1).
+        // Only exact {AF_INET, SOCK_STREAM} is blocked; SOCK_NONBLOCK variant and INET6 pass.
+        let and_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![pelagos::oci::OciSyscallRule {
+                names: vec!["socket".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: vec![
+                    pelagos::oci::OciSyscallArg {
+                        index: 0,
+                        value: 2,
+                        value_two: 0,
+                        op: "SCMP_CMP_EQ".to_string(),
+                    },
+                    pelagos::oci::OciSyscallArg {
+                        index: 1,
+                        value: 1,
+                        value_two: 0,
+                        op: "SCMP_CMP_EQ".to_string(),
+                    },
+                ],
+            }],
+        })
+        .expect("and filter");
+        let and = run_probe(and_filter);
+        assert!(
+            and.contains("INET_STREAM_FAIL"),
+            "AND: AF_INET+SOCK_STREAM blocked: {and:?}"
+        );
+        assert!(
+            and.contains("INET_STREAM_NB_OK"),
+            "AND: SOCK_NONBLOCK variant allowed: {and:?}"
+        );
+        assert!(
+            and.contains("INET6_STREAM_OK"),
+            "AND: INET6 allowed: {and:?}"
+        );
+        assert!(
+            and.contains("NETLINK_RAW_OK"),
+            "AND: NETLINK allowed: {and:?}"
+        );
+
+        // ---- Multi-rule OR ----
+        // Two separate rules for socket: block arg[0]==16 (AF_NETLINK) OR arg[0]==10 (AF_INET6).
+        // AF_INET(2) matches neither rule → allowed.
+        let or_filter = pelagos::seccomp::filter_from_oci(&pelagos::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![
+                pelagos::oci::OciSyscallRule {
+                    names: vec!["socket".to_string()],
+                    action: "SCMP_ACT_ERRNO".to_string(),
+                    args: vec![pelagos::oci::OciSyscallArg {
+                        index: 0,
+                        value: 16,
+                        value_two: 0,
+                        op: "SCMP_CMP_EQ".to_string(),
+                    }],
+                },
+                pelagos::oci::OciSyscallRule {
+                    names: vec!["socket".to_string()],
+                    action: "SCMP_ACT_ERRNO".to_string(),
+                    args: vec![pelagos::oci::OciSyscallArg {
+                        index: 0,
+                        value: 10,
+                        value_two: 0,
+                        op: "SCMP_CMP_EQ".to_string(),
+                    }],
+                },
+            ],
+        })
+        .expect("or filter");
+        let or = run_probe(or_filter);
+        assert!(or.contains("INET_STREAM_OK"), "OR: INET allowed: {or:?}");
+        assert!(
+            or.contains("INET_STREAM_NB_OK"),
+            "OR: INET_NB allowed: {or:?}"
+        );
+        assert!(
+            or.contains("INET6_STREAM_FAIL"),
+            "OR: INET6 blocked by rule 2: {or:?}"
+        );
+        assert!(
+            or.contains("NETLINK_RAW_FAIL"),
+            "OR: NETLINK blocked by rule 1: {or:?}"
+        );
+    }
+
     /// test_oci_kernel_mounts
     ///
     /// Requires: root, alpine-rootfs.
