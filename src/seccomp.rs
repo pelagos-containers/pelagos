@@ -49,7 +49,10 @@
 //! Seccomp filtering adds ~20-50ns overhead per syscall, which is negligible
 //! for most workloads (< 0.01% for typical applications).
 
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule,
+};
 use std::collections::BTreeMap;
 use std::io;
 
@@ -450,8 +453,9 @@ pub fn minimal_filter() -> Result<BpfProgram, io::Error> {
 /// Build a seccomp BPF program from an OCI `linux.seccomp` configuration.
 ///
 /// Handles `SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO`, `SCMP_ACT_KILL`, `SCMP_ACT_KILL_THREAD`,
-/// `SCMP_ACT_KILL_PROCESS`, `SCMP_ACT_LOG`, and `SCMP_ACT_TRAP`.
-/// Argument conditions (`args`) are ignored in this first-pass implementation.
+/// `SCMP_ACT_KILL_PROCESS`, `SCMP_ACT_LOG`, and `SCMP_ACT_TRAP`. Argument conditions
+/// (`args`) are fully translated: multiple `args` within one rule are ANDed; multiple
+/// rules for the same syscall are ORed.
 pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io::Error> {
     use std::convert::TryInto;
 
@@ -467,6 +471,21 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         }
     }
 
+    fn oci_arg_to_condition(arg: &crate::oci::OciSyscallArg) -> Option<SeccompCondition> {
+        let (op, value) = match arg.op.as_str() {
+            "SCMP_CMP_EQ" => (SeccompCmpOp::Eq, arg.value),
+            "SCMP_CMP_NE" => (SeccompCmpOp::Ne, arg.value),
+            "SCMP_CMP_LT" => (SeccompCmpOp::Lt, arg.value),
+            "SCMP_CMP_LE" => (SeccompCmpOp::Le, arg.value),
+            "SCMP_CMP_GT" => (SeccompCmpOp::Gt, arg.value),
+            "SCMP_CMP_GE" => (SeccompCmpOp::Ge, arg.value),
+            // value = mask, value_two = expected result of (arg & mask)
+            "SCMP_CMP_MASKED_EQ" => (SeccompCmpOp::MaskedEq(arg.value), arg.value_two),
+            _ => return None,
+        };
+        SeccompCondition::new(arg.index as u8, SeccompCmpArgLen::Qword, op, value).ok()
+    }
+
     let default_action = oci_action_to_seccomp(&config.default_action).ok_or_else(|| {
         io::Error::other(format!(
             "unknown seccomp defaultAction: {}",
@@ -474,43 +493,9 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         ))
     })?;
 
-    // Build syscall → rules map. For each rule, the action overrides the default.
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-
-    for rule in &config.syscalls {
-        let action = match oci_action_to_seccomp(&rule.action) {
-            Some(a) => a,
-            None => continue, // skip unknown actions
-        };
-
-        // Only add rules that differ from the default (seccompiler semantics:
-        // rules map is "match → match_action"; default_action is the fallback).
-        // We unconditionally add the entry; seccompiler handles the logic.
-        for name in &rule.names {
-            if let Ok(num) = syscall_number(name) {
-                rules.entry(num).or_default();
-                // An empty Vec<SeccompRule> means "match any args → match_action".
-                // We use the action as the match_action; but SeccompFilter only has
-                // one match_action. Work around this by building one filter per
-                // unique action if needed — for now handle the common case where
-                // all syscall rules share the same action.
-                let _ = action; // captured per-loop below
-            }
-        }
-    }
-
-    // Simplified but correct approach: build a single filter where:
-    // - rules map contains all syscalls with the per-rule action that matches
-    // - For heterogeneous actions we build them as separate entries
-    // The seccompiler model: filter has ONE match_action and ONE default_action.
-    // Entries in the rules map use the match_action if they match.
-    //
-    // This means we can only represent "allowlist" (default=KILL, rules=ALLOW)
-    // or "denylist" (default=ALLOW, rules=ERRNO) in a single filter.
-    //
-    // For full generality we'd need multiple chained filters. For now we collect
-    // only the rules whose action differs from the default.
-
+    // seccompiler supports a single match_action per filter. Collect all rules
+    // whose action differs from the default; warn and drop any that introduce a
+    // second distinct non-default action (see issue #166 for multi-filter support).
     let mut filtered_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     let mut match_action: Option<SeccompAction> = None;
 
@@ -520,23 +505,36 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
             None => continue,
         };
         if action == default_action {
-            continue; // Same as default — no need to add to map
+            continue;
         }
         if match_action.is_none() {
             match_action = Some(action.clone());
         } else if Some(&action) != match_action.as_ref() {
-            // seccompiler supports only one match_action per filter.  Rules
-            // whose action differs from the first non-default action seen are
-            // silently dropped.  See issue #166 for the proper multi-filter fix.
             log::warn!(
                 "seccomp: OCI rule action {:?} differs from filter match_action {:?} — rule(s) for {:?} dropped (issue #166)",
                 rule.action, match_action, rule.names
             );
             continue;
         }
+
         for name in &rule.names {
             if let Ok(num) = syscall_number(name) {
-                filtered_rules.entry(num).or_default();
+                let entry = filtered_rules.entry(num).or_default();
+                if rule.args.is_empty() {
+                    // Unconditional rule: clear any prior arg-conditional rules
+                    // for this syscall — an unconditional match supersedes them.
+                    entry.clear();
+                } else {
+                    // Build AND-conditions for this rule; push as one SeccompRule
+                    // (ORed with any other rules already in the Vec for this syscall).
+                    let conditions: Vec<SeccompCondition> =
+                        rule.args.iter().filter_map(oci_arg_to_condition).collect();
+                    if !conditions.is_empty() {
+                        if let Ok(sr) = SeccompRule::new(conditions) {
+                            entry.push(sr);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1239,5 +1237,57 @@ mod tests {
         assert!(syscall_number("io_uring_setup").is_ok());
         assert!(syscall_number("io_uring_enter").is_ok());
         assert!(syscall_number("io_uring_register").is_ok());
+    }
+
+    #[test]
+    fn test_filter_from_oci_with_args() {
+        // Verify that OCI seccomp arg conditions compile to a BpfProgram.
+        // Policy: allow everything except socket(AF_NETLINK, ...) → EPERM.
+        // AF_NETLINK = 16.
+        let config = crate::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![crate::oci::OciSyscallRule {
+                names: vec!["socket".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: vec![crate::oci::OciSyscallArg {
+                    index: 0,
+                    value: 16, // AF_NETLINK
+                    value_two: 0,
+                    op: "SCMP_CMP_EQ".to_string(),
+                }],
+            }],
+        };
+        let result = filter_from_oci(&config);
+        assert!(
+            result.is_ok(),
+            "filter_from_oci with args should compile: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_filter_from_oci_masked_eq() {
+        // Verify SCMP_CMP_MASKED_EQ compiles: value=mask, value_two=expected result.
+        let config = crate::oci::OciSeccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: vec![],
+            syscalls: vec![crate::oci::OciSyscallRule {
+                names: vec!["mmap".to_string()],
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: vec![crate::oci::OciSyscallArg {
+                    index: 3,
+                    value: 0x0f, // mask: lower 4 bits
+                    value_two: 0x02,
+                    op: "SCMP_CMP_MASKED_EQ".to_string(),
+                }],
+            }],
+        };
+        let result = filter_from_oci(&config);
+        assert!(
+            result.is_ok(),
+            "filter_from_oci MASKED_EQ should compile: {:?}",
+            result
+        );
     }
 }

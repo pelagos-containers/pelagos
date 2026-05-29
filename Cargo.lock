@@ -3616,9 +3616,9 @@ dependencies = [
 
 [[package]]
 name = "spdystream-rs"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e2496b7335dc830aa6382d0eb3a5cf1419a3989ac29cdfe606f72fd148e7f03"
+checksum = "0a304ad360eb2215099094300f0eebe5d340f947011598b27e675b21c7424de0"
 dependencies = [
  "bytes",
  "flate2",

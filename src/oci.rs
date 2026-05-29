@@ -315,6 +315,10 @@ pub struct OciSyscallRule {
 pub struct OciSyscallArg {
     pub index: u32,
     pub value: u64,
+    /// Second value used only by `SCMP_CMP_MASKED_EQ`: `value` is the mask,
+    /// `value_two` is the expected result of `(arg & mask)`.
+    #[serde(default, rename = "valueTwo")]
+    pub value_two: u64,
     pub op: String,
 }
 

@@ -1,113 +1,111 @@
 # Ongoing Tasks
 
-## Session 2026-05-29 — Issue #263 CRI cleanup (in progress)
+## Session 2026-05-29 — Issue #265: OCI seccomp arg conditions (feat/oci-seccomp-args-devices-265)
 
-Branch: `fix/cri-cleanup-263`
+### Scope adjustment
 
-### Root cause analysis
+After reading the code, `linux.devices` node creation is **already implemented** —
+`oci.rs` translates each `linux.devices[]` entry to a `DeviceNode` and calls
+`cmd.with_device()`, which does `mknod` in pre_exec (container.rs). No work needed there.
 
-Three CRI issues found during v0.64.0 deployment to ipc cluster:
+The sole remaining work is **`linux.seccomp` argument conditions** (`args` field per
+syscall rule). The comment in `src/seccomp.rs:454` explicitly says:
+> "Argument conditions (`args`) are ignored in this first-pass implementation."
 
-1. **Port-forward broken** (`kubectl port-forward` → "unable to negotiate protocol: client
-   supports 'portforward.k8s.io', server returned ''")
-2. **Exit code propagation for non-1 values broken** (`exit 42` propagates as exit 1)
-3. **pasta not installed on ipc2/ipc3**
+### Root cause
 
-Issues 1 and 2 share the same root cause: `send_upgrade_response` in
-`spdystream-rs/src/server.rs` always sends a fixed 101 response without echoing
-`X-Stream-Protocol-Version` back to the client.
+`filter_from_oci` in `src/seccomp.rs` builds `filtered_rules` by calling
+`filtered_rules.entry(num).or_default()` — this creates an empty `Vec<SeccompRule>`,
+meaning "match any call to this syscall → match_action". The `rule.args` field is
+parsed (already in `OciSyscallArg`) but never translated to `SeccompCondition`s.
 
-- For **exec/attach**: kubectl sends `X-Stream-Protocol-Version: v4.channel.k8s.io` (among
-  others for negotiation); server must echo the chosen version. Without v4 being confirmed,
-  kubectl falls back to v1/v2/v3 which don't use the error stream for exit codes → exit code
-  always appears as 1 (kubectl's own generic failure code).
-- For **port-forward**: kubectl sends `X-Stream-Protocol-Version: portforward.k8s.io/v1`;
-  server must echo it; without the echo kubectl rejects the upgrade entirely.
+### What needs to change
 
-### Fix plan
+#### 1. `src/oci.rs` — add `value_two` to `OciSyscallArg`
 
-#### spdystream-rs/src/server.rs
-
-Change `send_upgrade_response` signature to accept an optional protocol string to
-include as `X-Stream-Protocol-Version`:
+`SCMP_CMP_MASKED_EQ` requires two values: `value` is the mask, `valueTwo` is the
+expected masked result. The field is missing from our struct.
 
 ```rust
-pub async fn send_upgrade_response_with_protocol<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    protocol: Option<&str>,
-) -> Result<()>
+#[derive(Debug, Deserialize)]
+pub struct OciSyscallArg {
+    pub index: u32,
+    pub value: u64,
+    #[serde(default, rename = "valueTwo")]
+    pub value_two: u64,
+    pub op: String,
+}
 ```
 
-Keep the original `send_upgrade_response` calling the new one with `None` (backward compat
-for tests). The response with a protocol:
+#### 2. `src/seccomp.rs` — translate args to SeccompConditions
 
-```
-HTTP/1.1 101 Switching Protocols\r\n
-Connection: Upgrade\r\n
-Upgrade: spdy/3.1\r\n
-X-Stream-Protocol-Version: <protocol>\r\n
-\r\n
-```
-
-#### spdystream-rs/src/server.rs — parse_upgrade_request
-
-Already captures all headers in `req.headers`. No change needed; caller reads
-`X-Stream-Protocol-Version` from `req.headers`.
-
-#### pelagos-cri/src/streaming.rs — handle_connection
-
-After `parse_upgrade_request`, select the protocol to confirm:
-
+Update imports:
 ```rust
-// For exec/attach: prefer v4 > v3 > v2 > v1
-// For port-forward: use portforward.k8s.io/v1
-let protocol = select_protocol(&req, kind);
-send_upgrade_response_with_protocol(&mut tcp, protocol.as_deref()).await?;
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+    SeccompCondition, SeccompFilter, SeccompRule,
+};
 ```
 
-Where `select_protocol` inspects the path kind and `X-Stream-Protocol-Version` header(s):
-- `exec`/`attach` path → pick highest `*.channel.k8s.io` version the client offers
-- `portforward` path → `portforward.k8s.io/v1`
+Add helper `oci_arg_to_condition(arg: &OciSyscallArg) -> Option<SeccompCondition>`:
+- Maps OCI op strings to `SeccompCmpOp` variants
+- `SCMP_CMP_MASKED_EQ`: op = `MaskedEq(arg.value)`, comparison value = `arg.value_two`
+- All other ops: use `arg.value` as the comparison value
+- Uses `SeccompCmpArgLen::Qword` for all conditions (64-bit, safe for all syscall args)
 
-Note: the `accept()` function in spdystream-rs (used elsewhere) can keep using the
-no-protocol variant — it's not in the hot path for CRI.
+In the rule-building loop, replace `entry.or_default()` with:
+- If `rule.args` is empty → clear the entry (unconditional match wins over any
+  prior arg-conditional rules for the same syscall)
+- If `rule.args` is non-empty → build `SeccompCondition`s (ANDed), push a
+  `SeccompRule::new(conditions)` to the entry (ORed with other rules for same syscall)
 
-#### pasta on ipc2/ipc3
+OCI semantics map directly to seccompiler:
+- Multiple `args` within one rule → AND (all conditions in one `SeccompRule`)
+- Multiple `OciSyscallRule` entries for same syscall → OR (multiple `SeccompRule`s in Vec)
 
-Simple install: `sudo apt-get install -y passt` on both agent nodes.
-No code change.
+Also remove the dead first-pass loop (lines 478-499) that built `rules` but was
+never used. Update the doc comment to remove "args are ignored".
 
 ### Test plan
 
-1. `cargo test -p spdystream-rs --lib` — new unit tests for `send_upgrade_response_with_protocol`
-2. Deploy to ipc cluster: `scripts/install.sh` + `sudo systemctl restart pelagos-cri`
-3. On ipc1:
-   - `kubectl exec pod -- /bin/sh -c 'exit 42'; echo $?` → must print 42
-   - `kubectl port-forward pod/test 9090:80 &; curl localhost:9090` → must succeed
-4. `scripts/test-cri.sh` on ipc1 — all assertions pass
+#### Unit test in `src/seccomp.rs`
 
-### Session 2026-05-29 — Issue #261 COMPLETE; v0.64.0 RELEASED
+`test_filter_from_oci_with_args` — build an `OciSeccomp` directly in code with:
+- `defaultAction: SCMP_ACT_ALLOW`
+- One syscall rule: `socket`, action `SCMP_ACT_ERRNO`, args `[{index:0, op:SCMP_CMP_EQ, value:16}]`
 
-Issue #261 (replace all `nft` shell-outs with native NETLINK_NETFILTER client) is complete.
-PR #262 merged to main. Tag v0.64.0 pushed and released.
+Assert the BpfProgram compiles without error (no kernel required).
 
-### What was done
+#### Integration test `test_oci_seccomp_args`
 
-- New `src/nfnetlink.rs` (~1540 lines): raw nfnetlink socket client, no new dependencies
-- `src/network.rs`: all `run_nft`/`run_nft_quiet` call sites replaced with nfnetlink API
-- Fixed two protocol bugs found during implementation:
-  - `NFNL_SUBSYS_NFTABLES` constant was 12 (HOOK subsystem); correct value is 10
-  - Verdict immediates (accept/jump) must use `REG_VERDICT=0` as dreg, not REG1
-- 4 new `nfnetlink_native` integration tests (all `#[serial(nat)]`)
-- All 10 dockerd tests serialized with the `nat` group (`serial(nat, dockerd)`)
-- Improved error visibility: non-ENOENT failures from `nft_delete_ip_table` and
-  `nft_remove_filter_forward_compat` now emit `log::warn`
+OCI bundle with `defaultAction: SCMP_ACT_ALLOW` and one rule:
+- block `socket` when `arg[0] == 16` (AF_NETLINK = 16)
 
-### Release fixes
+Run a shell command inside the container that:
+1. Opens an AF_INET socket (must succeed → prints `INET_OK`)
+2. Opens an AF_NETLINK socket (must fail with EPERM → prints `NETLINK_FAIL`)
 
-- `msghdr` struct literal init fails on aarch64-musl (private `__pad1`/`__pad2` fields);
-  fixed with `zeroed() + field-assign` at 4 call sites in `src/nfnetlink.rs`
-- ECR rate limit caused transient test failure in `ensure_alpine()`; added 3-attempt
-  retry with 30s/60s backoff in both ECR-based `ensure_alpine` functions
+Use a small static C program compiled inside the test or a direct syscall via
+`busybox` approach. Simplest: compile a small C source via `cc` in the test tmpdir,
+copy into the bundle rootfs overlay, and run it via the OCI lifecycle.
 
-Final tag: `b93d473` — release at https://github.com/pelagos-containers/pelagos/releases/tag/v0.64.0
+Assert stdout contains `INET_OK` and `NETLINK_FAIL`.
+
+Document in `docs/INTEGRATION_TESTS.md`.
+
+### Files to change
+
+1. `src/oci.rs` — add `value_two` to `OciSyscallArg`
+2. `src/seccomp.rs` — implement arg conditions in `filter_from_oci`
+3. `tests/integration_tests.rs` — `test_oci_seccomp_args`
+4. `docs/INTEGRATION_TESTS.md` — document new test
+
+---
+
+## Previous: Session 2026-05-29 — Issue #263 CRI cleanup COMPLETE
+
+PR #264 merged. Issue #263 closed. pasta installed on ipc1/ipc2/ipc3.
+
+## Previous: Session 2026-05-29 — Issue #261 COMPLETE; v0.64.0 RELEASED
+
+Final tag: `b93d473` — https://github.com/pelagos-containers/pelagos/releases/tag/v0.64.0

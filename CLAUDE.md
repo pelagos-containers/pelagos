@@ -135,6 +135,16 @@ This is a hard requirement, not optional cleanup.
 5. Push both repos to remote
 6. Confirm both repos are clean and up to date with remote
 
+**"Once more into the breach!"** — Create issue, branch, plan, implement, test, report:
+1. Create a GitHub issue describing the work
+2. Create a feature branch named after the issue (e.g. `feat/description-NNN`)
+3. Move to that branch
+4. Write the full implementation plan to `ONGOING_TASKS.md`
+5. Present the plan to the user
+6. Quietly implement — no step-by-step narration
+7. Create integration tests and run them to success
+8. Report back with what was done and test results
+
 **"Engage!"** — Tag, release, and monitor:
 1. Create a git tag (ask user for version if unclear)
 2. Push the tag — this triggers the release workflow, which gates the build on
