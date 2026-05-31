@@ -39,7 +39,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables iproute2 passt
+          sudo apt-get install -y nftables iproute2 passt protobuf-compiler
       - name: Build
         run: cargo build -p pelagos -p pelagos-dockerd -p pelagos-cri
       - name: Build rootfs
