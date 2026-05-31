@@ -36,7 +36,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nftables iproute2 passt
       - name: Build
-        run: cargo build -p pelagos -p pelagos-dockerd
+        run: cargo build -p pelagos -p pelagos-dockerd -p pelagos-cri
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
       - name: Reset test environment
@@ -53,10 +53,12 @@ jobs:
             runner: ubuntu-latest
             artifact: pelagos-x86_64-linux
             dns_artifact: pelagos-dns-x86_64-linux
+            cri_artifact: pelagos-cri-x86_64-linux
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             artifact: pelagos-aarch64-linux
             dns_artifact: pelagos-dns-aarch64-linux
+            cri_artifact: pelagos-cri-aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +75,8 @@ jobs:
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
           cp target/${{ matrix.target }}/release/pelagos-dns ${{ matrix.dns_artifact }}
           sha256sum ${{ matrix.dns_artifact }} > ${{ matrix.dns_artifact }}.sha256
+          cp target/${{ matrix.target }}/release/pelagos-cri ${{ matrix.cri_artifact }}
+          sha256sum ${{ matrix.cri_artifact }} > ${{ matrix.cri_artifact }}.sha256
       - name: Verify static binary
         run: |
           file ${{ matrix.artifact }}
@@ -85,6 +89,8 @@ jobs:
             ${{ matrix.artifact }}.sha256
             ${{ matrix.dns_artifact }}
             ${{ matrix.dns_artifact }}.sha256
+            ${{ matrix.cri_artifact }}
+            ${{ matrix.cri_artifact }}.sha256
           generate_release_notes: true
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
@@ -96,6 +102,11 @@ jobs:
         with:
           name: ${{ matrix.dns_artifact }}
           path: ${{ matrix.dns_artifact }}
+      - name: Upload pelagos-cri as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.cri_artifact }}
+          path: ${{ matrix.cri_artifact }}
 
   package:
     needs: [build]
@@ -122,6 +133,16 @@ jobs:
         with:
           name: pelagos-dns-aarch64-linux
           path: dist/arm64
+      - name: Download x86_64 pelagos-cri binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pelagos-cri-x86_64-linux
+          path: dist/amd64
+      - name: Download aarch64 pelagos-cri binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pelagos-cri-aarch64-linux
+          path: dist/arm64
       - name: Install nfpm
         run: |
           echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
@@ -133,15 +154,18 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist/packages
 
-          for row in "amd64 pelagos-x86_64-linux pelagos-dns-x86_64-linux" "arm64 pelagos-aarch64-linux pelagos-dns-aarch64-linux"; do
+          for row in "amd64 pelagos-x86_64-linux pelagos-dns-x86_64-linux pelagos-cri-x86_64-linux" "arm64 pelagos-aarch64-linux pelagos-dns-aarch64-linux pelagos-cri-aarch64-linux"; do
             ARCH=$(echo $row | cut -d' ' -f1)
             BINARY_NAME=$(echo $row | cut -d' ' -f2)
             DNS_BINARY_NAME=$(echo $row | cut -d' ' -f3)
+            CRI_BINARY_NAME=$(echo $row | cut -d' ' -f4)
             BINARY="dist/$ARCH/$BINARY_NAME"
             DNS_BINARY="dist/$ARCH/$DNS_BINARY_NAME"
-            chmod +x "$BINARY" "$DNS_BINARY"
+            CRI_BINARY="dist/$ARCH/$CRI_BINARY_NAME"
+            chmod +x "$BINARY" "$DNS_BINARY" "$CRI_BINARY"
             cp "$BINARY" ./pelagos-current
             cp "$DNS_BINARY" ./pelagos-dns-current
+            cp "$CRI_BINARY" ./pelagos-cri-current
 
             ARCH=$ARCH VERSION=$VERSION \
               nfpm package --config pkg/nfpm/nfpm.yaml --packager deb \
@@ -204,6 +228,8 @@ jobs:
         run: |
           test "$(which pelagos)" = "/usr/bin/pelagos"
           pelagos --version
+          test "$(which pelagos-cri)" = "/usr/bin/pelagos-cri"
+          pelagos-cri --version
           test -d /var/lib/pelagos
           test -f /usr/share/pelagos/setup.sh
           test -f /usr/lib/tmpfiles.d/pelagos.conf
