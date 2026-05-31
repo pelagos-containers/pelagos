@@ -84,7 +84,7 @@ jobs:
           sudo unzip -q /tmp/protoc.zip bin/protoc -d /usr/local
           sudo chmod +x /usr/local/bin/protoc
       - name: Build release binary (musl static)
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p pelagos -p pelagos-cri
       - name: Prepare artifact
         run: |
           cp target/${{ matrix.target }}/release/pelagos ${{ matrix.artifact }}
