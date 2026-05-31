@@ -20,7 +20,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_stream::wrappers::UnixListenerStream;
 
 #[derive(Parser)]
-#[clap(name = "pelagos-cri", about = "CRI gRPC server for pelagos")]
+#[clap(name = "pelagos-cri", about = "CRI gRPC server for pelagos", version)]
 struct Args {
     /// Unix socket path to listen on.
     #[clap(long, default_value = "/run/pelagos/cri.sock")]

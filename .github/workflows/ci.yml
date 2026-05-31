@@ -40,8 +40,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nftables iproute2 passt
+      - name: Install protoc (>=23 for debug_redact support)
+        run: |
+          PROTOC_VERSION=25.3
+          ARCH=$(dpkg --print-architecture)
+          case "$ARCH" in amd64) PA=x86_64 ;; arm64) PA=aarch_64 ;; esac
+          curl -sL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PA}.zip" -o /tmp/protoc.zip
+          sudo unzip -q /tmp/protoc.zip bin/protoc -d /usr/local
+          sudo chmod +x /usr/local/bin/protoc
       - name: Build
-        run: cargo build -p pelagos -p pelagos-dockerd
+        run: cargo build -p pelagos -p pelagos-dockerd -p pelagos-cri
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
       - name: Reset test environment
