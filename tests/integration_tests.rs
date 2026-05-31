@@ -1747,6 +1747,60 @@ mod filesystem {
         );
     }
 
+    /// test_bind_mount_into_dev
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Verifies that a bind mount whose container path is inside /dev/ (e.g.
+    /// /dev/termination-log as used by the Kubernetes CRI) is writable from
+    /// inside the container.  The regression this guards against: user bind
+    /// mounts were applied BEFORE the /dev/ tmpfs setup, so they got covered
+    /// by the tmpfs and became inaccessible (the file appeared to not exist).
+    #[test]
+    fn test_bind_mount_into_dev() {
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_into_dev: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bind_mount_into_dev: alpine-rootfs not found");
+            return;
+        };
+
+        let host_file = tempfile::NamedTempFile::new().expect("temp file");
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "echo termination-msg > /dev/termination-log && cat /dev/termination-log",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_bind_mount(host_file.path(), "/dev/termination-log")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with /dev bind mount");
+
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        assert!(status.success(), "Container should exit cleanly");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("termination-msg"),
+            "Write+read to /dev/termination-log should work, got: {:?}",
+            out
+        );
+        // The host-side file should also have the written content.
+        let host_content = std::fs::read_to_string(host_file.path()).expect("read host file");
+        assert!(
+            host_content.contains("termination-msg"),
+            "Host-side file should reflect write, got: {:?}",
+            host_content
+        );
+    }
+
     #[test]
     fn test_tmpfs_mount() {
         if !is_root() {

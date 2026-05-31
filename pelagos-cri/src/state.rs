@@ -78,6 +78,10 @@ pub struct CriContainer {
     /// Override GID from pod securityContext.runAsGroup (None = use image default).
     #[serde(default)]
     pub run_as_group: Option<i64>,
+    /// Host-side path of the termination log file (empty when not set).
+    /// Populated from the mount whose container_path matches terminationMessagePath.
+    #[serde(default)]
+    pub termination_log_host_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
