@@ -3,7 +3,7 @@
 use crate::cri::image_service_server::ImageService;
 use crate::cri::{
     Image, ImageFsInfoRequest, ImageFsInfoResponse, ImageSpec, ImageStatusRequest,
-    ImageStatusResponse, ListImagesRequest, ListImagesResponse, PullImageRequest,
+    ImageStatusResponse, Int64Value, ListImagesRequest, ListImagesResponse, PullImageRequest,
     PullImageResponse, RemoveImageRequest, RemoveImageResponse, StreamImagesRequest,
     StreamImagesResponse,
 };
@@ -29,7 +29,7 @@ struct ImageManifest {
     config: ImageConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct ImageConfig {
     #[serde(default)]
     #[allow(dead_code)]
@@ -40,6 +40,9 @@ struct ImageConfig {
     #[serde(default)]
     #[allow(dead_code)]
     entrypoint: Vec<String>,
+    /// OCI image config `User` field — may be "uid", "user", "uid:gid", or "user:group".
+    #[serde(default)]
+    user: String,
 }
 
 /// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
@@ -97,13 +100,22 @@ impl ImageSvc {
     }
 
     fn manifest_to_image(manifest: &ImageManifest, size: u64) -> Image {
+        // The OCI User field may be "uid", "user", "uid:gid", or "user:group".
+        // kubelet uses uid (numeric) first, then username, to evaluate runAsNonRoot.
+        let user_str = manifest.config.user.split(':').next().unwrap_or("").trim();
+        let (uid, username) = if let Ok(n) = user_str.parse::<i64>() {
+            (Some(Int64Value { value: n }), String::new())
+        } else {
+            (None, user_str.to_string())
+        };
+
         Image {
             id: manifest.digest.clone(),
             repo_tags: vec![manifest.reference.clone()],
             repo_digests: vec![manifest.digest.clone()],
             size,
-            uid: None,
-            username: String::new(),
+            uid,
+            username,
             spec: Some(ImageSpec {
                 image: manifest.reference.clone(),
                 annotations: HashMap::new(),
@@ -237,5 +249,65 @@ impl ImageService for ImageSvc {
         _request: Request<StreamImagesRequest>,
     ) -> Result<Response<Self::StreamImagesStream>, Status> {
         Err(Status::unimplemented("not implemented"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_manifest(user: &str) -> ImageManifest {
+        ImageManifest {
+            reference: "test/image:latest".into(),
+            digest: "sha256:abc".into(),
+            layers: vec![],
+            layer_types: vec![],
+            config: ImageConfig {
+                user: user.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn test_numeric_user_sets_uid() {
+        let img = ImageSvc::manifest_to_image(&make_manifest("1000"), 1);
+        assert_eq!(img.uid, Some(Int64Value { value: 1000 }));
+        assert_eq!(img.username, "");
+    }
+
+    #[test]
+    fn test_numeric_user_with_gid_sets_uid() {
+        let img = ImageSvc::manifest_to_image(&make_manifest("1000:1000"), 1);
+        assert_eq!(img.uid, Some(Int64Value { value: 1000 }));
+        assert_eq!(img.username, "");
+    }
+
+    #[test]
+    fn test_named_user_sets_username() {
+        let img = ImageSvc::manifest_to_image(&make_manifest("nobody"), 1);
+        assert_eq!(img.uid, None);
+        assert_eq!(img.username, "nobody");
+    }
+
+    #[test]
+    fn test_named_user_with_group_sets_username() {
+        let img = ImageSvc::manifest_to_image(&make_manifest("appuser:appgroup"), 1);
+        assert_eq!(img.uid, None);
+        assert_eq!(img.username, "appuser");
+    }
+
+    #[test]
+    fn test_empty_user_leaves_both_unset() {
+        let img = ImageSvc::manifest_to_image(&make_manifest(""), 1);
+        assert_eq!(img.uid, None);
+        assert_eq!(img.username, "");
+    }
+
+    #[test]
+    fn test_root_uid_zero_is_set() {
+        let img = ImageSvc::manifest_to_image(&make_manifest("0"), 1);
+        assert_eq!(img.uid, Some(Int64Value { value: 0 }));
+        assert_eq!(img.username, "");
     }
 }
