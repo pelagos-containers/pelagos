@@ -731,6 +731,21 @@ impl RuntimeService for RuntimeSvc {
             })
             .unwrap_or((None, None));
 
+        // Identify the termination log mount.  Kubelet passes terminationMessagePath
+        // (default /dev/termination-log) as a regular bind mount; after the container
+        // exits we read that host-side file and return it as ContainerStatus.message.
+        let termination_msg_container_path = config
+            .annotations
+            .get("io.kubernetes.container.terminationMessagePath")
+            .map(|s| s.as_str())
+            .unwrap_or("/dev/termination-log");
+        let termination_log_host_path = config
+            .mounts
+            .iter()
+            .find(|m| m.container_path == termination_msg_container_path)
+            .map(|m| m.host_path.clone())
+            .unwrap_or_default();
+
         let container = CriContainer {
             id: id.clone(),
             sandbox_id,
@@ -751,6 +766,7 @@ impl RuntimeService for RuntimeSvc {
             exit_code: 0,
             run_as_user,
             run_as_group,
+            termination_log_host_path,
         };
 
         {
@@ -1019,6 +1035,17 @@ impl RuntimeService for RuntimeSvc {
 
         let cstate = cri_container_state_val(&container.state);
 
+        // Read termination message (up to 4096 bytes per CRI convention).
+        let message = if !container.termination_log_host_path.is_empty() {
+            std::fs::read_to_string(&container.termination_log_host_path)
+                .unwrap_or_default()
+                .chars()
+                .take(4096)
+                .collect()
+        } else {
+            String::new()
+        };
+
         let status = CriContainerStatus {
             id: container.id.clone(),
             metadata: Some(ContainerMetadata {
@@ -1037,7 +1064,7 @@ impl RuntimeService for RuntimeSvc {
             }),
             image_ref: container.image.clone(),
             reason: String::new(),
-            message: String::new(),
+            message,
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
             mounts: vec![],

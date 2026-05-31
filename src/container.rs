@@ -4152,68 +4152,6 @@ impl Command {
                         }
                     }
 
-                    // Perform bind mounts BEFORE chroot — source paths are host paths,
-                    // unreachable once we chroot.
-                    for bm in &bind_mounts {
-                        use std::os::unix::ffi::OsStrExt as _;
-                        // Target inside the effective root on the host side
-                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
-                        let host_target = effective_root.join(rel);
-                        // Linux requires the mount target to exist and be the same type
-                        // (file or directory) as the source.
-                        if bm.source.is_dir() {
-                            std::fs::create_dir_all(&host_target).map_err(|e| {
-                                io::Error::other(format!("bind mount mkdir: {}", e))
-                            })?;
-                        } else {
-                            if let Some(parent) = host_target.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkdir: {}", e))
-                                })?;
-                            }
-                            if !host_target.exists() {
-                                std::fs::File::create(&host_target).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkfile: {}", e))
-                                })?;
-                            }
-                        }
-                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
-                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
-                        // Step 1: establish the bind
-                        let r = libc::mount(
-                            src_c.as_ptr(),
-                            tgt_c.as_ptr(),
-                            ptr::null(),
-                            libc::MS_BIND,
-                            ptr::null(),
-                        );
-                        if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "bind mount {} -> {}: {}",
-                                bm.source.display(),
-                                host_target.display(),
-                                io::Error::last_os_error()
-                            )));
-                        }
-                        // Step 2 (if readonly): remount read-only — Linux requires two calls
-                        if bm.readonly {
-                            let r2 = libc::mount(
-                                ptr::null(),
-                                tgt_c.as_ptr(),
-                                ptr::null(),
-                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                                ptr::null(),
-                            );
-                            if r2 != 0 {
-                                return Err(io::Error::other(format!(
-                                    "bind mount remount ro {}: {}",
-                                    host_target.display(),
-                                    io::Error::last_os_error()
-                                )));
-                            }
-                        }
-                    }
-
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
@@ -4380,6 +4318,70 @@ impl Command {
                                     dev.path.display(),
                                     io::Error::last_os_error()
                                 );
+                            }
+                        }
+                    }
+
+                    // Bind mounts run after /dev/ tmpfs setup so that mounts targeting
+                    // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
+                    // being covered by it.  Source paths are still host paths here
+                    // (chroot has not happened yet).
+                    for bm in &bind_mounts {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        // Target inside the effective root on the host side
+                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
+                        let host_target = effective_root.join(rel);
+                        // Linux requires the mount target to exist and be the same type
+                        // (file or directory) as the source.
+                        if bm.source.is_dir() {
+                            std::fs::create_dir_all(&host_target).map_err(|e| {
+                                io::Error::other(format!("bind mount mkdir: {}", e))
+                            })?;
+                        } else {
+                            if let Some(parent) = host_target.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkdir: {}", e))
+                                })?;
+                            }
+                            if !host_target.exists() {
+                                std::fs::File::create(&host_target).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkfile: {}", e))
+                                })?;
+                            }
+                        }
+                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        // Step 1: establish the bind
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "bind mount {} -> {}: {}",
+                                bm.source.display(),
+                                host_target.display(),
+                                io::Error::last_os_error()
+                            )));
+                        }
+                        // Step 2 (if readonly): remount read-only — Linux requires two calls
+                        if bm.readonly {
+                            let r2 = libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                            if r2 != 0 {
+                                return Err(io::Error::other(format!(
+                                    "bind mount remount ro {}: {}",
+                                    host_target.display(),
+                                    io::Error::last_os_error()
+                                )));
                             }
                         }
                     }
@@ -6629,63 +6631,6 @@ impl Command {
                         }
                     }
 
-                    // Perform bind mounts BEFORE chroot — source paths are host paths,
-                    // unreachable once we chroot.
-                    for bm in &bind_mounts {
-                        use std::os::unix::ffi::OsStrExt as _;
-                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
-                        let host_target = effective_root.join(rel);
-                        if bm.source.is_dir() {
-                            std::fs::create_dir_all(&host_target).map_err(|e| {
-                                io::Error::other(format!("bind mount mkdir: {}", e))
-                            })?;
-                        } else {
-                            if let Some(parent) = host_target.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkdir: {}", e))
-                                })?;
-                            }
-                            if !host_target.exists() {
-                                std::fs::File::create(&host_target).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkfile: {}", e))
-                                })?;
-                            }
-                        }
-                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
-                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
-                        let r = libc::mount(
-                            src_c.as_ptr(),
-                            tgt_c.as_ptr(),
-                            ptr::null(),
-                            libc::MS_BIND,
-                            ptr::null(),
-                        );
-                        if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "bind mount {} -> {}: {}",
-                                bm.source.display(),
-                                host_target.display(),
-                                io::Error::last_os_error()
-                            )));
-                        }
-                        if bm.readonly {
-                            let r2 = libc::mount(
-                                ptr::null(),
-                                tgt_c.as_ptr(),
-                                ptr::null(),
-                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                                ptr::null(),
-                            );
-                            if r2 != 0 {
-                                return Err(io::Error::other(format!(
-                                    "bind mount remount ro {}: {}",
-                                    host_target.display(),
-                                    io::Error::last_os_error()
-                                )));
-                            }
-                        }
-                    }
-
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
@@ -6839,6 +6784,65 @@ impl Command {
                                     dev.path.display(),
                                     io::Error::last_os_error()
                                 );
+                            }
+                        }
+                    }
+
+                    // Bind mounts run after /dev/ tmpfs setup so that mounts targeting
+                    // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
+                    // being covered by it.  Source paths are still host paths here
+                    // (chroot has not happened yet).
+                    for bm in &bind_mounts {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
+                        let host_target = effective_root.join(rel);
+                        if bm.source.is_dir() {
+                            std::fs::create_dir_all(&host_target).map_err(|e| {
+                                io::Error::other(format!("bind mount mkdir: {}", e))
+                            })?;
+                        } else {
+                            if let Some(parent) = host_target.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkdir: {}", e))
+                                })?;
+                            }
+                            if !host_target.exists() {
+                                std::fs::File::create(&host_target).map_err(|e| {
+                                    io::Error::other(format!("bind mount mkfile: {}", e))
+                                })?;
+                            }
+                        }
+                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "bind mount {} -> {}: {}",
+                                bm.source.display(),
+                                host_target.display(),
+                                io::Error::last_os_error()
+                            )));
+                        }
+                        if bm.readonly {
+                            let r2 = libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                            if r2 != 0 {
+                                return Err(io::Error::other(format!(
+                                    "bind mount remount ro {}: {}",
+                                    host_target.display(),
+                                    io::Error::last_os_error()
+                                )));
                             }
                         }
                     }

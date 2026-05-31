@@ -355,6 +355,16 @@ This tests the `run.rs` parser path (distinct from `test_bind_mount_ro` which ca
 `:ro`/`:rw` from the mount-target path has regressed, causing the suffix to be treated
 as part of the filesystem path instead of a mount option.
 
+### `test_bind_mount_into_dev`
+**Requires:** root, rootfs
+
+Bind-mounts a host-side temp file at `/dev/termination-log` inside the container, then
+writes to it and reads it back. Also verifies that the written content is visible on the
+host-side file. Guards against the regression where user bind mounts were applied BEFORE
+the `/dev/` tmpfs setup: the tmpfs would cover the bind mount, making `/dev/termination-log`
+appear to not exist. This is the path taken by the Kubernetes CRI kubelet when it passes a
+termination log mount for `terminationMessagePath`.
+
 ### `test_tmpfs_mount`
 **Requires:** root, rootfs
 
