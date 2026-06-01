@@ -24946,3 +24946,131 @@ mod supplemental_groups {
         }
     }
 }
+
+mod dns_resolv_conf {
+    use super::*;
+    use pelagos::container::{Command, Namespace, Stdio};
+
+    /// Verify that with_dns_search() injects a `search` line into /etc/resolv.conf.
+    #[test]
+    fn test_dns_search_in_resolv_conf() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/etc/resolv.conf"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::NET)
+            .with_proc_mount()
+            .with_dns(&["1.1.1.1"])
+            .with_dns_search(&["cluster.local", "svc.cluster.local"])
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            out.contains("nameserver 1.1.1.1"),
+            "nameserver 1.1.1.1 not in resolv.conf:\n{out}"
+        );
+        assert!(
+            out.contains("search cluster.local svc.cluster.local"),
+            "search line not in resolv.conf:\n{out}"
+        );
+    }
+
+    /// Verify that with_dns_options() injects an `options` line into /etc/resolv.conf.
+    #[test]
+    fn test_dns_options_in_resolv_conf() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/etc/resolv.conf"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::NET)
+            .with_proc_mount()
+            .with_dns(&["8.8.8.8"])
+            .with_dns_options(&["ndots:5", "timeout:2"])
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            out.contains("nameserver 8.8.8.8"),
+            "nameserver 8.8.8.8 not in resolv.conf:\n{out}"
+        );
+        assert!(
+            out.contains("options ndots:5 timeout:2"),
+            "options line not in resolv.conf:\n{out}"
+        );
+    }
+
+    /// Verify that all three — nameserver, search, and options — appear together.
+    #[test]
+    fn test_dns_full_resolv_conf() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/etc/resolv.conf"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::NET)
+            .with_proc_mount()
+            .with_dns(&["10.96.0.10"])
+            .with_dns_search(&[
+                "default.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+            ])
+            .with_dns_options(&["ndots:5"])
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            out.contains("nameserver 10.96.0.10"),
+            "nameserver not in resolv.conf:\n{out}"
+        );
+        assert!(
+            out.contains("search default.svc.cluster.local svc.cluster.local cluster.local"),
+            "search line not in resolv.conf:\n{out}"
+        );
+        assert!(
+            out.contains("options ndots:5"),
+            "options line not in resolv.conf:\n{out}"
+        );
+    }
+}

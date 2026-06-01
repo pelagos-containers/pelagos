@@ -40,6 +40,15 @@ pub struct CriSandbox {
     /// Supplemental GIDs from the pod security context (fsGroup etc.).
     #[serde(default)]
     pub supplemental_groups: Vec<i64>,
+    /// DNS nameservers from the pod DNS config.
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    /// DNS search domains from the pod DNS config.
+    #[serde(default)]
+    pub dns_searches: Vec<String>,
+    /// DNS resolver options from the pod DNS config.
+    #[serde(default)]
+    pub dns_options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -4604,3 +4604,49 @@ the relay exits promptly after state.json is set to `"exited"`.
 
 Failure indicates the relay loop is not polling correctly, not writing CRI log
 format, or not terminating on container exit — meaning `kubectl logs` would not work.
+
+---
+
+## DNS resolv.conf injection (#293)
+
+### `test_dns_search_in_resolv_conf`
+**Requires:** root, rootfs
+**Module:** `dns_resolv_conf`
+
+Spawns a container with `with_dns(&["1.1.1.1"])` and `with_dns_search(&["cluster.local", "svc.cluster.local"])`.
+Reads `/etc/resolv.conf` inside the container and asserts both `nameserver 1.1.1.1` and
+`search cluster.local svc.cluster.local` appear.
+
+Failure indicates the `search` line is not being written to resolv.conf, meaning cluster
+DNS search domains injected by kubelet would not take effect.
+
+### `test_dns_options_in_resolv_conf`
+**Requires:** root, rootfs
+**Module:** `dns_resolv_conf`
+
+Spawns a container with `with_dns(&["8.8.8.8"])` and `with_dns_options(&["ndots:5", "timeout:2"])`.
+Asserts `nameserver 8.8.8.8` and `options ndots:5 timeout:2` appear in `/etc/resolv.conf`.
+
+Failure indicates DNS options are not being written, meaning Kubernetes `ndots:5` would not
+be applied — causing all short names to bypass the search path and fail to resolve.
+
+### `test_dns_full_resolv_conf`
+**Requires:** root, rootfs
+**Module:** `dns_resolv_conf`
+
+Spawns a container with the full Kubernetes-style DNS config: nameserver `10.96.0.10`,
+three search domains (`default.svc.cluster.local`, `svc.cluster.local`, `cluster.local`),
+and option `ndots:5`. Asserts all three sections appear in `/etc/resolv.conf`.
+
+This is the canonical regression test for issue #293: if any of the three fields are
+missing, cluster DNS would be broken even if the others are present.
+
+### `test_cri_sandbox_dns_fields_roundtrip`
+**Type:** unit (no root, no rootfs)
+**Module:** `pelagos-cri::runtime::tests`
+
+Constructs a `CriSandbox` with dns_servers, dns_searches, and dns_options populated.
+Serializes to JSON and deserializes back; asserts all three DNS fields round-trip correctly.
+
+Failure indicates the serde `#[serde(default)]` annotations or field names are broken,
+meaning persisted sandbox state would lose DNS config on restart.
