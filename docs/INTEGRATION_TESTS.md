@@ -4585,3 +4585,22 @@ appear in the `Groups:` line of `/proc/self/status`.
 
 Failure indicates that only a subset of supplemental GIDs is being applied, which would
 cause selective permission failures when a workload depends on more than one supplemental group.
+
+---
+
+## `pelagos-cri` unit tests — CRI log relay (#290)
+
+These run via `cargo test -p pelagos-cri` (no root, no rootfs).
+
+### `test_relay_logs_from_dir_e2e`
+**Type:** unit/e2e (no root, no rootfs)
+**Module:** `pelagos-cri::runtime::tests`
+
+Full end-to-end test of the `relay_logs_from_dir` loop. Creates a temp directory
+mimicking a pelagos container dir (`stdout.log`, `stderr.log`, `state.json`).
+Verifies catch-up (line written before the relay starts), streaming (line written
+while the relay is running), stderr tagging, RFC3339 timestamp format, and that
+the relay exits promptly after state.json is set to `"exited"`.
+
+Failure indicates the relay loop is not polling correctly, not writing CRI log
+format, or not terminating on container exit — meaning `kubectl logs` would not work.

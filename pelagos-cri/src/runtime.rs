@@ -1573,9 +1573,19 @@ async fn relay_container_logs(pelagos_name: String, cri_log_path: String) {
     // Wait for log files to appear (container may take a moment to start writing).
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let stdout_src = format!("/run/pelagos/containers/{}/stdout.log", pelagos_name);
-    let stderr_src = format!("/run/pelagos/containers/{}/stderr.log", pelagos_name);
-    let state_file = format!("/run/pelagos/containers/{}/state.json", pelagos_name);
+    let container_dir = format!("/run/pelagos/containers/{}", pelagos_name);
+    relay_logs_from_dir(container_dir, cri_log_path).await;
+}
+
+/// Core relay loop: polls stdout/stderr log files in `container_dir` and writes
+/// CRI-formatted entries to `cri_log_path` until the container exits.
+///
+/// Separated from `relay_container_logs` so tests can inject a temp directory
+/// instead of the live `/run/pelagos/containers/<name>/` path.
+async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
+    let stdout_src = format!("{}/stdout.log", container_dir);
+    let stderr_src = format!("{}/stderr.log", container_dir);
+    let state_file = format!("{}/state.json", container_dir);
 
     // Ensure CRI log parent directory exists.
     if let Some(parent) = std::path::Path::new(&cri_log_path).parent() {
@@ -1705,5 +1715,110 @@ mod tests {
 
         let content = std::fs::read_to_string(&dest_path).unwrap();
         assert!(content.is_empty(), "nothing should be written for empty buf");
+    }
+
+    /// End-to-end test for the relay loop.
+    ///
+    /// Sets up a fake container directory with stdout/stderr log files and a
+    /// state.json, then runs relay_logs_from_dir and verifies:
+    ///   - Lines written before the relay started are captured (catch-up).
+    ///   - Lines appended while the relay is running are captured (streaming).
+    ///   - Each entry has the CRI log format: `{RFC3339Nano} {stream} F {line}`.
+    ///   - The relay exits promptly once state.json shows "exited".
+    ///   - Both stdout and stderr entries appear with the correct stream tag.
+    #[tokio::test]
+    async fn test_relay_logs_from_dir_e2e() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+
+        // Write the initial state: container is running.
+        let state_path = dir.path().join("state.json");
+        std::fs::write(&state_path, r#"{"status":"running"}"#).unwrap();
+
+        // Pre-write some stdout before the relay starts (catch-up scenario).
+        let stdout_path = dir.path().join("stdout.log");
+        let stderr_path = dir.path().join("stderr.log");
+        std::fs::write(&stdout_path, "line before relay\n").unwrap();
+
+        // CRI log destination.
+        let cri_log = NamedTempFile::new().unwrap();
+        let cri_log_path = cri_log.path().to_str().unwrap().to_string();
+
+        // Spawn the relay; it sleeps 0 ms here because we use relay_logs_from_dir
+        // directly (skipping the 300 ms startup wait in relay_container_logs).
+        let dir_clone = dir_path.clone();
+        let cri_clone = cri_log_path.clone();
+        let relay = tokio::spawn(async move {
+            relay_logs_from_dir(dir_clone, cri_clone).await;
+        });
+
+        // Give the relay time to start and pick up the pre-written line.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Append more output while the relay is running.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&stdout_path)
+                .unwrap();
+            writeln!(f, "line during relay").unwrap();
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stderr_path)
+                .unwrap();
+            writeln!(f, "stderr line").unwrap();
+        }
+
+        // Let the relay pick up the new lines.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Signal container exit; relay should drain and stop.
+        std::fs::write(&state_path, r#"{"status":"exited"}"#).unwrap();
+
+        // Wait for the relay task with a generous timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(3), relay)
+            .await
+            .expect("relay did not stop within 3 s after container exited")
+            .expect("relay task panicked");
+
+        let content = std::fs::read_to_string(cri_log.path()).unwrap();
+
+        // Every non-empty line must be a valid CRI log entry.
+        let entries: Vec<&str> = content.lines().collect();
+        assert!(!entries.is_empty(), "no CRI log entries written");
+        for entry in &entries {
+            assert!(
+                entry.contains(" stdout F ") || entry.contains(" stderr F "),
+                "entry missing CRI stream tag: {entry}"
+            );
+            // Timestamp must look like RFC3339: starts with a digit and contains 'T'.
+            assert!(
+                entry.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    && entry.contains('T'),
+                "entry missing RFC3339 timestamp: {entry}"
+            );
+        }
+
+        // All three expected payload lines must appear.
+        let payload = |needle: &str| entries.iter().any(|e| e.ends_with(needle));
+        assert!(payload("line before relay"), "catch-up line missing");
+        assert!(payload("line during relay"), "streaming line missing");
+        assert!(payload("stderr line"), "stderr line missing");
+
+        // Stream tags must be correct.
+        assert!(
+            entries.iter().any(|e| e.contains(" stdout F ")),
+            "no stdout entries"
+        );
+        assert!(
+            entries.iter().any(|e| e.contains(" stderr F ")),
+            "no stderr entries"
+        );
     }
 }
