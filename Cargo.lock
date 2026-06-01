@@ -2531,6 +2531,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spdystream-rs",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

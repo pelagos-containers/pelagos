@@ -1539,7 +1539,6 @@ async fn read_from_offset(path: &str, offset: u64) -> Option<(Vec<u8>, u64)> {
 
 /// Write complete lines from `buf` to `dest` in CRI log format; keeps any trailing partial line.
 async fn flush_lines(buf: &mut String, dest: &str, stream: &str) {
-    use tokio::io::AsyncWriteExt;
     let flush_len = match buf.rfind('\n') {
         Some(pos) => pos + 1,
         None => return,
@@ -1547,19 +1546,26 @@ async fn flush_lines(buf: &mut String, dest: &str, stream: &str) {
     let to_write = buf[..flush_len].to_string();
     buf.drain(..flush_len);
 
-    let mut out = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dest)
-        .await
-    {
-        Ok(f) => f,
-        Err(_) => return,
-    };
+    // Build the full output string before the blocking write.
+    let stream = stream.to_string();
+    let mut output = String::new();
     for line in to_write.lines() {
-        let entry = format!("{} {} F {}\n", cri_now(), stream, line);
-        let _ = out.write_all(entry.as_bytes()).await;
+        output.push_str(&format!("{} {} F {}\n", cri_now(), stream, line));
     }
+    if output.is_empty() {
+        return;
+    }
+
+    let dest = dest.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dest)
+            .and_then(|mut f| f.write_all(output.as_bytes()))
+    })
+    .await;
 }
 
 /// Background task: tail pelagos container log files and write to the CRI log file.
@@ -1616,5 +1622,88 @@ async fn relay_container_logs(pelagos_name: String, cri_log_path: String) {
             }
             Err(_) => break, // Container removed.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_cri_now_format() {
+        let ts = cri_now();
+        // Must match RFC3339Nano: 2006-01-02T15:04:05.000000000Z
+        assert!(
+            ts.ends_with('Z'),
+            "timestamp must end with Z: {ts}"
+        );
+        assert!(
+            ts.len() >= 20,
+            "timestamp too short: {ts}"
+        );
+        // Basic date structure: YYYY-MM-DDTHH:MM:SS
+        assert_eq!(&ts[4..5], "-", "year-month separator: {ts}");
+        assert_eq!(&ts[7..8], "-", "month-day separator: {ts}");
+        assert_eq!(&ts[10..11], "T", "date-time separator: {ts}");
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_complete_lines() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = "hello world\nfoo bar\n".to_string();
+        flush_lines(&mut buf, &dest_path, "stdout").await;
+
+        assert!(buf.is_empty(), "complete lines should be flushed: {buf:?}");
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "two log entries expected");
+        assert!(lines[0].contains(" stdout F hello world"), "line: {}", lines[0]);
+        assert!(lines[1].contains(" stdout F foo bar"), "line: {}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_partial_line_retained() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = "complete line\npartial".to_string();
+        flush_lines(&mut buf, &dest_path, "stdout").await;
+
+        // "partial" has no trailing newline — must stay in buffer.
+        assert_eq!(buf, "partial", "partial line must be retained: {buf:?}");
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "only the complete line should be written");
+        assert!(lines[0].contains("complete line"));
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_stderr_tag() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = "error output\n".to_string();
+        flush_lines(&mut buf, &dest_path, "stderr").await;
+
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        assert!(
+            content.contains(" stderr F error output"),
+            "stderr tag expected: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_empty_buf_noop() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = String::new();
+        flush_lines(&mut buf, &dest_path, "stdout").await;
+
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        assert!(content.is_empty(), "nothing should be written for empty buf");
     }
 }
