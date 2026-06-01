@@ -139,6 +139,7 @@ fn spawn_config_to_run_args(
         sysctl: vec![],
         masked_path: vec![],
         dns_backend: None,
+        group_add: vec![],
         rootfs: rootfs_field,
         args,
         label: sc.labels,

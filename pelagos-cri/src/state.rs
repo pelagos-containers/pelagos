@@ -34,6 +34,12 @@ pub struct CriSandbox {
     /// PID of the pause process holding IPC/UTS namespaces open (CNI path only).
     #[serde(default)]
     pub pause_pid: i32,
+    /// Sandbox log directory (passed by kubelet for kubectl logs).
+    #[serde(default)]
+    pub log_directory: String,
+    /// Supplemental GIDs from the pod security context (fsGroup etc.).
+    #[serde(default)]
+    pub supplemental_groups: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,6 +88,12 @@ pub struct CriContainer {
     /// Populated from the mount whose container_path matches terminationMessagePath.
     #[serde(default)]
     pub termination_log_host_path: String,
+    /// Log path relative to sandbox log_directory (kubelet-assigned).
+    #[serde(default)]
+    pub log_path: String,
+    /// Supplemental GIDs from the container security context.
+    #[serde(default)]
+    pub supplemental_groups: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
