@@ -1644,14 +1644,8 @@ mod tests {
     fn test_cri_now_format() {
         let ts = cri_now();
         // Must match RFC3339Nano: 2006-01-02T15:04:05.000000000Z
-        assert!(
-            ts.ends_with('Z'),
-            "timestamp must end with Z: {ts}"
-        );
-        assert!(
-            ts.len() >= 20,
-            "timestamp too short: {ts}"
-        );
+        assert!(ts.ends_with('Z'), "timestamp must end with Z: {ts}");
+        assert!(ts.len() >= 20, "timestamp too short: {ts}");
         // Basic date structure: YYYY-MM-DDTHH:MM:SS
         assert_eq!(&ts[4..5], "-", "year-month separator: {ts}");
         assert_eq!(&ts[7..8], "-", "month-day separator: {ts}");
@@ -1670,7 +1664,11 @@ mod tests {
         let content = std::fs::read_to_string(&dest_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2, "two log entries expected");
-        assert!(lines[0].contains(" stdout F hello world"), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" stdout F hello world"),
+            "line: {}",
+            lines[0]
+        );
         assert!(lines[1].contains(" stdout F foo bar"), "line: {}", lines[1]);
     }
 
@@ -1714,7 +1712,10 @@ mod tests {
         flush_lines(&mut buf, &dest_path, "stdout").await;
 
         let content = std::fs::read_to_string(&dest_path).unwrap();
-        assert!(content.is_empty(), "nothing should be written for empty buf");
+        assert!(
+            content.is_empty(),
+            "nothing should be written for empty buf"
+        );
     }
 
     /// End-to-end test for the relay loop.
@@ -1799,7 +1800,11 @@ mod tests {
             );
             // Timestamp must look like RFC3339: starts with a digit and contains 'T'.
             assert!(
-                entry.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                entry
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
                     && entry.contains('T'),
                 "entry missing RFC3339 timestamp: {entry}"
             );
