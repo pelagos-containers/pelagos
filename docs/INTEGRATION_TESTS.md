@@ -4560,3 +4560,47 @@ the same host port (which should fail). Asserts that the failed-spawn container 
 Failure indicates the watcher is not cleaning up the state directory on `cmd.spawn()` error,
 leaving ghost containers with `status=running, pid=0` visible in `pelagos ps` until manually
 removed.
+
+---
+
+## `supplemental_groups` — Supplemental GIDs / fsGroup (#289)
+
+### `test_additional_gids_appear_in_proc_status`
+**Requires:** root, rootfs
+**Module:** `supplemental_groups`
+
+Spawns a container as UID/GID 1000 with `with_additional_gids(&[1337])` and reads
+`/proc/self/status` inside it. Asserts that `1337` appears in the `Groups:` line.
+
+Failure means `setgroups(2)` is not being called in the container pre_exec hook, so
+non-root container processes would fail with `EACCES` when reading files owned by
+a supplemental group (e.g., Kubernetes service account tokens chowned to `root:<fsGroup>:640`).
+
+### `test_multiple_additional_gids`
+**Requires:** root, rootfs
+**Module:** `supplemental_groups`
+
+Spawns a container with three supplemental GIDs (100, 1337, 2000) and asserts all three
+appear in the `Groups:` line of `/proc/self/status`.
+
+Failure indicates that only a subset of supplemental GIDs is being applied, which would
+cause selective permission failures when a workload depends on more than one supplemental group.
+
+---
+
+## `pelagos-cri` unit tests — CRI log relay (#290)
+
+These run via `cargo test -p pelagos-cri` (no root, no rootfs).
+
+### `test_relay_logs_from_dir_e2e`
+**Type:** unit/e2e (no root, no rootfs)
+**Module:** `pelagos-cri::runtime::tests`
+
+Full end-to-end test of the `relay_logs_from_dir` loop. Creates a temp directory
+mimicking a pelagos container dir (`stdout.log`, `stderr.log`, `state.json`).
+Verifies catch-up (line written before the relay starts), streaming (line written
+while the relay is running), stderr tagging, RFC3339 timestamp format, and that
+the relay exits promptly after state.json is set to `"exited"`.
+
+Failure indicates the relay loop is not polling correctly, not writing CRI log
+format, or not terminating on container exit — meaning `kubectl logs` would not work.

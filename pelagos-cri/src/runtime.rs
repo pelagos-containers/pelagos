@@ -489,6 +489,13 @@ impl RuntimeService for RuntimeSvc {
             ip,
             cni_conf,
             pause_pid,
+            log_directory: config.log_directory.clone(),
+            supplemental_groups: config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref())
+                .map(|sc| sc.supplemental_groups.clone())
+                .unwrap_or_default(),
         };
 
         {
@@ -767,6 +774,13 @@ impl RuntimeService for RuntimeSvc {
             run_as_user,
             run_as_group,
             termination_log_host_path,
+            log_path: config.log_path.clone(),
+            supplemental_groups: config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref())
+                .map(|sc| sc.supplemental_groups.clone())
+                .unwrap_or_default(),
         };
 
         {
@@ -858,6 +872,25 @@ impl RuntimeService for RuntimeSvc {
             }
         }
 
+        // Supplemental groups: merge sandbox-level (fsGroup) and container-level groups.
+        let sandbox_supplemental_groups: Vec<i64> = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes
+                .get(&container.sandbox_id)
+                .map(|s| s.supplemental_groups.clone())
+                .unwrap_or_default()
+        };
+        let mut all_supp_groups: Vec<i64> = sandbox_supplemental_groups;
+        for g in &container.supplemental_groups {
+            if !all_supp_groups.contains(g) {
+                all_supp_groups.push(*g);
+            }
+        }
+        for g in all_supp_groups {
+            args.push("--group-add".into());
+            args.push(g.to_string());
+        }
+
         args.push(image);
         args.extend(effective_entrypoint);
         args.extend(effective_cmd);
@@ -880,11 +913,33 @@ impl RuntimeService for RuntimeSvc {
             )));
         }
 
+        let (log_directory, log_path_rel) = {
+            let st = self.state.inner.lock().await;
+            let log_dir = st
+                .sandboxes
+                .get(&container.sandbox_id)
+                .map(|s| s.log_directory.clone())
+                .unwrap_or_default();
+            let log_rel = st
+                .containers
+                .get(&container_id)
+                .map(|c| c.log_path.clone())
+                .unwrap_or_default();
+            (log_dir, log_rel)
+        };
+
         let mut st = self.state.inner.lock().await;
         if let Some(c) = st.containers.get_mut(&container_id) {
             c.state = MyContainerState::Running;
             c.started_at_ns = now_ns();
             let _ = state::save_container(c);
+        }
+        drop(st);
+
+        if !log_directory.is_empty() && !log_path_rel.is_empty() {
+            let cri_log_path = format!("{}/{}", log_directory, log_path_rel);
+            let pelagos_name = container.pelagos_name.clone();
+            tokio::spawn(relay_container_logs(pelagos_name, cri_log_path));
         }
 
         Ok(Response::new(StartContainerResponse {}))
@@ -1035,6 +1090,16 @@ impl RuntimeService for RuntimeSvc {
 
         let cstate = cri_container_state_val(&container.state);
 
+        let full_log_path = if !container.log_path.is_empty() {
+            st.sandboxes
+                .get(&container.sandbox_id)
+                .filter(|s| !s.log_directory.is_empty())
+                .map(|s| format!("{}/{}", s.log_directory, container.log_path))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         // Read termination message (up to 4096 bytes per CRI convention).
         let message = if !container.termination_log_host_path.is_empty() {
             std::fs::read_to_string(&container.termination_log_host_path)
@@ -1068,7 +1133,7 @@ impl RuntimeService for RuntimeSvc {
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
             mounts: vec![],
-            log_path: String::new(),
+            log_path: full_log_path,
             resources: None,
             image_id: container.image.clone(),
             user: None,
@@ -1445,5 +1510,315 @@ impl RuntimeService for RuntimeSvc {
         _request: Request<StreamPodSandboxMetricsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxMetricsStream>, Status> {
         Err(Status::unimplemented("not implemented"))
+    }
+}
+
+// ── CRI log relay ─────────────────────────────────────────────────────────────
+
+/// Format current time as RFC3339 with nanosecond precision for the CRI log format.
+fn cri_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .to_string()
+}
+
+/// Read bytes from `path` starting at `offset`. Returns `(new_bytes, new_offset)` or `None`.
+async fn read_from_offset(path: &str, offset: u64) -> Option<(Vec<u8>, u64)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path).await.ok()?;
+    let size = f.seek(tokio::io::SeekFrom::End(0)).await.ok()?;
+    if size <= offset {
+        return None;
+    }
+    f.seek(tokio::io::SeekFrom::Start(offset)).await.ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).await.ok()?;
+    let new_offset = offset + buf.len() as u64;
+    Some((buf, new_offset))
+}
+
+/// Write complete lines from `buf` to `dest` in CRI log format; keeps any trailing partial line.
+async fn flush_lines(buf: &mut String, dest: &str, stream: &str) {
+    let flush_len = match buf.rfind('\n') {
+        Some(pos) => pos + 1,
+        None => return,
+    };
+    let to_write = buf[..flush_len].to_string();
+    buf.drain(..flush_len);
+
+    // Build the full output string before the blocking write.
+    let stream = stream.to_string();
+    let mut output = String::new();
+    for line in to_write.lines() {
+        output.push_str(&format!("{} {} F {}\n", cri_now(), stream, line));
+    }
+    if output.is_empty() {
+        return;
+    }
+
+    let dest = dest.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dest)
+            .and_then(|mut f| f.write_all(output.as_bytes()))
+    })
+    .await;
+}
+
+/// Background task: tail pelagos container log files and write to the CRI log file.
+async fn relay_container_logs(pelagos_name: String, cri_log_path: String) {
+    // Wait for log files to appear (container may take a moment to start writing).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let container_dir = format!("/run/pelagos/containers/{}", pelagos_name);
+    relay_logs_from_dir(container_dir, cri_log_path).await;
+}
+
+/// Core relay loop: polls stdout/stderr log files in `container_dir` and writes
+/// CRI-formatted entries to `cri_log_path` until the container exits.
+///
+/// Separated from `relay_container_logs` so tests can inject a temp directory
+/// instead of the live `/run/pelagos/containers/<name>/` path.
+async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
+    let stdout_src = format!("{}/stdout.log", container_dir);
+    let stderr_src = format!("{}/stderr.log", container_dir);
+    let state_file = format!("{}/state.json", container_dir);
+
+    // Ensure CRI log parent directory exists.
+    if let Some(parent) = std::path::Path::new(&cri_log_path).parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    let mut stdout_off: u64 = 0;
+    let mut stderr_off: u64 = 0;
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        if let Some((data, new_off)) = read_from_offset(&stdout_src, stdout_off).await {
+            stdout_off = new_off;
+            stdout_buf.push_str(&String::from_utf8_lossy(&data));
+            flush_lines(&mut stdout_buf, &cri_log_path, "stdout").await;
+        }
+
+        if let Some((data, new_off)) = read_from_offset(&stderr_src, stderr_off).await {
+            stderr_off = new_off;
+            stderr_buf.push_str(&String::from_utf8_lossy(&data));
+            flush_lines(&mut stderr_buf, &cri_log_path, "stderr").await;
+        }
+
+        // Stop when the container exits.
+        match tokio::fs::read_to_string(&state_file).await {
+            Ok(data) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["status"].as_str() == Some("exited") {
+                        // Final drain including any partial line.
+                        if !stdout_buf.is_empty() {
+                            stdout_buf.push('\n');
+                            flush_lines(&mut stdout_buf, &cri_log_path, "stdout").await;
+                        }
+                        if !stderr_buf.is_empty() {
+                            stderr_buf.push('\n');
+                            flush_lines(&mut stderr_buf, &cri_log_path, "stderr").await;
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(_) => break, // Container removed.
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_cri_now_format() {
+        let ts = cri_now();
+        // Must match RFC3339Nano: 2006-01-02T15:04:05.000000000Z
+        assert!(
+            ts.ends_with('Z'),
+            "timestamp must end with Z: {ts}"
+        );
+        assert!(
+            ts.len() >= 20,
+            "timestamp too short: {ts}"
+        );
+        // Basic date structure: YYYY-MM-DDTHH:MM:SS
+        assert_eq!(&ts[4..5], "-", "year-month separator: {ts}");
+        assert_eq!(&ts[7..8], "-", "month-day separator: {ts}");
+        assert_eq!(&ts[10..11], "T", "date-time separator: {ts}");
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_complete_lines() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = "hello world\nfoo bar\n".to_string();
+        flush_lines(&mut buf, &dest_path, "stdout").await;
+
+        assert!(buf.is_empty(), "complete lines should be flushed: {buf:?}");
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "two log entries expected");
+        assert!(lines[0].contains(" stdout F hello world"), "line: {}", lines[0]);
+        assert!(lines[1].contains(" stdout F foo bar"), "line: {}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_partial_line_retained() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = "complete line\npartial".to_string();
+        flush_lines(&mut buf, &dest_path, "stdout").await;
+
+        // "partial" has no trailing newline — must stay in buffer.
+        assert_eq!(buf, "partial", "partial line must be retained: {buf:?}");
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "only the complete line should be written");
+        assert!(lines[0].contains("complete line"));
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_stderr_tag() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = "error output\n".to_string();
+        flush_lines(&mut buf, &dest_path, "stderr").await;
+
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        assert!(
+            content.contains(" stderr F error output"),
+            "stderr tag expected: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_lines_empty_buf_noop() {
+        let dest = NamedTempFile::new().unwrap();
+        let dest_path = dest.path().to_str().unwrap().to_string();
+
+        let mut buf = String::new();
+        flush_lines(&mut buf, &dest_path, "stdout").await;
+
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        assert!(content.is_empty(), "nothing should be written for empty buf");
+    }
+
+    /// End-to-end test for the relay loop.
+    ///
+    /// Sets up a fake container directory with stdout/stderr log files and a
+    /// state.json, then runs relay_logs_from_dir and verifies:
+    ///   - Lines written before the relay started are captured (catch-up).
+    ///   - Lines appended while the relay is running are captured (streaming).
+    ///   - Each entry has the CRI log format: `{RFC3339Nano} {stream} F {line}`.
+    ///   - The relay exits promptly once state.json shows "exited".
+    ///   - Both stdout and stderr entries appear with the correct stream tag.
+    #[tokio::test]
+    async fn test_relay_logs_from_dir_e2e() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+
+        // Write the initial state: container is running.
+        let state_path = dir.path().join("state.json");
+        std::fs::write(&state_path, r#"{"status":"running"}"#).unwrap();
+
+        // Pre-write some stdout before the relay starts (catch-up scenario).
+        let stdout_path = dir.path().join("stdout.log");
+        let stderr_path = dir.path().join("stderr.log");
+        std::fs::write(&stdout_path, "line before relay\n").unwrap();
+
+        // CRI log destination.
+        let cri_log = NamedTempFile::new().unwrap();
+        let cri_log_path = cri_log.path().to_str().unwrap().to_string();
+
+        // Spawn the relay; it sleeps 0 ms here because we use relay_logs_from_dir
+        // directly (skipping the 300 ms startup wait in relay_container_logs).
+        let dir_clone = dir_path.clone();
+        let cri_clone = cri_log_path.clone();
+        let relay = tokio::spawn(async move {
+            relay_logs_from_dir(dir_clone, cri_clone).await;
+        });
+
+        // Give the relay time to start and pick up the pre-written line.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Append more output while the relay is running.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&stdout_path)
+                .unwrap();
+            writeln!(f, "line during relay").unwrap();
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stderr_path)
+                .unwrap();
+            writeln!(f, "stderr line").unwrap();
+        }
+
+        // Let the relay pick up the new lines.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Signal container exit; relay should drain and stop.
+        std::fs::write(&state_path, r#"{"status":"exited"}"#).unwrap();
+
+        // Wait for the relay task with a generous timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(3), relay)
+            .await
+            .expect("relay did not stop within 3 s after container exited")
+            .expect("relay task panicked");
+
+        let content = std::fs::read_to_string(cri_log.path()).unwrap();
+
+        // Every non-empty line must be a valid CRI log entry.
+        let entries: Vec<&str> = content.lines().collect();
+        assert!(!entries.is_empty(), "no CRI log entries written");
+        for entry in &entries {
+            assert!(
+                entry.contains(" stdout F ") || entry.contains(" stderr F "),
+                "entry missing CRI stream tag: {entry}"
+            );
+            // Timestamp must look like RFC3339: starts with a digit and contains 'T'.
+            assert!(
+                entry.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    && entry.contains('T'),
+                "entry missing RFC3339 timestamp: {entry}"
+            );
+        }
+
+        // All three expected payload lines must appear.
+        let payload = |needle: &str| entries.iter().any(|e| e.ends_with(needle));
+        assert!(payload("line before relay"), "catch-up line missing");
+        assert!(payload("line during relay"), "streaming line missing");
+        assert!(payload("stderr line"), "stderr line missing");
+
+        // Stream tags must be correct.
+        assert!(
+            entries.iter().any(|e| e.contains(" stdout F ")),
+            "no stdout entries"
+        );
+        assert!(
+            entries.iter().any(|e| e.contains(" stderr F ")),
+            "no stderr entries"
+        );
     }
 }

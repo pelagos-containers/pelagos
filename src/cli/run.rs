@@ -195,6 +195,11 @@ pub struct RunArgs {
     #[clap(long = "sig-proxy", value_name = "BOOL", hide = true)]
     pub sig_proxy: Option<String>,
 
+    /// Additional supplemental GIDs to add to the container process (repeatable).
+    /// Accepts numeric GIDs only.
+    #[clap(long = "group-add", value_name = "GID")]
+    pub group_add: Vec<u64>,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -825,6 +830,12 @@ fn apply_cli_options(
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);
         }
+    }
+
+    // Supplemental groups
+    if !args.group_add.is_empty() {
+        let gids: Vec<u32> = args.group_add.iter().map(|&g| g as u32).collect();
+        cmd = cmd.with_additional_gids(&gids);
     }
 
     // Workdir

@@ -2521,6 +2521,7 @@ name = "pelagos-cri"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "clap",
  "env_logger",
  "futures-core",
@@ -2530,6 +2531,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spdystream-rs",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

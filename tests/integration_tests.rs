@@ -24863,3 +24863,86 @@ mod rm_multi_name_and_stale_state {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
+
+mod supplemental_groups {
+    use super::*;
+    use pelagos::container::{Command, Namespace, Stdio};
+
+    /// Verify that `with_additional_gids` adds a supplemental GID to the container process.
+    ///
+    /// Requires root (to chroot) and the alpine rootfs.
+    /// Asserts that the GID 1337 appears in `/proc/self/status`'s `Groups:` line,
+    /// which is populated by `setgroups(2)` in pre_exec.
+    /// Failure here means the container process would NOT be able to read files
+    /// owned by that group (e.g., a service account token chowned to root:fsGroup).
+    #[test]
+    fn test_additional_gids_appear_in_proc_status() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "grep '^Groups:' /proc/self/status"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_uid(1000)
+            .with_gid(1000)
+            .with_additional_gids(&[1337])
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            stdout.contains("1337"),
+            "GID 1337 not in Groups: line — setgroups not applied.\nOutput: {stdout}"
+        );
+    }
+
+    /// Verify that multiple supplemental GIDs all appear.
+    #[test]
+    fn test_multiple_additional_gids() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "grep '^Groups:' /proc/self/status"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_uid(1000)
+            .with_gid(1000)
+            .with_additional_gids(&[100, 1337, 2000])
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        for gid in [100u32, 1337, 2000] {
+            assert!(
+                stdout.contains(&gid.to_string()),
+                "GID {gid} not in Groups: line.\nOutput: {stdout}"
+            );
+        }
+    }
+}
