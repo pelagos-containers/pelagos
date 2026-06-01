@@ -4650,3 +4650,16 @@ Serializes to JSON and deserializes back; asserts all three DNS fields round-tri
 
 Failure indicates the serde `#[serde(default)]` annotations or field names are broken,
 meaning persisted sandbox state would lose DNS config on restart.
+
+### `test_cli_dns_search_option_flags`
+**Requires:** root, rootfs
+**Module:** `dns_resolv_conf`
+
+Regression test for #293 (round 2). Invokes `pelagos run` via CLI with `--dns 10.43.0.10`,
+`--dns-search default.svc.cluster.local`, `--dns-search cluster.local`, and `--dns-option ndots:5`.
+Reads `/etc/resolv.conf` in the container and asserts all three sections appear.
+
+This test exercises the CLI wiring, not just the library. The original #293 fix placed
+`dns_search`/`dns_option` wiring inside the non-sandbox `else` block in `cmd_run`, so they were
+silently ignored for CRI containers (which always use `--sandbox`). A passing library test would
+not have caught this — only a CLI-level test does.

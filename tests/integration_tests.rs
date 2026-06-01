@@ -25073,4 +25073,61 @@ mod dns_resolv_conf {
             "options line not in resolv.conf:\n{out}"
         );
     }
+
+    /// Regression test for #293 (round 2): verify that --dns-search and --dns-option
+    /// are wired through the `pelagos run` CLI correctly and produce the expected
+    /// resolv.conf. Previously these flags were inside the non-sandbox `else` block
+    /// and were silently ignored for CRI containers (which always use --sandbox).
+    ///
+    /// This test exercises the CLI path rather than the library directly.
+    #[test]
+    fn test_cli_dns_search_option_flags() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--dns",
+                "10.43.0.10",
+                "--dns-search",
+                "default.svc.cluster.local",
+                "--dns-search",
+                "cluster.local",
+                "--dns-option",
+                "ndots:5",
+                "/bin/cat",
+                "/etc/resolv.conf",
+            ])
+            .output()
+            .expect("pelagos run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("nameserver 10.43.0.10"),
+            "nameserver missing from resolv.conf:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("search default.svc.cluster.local cluster.local"),
+            "search line missing from resolv.conf:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("options ndots:5"),
+            "options line missing from resolv.conf:\n{stdout}"
+        );
+    }
 }

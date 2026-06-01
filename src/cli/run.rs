@@ -753,25 +753,33 @@ fn apply_cli_options(
         if !effective_dns.is_empty() {
             cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
         }
-        if !args.dns_search.is_empty() {
-            cmd = cmd.with_dns_search(
-                &args
-                    .dns_search
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>(),
-            );
-        }
-        if !args.dns_option.is_empty() {
-            cmd = cmd.with_dns_options(
-                &args
-                    .dns_option
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>(),
-            );
-        }
     } // end of `else` block for non-sandbox networking
+
+    // DNS search domains and options apply in both sandbox and non-sandbox mode.
+    // In sandbox mode (CRI containers), kubelet passes dns_config with search/options
+    // that must reach the container even though it shares the sandbox network namespace.
+    // Explicit --dns also applies in sandbox mode when provided.
+    if args.sandbox.is_some() && !args.dns.is_empty() {
+        cmd = cmd.with_dns(&args.dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    }
+    if !args.dns_search.is_empty() {
+        cmd = cmd.with_dns_search(
+            &args
+                .dns_search
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+        );
+    }
+    if !args.dns_option.is_empty() {
+        cmd = cmd.with_dns_options(
+            &args
+                .dns_option
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+        );
+    }
 
     for link_spec in &args.link {
         if let Some((name, alias)) = link_spec.split_once(':') {
