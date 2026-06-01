@@ -1011,6 +1011,10 @@ pub struct Command {
     port_forwards: Vec<(u16, u16, crate::network::PortProto)>,
     // DNS servers to write into the container's /etc/resolv.conf.
     dns_servers: Vec<String>,
+    // DNS search domains (search line in resolv.conf).
+    dns_searches: Vec<String>,
+    // DNS resolver options (options line in resolv.conf, e.g. "ndots:5").
+    dns_options: Vec<String>,
     // Overlay filesystem (upper + work dirs; lower = chroot_dir).
     overlay: Option<OverlayConfig>,
     // OCI sync: (ready_write_fd, listen_fd). Used by cmd_create to block the container
@@ -1180,6 +1184,8 @@ impl Command {
             nat: false,
             port_forwards: Vec::new(),
             dns_servers: Vec::new(),
+            dns_searches: Vec::new(),
+            dns_options: Vec::new(),
             overlay: None,
             oci_sync: None,
             pty_slave: None,
@@ -1939,6 +1945,20 @@ impl Command {
     /// ```
     pub fn with_dns<S: AsRef<str>>(mut self, servers: &[S]) -> Self {
         self.dns_servers = servers.iter().map(|s| s.as_ref().to_owned()).collect();
+        self
+    }
+
+    /// Set DNS search domains written to the container's `/etc/resolv.conf`.
+    /// Produces a `search` line, e.g. `search svc.cluster.local cluster.local`.
+    pub fn with_dns_search<S: AsRef<str>>(mut self, searches: &[S]) -> Self {
+        self.dns_searches = searches.iter().map(|s| s.as_ref().to_owned()).collect();
+        self
+    }
+
+    /// Set DNS resolver options written to the container's `/etc/resolv.conf`.
+    /// Produces an `options` line, e.g. `options ndots:5`.
+    pub fn with_dns_options<S: AsRef<str>>(mut self, options: &[S]) -> Self {
+        self.dns_options = options.iter().map(|s| s.as_ref().to_owned()).collect();
         self
     }
 
@@ -3178,6 +3198,16 @@ impl Command {
             for s in &auto_dns {
                 content.push_str("nameserver ");
                 content.push_str(s);
+                content.push('\n');
+            }
+            if !self.dns_searches.is_empty() {
+                content.push_str("search ");
+                content.push_str(&self.dns_searches.join(" "));
+                content.push('\n');
+            }
+            if !self.dns_options.is_empty() {
+                content.push_str("options ");
+                content.push_str(&self.dns_options.join(" "));
                 content.push('\n');
             }
             std::fs::write(dir.join("resolv.conf"), content).map_err(Error::Io)?;
@@ -5811,6 +5841,16 @@ impl Command {
             for s in &auto_dns {
                 content.push_str("nameserver ");
                 content.push_str(s);
+                content.push('\n');
+            }
+            if !self.dns_searches.is_empty() {
+                content.push_str("search ");
+                content.push_str(&self.dns_searches.join(" "));
+                content.push('\n');
+            }
+            if !self.dns_options.is_empty() {
+                content.push_str("options ");
+                content.push_str(&self.dns_options.join(" "));
                 content.push('\n');
             }
             std::fs::write(dir.join("resolv.conf"), content).map_err(Error::Io)?;

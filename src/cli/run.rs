@@ -83,6 +83,14 @@ pub struct RunArgs {
     #[clap(long)]
     pub dns: Vec<String>,
 
+    /// DNS search domain (repeatable)
+    #[clap(long = "dns-search", value_name = "DOMAIN")]
+    pub dns_search: Vec<String>,
+
+    /// DNS option (repeatable; e.g. ndots:5)
+    #[clap(long = "dns-option", value_name = "OPTION")]
+    pub dns_option: Vec<String>,
+
     /// Named volume or bind mount: NAME:/path or /host:/container
     #[clap(long = "volume", short = 'v')]
     pub volume: Vec<String>,
@@ -428,6 +436,8 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         network: args.network.clone(),
         publish: args.publish.clone(),
         dns: args.dns.clone(),
+        dns_search: args.dns_search.clone(),
+        dns_options: args.dns_option.clone(),
         working_dir: args.workdir.clone(),
         user: args.user.clone(),
         hostname: args.hostname.clone(),
@@ -742,6 +752,24 @@ fn apply_cli_options(
         };
         if !effective_dns.is_empty() {
             cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        }
+        if !args.dns_search.is_empty() {
+            cmd = cmd.with_dns_search(
+                &args
+                    .dns_search
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if !args.dns_option.is_empty() {
+            cmd = cmd.with_dns_options(
+                &args
+                    .dns_option
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            );
         }
     } // end of `else` block for non-sandbox networking
 

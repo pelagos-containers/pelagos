@@ -496,6 +496,21 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|l| l.security_context.as_ref())
                 .map(|sc| sc.supplemental_groups.clone())
                 .unwrap_or_default(),
+            dns_servers: config
+                .dns_config
+                .as_ref()
+                .map(|d| d.servers.clone())
+                .unwrap_or_default(),
+            dns_searches: config
+                .dns_config
+                .as_ref()
+                .map(|d| d.searches.clone())
+                .unwrap_or_default(),
+            dns_options: config
+                .dns_config
+                .as_ref()
+                .map(|d| d.options.clone())
+                .unwrap_or_default(),
         };
 
         {
@@ -889,6 +904,33 @@ impl RuntimeService for RuntimeSvc {
         for g in all_supp_groups {
             args.push("--group-add".into());
             args.push(g.to_string());
+        }
+
+        // DNS config: inject nameservers, search domains, and options from the pod sandbox.
+        let (sandbox_dns_servers, sandbox_dns_searches, sandbox_dns_options) = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes
+                .get(&container.sandbox_id)
+                .map(|s| {
+                    (
+                        s.dns_servers.clone(),
+                        s.dns_searches.clone(),
+                        s.dns_options.clone(),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        for server in &sandbox_dns_servers {
+            args.push("--dns".into());
+            args.push(server.clone());
+        }
+        for domain in &sandbox_dns_searches {
+            args.push("--dns-search".into());
+            args.push(domain.clone());
+        }
+        for opt in &sandbox_dns_options {
+            args.push("--dns-option".into());
+            args.push(opt.clone());
         }
 
         args.push(image);
@@ -1825,5 +1867,41 @@ mod tests {
             entries.iter().any(|e| e.contains(" stderr F ")),
             "no stderr entries"
         );
+    }
+
+    /// Verify that DNS fields from CriSandbox round-trip through serde correctly,
+    /// matching what run_pod_sandbox stores from a CRI DnsConfig proto.
+    #[test]
+    fn test_cri_sandbox_dns_fields_roundtrip() {
+        let sandbox = state::CriSandbox {
+            id: "abc".into(),
+            name: "test-pod".into(),
+            namespace: "default".into(),
+            uid: "uid-1".into(),
+            attempt: 0,
+            labels: Default::default(),
+            annotations: Default::default(),
+            created_at_ns: 0,
+            state: state::SandboxState::Running,
+            netns: String::new(),
+            ip: String::new(),
+            cni_conf: String::new(),
+            pause_pid: 0,
+            log_directory: String::new(),
+            supplemental_groups: vec![],
+            dns_servers: vec!["10.96.0.10".into()],
+            dns_searches: vec!["default.svc.cluster.local".into(), "cluster.local".into()],
+            dns_options: vec!["ndots:5".into()],
+        };
+
+        let json = serde_json::to_string(&sandbox).expect("serialize");
+        let decoded: state::CriSandbox = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded.dns_servers, vec!["10.96.0.10"]);
+        assert_eq!(
+            decoded.dns_searches,
+            vec!["default.svc.cluster.local", "cluster.local"]
+        );
+        assert_eq!(decoded.dns_options, vec!["ndots:5"]);
     }
 }

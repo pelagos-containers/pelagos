@@ -175,6 +175,12 @@ pub struct SpawnConfig {
     /// Explicit DNS servers.
     #[serde(default)]
     pub dns: Vec<String>,
+    /// DNS search domains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_search: Vec<String>,
+    /// DNS options (e.g. "ndots:5").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_options: Vec<String>,
     /// Working directory inside the container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
