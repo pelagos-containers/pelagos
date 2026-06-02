@@ -111,6 +111,27 @@ pub struct CriContainer {
     /// Supplemental GIDs from the container security context.
     #[serde(default)]
     pub supplemental_groups: Vec<i64>,
+    /// Capabilities to add on top of the default set (from CRI LinuxContainerSecurityContext).
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+    /// Capabilities to drop from the default set (from CRI LinuxContainerSecurityContext).
+    #[serde(default)]
+    pub cap_drop: Vec<String>,
+    /// Run in privileged mode: all capabilities, no seccomp, /sys RW.
+    #[serde(default)]
+    pub privileged: bool,
+    /// Memory limit in bytes (0 = no limit).
+    #[serde(default)]
+    pub memory_limit: i64,
+    /// CPU CFS period in microseconds (0 = not specified).
+    #[serde(default)]
+    pub cpu_period: i64,
+    /// CPU CFS quota in microseconds (0 = not specified).
+    #[serde(default)]
+    pub cpu_quota: i64,
+    /// CPU shares (relative weight; 0 = not specified).
+    #[serde(default)]
+    pub cpu_shares: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

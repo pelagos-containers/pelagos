@@ -25327,6 +25327,266 @@ mod cgroup_placement {
     }
 }
 
+mod privileged_mode {
+    use super::*;
+
+    #[test]
+    fn test_privileged_mode_library_api() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Privileged mode: process should have all capabilities (CapEff = full bitmask).
+        // Read /proc/self/status CapEff inside the container and verify it is non-zero
+        // and equals CapPrm (permitted set — full caps in privileged mode).
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "cat /proc/self/status"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .with_privileged()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn privileged container");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let output = String::from_utf8_lossy(&stdout);
+
+        let cap_eff = output
+            .lines()
+            .find(|l| l.starts_with("CapEff:"))
+            .expect("CapEff line");
+        let cap_prm = output
+            .lines()
+            .find(|l| l.starts_with("CapPrm:"))
+            .expect("CapPrm line");
+
+        let eff_val = u64::from_str_radix(cap_eff.split_whitespace().nth(1).unwrap(), 16)
+            .expect("parse CapEff");
+        let prm_val = u64::from_str_radix(cap_prm.split_whitespace().nth(1).unwrap(), 16)
+            .expect("parse CapPrm");
+
+        // In privileged mode: CapEff must be non-zero and must equal CapPrm.
+        assert!(
+            eff_val > 0,
+            "privileged mode should have non-zero CapEff; got {cap_eff}"
+        );
+        assert_eq!(
+            eff_val, prm_val,
+            "privileged mode: CapEff should equal CapPrm (all caps retained)"
+        );
+    }
+
+    #[test]
+    fn test_privileged_mode_cli_flag() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-test-privileged";
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        // Run privileged container that prints its CapEff.
+        // Use --network loopback (avoids pasta) and --no-pid-ns (single-fork, simpler path).
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--privileged",
+                "/bin/ash",
+                "-c",
+                "grep CapEff /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "privileged run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let cap_eff_line = stdout
+            .lines()
+            .find(|l| l.starts_with("CapEff:"))
+            .expect("CapEff:");
+        let eff_val = u64::from_str_radix(cap_eff_line.split_whitespace().nth(1).unwrap(), 16)
+            .expect("parse CapEff");
+        // All 41 kernel caps set in privileged mode → bitmask ≥ (1<<41)-1
+        assert!(
+            eff_val >= (1u64 << 41) - 1,
+            "privileged CLI: expected full CapEff, got {cap_eff_line}"
+        );
+    }
+
+    #[test]
+    fn test_cap_drop_all_cap_add_net_bind_service_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Drop ALL caps then add only NET_BIND_SERVICE back.
+        // CapEff should have exactly bit 10 set (NET_BIND_SERVICE = 1<<10 = 0x400).
+        // Use --network loopback to avoid pasta auto-selection and --no-pid-ns to use
+        // single-fork path (simpler for a capability correctness test).
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "NET_BIND_SERVICE",
+                "/bin/ash",
+                "-c",
+                "grep CapEff /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "cap-drop ALL + cap-add NET_BIND_SERVICE failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let cap_eff_line = stdout
+            .lines()
+            .find(|l| l.starts_with("CapEff:"))
+            .expect("CapEff:");
+        let eff_val = u64::from_str_radix(cap_eff_line.split_whitespace().nth(1).unwrap(), 16)
+            .expect("parse CapEff");
+        assert_eq!(
+            eff_val,
+            1u64 << 10, // NET_BIND_SERVICE only
+            "cap-drop ALL + cap-add NET_BIND_SERVICE: expected 0x400, got {cap_eff_line}"
+        );
+    }
+
+    #[test]
+    fn test_memory_limit_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-test-memlimit";
+        let limit_bytes: u64 = 64 * 1024 * 1024; // 64 MiB
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        // Use --network loopback (explicit, avoids pasta auto-selection) and --no-pid-ns
+        // (single-fork path) so that the cgroup is created on the container process
+        // directly without the double-fork cgroup-migration complexity.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--memory",
+                &limit_bytes.to_string(),
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "run --memory failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Read cgroup memory.max for this container.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let state_json =
+            std::fs::read_to_string(&state_path).unwrap_or_else(|e| panic!("read state: {e}"));
+        let state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let cgroup_name = state["cgroup_name"].as_str().unwrap_or("");
+
+        let cleanup = || {
+            let _ = std::process::Command::new(bin)
+                .args(["stop", name])
+                .output();
+            let _ = std::process::Command::new(bin).args(["rm", name]).output();
+        };
+
+        if cgroup_name.is_empty() {
+            cleanup();
+            eprintln!(
+                "Skipping memory limit check: no cgroup_name in state (cgroups not available)"
+            );
+            return;
+        }
+
+        let cgroup_path = format!("/sys/fs/cgroup/{}/memory.max", cgroup_name);
+        let memory_max = std::fs::read_to_string(&cgroup_path)
+            .unwrap_or_else(|e| panic!("read {cgroup_path}: {e}"));
+        let memory_max = memory_max.trim();
+
+        cleanup();
+
+        let actual: u64 = memory_max
+            .parse()
+            .unwrap_or_else(|_| panic!("parse memory.max '{memory_max}'"));
+        assert_eq!(
+            actual, limit_bytes,
+            "memory.max should be {limit_bytes}, got {actual}"
+        );
+    }
+}
+
 mod pid_namespace {
     use super::*;
 

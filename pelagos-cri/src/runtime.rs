@@ -779,6 +779,36 @@ impl RuntimeService for RuntimeSvc {
             })
             .unwrap_or((None, None));
 
+        // Extract capabilities and privileged from LinuxContainerSecurityContext.
+        let (cap_add, cap_drop, privileged) = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map(|sc| {
+                let (add, drop) = sc
+                    .capabilities
+                    .as_ref()
+                    .map(|c| (c.add_capabilities.clone(), c.drop_capabilities.clone()))
+                    .unwrap_or_default();
+                (add, drop, sc.privileged)
+            })
+            .unwrap_or_default();
+
+        // Extract resource limits from LinuxContainerConfig.
+        let (memory_limit, cpu_period, cpu_quota, cpu_shares) = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.as_ref())
+            .map(|r| {
+                (
+                    r.memory_limit_in_bytes,
+                    r.cpu_period,
+                    r.cpu_quota,
+                    r.cpu_shares,
+                )
+            })
+            .unwrap_or_default();
+
         // Identify the termination log mount.  Kubelet passes terminationMessagePath
         // (default /dev/termination-log) as a regular bind mount; after the container
         // exits we read that host-side file and return it as ContainerStatus.message.
@@ -822,6 +852,13 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|l| l.security_context.as_ref())
                 .map(|sc| sc.supplemental_groups.clone())
                 .unwrap_or_default(),
+            cap_add,
+            cap_drop,
+            privileged,
+            memory_limit,
+            cpu_period,
+            cpu_quota,
+            cpu_shares,
         };
 
         {
@@ -979,6 +1016,37 @@ impl RuntimeService for RuntimeSvc {
             let cgroup_path = format!("{}/{}", sandbox_cgroup_parent, container_id);
             args.push("--cgroup-path".into());
             args.push(cgroup_path);
+        }
+
+        // Privileged mode (securityContext.privileged = true).
+        if container.privileged {
+            args.push("--privileged".into());
+        }
+
+        // Capabilities from CRI LinuxContainerSecurityContext.capabilities.
+        for cap in &container.cap_add {
+            args.push("--cap-add".into());
+            args.push(cap.clone());
+        }
+        for cap in &container.cap_drop {
+            args.push("--cap-drop".into());
+            args.push(cap.clone());
+        }
+
+        // Resource limits from CRI LinuxContainerResources.
+        if container.memory_limit > 0 {
+            args.push("--memory".into());
+            args.push(container.memory_limit.to_string());
+        }
+        if container.cpu_quota > 0 && container.cpu_period > 0 {
+            // pelagos --cpus accepts a float: quota_us / period_us.
+            let cpus = container.cpu_quota as f64 / container.cpu_period as f64;
+            args.push("--cpus".into());
+            args.push(format!("{:.6}", cpus));
+        }
+        if container.cpu_shares > 0 {
+            args.push("--cpu-shares".into());
+            args.push(container.cpu_shares.to_string());
         }
 
         args.push(image);
