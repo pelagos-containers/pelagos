@@ -10,7 +10,7 @@ h2 = { path = "vendor/h2" }
 
 [package]
 name = "pelagos"
-version = "0.65.7"
+version = "0.65.8"
 edition = "2021"
 rust-version = "1.76"
 description = "Fast Linux container runtime — OCI-compatible, namespaces, cgroups v2, seccomp, networking, image management"
