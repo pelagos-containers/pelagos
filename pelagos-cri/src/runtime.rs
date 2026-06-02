@@ -77,6 +77,20 @@ struct PelagosContainerState {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Generate a 64-character lowercase hex container/sandbox ID.
+///
+/// 32 bytes from the OS CSPRNG encoded as hex — identical to the format used
+/// by containerd and CRI-O.  The 64-char length is a de facto standard
+/// hardcoded in SPIRE, Fluentd, Fluent Bit, OTel, Datadog, Falco, and cAdvisor.
+fn generate_id() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("read /dev/urandom for container ID generation");
+    bytes.map(|b| format!("{:02x}", b)).concat()
+}
+
 fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -384,7 +398,7 @@ impl RuntimeService for RuntimeSvc {
             cni::find_cni_conf()
         {
             // ── CNI path ───────────────────────────────────────────────────
-            let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+            let id = generate_id();
             let ns_name = format!("pcri-{}", &id[..12]);
 
             let netns_path = cni::create_netns(&ns_name)
@@ -728,7 +742,7 @@ impl RuntimeService for RuntimeSvc {
 
         let image_ref = config.image.map(|s| s.image).unwrap_or_default();
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        let id = generate_id();
         let pelagos_name = format!("pcri-{}", &id[..12]);
 
         let envs: Vec<(String, String)> = config
@@ -1927,6 +1941,7 @@ mod tests {
             dns_servers: vec!["10.96.0.10".into()],
             dns_searches: vec!["default.svc.cluster.local".into(), "cluster.local".into()],
             dns_options: vec!["ndots:5".into()],
+            pid_namespace_mode: 0,
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -1964,6 +1979,7 @@ mod tests {
             dns_servers: vec![],
             dns_searches: vec![],
             dns_options: vec![],
+            pid_namespace_mode: 0,
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -1994,5 +2010,39 @@ mod tests {
         let container_id = "ctr-xyz";
         let full = format!("{}/{}", stored, container_id);
         assert_eq!(full, "kubepods/besteffort/pod-uid-123/ctr-xyz");
+    }
+
+    /// Verify generate_id() produces a 64-character lowercase hex string.
+    ///
+    /// This is the de facto standard used by containerd and CRI-O.  Tools like SPIRE,
+    /// Fluentd, Fluent Bit, OTel, Datadog, and Falco hardcode `[a-f0-9]{64}` regexes
+    /// to extract container IDs from cgroup paths and log file names.  A 32-char UUID
+    /// simple string would produce zero matches — no workload identity, no log correlation.
+    #[test]
+    fn test_generate_id_is_64_char_hex() {
+        let id = generate_id();
+        assert_eq!(
+            id.len(),
+            64,
+            "container ID must be 64 chars (containerd/CRI-O compat); got {} chars: {}",
+            id.len(),
+            id
+        );
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "container ID must be lowercase hex; got: {}",
+            id
+        );
+    }
+
+    /// Verify generate_id() produces unique IDs on repeated calls.
+    ///
+    /// Collision probability at 256 bits is negligible, but an obvious bug
+    /// (e.g. seeded PRNG, zero bytes) would produce duplicates.
+    #[test]
+    fn test_generate_id_is_unique() {
+        let ids: std::collections::HashSet<String> = (0..20).map(|_| generate_id()).collect();
+        assert_eq!(ids.len(), 20, "generate_id() produced duplicate IDs");
     }
 }

@@ -4732,3 +4732,26 @@ host and asserts NSpid has exactly one entry (host namespace only, no isolation)
 This is the regression test for issue #299 (hostPID: true / namespace_options.pid = NODE not
 respected). Failure would mean the SPIRE agent cannot attest workloads via SO_PEERCRED because
 the container is in an isolated PID namespace and PID 0 is returned instead of the real PID.
+
+## CRI Container ID Format (`pelagos-cri` unit tests)
+
+### `test_generate_id_is_64_char_hex`
+**Requires:** nothing (unit test in pelagos-cri)
+**Module:** `runtime::tests`
+
+Calls `generate_id()` and asserts the result is exactly 64 lowercase hex characters.
+This is the de facto standard used by containerd and CRI-O; SPIRE, Fluentd, Fluent Bit,
+OTel, Datadog, and Falco all hardcode `[a-f0-9]{64}` regexes to extract container IDs
+from cgroup paths.
+
+Failure indicates that the ID format regressed back to a shorter form (e.g. 32-char UUID
+simple string) which would silently break workload attestation and log correlation in every
+Kubernetes observability/security tool.
+
+### `test_generate_id_is_unique`
+**Requires:** nothing (unit test in pelagos-cri)
+**Module:** `runtime::tests`
+
+Generates 20 IDs and inserts them into a HashSet, asserting all 20 are distinct.
+Catches obvious bugs such as a zero-initialized RNG or a seeded PRNG that always
+produces the same output.
