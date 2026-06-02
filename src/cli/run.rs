@@ -208,6 +208,12 @@ pub struct RunArgs {
     #[clap(long = "group-add", value_name = "GID")]
     pub group_add: Vec<u64>,
 
+    /// Explicit cgroup path for the container (relative to /sys/fs/cgroup).
+    /// Used by pelagos-cri to place containers in the kubelet-assigned kubepods
+    /// hierarchy (e.g. kubepods/besteffort/pod<uid>/<container-id>).
+    #[clap(long = "cgroup-path", value_name = "PATH")]
+    pub cgroup_path: Option<String>,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -872,6 +878,10 @@ fn apply_cli_options(
     if !args.group_add.is_empty() {
         let gids: Vec<u32> = args.group_add.iter().map(|&g| g as u32).collect();
         cmd = cmd.with_additional_gids(&gids);
+    }
+
+    if let Some(ref path) = args.cgroup_path {
+        cmd = cmd.with_cgroup_path(path.clone());
     }
 
     // Workdir

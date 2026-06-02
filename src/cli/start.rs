@@ -117,6 +117,7 @@ fn spawn_config_to_run_args(
         dns: sc.dns,
         dns_search: sc.dns_search,
         dns_option: sc.dns_options,
+        cgroup_path: None,
         volume: sc.volume,
         bind: sc.bind,
         bind_ro: sc.bind_ro,

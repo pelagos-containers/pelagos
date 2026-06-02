@@ -40,6 +40,10 @@ pub struct CriSandbox {
     /// Supplemental GIDs from the pod security context (fsGroup etc.).
     #[serde(default)]
     pub supplemental_groups: Vec<i64>,
+    /// Cgroup parent path assigned by kubelet (e.g. "kubepods/besteffort/pod<uid>").
+    /// Empty means no explicit cgroup placement (container inherits daemon cgroup).
+    #[serde(default)]
+    pub cgroup_parent: String,
     /// DNS nameservers from the pod DNS config.
     #[serde(default)]
     pub dns_servers: Vec<String>,

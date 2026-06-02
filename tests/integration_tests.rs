@@ -25131,3 +25131,198 @@ mod dns_resolv_conf {
         );
     }
 }
+
+mod cgroup_placement {
+    use super::*;
+    use pelagos::container::{Command, Namespace, Stdio};
+
+    /// Verify that with_cgroup_path() actually places the container process in
+    /// the specified cgroup. Reads /proc/self/cgroup inside the container and
+    /// asserts the path contains the configured cgroup name.
+    ///
+    /// This is the core regression test for #297: previously with_cgroup_path()
+    /// stored the value but spawn() ignored it, always using cgroup_unique_name().
+    #[test]
+    fn test_with_cgroup_path_places_process() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let cgroup_path = "pelagos-test-cgroup/cgroup-placement-test";
+
+        // Clean up any leftover from a previous run.
+        let _ = std::fs::remove_dir_all(format!("/sys/fs/cgroup/{}", cgroup_path));
+        std::fs::create_dir_all(format!(
+            "/sys/fs/cgroup/{}",
+            cgroup_path.split('/').next().unwrap()
+        ))
+        .ok();
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/proc/self/cgroup"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_cgroup_path(cgroup_path)
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(
+            out.contains("cgroup-placement-test"),
+            "container is not in the expected cgroup.\n\
+             Expected path to contain 'cgroup-placement-test'.\n\
+             /proc/self/cgroup output:\n{out}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", cgroup_path));
+    }
+
+    /// Verify that with_cgroup_path() works for nested paths (slash-separated),
+    /// matching the kubepods hierarchy pattern used by Kubernetes.
+    #[test]
+    fn test_with_cgroup_path_nested() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Simulate kubepods/besteffort/pod<uid>/<container-id> pattern.
+        let cgroup_path = "pelagos-test-cgroup/besteffort/pod-abc123/ctr-def456";
+
+        // Ensure parent exists (kubelet would create this in production).
+        std::fs::create_dir_all(format!(
+            "/sys/fs/cgroup/pelagos-test-cgroup/besteffort/pod-abc123"
+        ))
+        .expect("create parent cgroup");
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/proc/self/cgroup"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_cgroup_path(cgroup_path)
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(
+            out.contains("ctr-def456"),
+            "container not in nested cgroup.\n\
+             Expected '/proc/self/cgroup' to contain 'ctr-def456'.\nGot:\n{out}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", cgroup_path));
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/pelagos-test-cgroup/besteffort/pod-abc123");
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/pelagos-test-cgroup/besteffort");
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/pelagos-test-cgroup");
+    }
+
+    /// CLI-level regression test: pelagos run --cgroup-path places the container
+    /// in the specified cgroup. Tests the full CLI wiring (RunArgs → apply_cli_options
+    /// → with_cgroup_path).
+    #[test]
+    fn test_cli_cgroup_path_flag() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let name = "pelagos-test-cg-cli-flag";
+        let cgroup_path = "pelagos-test-cgroup/cli-test";
+        std::fs::create_dir_all("/sys/fs/cgroup/pelagos-test-cgroup").ok();
+        let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", cgroup_path));
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Run detached with a long-lived command so the watcher has time to write state.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--cgroup-path",
+                cgroup_path,
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run --detach");
+
+        assert!(
+            out.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Give the watcher a moment to write the state file with the real PID.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Determine the container's actual (grandchild) host PID from the state file.
+        // state.pid = the intermediate process (P); children file = grandchild (G).
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let state_json =
+            std::fs::read_to_string(&state_path).unwrap_or_else(|e| panic!("read state: {e}"));
+        let state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let intermediate_pid = state["pid"].as_i64().expect("pid field") as u32;
+
+        // Find grandchild (the actual container process).
+        let children_path = format!("/proc/{intermediate_pid}/task/{intermediate_pid}/children");
+        let children = std::fs::read_to_string(&children_path)
+            .unwrap_or_else(|e| panic!("read children: {e}"));
+        let container_pid: u32 = children
+            .split_whitespace()
+            .next()
+            .expect("no children — container not running?")
+            .parse()
+            .expect("parse container pid");
+
+        // Read the cgroup path from the HOST's view (outside any cgroup namespace).
+        let host_cgroup = std::fs::read_to_string(format!("/proc/{container_pid}/cgroup"))
+            .unwrap_or_else(|e| panic!("read container cgroup: {e}"));
+
+        // Cleanup.
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+        let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", cgroup_path));
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/pelagos-test-cgroup");
+
+        assert!(
+            host_cgroup.contains("cli-test"),
+            "container not in expected cgroup (host view).\n\
+             Expected 'cli-test' in /proc/{container_pid}/cgroup.\nGot:\n{host_cgroup}"
+        );
+    }
+}
