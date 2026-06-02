@@ -3443,20 +3443,29 @@ impl Command {
             (None, None)
         };
 
-        // For PID-namespace containers, the grandchild's cgroup assignment must come from
-        // the host (parent) process AFTER spawn, because:
-        //   (a) the grandchild is PID 1 in its own namespace — cgroup.procs writes are
-        //       resolved relative to the writer's PID namespace, so writing "1" is wrong
-        //       and writing the host PID fails because the kernel can't find it in the
-        //       grandchild's namespace view; and
-        //   (b) the intermediate process (P) has already done unshare(CLONE_NEWCGROUP)
-        //       at step 1, so P can no longer see the host-root-anchored cgroup path.
-        // Keep a parent-side copy of procs_path; it's written to after spawn() below.
-        let parent_cgroup_procs_path: Option<String> = if namespaces.contains(Namespace::PID) {
-            pre_cgroup_procs_path.clone()
-        } else {
-            None
-        };
+        // For PID-namespace containers with an EXPLICIT cgroup path (kubepods hierarchy),
+        // the cgroup.procs write must come from the host process after spawn:
+        //   (a) writing "1" from the grandchild's new PID namespace would place the
+        //       grandchild in the cgroup, but only works when the cgroup is at the root
+        //       level visible from the new CGROUP namespace — kubepods is typically under
+        //       the kubelet's slice which is NOT visible from pelagos-cri's CGROUP ns.
+        //   (b) the intermediate (P) has done unshare(CLONE_NEWCGROUP) at step 1, so P
+        //       can no longer see the host-root-anchored cgroup path either.
+        // For GENERATED cgroup names (memory/PID/CPU limits without explicit path),
+        // the grandchild writes its own PID (1 in the new namespace) in pre_exec at
+        // step 1.65 — the generated path is at the host root and visible from the new
+        // CGROUP namespace, and "1" correctly identifies the grandchild.
+        let has_explicit_cgroup_path = self
+            .cgroup_config
+            .as_ref()
+            .and_then(|c| c.path.as_ref())
+            .is_some();
+        let parent_cgroup_procs_path: Option<String> =
+            if namespaces.contains(Namespace::PID) && has_explicit_cgroup_path {
+                pre_cgroup_procs_path.clone()
+            } else {
+                None
+            };
 
         // Install our combined pre_exec hook
         unsafe {
@@ -3784,11 +3793,22 @@ impl Command {
                         }
                     }
                     // Grandchild (G): we are now PID 1 in the new PID namespace.
-                    // The intermediate (P) already wrote our host PID to cgroup.procs
-                    // above — we must NOT do it here because the kernel resolves PIDs
-                    // written to cgroup.procs relative to the writer's PID namespace,
-                    // and from G's namespace PID 1 is the only visible process.
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    // For generated cgroup names (memory/PID/CPU limits), write our
+                    // namespace PID (1) to cgroup.procs immediately — "1" resolves to
+                    // us in the kernel's PID-namespace table, and the generated path is
+                    // at the host cgroup root visible from the new CGROUP namespace.
+                    // For explicit kubepods-style paths, the parent writes after spawn()
+                    // (see parent_cgroup_procs_path) because the kubepods path is outside
+                    // the pelagos-cri cgroup namespace subtree.
+                    if !has_explicit_cgroup_path {
+                        if let Some(ref procs_path) = pre_cgroup_procs_path {
+                            let pid = libc::getpid();
+                            let pid_str = format!("{}\n", pid);
+                            std::fs::write(procs_path, pid_str.as_bytes())
+                                .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
+                        }
+                    }
                 } else if let Some(&(pid_join_fd, _)) =
                     join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
                 {
@@ -6094,12 +6114,18 @@ impl Command {
         };
 
         // Keep a parent-side copy for post-spawn PID-namespace cgroup assignment
-        // (same reasoning as parent_cgroup_procs_path in spawn()).
-        let parent_cgroup_procs_path_i: Option<String> = if namespaces.contains(Namespace::PID) {
-            pre_cgroup_procs_path_i.clone()
-        } else {
-            None
-        };
+        // (same reasoning as parent_cgroup_procs_path / has_explicit_cgroup_path in spawn()).
+        let has_explicit_cgroup_path_i = self
+            .cgroup_config
+            .as_ref()
+            .and_then(|c| c.path.as_ref())
+            .is_some();
+        let parent_cgroup_procs_path_i: Option<String> =
+            if namespaces.contains(Namespace::PID) && has_explicit_cgroup_path_i {
+                pre_cgroup_procs_path_i.clone()
+            } else {
+                None
+            };
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -6332,8 +6358,16 @@ impl Command {
                             libc::_exit(128 + libc::WTERMSIG(status));
                         }
                     }
-                    // Grandchild: P already wrote our host PID to cgroup.procs above.
+                    // Grandchild (interactive): same cgroup assignment logic as spawn().
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    if !has_explicit_cgroup_path_i {
+                        if let Some(ref procs_path) = pre_cgroup_procs_path_i {
+                            let pid = libc::getpid();
+                            let pid_str = format!("{}\n", pid);
+                            std::fs::write(procs_path, pid_str.as_bytes())
+                                .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
+                        }
+                    }
                 } else if let Some(&(pid_join_fd, _)) =
                     join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
                 {
