@@ -53,6 +53,10 @@ pub struct CriSandbox {
     /// DNS resolver options from the pod DNS config.
     #[serde(default)]
     pub dns_options: Vec<String>,
+    /// PID namespace mode from namespace_options.pid:
+    ///   0 = POD (isolated, default), 1 = CONTAINER (isolated), 2 = NODE (host PID namespace).
+    #[serde(default)]
+    pub pid_namespace_mode: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

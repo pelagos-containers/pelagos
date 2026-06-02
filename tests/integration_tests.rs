@@ -25326,3 +25326,180 @@ mod cgroup_placement {
         );
     }
 }
+
+mod pid_namespace {
+    use super::*;
+
+    /// Verify that a container without --no-pid-ns runs in an isolated PID namespace.
+    /// The container process's NSpid (read from the host) must have exactly two entries:
+    /// the host PID and PID 1 inside the new namespace.  Failure indicates that
+    /// Namespace::PID is being ignored and the container is running in the host PID ns.
+    #[test]
+    fn test_isolated_pid_namespace_by_default() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-test-isolated-pid-ns";
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                // No --no-pid-ns: default is isolated PID namespace.
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let state_json =
+            std::fs::read_to_string(&state_path).unwrap_or_else(|e| panic!("read state: {e}"));
+        let state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let intermediate_pid = state["pid"].as_i64().expect("pid field") as u32;
+
+        // Find the grandchild (PID 1 in the container's PID namespace).
+        let children_path = format!("/proc/{intermediate_pid}/task/{intermediate_pid}/children");
+        let children = std::fs::read_to_string(&children_path)
+            .unwrap_or_else(|e| panic!("read children: {e}"));
+        let container_pid: u32 = children
+            .split_whitespace()
+            .next()
+            .expect("no grandchild — PID namespace double-fork did not happen?")
+            .parse()
+            .expect("parse container pid");
+
+        // From the HOST's /proc, NSpid has two entries: host_pid and ns_pid (1).
+        let proc_status = std::fs::read_to_string(format!("/proc/{container_pid}/status"))
+            .unwrap_or_else(|e| panic!("read /proc/{container_pid}/status: {e}"));
+
+        let nspid_line = proc_status
+            .lines()
+            .find(|l| l.starts_with("NSpid:"))
+            .expect("NSpid line not found");
+
+        let nspid_values: Vec<&str> = nspid_line.split_whitespace().skip(1).collect();
+
+        // Cleanup before asserting.
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        assert_eq!(
+            nspid_values.len(),
+            2,
+            "isolated PID namespace should produce 2 NSpid entries; got: {nspid_line}"
+        );
+        assert_eq!(
+            nspid_values[1], "1",
+            "container should be PID 1 in its namespace; got: {nspid_line}"
+        );
+    }
+
+    /// Verify that --no-pid-ns runs the container in the host PID namespace.
+    /// The container's /proc/self/status must show exactly one NSpid entry (the host PID),
+    /// meaning no PID namespace isolation is in effect.
+    #[test]
+    fn test_no_pid_ns_flag_uses_host_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-test-no-pid-ns";
+
+        // Clean up any leftover from a previous run.
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--no-pid-ns",
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Read the container's host PID from the state file.
+        // Without --no-pid-ns, there is no double-fork: state.pid IS the container process.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let state_json =
+            std::fs::read_to_string(&state_path).unwrap_or_else(|e| panic!("read state: {e}"));
+        let state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let container_pid = state["pid"].as_i64().expect("pid field") as u32;
+
+        // Read NSpid from the container's /proc/<host_pid>/status on the HOST.
+        // When running in the host PID namespace, NSpid has exactly one entry.
+        let proc_status = std::fs::read_to_string(format!("/proc/{container_pid}/status"))
+            .unwrap_or_else(|e| panic!("read /proc/{container_pid}/status: {e}"));
+
+        let nspid_line = proc_status
+            .lines()
+            .find(|l| l.starts_with("NSpid:"))
+            .expect("NSpid line not found");
+
+        let nspid_values: Vec<&str> = nspid_line
+            .split_whitespace()
+            .skip(1) // skip "NSpid:"
+            .collect();
+
+        // Cleanup before asserting.
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        assert_eq!(
+            nspid_values.len(),
+            1,
+            "--no-pid-ns should produce exactly 1 NSpid entry (host namespace only); got: {nspid_line}"
+        );
+    }
+}

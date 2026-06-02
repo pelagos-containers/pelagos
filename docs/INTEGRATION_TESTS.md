@@ -4707,3 +4707,28 @@ using `find_container_pid()` to get the grandchild's host PID.
 
 Failure would indicate the SPIRE-conformant cgroup placement is broken and workload attestation
 would fail because `/proc/<pid>/cgroup` would not match the kubepods hierarchy pattern.
+
+## PID Namespace Mode (`pid_namespace` module)
+
+### `test_isolated_pid_namespace_by_default`
+**Requires:** root, rootfs
+**Module:** `pid_namespace`
+
+Runs `pelagos run --detach /bin/sleep 30` (no `--no-pid-ns`) and reads the grandchild's
+NSpid from `/proc/<container_pid>/status` on the HOST. Asserts that NSpid has exactly two
+entries and the in-namespace PID is 1.
+
+Validates that the default behavior (Namespace::PID included) performs the PID namespace
+double-fork correctly. Failure indicates Namespace::PID is being ignored.
+
+### `test_no_pid_ns_flag_uses_host_pid_namespace`
+**Requires:** root, rootfs
+**Module:** `pid_namespace`
+
+Runs `pelagos run --detach --no-pid-ns /bin/sleep 30`. Without Namespace::PID there is no
+double-fork: `state.pid` IS the container process. Reads `/proc/<state.pid>/status` from the
+host and asserts NSpid has exactly one entry (host namespace only, no isolation).
+
+This is the regression test for issue #299 (hostPID: true / namespace_options.pid = NODE not
+respected). Failure would mean the SPIRE agent cannot attest workloads via SO_PEERCRED because
+the container is in an isolated PID namespace and PID 0 is returned instead of the real PID.
