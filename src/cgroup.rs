@@ -121,7 +121,9 @@ pub struct CgroupDeviceRule {
 /// the container process can add its own PID before doing any memory-intensive
 /// work, eliminating the parent-side race in [`setup_cgroup`].
 ///
-/// `name` must be unique — use [`cgroup_unique_name`] to generate one before
+/// If `cfg.path` is set it is used as the cgroup name (supporting nested paths
+/// such as `kubepods/besteffort/pod<uid>/<container-id>`); otherwise `name` is
+/// used and must be unique — use [`cgroup_unique_name`] to generate one before
 /// fork when the child PID is not yet known.
 ///
 /// Verifies the resulting `cgroup.procs` file exists before returning. On
@@ -134,8 +136,19 @@ pub struct CgroupDeviceRule {
 /// context and the user sees only `Failed to spawn process: No such file or
 /// directory (os error 2)`.
 pub fn create_cgroup_no_task(cfg: &CgroupConfig, name: &str) -> io::Result<(Cgroup, String)> {
-    let cg = build_cgroup(cfg, name)?;
-    let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
+    // Honor an explicit cgroup path (e.g. kubepods hierarchy from CRI).
+    // When the path contains slashes we must ensure the parent directory exists
+    // before cgroups-rs tries to create the leaf; kubelet creates the pod-level
+    // parent but not the container-level leaf.
+    let effective_name: &str = cfg.path.as_deref().unwrap_or(name);
+    let cg_dir = std::path::Path::new("/sys/fs/cgroup").join(effective_name);
+    if let Some(parent) = cg_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            io::Error::other(format!("cgroup parent dir '{}': {}", parent.display(), e))
+        })?;
+    }
+    let cg = build_cgroup(cfg, effective_name)?;
+    let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", effective_name);
     if !std::path::Path::new(&procs_path).exists() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,

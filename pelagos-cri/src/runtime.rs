@@ -490,6 +490,11 @@ impl RuntimeService for RuntimeSvc {
             cni_conf,
             pause_pid,
             log_directory: config.log_directory.clone(),
+            cgroup_parent: config
+                .linux
+                .as_ref()
+                .map(|l| l.cgroup_parent.trim_start_matches('/').to_owned())
+                .unwrap_or_default(),
             supplemental_groups: config
                 .linux
                 .as_ref()
@@ -906,8 +911,8 @@ impl RuntimeService for RuntimeSvc {
             args.push(g.to_string());
         }
 
-        // DNS config: inject nameservers, search domains, and options from the pod sandbox.
-        let (sandbox_dns_servers, sandbox_dns_searches, sandbox_dns_options) = {
+        // DNS config and cgroup placement from the pod sandbox.
+        let (sandbox_dns_servers, sandbox_dns_searches, sandbox_dns_options, sandbox_cgroup_parent) = {
             let st = self.state.inner.lock().await;
             st.sandboxes
                 .get(&container.sandbox_id)
@@ -916,6 +921,7 @@ impl RuntimeService for RuntimeSvc {
                         s.dns_servers.clone(),
                         s.dns_searches.clone(),
                         s.dns_options.clone(),
+                        s.cgroup_parent.clone(),
                     )
                 })
                 .unwrap_or_default()
@@ -931,6 +937,14 @@ impl RuntimeService for RuntimeSvc {
         for opt in &sandbox_dns_options {
             args.push("--dns-option".into());
             args.push(opt.clone());
+        }
+        // Place the container in the kubelet-assigned cgroup under the pod-level
+        // parent so that /proc/<pid>/cgroup encodes the container ID, enabling
+        // SPIRE workload attestation and per-container resource accounting.
+        if !sandbox_cgroup_parent.is_empty() {
+            let cgroup_path = format!("{}/{}", sandbox_cgroup_parent, container_id);
+            args.push("--cgroup-path".into());
+            args.push(cgroup_path);
         }
 
         args.push(image);
@@ -1888,6 +1902,7 @@ mod tests {
             cni_conf: String::new(),
             pause_pid: 0,
             log_directory: String::new(),
+            cgroup_parent: String::new(),
             supplemental_groups: vec![],
             dns_servers: vec!["10.96.0.10".into()],
             dns_searches: vec!["default.svc.cluster.local".into(), "cluster.local".into()],
@@ -1903,5 +1918,61 @@ mod tests {
             vec!["default.svc.cluster.local", "cluster.local"]
         );
         assert_eq!(decoded.dns_options, vec!["ndots:5"]);
+    }
+
+    /// Verify that CriSandbox.cgroup_parent round-trips through serde, and that
+    /// start_container constructs the correct cgroup path as <parent>/<container-id>.
+    #[test]
+    fn test_cri_sandbox_cgroup_parent_roundtrip() {
+        let sandbox = state::CriSandbox {
+            id: "sb1".into(),
+            name: "test-pod".into(),
+            namespace: "default".into(),
+            uid: "uid-1".into(),
+            attempt: 0,
+            labels: Default::default(),
+            annotations: Default::default(),
+            created_at_ns: 0,
+            state: state::SandboxState::Running,
+            netns: String::new(),
+            ip: String::new(),
+            cni_conf: String::new(),
+            pause_pid: 0,
+            log_directory: String::new(),
+            cgroup_parent: "kubepods/besteffort/pod084f1637-fccf-40a9-8048-7aea569fe82b".into(),
+            supplemental_groups: vec![],
+            dns_servers: vec![],
+            dns_searches: vec![],
+            dns_options: vec![],
+        };
+
+        let json = serde_json::to_string(&sandbox).expect("serialize");
+        let decoded: state::CriSandbox = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            decoded.cgroup_parent,
+            "kubepods/besteffort/pod084f1637-fccf-40a9-8048-7aea569fe82b"
+        );
+
+        // Verify the path construction logic used in start_container.
+        let container_id = "abc123def456";
+        let cgroup_path = format!("{}/{}", decoded.cgroup_parent, container_id);
+        assert_eq!(
+            cgroup_path,
+            "kubepods/besteffort/pod084f1637-fccf-40a9-8048-7aea569fe82b/abc123def456"
+        );
+    }
+
+    /// Verify that leading slashes in cgroup_parent from kubelet are stripped so
+    /// the path is always relative to /sys/fs/cgroup.
+    #[test]
+    fn test_cgroup_parent_leading_slash_stripped() {
+        // Simulate what run_pod_sandbox does when kubelet sends "/kubepods/besteffort/pod<uid>".
+        let raw = "/kubepods/besteffort/pod-uid-123";
+        let stored = raw.trim_start_matches('/').to_owned();
+        assert_eq!(stored, "kubepods/besteffort/pod-uid-123");
+
+        let container_id = "ctr-xyz";
+        let full = format!("{}/{}", stored, container_id);
+        assert_eq!(full, "kubepods/besteffort/pod-uid-123/ctr-xyz");
     }
 }

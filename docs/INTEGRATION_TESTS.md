@@ -4663,3 +4663,47 @@ This test exercises the CLI wiring, not just the library. The original #293 fix 
 `dns_search`/`dns_option` wiring inside the non-sandbox `else` block in `cmd_run`, so they were
 silently ignored for CRI containers (which always use `--sandbox`). A passing library test would
 not have caught this — only a CLI-level test does.
+
+## Cgroup Placement (issue #297)
+
+### `test_with_cgroup_path_places_process`
+**Requires:** root, rootfs
+**Module:** `cgroup_placement`
+
+Spawns a library-level container (no PID or CGROUP namespace: `Namespace::UTS | Namespace::MOUNT`)
+with `with_cgroup_path("pelagos-test-cgroup/cgroup-placement-test")`. Reads `/proc/self/cgroup`
+from inside the container and asserts it contains "cgroup-placement-test". Without the CGROUP
+namespace, the container sees the full host cgroup path — making this a simple positive test for
+the path-based cgroup assignment.
+
+Failure indicates `with_cgroup_path()` is not honoured by `create_cgroup_no_task()`.
+
+### `test_with_cgroup_path_nested`
+**Requires:** root, rootfs
+**Module:** `cgroup_placement`
+
+Same as above but with a three-level nested path
+(`pelagos-test-cgroup/level2/cgroup-nested-test`) to validate slash-separated paths that mirror
+the kubepods hierarchy (e.g. `kubepods/besteffort/podUID/containerID`).
+
+Failure indicates nested cgroup paths are not being created correctly.
+
+### `test_cli_cgroup_path_flag`
+**Requires:** root, rootfs
+**Module:** `cgroup_placement`
+
+Runs `pelagos run --detach --cgroup-path pelagos-test-cgroup/cli-test /bin/sleep 30` via the
+CLI. After 300ms (time for the watcher to write state.json), reads the container's intermediate
+PID from state.json, finds the grandchild (real container) PID from
+`/proc/<intermediate>/task/<intermediate>/children`, then reads `/proc/<grandchild>/cgroup` from
+the HOST and asserts it contains "cli-test".
+
+This test validates the full end-to-end cgroup placement path including the PID-namespace
+double-fork. The CLI always adds `Namespace::PID` and `Namespace::CGROUP`. The fundamental
+challenge: writing from inside the CGROUP namespace loses visibility of the host-root-anchored
+cgroup path, and writing from inside the PID namespace makes the kernel resolve the PID in the
+wrong namespace table (ESRCH). The fix writes from the host-side parent process after spawn(),
+using `find_container_pid()` to get the grandchild's host PID.
+
+Failure would indicate the SPIRE-conformant cgroup placement is broken and workload attestation
+would fail because `/proc/<pid>/cgroup` would not match the kubepods hierarchy pattern.
