@@ -1101,6 +1101,8 @@ pub struct Command {
     stdio_in: Stdio,
     stdio_out: Stdio,
     stdio_err: Stdio,
+    // Privileged mode: all capabilities, no seccomp, /sys mounted RW.
+    privileged: bool,
 }
 
 /// Perform `pivot_root(new_root, new_root/<put_old_name>)` and detach the old root.
@@ -1239,6 +1241,7 @@ impl Command {
             stdio_in: Stdio::Inherit,
             stdio_out: Stdio::Inherit,
             stdio_err: Stdio::Inherit,
+            privileged: false,
         }
     }
 
@@ -1568,6 +1571,16 @@ impl Command {
     /// Equivalent to `with_capabilities(Capability::empty())`.
     pub fn drop_all_capabilities(mut self) -> Self {
         self.capabilities = Some(Capability::empty());
+        self
+    }
+
+    /// Run in privileged mode: all capabilities, no seccomp filtering, /sys mounted read-write.
+    ///
+    /// This matches the CRI `privileged: true` semantics (e.g. `securityContext.privileged`
+    /// in a Kubernetes pod spec).  Privileged containers have full access to host devices
+    /// and kernel interfaces — only use when required (e.g. kubeadm, CNI plugins, SPIRE agent).
+    pub fn with_privileged(mut self) -> Self {
+        self.privileged = true;
         self
     }
 
@@ -2674,6 +2687,15 @@ impl Command {
             wasi_cfg.is_some() || crate::wasm::is_wasm_binary(&prog_path).unwrap_or(false);
         if use_wasm {
             return self.spawn_wasm_impl(prog_path, wasi_cfg.unwrap_or_default());
+        }
+
+        // Privileged mode: all capabilities, no seccomp, /sys mounted read-write.
+        if self.privileged {
+            // Keep all caps (None = no drop).
+            self.capabilities = None;
+            // Disable seccomp.
+            self.seccomp_profile = None;
+            self.seccomp_program = None;
         }
 
         // Compile seccomp filter in parent process (requires allocation, can't be done in pre_exec)
@@ -5450,6 +5472,13 @@ impl Command {
         }
 
         // --- From here, identical setup to spawn() except we capture slave_raw_fd ---
+
+        // Privileged mode: all capabilities, no seccomp.
+        if self.privileged {
+            self.capabilities = None;
+            self.seccomp_profile = None;
+            self.seccomp_program = None;
+        }
 
         let seccomp_filter: Option<seccompiler::BpfProgram> =
             if let Some(prog) = self.seccomp_program.take() {

@@ -4755,3 +4755,56 @@ Kubernetes observability/security tool.
 Generates 20 IDs and inserts them into a HashSet, asserting all 20 are distinct.
 Catches obvious bugs such as a zero-initialized RNG or a seeded PRNG that always
 produces the same output.
+
+## Privileged Mode and CRI Security/Resource Wiring (`mod privileged_mode`)
+
+### `test_privileged_mode_library_api`
+**Requires:** root, alpine-rootfs
+**Module:** `privileged_mode`
+
+Spawns a container using the `Command` builder with `.with_privileged()`. Reads `/proc/self/status`
+inside the container and asserts that `CapEff` is non-zero and equals `CapPrm` (all capabilities
+retained). This verifies that privileged mode suppresses capability dropping and leaves the full
+capability set in place.
+
+Failure indicates that `with_privileged()` is not properly bypassing capability management in the
+spawn path — the CRI privileged container feature (required by tools like kubeadm, CNI plugins)
+would be silently broken.
+
+### `test_privileged_mode_cli_flag`
+**Requires:** root, alpine-rootfs
+**Module:** `privileged_mode`
+
+Runs `pelagos run --privileged --network loopback --no-pid-ns /bin/ash -c "grep CapEff /proc/self/status"`.
+Parses the hex `CapEff` value and asserts it is ≥ `(1<<41)-1` (all 41 kernel capabilities set).
+This is the CLI-level regression test for issue #306.
+
+Failure means the `--privileged` flag is accepted by the CLI but not actually wired to
+`Command::with_privileged()`, leaving Kubernetes privileged containers running with the
+default (restricted) capability set.
+
+### `test_cap_drop_all_cap_add_net_bind_service_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `privileged_mode`
+
+Runs `pelagos run --cap-drop ALL --cap-add NET_BIND_SERVICE --network loopback --no-pid-ns`.
+Parses `CapEff` and asserts it equals exactly `0x400` (only `CAP_NET_BIND_SERVICE`, bit 10).
+This tests both the CRI capability wiring (issue #304) and the existing `--cap-drop`/`--cap-add`
+CLI mechanics end-to-end.
+
+Failure means that capabilities are not being wired correctly from CRI
+`LinuxContainerSecurityContext.capabilities` through to the container process.
+
+### `test_memory_limit_cli`
+**Requires:** root, alpine-rootfs, cgroups v2
+**Module:** `privileged_mode`
+
+Runs `pelagos run --detach --memory 67108864 --network loopback --no-pid-ns /bin/sleep 30`.
+Reads the container's cgroup path from state.json, then reads
+`/sys/fs/cgroup/<cgroup_name>/memory.max` and asserts it equals 64 MiB exactly.
+This is the CLI regression test for issue #305 (CRI resource limits wiring).
+
+If `cgroup_name` is empty in state.json (cgroups unavailable in test environment), the test
+prints a skip message and returns without failing. Failure means `--memory` is not being
+passed through the CRI `LinuxContainerResources.memory_limit_in_bytes` → `--memory` path,
+so kubelet-requested memory limits for Kubernetes pods are silently ignored.

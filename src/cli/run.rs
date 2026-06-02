@@ -220,6 +220,11 @@ pub struct RunArgs {
     #[clap(long = "no-pid-ns")]
     pub no_pid_ns: bool,
 
+    /// Run in privileged mode: all capabilities, no seccomp filtering, /sys mounted RW.
+    /// Matches Kubernetes securityContext.privileged = true.
+    #[clap(long)]
+    pub privileged: bool,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -463,6 +468,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         labels: args.label.clone(),
         tmpfs: args.tmpfs.clone(),
         no_pid_ns: args.no_pid_ns,
+        privileged: args.privileged,
     }
 }
 
@@ -935,6 +941,11 @@ fn apply_cli_options(
     for u in &args.ulimit {
         let (res, soft, hard) = parse_ulimit(u)?;
         cmd = cmd.with_rlimit(res, soft, hard);
+    }
+
+    // Privileged mode: all capabilities, no seccomp — applied in Command::spawn().
+    if args.privileged {
+        cmd = cmd.with_privileged();
     }
 
     // Capabilities: start from DEFAULT_CAPS, apply --cap-drop then --cap-add.
