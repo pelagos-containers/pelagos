@@ -516,6 +516,13 @@ impl RuntimeService for RuntimeSvc {
                 .as_ref()
                 .map(|d| d.options.clone())
                 .unwrap_or_default(),
+            pid_namespace_mode: config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref())
+                .and_then(|sc| sc.namespace_options.as_ref())
+                .map(|no| no.pid)
+                .unwrap_or(0),
         };
 
         {
@@ -911,8 +918,14 @@ impl RuntimeService for RuntimeSvc {
             args.push(g.to_string());
         }
 
-        // DNS config and cgroup placement from the pod sandbox.
-        let (sandbox_dns_servers, sandbox_dns_searches, sandbox_dns_options, sandbox_cgroup_parent) = {
+        // DNS config, cgroup placement, and PID namespace mode from the pod sandbox.
+        let (
+            sandbox_dns_servers,
+            sandbox_dns_searches,
+            sandbox_dns_options,
+            sandbox_cgroup_parent,
+            sandbox_pid_ns_mode,
+        ) = {
             let st = self.state.inner.lock().await;
             st.sandboxes
                 .get(&container.sandbox_id)
@@ -922,6 +935,7 @@ impl RuntimeService for RuntimeSvc {
                         s.dns_searches.clone(),
                         s.dns_options.clone(),
                         s.cgroup_parent.clone(),
+                        s.pid_namespace_mode,
                     )
                 })
                 .unwrap_or_default()
@@ -938,6 +952,12 @@ impl RuntimeService for RuntimeSvc {
             args.push("--dns-option".into());
             args.push(opt.clone());
         }
+        // NODE PID namespace mode (hostPID: true): run in the host PID namespace so
+        // the SPIRE agent can attest workloads via SO_PEERCRED (PID 0 is never returned).
+        if sandbox_pid_ns_mode == 2 {
+            args.push("--no-pid-ns".into());
+        }
+
         // Place the container in the kubelet-assigned cgroup under the pod-level
         // parent so that /proc/<pid>/cgroup encodes the container ID, enabling
         // SPIRE workload attestation and per-container resource accounting.

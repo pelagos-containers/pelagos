@@ -214,6 +214,12 @@ pub struct RunArgs {
     #[clap(long = "cgroup-path", value_name = "PATH")]
     pub cgroup_path: Option<String>,
 
+    /// Run in the host PID namespace instead of an isolated one (hostPID: true).
+    /// Used by pelagos-cri when namespace_options.pid == NODE (2) so that the
+    /// SPIRE agent can attest workloads via SO_PEERCRED.
+    #[clap(long = "no-pid-ns")]
+    pub no_pid_ns: bool,
+
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
     pub rootfs: Option<String>,
@@ -456,6 +462,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         no_nat: args.no_nat,
         labels: args.label.clone(),
         tmpfs: args.tmpfs.clone(),
+        no_pid_ns: args.no_pid_ns,
     }
 }
 
@@ -574,13 +581,18 @@ fn build_image_run(
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
 
+    let pid_ns = if args.no_pid_ns {
+        Namespace::empty()
+    } else {
+        Namespace::PID
+    };
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_image_layers(layers)
         // Add UTS (hostname isolation) + PID namespace.  Use add_namespaces so
         // we OR into the flags already set by with_image_layers (MOUNT) rather
         // than replacing them.
-        .add_namespaces(Namespace::UTS | Namespace::PID | Namespace::IPC | Namespace::CGROUP);
+        .add_namespaces(Namespace::UTS | pid_ns | Namespace::IPC | Namespace::CGROUP);
 
     // Apply image config environment.  This includes any PATH set by Dockerfile
     // ENV instructions.  apply_cli_options no longer injects a fallback PATH
@@ -647,11 +659,16 @@ fn build_command(
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
 
+    let pid_ns = if args.no_pid_ns {
+        Namespace::empty()
+    } else {
+        Namespace::PID
+    };
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_chroot(rootfs_dir)
         .with_namespaces(
-            Namespace::UTS | Namespace::MOUNT | Namespace::PID | Namespace::IPC | Namespace::CGROUP,
+            Namespace::UTS | Namespace::MOUNT | pid_ns | Namespace::IPC | Namespace::CGROUP,
         )
         .with_proc_mount()
         .with_dev_mount()

@@ -218,6 +218,10 @@ pub struct SpawnConfig {
     /// tmpfs mounts as "path" or "path:options" strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tmpfs: Vec<String>,
+    /// When true, the container runs in the host PID namespace (no CLONE_NEWPID).
+    /// Saved from `--no-pid-ns`; restored by `pelagos start`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_pid_ns: bool,
 }
 
 /// Persisted state for a running or exited container.
