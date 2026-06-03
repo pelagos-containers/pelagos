@@ -99,12 +99,13 @@ pub(crate) fn check_rootless_bridge(
     is_rootless: bool,
     network_mode: &pelagos::network::NetworkMode,
     nat: bool,
-    has_ports: bool,
 ) -> Option<String> {
     if !is_rootless {
         return None;
     }
-    if network_mode.is_bridge() || nat || has_ports {
+    // -p and --nat with no explicit --network are caught earlier (auto-bridge path),
+    // so here we only need to guard against an explicit bridge/nat selection.
+    if network_mode.is_bridge() || nat {
         Some(
             "pelagos: bridge networking requires root (CAP_NET_ADMIN / nftables).\n\
              Use --network pasta for rootless internet access, or run with sudo."
@@ -1078,45 +1079,43 @@ mod tests {
     #[test]
     fn rootless_bridge_errors() {
         use pelagos::network::NetworkMode;
-        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, false, false).is_some());
+        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, false).is_some());
         assert!(
-            check_rootless_bridge(true, &NetworkMode::BridgeNamed("foo".into()), false, false)
-                .is_some()
+            check_rootless_bridge(true, &NetworkMode::BridgeNamed("foo".into()), false).is_some()
         );
         assert!(
-            check_rootless_bridge(true, &NetworkMode::Bridge, false, false)
+            check_rootless_bridge(true, &NetworkMode::Bridge, false)
                 .unwrap()
                 .contains("requires root")
         );
     }
 
     #[test]
-    fn rootless_nat_or_ports_errors() {
+    fn rootless_nat_errors() {
         use pelagos::network::NetworkMode;
-        // nat=true with non-bridge mode
-        assert!(check_rootless_bridge(true, &NetworkMode::None, true, false).is_some());
-        // has_ports=true with non-bridge mode
-        assert!(check_rootless_bridge(true, &NetworkMode::None, false, true).is_some());
-        // bridge + nat + ports
-        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, true, true).is_some());
+        // --nat with a non-bridge mode is caught here (edge case: explicit --nat --network pasta)
+        assert!(check_rootless_bridge(true, &NetworkMode::None, true).is_some());
+        // bridge + nat
+        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, true).is_some());
     }
 
     #[test]
     fn rootless_pasta_and_loopback_ok() {
         use pelagos::network::NetworkMode;
-        assert!(check_rootless_bridge(true, &NetworkMode::Pasta, false, false).is_none());
-        assert!(check_rootless_bridge(true, &NetworkMode::Loopback, false, false).is_none());
-        assert!(check_rootless_bridge(true, &NetworkMode::None, false, false).is_none());
+        // -p with pasta rootless is handled upstream (auto-bridge path); by the time
+        // check_rootless_bridge is called, pasta+no-nat is always permitted.
+        assert!(check_rootless_bridge(true, &NetworkMode::Pasta, false).is_none());
+        assert!(check_rootless_bridge(true, &NetworkMode::Loopback, false).is_none());
+        assert!(check_rootless_bridge(true, &NetworkMode::None, false).is_none());
     }
 
     #[test]
     fn root_bridge_ok() {
         use pelagos::network::NetworkMode;
         // root (is_rootless=false) should never return an error regardless of mode
-        assert!(check_rootless_bridge(false, &NetworkMode::Bridge, true, true).is_none());
+        assert!(check_rootless_bridge(false, &NetworkMode::Bridge, true).is_none());
         assert!(
-            check_rootless_bridge(false, &NetworkMode::BridgeNamed("net".into()), true, true)
-                .is_none()
+            check_rootless_bridge(false, &NetworkMode::BridgeNamed("net".into()), true).is_none()
         );
     }
 }

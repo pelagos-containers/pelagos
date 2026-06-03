@@ -307,12 +307,24 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Parse network mode early (no filesystem access) so the rootless guard can fire
     // before we touch the state directory.
     let port_forwards = parse_port_forwards(&args.publish)?;
-    let network_mode = if args.network.is_empty() {
-        // No explicit --network: prefer pasta for both root and rootless.
-        // pasta provides full internet (IPv4 + IPv6) without kernel forwarding
-        // or NAT66 (which was removed — it required all/forwarding=1 and corrupted
-        // SLAAC-managed interfaces on T-Mobile / home WiFi networks).
-        // Fall back to loopback if pasta is not installed.
+    let network_mode = if !args.network.is_empty() {
+        // Explicit --network: always respect it.
+        parse_network_mode(args.network.first().unwrap())?
+    } else if !port_forwards.is_empty() || args.nat {
+        // -p / --nat implies bridge: port forwarding and NAT only work with a kernel
+        // bridge (veth + nftables).  Auto-select it so the user doesn't have to know
+        // the backend difference.  If rootless, fail now with actionable advice.
+        if pelagos::paths::is_rootless() {
+            eprintln!(
+                "pelagos: port forwarding and NAT require root (CAP_NET_ADMIN / nftables).\n\
+                 Run with sudo."
+            );
+            std::process::exit(1);
+        }
+        NetworkMode::Bridge
+    } else {
+        // No network-specific flags: pasta gives full internet (IPv4+IPv6) without
+        // kernel forwarding or NAT66 — safe on T-Mobile/home WiFi (no SLAAC breakage).
         if pelagos::network::is_pasta_available() {
             NetworkMode::Pasta
         } else {
@@ -322,20 +334,27 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
             NetworkMode::Loopback
         }
-    } else {
-        parse_network_mode(args.network.first().unwrap())?
     };
     let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
 
-    // Early rootless + bridge guard — emit a friendly message before doing any filesystem work.
+    // Guard against an explicit --network bridge/--nat from a rootless user.
+    // (The -p auto-bridge path above already handled the rootless+ports case.)
     if let Some(msg) = super::check_rootless_bridge(
         pelagos::paths::is_rootless(),
         &network_mode,
         args.nat,
-        !args.publish.is_empty(),
     ) {
         eprintln!("{}", msg);
         std::process::exit(1);
+    }
+
+    // Warn if the user explicitly chose pasta but also requested port forwarding —
+    // the ports will be silently inoperative.
+    if matches!(network_mode, NetworkMode::Pasta) && !port_forwards.is_empty() {
+        eprintln!(
+            "pelagos: warning: --network pasta does not support host port forwarding (-p).\n\
+             Use --network bridge (with root) to expose ports on the host."
+        );
     }
 
     // Generate container name

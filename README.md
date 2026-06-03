@@ -203,9 +203,12 @@ Pelagos defaults to **rootless** — most operations work without `sudo`. Root i
 required only for bridge networking, NAT, port mapping, and OCI lifecycle commands
 (`create`/`start`/`kill`/`delete`).
 
-Network mode is auto-selected: root → bridge + NAT; rootless → pasta (requires
-`pasta` from [passt.top](https://passt.top)); rootless without pasta → loopback
-with a warning. No `--network` or `--nat` flags needed in the common case.
+Network mode is auto-selected based on what you ask for:
+
+- **`-p` or `--nat` requested** → bridge + NAT (requires root; `-p` alone is enough, no `--network` flag needed)
+- **Neither** → pasta for full IPv4/IPv6 internet (`pasta` from [passt.top](https://passt.top)), or loopback with a warning if pasta is not installed
+
+Use `--network <mode>` to override explicitly.
 
 On kernel 5.11+ Pelagos uses native overlayfs with `userxattr` (zero-copy,
 kernel-native). On older kernels it falls back to `fuse-overlayfs` automatically.
@@ -220,13 +223,16 @@ pelagos run alpine /bin/echo hello
 pelagos run -i alpine /bin/sh
 ```
 
-### Root (bridge networking, NAT, port mapping)
+### Root (port mapping, bridge networking)
 
 ```bash
-# Bridge + NAT are auto-selected as root — no flags needed
+# Internet access as root — pasta, same as rootless, no flags needed
 sudo pelagos run -i alpine /bin/sh
 
-# Detached container (bridge + NAT implied)
+# Port mapping — bridge + NAT are auto-selected when -p is given
+sudo pelagos run -d --name mybox -p 8080:80 alpine /bin/sh -c 'httpd -f'
+
+# Detached container without port mapping — also pasta
 sudo pelagos run -d --name mybox alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 

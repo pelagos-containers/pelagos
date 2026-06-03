@@ -1200,18 +1200,23 @@ pelagos exec -u 1000:1000 mybox /bin/id
 
 Pelagos selects a network mode automatically when `--network` is not specified:
 
-- **pasta available** → pasta (full IPv4 + IPv6 internet, works with or without root)
-- **pasta not installed** → loopback only (+ warning to install pasta)
+- **`-p` or `--nat` requested** → bridge + NAT (requires root; these imply a kernel bridge)
+- **Neither of the above, pasta available** → pasta (full IPv4 + IPv6 internet, root or rootless)
+- **Neither of the above, pasta not installed** → loopback only (+ warning to install pasta)
 
 This means `pelagos run alpine ping -c 5 google.com` works out of the box in
-both root and rootless environments, with no extra flags.
+both root and rootless environments with no extra flags, and
+`sudo pelagos run -p 8080:80 myimage` Just Works without knowing about bridge mode.
 
 ### Network Modes
 
 ```bash
-# Auto (default) — pasta for both root and rootless:
+# Auto (default) — pasta when no -p/--nat, for both root and rootless:
 sudo pelagos run alpine /bin/sh        # pasta (full internet, IPv4 + IPv6)
 pelagos run alpine /bin/sh             # pasta (same, no sudo needed)
+
+# Port mapping — bridge + NAT are auto-selected, no --network flag needed:
+sudo pelagos run -p 8080:80 myimage    # bridge+NAT implied by -p
 
 # Explicit modes:
 
@@ -1225,7 +1230,7 @@ sudo pelagos run --network bridge alpine /bin/sh     # NAT implied by bridge
 # Bridge without NAT (container has bridge IP, but no masquerade to internet)
 sudo pelagos run --network bridge --no-nat alpine /bin/sh
 
-# Pasta (explicit; same as auto-default)
+# Pasta (explicit; same as auto-default when no -p)
 pelagos run --network pasta alpine /bin/sh
 
 # No network at all (air-gapped)
@@ -1245,18 +1250,29 @@ sudo pelagos run --network none alpine /bin/sh
 ### NAT, Port Forwarding, and DNS
 
 ```bash
-# Outbound IPv4 internet: NAT is implied whenever bridge is selected (explicit)
+# Port mapping — bridge + NAT are auto-selected; just pass -p:
+sudo pelagos run -p 8080:80 alpine /bin/sh
+sudo pelagos run -p 3030:3030 -p 443:443 myimage   # multiple ports
+
+# Rootless + -p is an early error with actionable advice:
+pelagos run -p 8080:80 alpine /bin/sh
+# pelagos: port forwarding and NAT require root (CAP_NET_ADMIN / nftables).
+# Run with sudo.
+
+# Outbound NAT only (no port mapping), explicit bridge:
 sudo pelagos run --network bridge alpine /bin/sh
 
 # Suppress NAT (routed prefix, no masquerade)
 sudo pelagos run --network bridge --no-nat alpine /bin/sh
 
-# Publish ports (host:container TCP forwarding)
-sudo pelagos run -p 8080:80 alpine /bin/sh
-
 # Custom DNS servers
 sudo pelagos run --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
 ```
+
+Port forwarding uses nftables DNAT + a userspace TCP proxy. It requires a kernel
+bridge (veth pair) — it is not supported with `--network pasta`. If you explicitly
+pass `--network pasta -p …`, pelagos will warn and start the container anyway, but
+the ports will not be reachable on the host.
 
 ### DNS Backend
 
@@ -1287,24 +1303,25 @@ sudo pelagos run --link db alpine /bin/sh -c 'ping -c1 db'
 
 ### Pasta Networking
 
-Pelagos uses [pasta](https://passt.top) (user-mode networking) by default for
-both root and rootless containers — no flags needed:
+Pelagos uses [pasta](https://passt.top) (user-mode networking) as the default
+when no port mapping or NAT is requested — no flags needed:
 
 ```bash
 # Full IPv4 + IPv6 internet, rootless
 pelagos run -i alpine /bin/sh
 
-# Full IPv4 + IPv6 internet, root
+# Full IPv4 + IPv6 internet, root (pasta, not bridge — same as rootless)
 sudo pelagos run -i alpine /bin/sh
 
-# Explicit pasta (same as above)
+# Explicit pasta (same as auto-default)
 pelagos run --network pasta -i alpine /bin/sh
 ```
 
 Install pasta with your distro's package manager (`passt` package on Arch/Fedora/Debian).
 If pasta is not found, pelagos falls back to loopback with a warning.
 
-Bridge networking requires root and is rejected in rootless mode.
+Bridge networking requires root and is rejected in rootless mode. Using `-p` or
+`--nat` with no explicit `--network` automatically selects bridge — no extra flag needed.
 
 ### Named Networks
 
