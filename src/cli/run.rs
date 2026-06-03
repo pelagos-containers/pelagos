@@ -339,11 +339,9 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Guard against an explicit --network bridge/--nat from a rootless user.
     // (The -p auto-bridge path above already handled the rootless+ports case.)
-    if let Some(msg) = super::check_rootless_bridge(
-        pelagos::paths::is_rootless(),
-        &network_mode,
-        args.nat,
-    ) {
+    if let Some(msg) =
+        super::check_rootless_bridge(pelagos::paths::is_rootless(), &network_mode, args.nat)
+    {
         eprintln!("{}", msg);
         std::process::exit(1);
     }

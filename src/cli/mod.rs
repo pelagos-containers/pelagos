@@ -1083,11 +1083,9 @@ mod tests {
         assert!(
             check_rootless_bridge(true, &NetworkMode::BridgeNamed("foo".into()), false).is_some()
         );
-        assert!(
-            check_rootless_bridge(true, &NetworkMode::Bridge, false)
-                .unwrap()
-                .contains("requires root")
-        );
+        assert!(check_rootless_bridge(true, &NetworkMode::Bridge, false)
+            .unwrap()
+            .contains("requires root"));
     }
 
     #[test]
