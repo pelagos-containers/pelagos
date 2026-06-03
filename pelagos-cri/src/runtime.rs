@@ -211,6 +211,49 @@ fn cri_container_state_val(s: &MyContainerState) -> i32 {
     }
 }
 
+/// Convert a CRI Signal proto enum value to a signal name string for `pelagos --stop-signal`.
+/// Returns empty string for RUNTIME_DEFAULT (0) meaning "use runtime default (SIGTERM)".
+fn cri_signal_to_name(sig: i32) -> String {
+    match sig {
+        0 => String::new(), // RUNTIME_DEFAULT — no override
+        1 => "SIGABRT".into(),
+        2 => "SIGALRM".into(),
+        3 => "SIGBUS".into(),
+        4 => "SIGCHLD".into(),
+        5 => "SIGCLD".into(),
+        6 => "SIGCONT".into(),
+        7 => "SIGFPE".into(),
+        8 => "SIGHUP".into(),
+        9 => "SIGILL".into(),
+        10 => "SIGINT".into(),
+        11 => "SIGIO".into(),
+        12 => "SIGIOT".into(),
+        13 => "SIGKILL".into(),
+        14 => "SIGPIPE".into(),
+        15 => "SIGPOLL".into(),
+        16 => "SIGPROF".into(),
+        17 => "SIGPWR".into(),
+        18 => "SIGQUIT".into(),
+        19 => "SIGSEGV".into(),
+        20 => "SIGSTKFLT".into(),
+        21 => "SIGSTOP".into(),
+        22 => "SIGSYS".into(),
+        23 => "SIGTERM".into(),
+        24 => "SIGTRAP".into(),
+        25 => "SIGTSTP".into(),
+        26 => "SIGTTIN".into(),
+        27 => "SIGTTOU".into(),
+        28 => "SIGURG".into(),
+        29 => "SIGUSR1".into(),
+        30 => "SIGUSR2".into(),
+        31 => "SIGVTALRM".into(),
+        32 => "SIGWINCH".into(),
+        33 => "SIGXCPU".into(),
+        34 => "SIGXFSZ".into(),
+        n => format!("{}", n), // numeric fallback; parse_signal handles numeric strings
+    }
+}
+
 fn labels_match(
     container_labels: &HashMap<String, String>,
     selector: &HashMap<String, String>,
@@ -868,7 +911,7 @@ impl RuntimeService for RuntimeSvc {
             .and_then(|sc| sc.selinux_options.as_ref())
             .map(|s| {
                 // Combine user:role:type:level into a single label string.
-                format!("{}:{}:{}:{}", s.user, s.role, s.type_, s.level)
+                format!("{}:{}:{}:{}", s.user, s.role, s.r#type, s.level)
             })
             .filter(|s| s != ":::")
             .unwrap_or_default();
@@ -889,7 +932,8 @@ impl RuntimeService for RuntimeSvc {
             .unwrap_or_default();
 
         // Extract stop signal from ContainerConfig.
-        let stop_signal = config.stop_signal.clone();
+        // config.stop_signal is the Signal proto enum (i32); 0 = RUNTIME_DEFAULT (no override).
+        let stop_signal = cri_signal_to_name(config.stop_signal);
 
         // Identify the termination log mount.  Kubelet passes terminationMessagePath
         // (default /dev/termination-log) as a regular bind mount; after the container
