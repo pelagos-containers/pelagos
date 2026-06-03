@@ -4808,3 +4808,24 @@ If `cgroup_name` is empty in state.json (cgroups unavailable in test environment
 prints a skip message and returns without failing. Failure means `--memory` is not being
 passed through the CRI `LinuxContainerResources.memory_limit_in_bytes` → `--memory` path,
 so kubelet-requested memory limits for Kubernetes pods are silently ignored.
+
+### `test_cap_drop_all_with_non_root_user`
+**Requires:** root, alpine-rootfs
+**Module:** `privileged_mode`
+
+Regression test for issue #308: `--cap-drop ALL --user 1000` previously failed with EINVAL.
+
+Root cause: `capset()` ran at step 4.86 (before `setuid()`), zeroing `CAP_SETUID`.
+When `setuid(1000)` then ran it got EPERM, which became EINVAL via the spawn error pipe
+(`io::Error::other()` has no `raw_os_error`).
+
+Fix: `PR_CAPBSET_DROP` only at step 4.86; `PR_SET_KEEPCAPS` set before `setuid()`
+so the permitted set survives the UID switch; `capset()` moved to step 8.6
+(after `setuid()`).
+
+Runs `pelagos run --cap-drop ALL --user 1000 --network loopback --no-pid-ns`
+and asserts:
+1. The process exits successfully (no EINVAL).
+2. `CapEff` from `/proc/self/status` is exactly 0 (all caps dropped).
+
+Failure means the capset/setuid ordering regression has returned.
