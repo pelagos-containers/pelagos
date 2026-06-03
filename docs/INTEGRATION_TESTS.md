@@ -4871,3 +4871,38 @@ Asserts value is 0 (disabled). Verifies CRI `securityContext.seccomp.profileType
 Runs `pelagos run --masked-path /proc/kcore` and uses `stat -c '%t:%T'` to verify the device
 is `1:3` (major:minor in hex = `/dev/null`). Verifies CRI `securityContext.maskedPaths` →
 `--masked-path` wiring (issue #311). Failure means sensitive kernel paths are exposed to containers.
+
+## CRI Phase 3 Compatibility (`mod cri_phase3_compat`)
+
+### `test_no_ipc_ns_shares_host_ipc`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase3_compat`
+
+Runs `pelagos run --no-ipc-ns` and verifies that `readlink /proc/self/ns/ipc` inside the
+container matches the host's IPC namespace inode. Verifies CRI
+`namespace_options.ipc = NODE (2)` → `--no-ipc-ns` wiring (issue #313).
+Failure means `hostIPC: true` pods share an isolated IPC namespace instead of the host's.
+
+### `test_isolated_ipc_ns_by_default`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase3_compat`
+
+Baseline: without `--no-ipc-ns`, the container IPC namespace inode differs from the host.
+Ensures the positive test is meaningful — if this fails, IPC isolation is broken entirely.
+
+### `test_oom_score_adj_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase3_compat`
+
+Runs `pelagos run --oom-score-adj 500` and reads `/proc/self/oom_score_adj` inside the
+container. Asserts value is 500. Verifies CRI `resources.oom_score_adj` → `--oom-score-adj`
+wiring (issue #313). Failure means kubelet OOM priority assignments are silently ignored.
+
+### `test_memory_swap_limit_cli`
+**Requires:** root, alpine-rootfs, cgroups v2 with swap accounting
+**Module:** `cri_phase3_compat`
+
+Runs `pelagos run --detach --memory 64m --memory-swap 128m` and reads `memory.swap.max`
+from the container's cgroup directory. Asserts it equals 128 MiB. Skips if
+`memory.swap.max` is not present (swap accounting disabled in kernel). Verifies CRI
+`resources.memory_swap_limit_in_bytes` → `--memory-swap` wiring (issue #313).

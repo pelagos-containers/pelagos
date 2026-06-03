@@ -537,6 +537,13 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|sc| sc.namespace_options.as_ref())
                 .map(|no| no.pid)
                 .unwrap_or(0),
+            ipc_namespace_mode: config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref())
+                .and_then(|sc| sc.namespace_options.as_ref())
+                .map(|no| no.ipc)
+                .unwrap_or(0),
         };
 
         {
@@ -820,19 +827,31 @@ impl RuntimeService for RuntimeSvc {
             .unwrap_or_default();
 
         // Extract resource limits from LinuxContainerConfig.
-        let (memory_limit, cpu_period, cpu_quota, cpu_shares) = config
+        let (memory_limit, cpu_period, cpu_quota, cpu_shares, oom_score_adj, memory_swap_limit) =
+            config
+                .linux
+                .as_ref()
+                .and_then(|l| l.resources.as_ref())
+                .map(|r| {
+                    (
+                        r.memory_limit_in_bytes,
+                        r.cpu_period,
+                        r.cpu_quota,
+                        r.cpu_shares,
+                        r.oom_score_adj,
+                        r.memory_swap_limit_in_bytes,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, i32::MIN, 0));
+
+        // Extract AppArmor profile from LinuxContainerSecurityContext.
+        let (apparmor_profile_type, apparmor_profile_path) = config
             .linux
             .as_ref()
-            .and_then(|l| l.resources.as_ref())
-            .map(|r| {
-                (
-                    r.memory_limit_in_bytes,
-                    r.cpu_period,
-                    r.cpu_quota,
-                    r.cpu_shares,
-                )
-            })
-            .unwrap_or_default();
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|sc| sc.apparmor.as_ref())
+            .map(|a| (a.profile_type, a.localhost_ref.clone()))
+            .unwrap_or((0, String::new()));
 
         // Identify the termination log mount.  Kubelet passes terminationMessagePath
         // (default /dev/termination-log) as a regular bind mount; after the container
@@ -890,6 +909,10 @@ impl RuntimeService for RuntimeSvc {
             no_new_privs,
             masked_paths,
             readonly_paths,
+            apparmor_profile_type,
+            apparmor_profile_path,
+            oom_score_adj,
+            memory_swap_limit,
         };
 
         {
@@ -1124,6 +1147,50 @@ impl RuntimeService for RuntimeSvc {
         for path in &container.readonly_paths {
             args.push("--bind-ro".into());
             args.push(format!("{}:{}", path, path));
+        }
+
+        // AppArmor profile (securityContext.apparmor).
+        // Type: 0=RuntimeDefault (pelagos applies its default automatically, no flag needed),
+        //       1=Unconfined, 2=Localhost.
+        match container.apparmor_profile_type {
+            1 => {
+                args.push("--apparmor-profile".into());
+                args.push("unconfined".into());
+            }
+            2 => {
+                if !container.apparmor_profile_path.is_empty() {
+                    args.push("--apparmor-profile".into());
+                    args.push(container.apparmor_profile_path.clone());
+                }
+            }
+            _ => {}
+        }
+
+        // OOM score adjustment (resources.oom_score_adj).
+        // i32::MIN sentinel means the field was absent from the proto.
+        if container.oom_score_adj != i32::MIN {
+            args.push("--oom-score-adj".into());
+            args.push(container.oom_score_adj.to_string());
+        }
+
+        // Memory+swap combined limit (resources.memory_swap_limit_in_bytes).
+        if container.memory_swap_limit != 0 {
+            args.push("--memory-swap".into());
+            args.push(container.memory_swap_limit.to_string());
+        }
+
+        // Host IPC namespace mode (sandbox namespace_options.ipc == 2).
+        // Pass --no-ipc-ns to skip IPC namespace unsharing so the container
+        // shares the host IPC namespace (hostIPC: true in the pod spec).
+        let sandbox_ipc_ns_mode = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes
+                .get(&container.sandbox_id)
+                .map(|s| s.ipc_namespace_mode)
+                .unwrap_or(0)
+        };
+        if sandbox_ipc_ns_mode == 2 {
+            args.push("--no-ipc-ns".into());
         }
 
         args.push(image);
@@ -2087,6 +2154,7 @@ mod tests {
             dns_searches: vec!["default.svc.cluster.local".into(), "cluster.local".into()],
             dns_options: vec!["ndots:5".into()],
             pid_namespace_mode: 0,
+            ipc_namespace_mode: 0,
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -2125,6 +2193,7 @@ mod tests {
             dns_searches: vec![],
             dns_options: vec![],
             pid_namespace_mode: 0,
+            ipc_namespace_mode: 0,
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
