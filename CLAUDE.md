@@ -140,11 +140,14 @@ This is a hard requirement, not optional cleanup.
 7. Report back with what was done and test results
 
 **"Engage!"** — Tag, release, and monitor:
-1. Create a git tag (ask user for version if unclear)
-2. Push the tag — this triggers the release workflow, which gates the build on
+1. **Bump `version` in `Cargo.toml` to match the release version** — commit this first.
+   This is MANDATORY. `pelagos --version` reads from Cargo.toml; a mismatched version
+   is a broken release. Never tag without bumping Cargo.toml first.
+2. Create a git tag matching the Cargo.toml version (ask user for version if unclear)
+3. Push the tag — this triggers the release workflow, which gates the build on
    lint + unit-tests + integration-tests passing first (no release is cut if CI fails)
-3. Monitor the release workflow with a background agent; report pass/fail and release URL
-4. **If the release workflow fails**: diagnose immediately, fix, delete the tag locally
+4. Monitor the release workflow with a background agent; report pass/fail and release URL
+5. **If the release workflow fails**: diagnose immediately, fix, delete the tag locally
    and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), push the
    fix, re-tag, and re-push — do not leave a broken tag pointing at bad code
 
