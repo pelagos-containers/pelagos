@@ -1740,6 +1740,24 @@ impl Command {
         self
     }
 
+    /// Add a hugepage limit for the given page size.
+    ///
+    /// `page_size` is the kernel's canonical size string (e.g. `"2MB"`, `"1GB"`).
+    /// `limit_bytes` is the maximum number of bytes of that page size the cgroup may use.
+    /// Written to `hugetlb.<size>.max` (cgroupv2) or `hugetlb.<size>.limit_in_bytes` (v1).
+    /// Silently skipped if the file doesn't exist (hugepage support not compiled in kernel).
+    pub fn with_cgroup_hugepage_limit(
+        mut self,
+        page_size: impl Into<String>,
+        limit_bytes: u64,
+    ) -> Self {
+        self.cgroup_config
+            .get_or_insert_with(Default::default)
+            .hugepage_limits
+            .push((page_size.into(), limit_bytes));
+        self
+    }
+
     /// Set the block I/O weight (10–1000; maps to `io.weight` on v2, `blkio.weight` on v1).
     pub fn with_cgroup_blkio_weight(mut self, weight: u16) -> Self {
         self.cgroup_config

@@ -147,6 +147,14 @@ pub struct RunArgs {
     #[clap(long = "pids-limit")]
     pub pids_limit: Option<u64>,
 
+    /// CPUs this container may use (cpuset string, e.g. "0-3,6")
+    #[clap(long = "cpuset-cpus", value_name = "CPUS")]
+    pub cpuset_cpus: Option<String>,
+
+    /// Memory nodes this container may use (cpuset string, e.g. "0-1")
+    #[clap(long = "cpuset-mems", value_name = "MEMS")]
+    pub cpuset_mems: Option<String>,
+
     /// rlimit RESOURCE=SOFT:HARD (repeatable)
     #[clap(long = "ulimit")]
     pub ulimit: Vec<String>,
@@ -174,6 +182,10 @@ pub struct RunArgs {
     /// Combined memory+swap limit in bytes (0 = same as --memory, -1 = unlimited swap)
     #[clap(long = "memory-swap", value_name = "BYTES")]
     pub memory_swap: Option<i64>,
+
+    /// HugePage limit: SIZE=BYTES (e.g. "2MB=1073741824", repeatable)
+    #[clap(long = "hugepage-limit", value_name = "SIZE=BYTES")]
+    pub hugepage_limit: Vec<String>,
 
     /// SELinux process label to apply at container exec time
     /// (e.g. "system_u:system_r:container_t:s0")
@@ -237,6 +249,11 @@ pub struct RunArgs {
     /// Matches Kubernetes securityContext.privileged = true.
     #[clap(long)]
     pub privileged: bool,
+
+    /// Signal to send when stopping the container (default: SIGTERM).
+    /// Accepts signal names (SIGTERM, SIGQUIT, SIGINT) or numbers (15, 3, 2).
+    #[clap(long = "stop-signal", value_name = "SIGNAL")]
+    pub stop_signal: Option<String>,
 
     /// Use a local rootfs instead of an OCI image (advanced)
     #[clap(long)]
@@ -483,6 +500,9 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         no_pid_ns: args.no_pid_ns,
         no_ipc_ns: args.no_ipc_ns,
         privileged: args.privileged,
+        stop_signal: args.stop_signal.clone(),
+        cpuset_cpus: args.cpuset_cpus.clone(),
+        cpuset_mems: args.cpuset_mems.clone(),
     }
 }
 
@@ -964,8 +984,21 @@ fn apply_cli_options(
     if let Some(pids) = args.pids_limit {
         cmd = cmd.with_cgroup_pids_limit(pids);
     }
+    if let Some(ref cpus) = args.cpuset_cpus {
+        cmd = cmd.with_cgroup_cpuset_cpus(cpus.clone());
+    }
+    if let Some(ref mems) = args.cpuset_mems {
+        cmd = cmd.with_cgroup_cpuset_mems(mems.clone());
+    }
     if let Some(score) = args.oom_score_adj {
         cmd = cmd.with_oom_score_adj(score);
+    }
+    for spec in &args.hugepage_limit {
+        if let Some((size, bytes_str)) = spec.split_once('=') {
+            if let Ok(bytes) = bytes_str.parse::<u64>() {
+                cmd = cmd.with_cgroup_hugepage_limit(size.to_string(), bytes);
+            }
+        }
     }
 
     // Ulimits

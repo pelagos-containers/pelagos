@@ -167,6 +167,21 @@ pub struct CriContainer {
     /// Combined memory+swap cgroup limit in bytes (0 = not set, -1 = unlimited swap).
     #[serde(default)]
     pub memory_swap_limit: i64,
+    /// CPUs this container may use (cpuset string, e.g. "0-3,6").
+    #[serde(default)]
+    pub cpuset_cpus: String,
+    /// Memory nodes this container may use (cpuset string, e.g. "0-1").
+    #[serde(default)]
+    pub cpuset_mems: String,
+    /// Signal to send when stopping the container (empty = SIGTERM default).
+    #[serde(default)]
+    pub stop_signal: String,
+    /// HugePage limits: (page_size_string, limit_in_bytes).
+    #[serde(default)]
+    pub hugepage_limits: Vec<(String, u64)>,
+    /// SELinux label "user:role:type:level" (empty = not set).
+    #[serde(default)]
+    pub selinux_label: String,
 }
 
 fn default_oom_score_unset() -> i32 {

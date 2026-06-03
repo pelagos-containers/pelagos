@@ -98,6 +98,12 @@ pub struct CgroupConfig {
     /// Explicit cgroup path from OCI `linux.cgroupsPath`.
     /// If set, used as-is as the cgroup name/path; otherwise defaults to `pelagos-{pid}`.
     pub path: Option<String>,
+
+    /// HugePage limits: `(page_size_string, limit_in_bytes)`.
+    /// Example: `("2MB", 1073741824)` limits 2 MB hugepages to 1 GiB.
+    /// Written to `hugetlb.<size>.limit_in_bytes` on cgroupv1 or
+    /// `hugetlb.<size>.max` on cgroupv2; skipped if the file doesn't exist.
+    pub hugepage_limits: Vec<(String, u64)>,
 }
 
 /// A single device cgroup allow/deny rule.
@@ -311,6 +317,36 @@ fn build_cgroup(cfg: &CgroupConfig, name: &str) -> io::Result<Cgroup> {
             }
         } else {
             log::debug!("cpuset controller unavailable; cpus/mems not applied");
+        }
+    }
+
+    // --- HugePage limits (direct filesystem write; cgroups-rs has no controller) ---
+    if !cfg.hugepage_limits.is_empty() {
+        for (page_size, limit) in &cfg.hugepage_limits {
+            // cgroupv2: hugetlb.<size>.max; cgroupv1: hugetlb.<size>.limit_in_bytes
+            let v2_path = format!("/sys/fs/cgroup/{}/hugetlb.{}.max", name, page_size);
+            let v1_path = format!(
+                "/sys/fs/cgroup/{}/hugetlb.{}.limit_in_bytes",
+                name, page_size
+            );
+            if std::path::Path::new(&v2_path).exists() {
+                if let Err(e) = std::fs::write(&v2_path, format!("{}\n", limit)) {
+                    log::warn!("hugetlb.{}.max write failed (non-fatal): {}", page_size, e);
+                }
+            } else if std::path::Path::new(&v1_path).exists() {
+                if let Err(e) = std::fs::write(&v1_path, format!("{}\n", limit)) {
+                    log::warn!(
+                        "hugetlb.{}.limit_in_bytes write failed (non-fatal): {}",
+                        page_size,
+                        e
+                    );
+                }
+            } else {
+                log::debug!(
+                    "hugetlb.{}.max not present; hugepage limit not applied",
+                    page_size
+                );
+            }
         }
     }
 
