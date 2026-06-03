@@ -26084,3 +26084,233 @@ mod cri_phase2_security {
         );
     }
 }
+
+mod cri_phase3_compat {
+    use super::*;
+
+    /// `--no-ipc-ns` runs the container in the host IPC namespace.
+    /// Verifies CRI `namespace_options.ipc = NODE (2)` → `--no-ipc-ns` wiring (issue #313).
+    ///
+    /// Inside the container, /proc/self/status IpcNs should equal the host's IPC namespace inode.
+    #[test]
+    fn test_no_ipc_ns_shares_host_ipc() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Get the host IPC namespace inode.
+        let host_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("read host ipc ns symlink")
+            .to_string_lossy()
+            .to_string();
+
+        // Container should see the same IPC namespace inode.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--no-ipc-ns",
+                "/bin/ash",
+                "-c",
+                "readlink /proc/self/ns/ipc",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--no-ipc-ns run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let container_ipc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            container_ipc, host_ipc,
+            "--no-ipc-ns: container IPC ns ({container_ipc}) should equal host ({host_ipc})"
+        );
+    }
+
+    /// Without `--no-ipc-ns` the container gets an isolated IPC namespace.
+    /// Confirms baseline that IPC isolation works so the positive test is meaningful.
+    #[test]
+    fn test_isolated_ipc_ns_by_default() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let host_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("read host ipc ns symlink")
+            .to_string_lossy()
+            .to_string();
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "/bin/ash",
+                "-c",
+                "readlink /proc/self/ns/ipc",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let container_ipc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_ne!(
+            container_ipc, host_ipc,
+            "default run: container IPC ns should be isolated from host"
+        );
+    }
+
+    /// `--oom-score-adj N` writes N to /proc/<pid>/oom_score_adj inside the container.
+    /// Verifies CRI `resources.oom_score_adj` → `--oom-score-adj` wiring (issue #313).
+    #[test]
+    fn test_oom_score_adj_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--oom-score-adj",
+                "500",
+                "/bin/ash",
+                "-c",
+                "cat /proc/self/oom_score_adj",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--oom-score-adj failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let val: i32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse oom_score_adj");
+        assert_eq!(val, 500, "oom_score_adj should be 500, got {val}");
+    }
+
+    /// `--memory-swap` sets the combined memory+swap cgroup limit.
+    /// Verifies CRI `resources.memory_swap_limit_in_bytes` → `--memory-swap` wiring (issue #313).
+    #[test]
+    fn test_memory_swap_limit_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Check that swap cgroup accounting is available.
+        if !std::path::Path::new("/sys/fs/cgroup/memory.swap.max").exists()
+            && !std::path::Path::new("/sys/fs/cgroup/system.slice/memory.swap.max").exists()
+        {
+            eprintln!("Skipping: memory.swap.max not available in this environment");
+            return;
+        }
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-test-memswap";
+        let memory_bytes: i64 = 64 * 1024 * 1024; // 64 MiB
+        let swap_bytes: i64 = 128 * 1024 * 1024; // 128 MiB combined
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--memory",
+                &memory_bytes.to_string(),
+                "--memory-swap",
+                &swap_bytes.to_string(),
+                "/bin/sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run --detach");
+
+        assert!(
+            out.status.success(),
+            "--memory-swap run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Read state to find the cgroup path.
+        let state_path = format!("/run/pelagos/{}/state.json", name);
+        let state_json = std::fs::read_to_string(&state_path).unwrap_or_default();
+        let state: serde_json::Value = serde_json::from_str(&state_json).unwrap_or_default();
+        let cgroup_name = state["cgroup_name"].as_str().unwrap_or("").to_string();
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        if cgroup_name.is_empty() {
+            eprintln!("Skipping: cgroup not available in this environment");
+            return;
+        }
+
+        let swap_max_path = format!("/sys/fs/cgroup/{}/memory.swap.max", cgroup_name);
+        if let Ok(val) = std::fs::read_to_string(&swap_max_path) {
+            let swap_limit: i64 = val.trim().parse().unwrap_or(-1);
+            assert_eq!(
+                swap_limit, swap_bytes,
+                "memory.swap.max should be {swap_bytes} bytes, got {swap_limit}"
+            );
+        }
+    }
+}

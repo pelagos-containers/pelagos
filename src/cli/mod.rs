@@ -222,6 +222,10 @@ pub struct SpawnConfig {
     /// Saved from `--no-pid-ns`; restored by `pelagos start`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_pid_ns: bool,
+    /// When true, the container runs in the host IPC namespace (no CLONE_NEWIPC).
+    /// Saved from `--no-ipc-ns`; restored by `pelagos start`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_ipc_ns: bool,
     /// When true, the container runs in privileged mode (all caps, no seccomp).
     /// Saved from `--privileged`; restored by `pelagos start`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

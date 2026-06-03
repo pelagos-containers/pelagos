@@ -167,6 +167,14 @@ pub struct RunArgs {
     #[clap(long = "apparmor-profile", value_name = "PROFILE")]
     pub apparmor_profile: Option<String>,
 
+    /// OOM score adjustment written to /proc/<pid>/oom_score_adj (-1000 to 1000)
+    #[clap(long = "oom-score-adj", value_name = "SCORE")]
+    pub oom_score_adj: Option<i32>,
+
+    /// Combined memory+swap limit in bytes (0 = same as --memory, -1 = unlimited swap)
+    #[clap(long = "memory-swap", value_name = "BYTES")]
+    pub memory_swap: Option<i64>,
+
     /// SELinux process label to apply at container exec time
     /// (e.g. "system_u:system_r:container_t:s0")
     #[clap(long = "selinux-label", value_name = "LABEL")]
@@ -219,6 +227,11 @@ pub struct RunArgs {
     /// SPIRE agent can attest workloads via SO_PEERCRED.
     #[clap(long = "no-pid-ns")]
     pub no_pid_ns: bool,
+
+    /// Run in the host IPC namespace instead of an isolated one (hostIPC: true).
+    /// Used by pelagos-cri when namespace_options.ipc == NODE (2).
+    #[clap(long = "no-ipc-ns")]
+    pub no_ipc_ns: bool,
 
     /// Run in privileged mode: all capabilities, no seccomp filtering, /sys mounted RW.
     /// Matches Kubernetes securityContext.privileged = true.
@@ -468,6 +481,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         labels: args.label.clone(),
         tmpfs: args.tmpfs.clone(),
         no_pid_ns: args.no_pid_ns,
+        no_ipc_ns: args.no_ipc_ns,
         privileged: args.privileged,
     }
 }
@@ -592,13 +606,18 @@ fn build_image_run(
     } else {
         Namespace::PID
     };
+    let ipc_ns = if args.no_ipc_ns {
+        Namespace::empty()
+    } else {
+        Namespace::IPC
+    };
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_image_layers(layers)
-        // Add UTS (hostname isolation) + PID namespace.  Use add_namespaces so
+        // Add UTS (hostname isolation) + PID + IPC namespaces.  Use add_namespaces so
         // we OR into the flags already set by with_image_layers (MOUNT) rather
         // than replacing them.
-        .add_namespaces(Namespace::UTS | pid_ns | Namespace::IPC | Namespace::CGROUP);
+        .add_namespaces(Namespace::UTS | pid_ns | ipc_ns | Namespace::CGROUP);
 
     // Apply image config environment.  This includes any PATH set by Dockerfile
     // ENV instructions.  apply_cli_options no longer injects a fallback PATH
@@ -670,12 +689,15 @@ fn build_command(
     } else {
         Namespace::PID
     };
+    let ipc_ns = if args.no_ipc_ns {
+        Namespace::empty()
+    } else {
+        Namespace::IPC
+    };
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_chroot(rootfs_dir)
-        .with_namespaces(
-            Namespace::UTS | Namespace::MOUNT | pid_ns | Namespace::IPC | Namespace::CGROUP,
-        )
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT | pid_ns | ipc_ns | Namespace::CGROUP)
         .with_proc_mount()
         .with_dev_mount()
         // Rootfs-based runs have no image config; inject the OCI default PATH
@@ -924,7 +946,13 @@ fn apply_cli_options(
         // Disable swap for the cgroup so the memory limit acts as a hard
         // ceiling and the OOM killer fires instead of paging to swap.
         // (Matches Docker's --memory-only behaviour on systems with swap.)
-        cmd = cmd.with_cgroup_memory_swap(0);
+        // If --memory-swap is also specified it overrides this default.
+        if args.memory_swap.is_none() {
+            cmd = cmd.with_cgroup_memory_swap(0);
+        }
+    }
+    if let Some(swap) = args.memory_swap {
+        cmd = cmd.with_cgroup_memory_swap(swap);
     }
     if let Some(ref c) = args.cpus {
         let (quota, period) = parse_cpus(c)?;
@@ -935,6 +963,9 @@ fn apply_cli_options(
     }
     if let Some(pids) = args.pids_limit {
         cmd = cmd.with_cgroup_pids_limit(pids);
+    }
+    if let Some(score) = args.oom_score_adj {
+        cmd = cmd.with_oom_score_adj(score);
     }
 
     // Ulimits

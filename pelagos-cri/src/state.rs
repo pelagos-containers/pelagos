@@ -57,6 +57,10 @@ pub struct CriSandbox {
     ///   0 = POD (isolated, default), 1 = CONTAINER (isolated), 2 = NODE (host PID namespace).
     #[serde(default)]
     pub pid_namespace_mode: i32,
+    /// IPC namespace mode from namespace_options.ipc:
+    ///   0 = POD (isolated, default), 1 = CONTAINER (isolated), 2 = NODE (host IPC namespace).
+    #[serde(default)]
+    pub ipc_namespace_mode: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,6 +154,23 @@ pub struct CriContainer {
     /// Paths to bind-mount read-only inside the container.
     #[serde(default)]
     pub readonly_paths: Vec<String>,
+    /// AppArmor profile type: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
+    #[serde(default)]
+    pub apparmor_profile_type: i32,
+    /// AppArmor localhost profile name (only used when apparmor_profile_type == 2).
+    #[serde(default)]
+    pub apparmor_profile_path: String,
+    /// OOM score adjustment written to /proc/<pid>/oom_score_adj (-1000 to 1000).
+    /// i32::MIN means "not set" (field absent from proto).
+    #[serde(default = "default_oom_score_unset")]
+    pub oom_score_adj: i32,
+    /// Combined memory+swap cgroup limit in bytes (0 = not set, -1 = unlimited swap).
+    #[serde(default)]
+    pub memory_swap_limit: i64,
+}
+
+fn default_oom_score_unset() -> i32 {
+    i32::MIN
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
