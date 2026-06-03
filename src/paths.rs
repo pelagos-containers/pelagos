@@ -62,30 +62,37 @@ pub fn data_dir() -> PathBuf {
 
 /// Ephemeral runtime directory.
 ///
-/// - Root: `/run/pelagos/`
-/// - Rootless: `$XDG_RUNTIME_DIR/pelagos/` (fallback `/tmp/pelagos-<uid>/`, mode 0700)
+/// - Root (or system runtime already initialised): `/run/pelagos/`
+/// - Rootless with no system runtime: `$XDG_RUNTIME_DIR/pelagos/`
+///   (fallback `/tmp/pelagos-<uid>/`, mode 0700)
+///
+/// If `/run/pelagos/` already exists we always use it, regardless of UID —
+/// the same policy as `data_dir()`.  This ensures that `pelagos ps` (and
+/// other read-only commands) run without sudo can still see containers that
+/// were started by root.
 pub fn runtime_dir() -> PathBuf {
-    if is_rootless() {
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("pelagos");
-            }
-        }
-        let uid = unsafe { libc::getuid() };
-        let fallback = PathBuf::from(format!("/tmp/pelagos-{}", uid));
-        // Best-effort create with 0700.
-        if !fallback.exists() {
-            let _ = std::fs::create_dir_all(&fallback);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        fallback
-    } else {
-        PathBuf::from("/run/pelagos")
+    let system_dir = PathBuf::from("/run/pelagos");
+    if system_dir.exists() || !is_rootless() {
+        return system_dir;
     }
+    // Pure rootless: system runtime has never been initialised.
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("pelagos");
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    let fallback = PathBuf::from(format!("/tmp/pelagos-{}", uid));
+    // Best-effort create with 0700.
+    if !fallback.exists() {
+        let _ = std::fs::create_dir_all(&fallback);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    fallback
 }
 
 // ── Derived from data_dir() ─────────────────────────────────────────────────
@@ -302,6 +309,160 @@ pub fn sandbox_ns_name_file(id: &str) -> PathBuf {
 /// Optional human-readable name file: `<runtime>/sandboxes/<id>/name`.
 pub fn sandbox_name_file(id: &str) -> PathBuf {
     sandbox_dir(id).join("name")
+}
+
+// ── Install invariant checker ────────────────────────────────────────────────
+
+/// A single invariant violation found by [`validate_install`].
+#[derive(Debug)]
+pub struct InstallIssue {
+    pub path: std::path::PathBuf,
+    pub message: String,
+}
+
+impl std::fmt::Display for InstallIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.message)
+    }
+}
+
+/// Check that the pelagos data and runtime directories exist with the expected
+/// ownership and permissions.  Returns a list of issues; empty means all good.
+///
+/// Called at startup (after `Cli::parse()`) so that missing-dir failures surface
+/// as a clear "run sudo scripts/setup.sh" message rather than a cryptic ENOENT
+/// later in a subcommand.
+///
+/// Only checks directories that are relevant to the current UID:
+/// - Root: data dir + all subdirs + runtime dir.
+/// - Rootless (system store present): checks readability of the dirs it needs.
+pub fn validate_install() -> Vec<InstallIssue> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut issues = Vec::new();
+
+    // Look up the "pelagos" group GID once.
+    let pelagos_gid: Option<u32> = {
+        // SAFETY: getgrnam_r would be safer but nix covers it; this is a
+        // read-only lookup called before any threads are spawned.
+        let name = std::ffi::CString::new("pelagos").unwrap();
+        let grp = unsafe { libc::getgrnam(name.as_ptr()) };
+        if grp.is_null() {
+            None
+        } else {
+            Some(unsafe { (*grp).gr_gid })
+        }
+    };
+
+    // ── Data directory ────────────────────────────────────────────────────────
+
+    let data = data_dir();
+
+    if !data.exists() {
+        issues.push(InstallIssue {
+            path: data.clone(),
+            message: "does not exist — run: sudo scripts/setup.sh".into(),
+        });
+        // Nothing else can be checked without the root dir.
+        return issues;
+    }
+
+    // Subdirectories that must exist, with expected (owner_uid, group_gid, min_mode).
+    // gid=None means we don't enforce the group (e.g. root:root dirs).
+    // The mode is a minimum — extra bits are fine.
+    struct DirSpec {
+        name: &'static str,
+        expected_uid: u32,
+        expected_gid: Option<u32>, // None = pelagos group, Some(x) = exact gid
+        min_mode: u32,
+    }
+
+    let group_writable_dirs = ["images", "layers", "blobs", "build-cache"];
+    let root_only_dirs = ["volumes", "networks", "rootfs"];
+
+    let mut dir_specs: Vec<DirSpec> = group_writable_dirs
+        .iter()
+        .map(|&name| DirSpec {
+            name,
+            expected_uid: 0,
+            expected_gid: None, // pelagos group
+            min_mode: 0o2775,
+        })
+        .chain(root_only_dirs.iter().map(|&name| DirSpec {
+            name,
+            expected_uid: 0,
+            expected_gid: Some(0), // root:root
+            min_mode: 0o755,
+        }))
+        .collect();
+
+    for spec in &dir_specs {
+        let path = data.join(spec.name);
+        match std::fs::metadata(&path) {
+            Err(_) => {
+                issues.push(InstallIssue {
+                    path,
+                    message: "does not exist — run: sudo scripts/setup.sh".into(),
+                });
+            }
+            Ok(meta) => {
+                let mode = meta.mode() & 0o7777;
+                let uid = meta.uid();
+                let gid = meta.gid();
+                let expected_gid = spec.expected_gid.unwrap_or_else(|| pelagos_gid.unwrap_or(u32::MAX));
+
+                if uid != spec.expected_uid {
+                    issues.push(InstallIssue {
+                        path: path.clone(),
+                        message: format!(
+                            "owned by uid {} (expected 0) — run: sudo scripts/setup.sh",
+                            uid
+                        ),
+                    });
+                }
+                if pelagos_gid.is_some() && gid != expected_gid {
+                    issues.push(InstallIssue {
+                        path: path.clone(),
+                        message: format!(
+                            "group gid {} (expected {}) — run: sudo scripts/setup.sh",
+                            gid, expected_gid
+                        ),
+                    });
+                }
+                if mode & spec.min_mode != spec.min_mode {
+                    issues.push(InstallIssue {
+                        path,
+                        message: format!(
+                            "mode {:04o} (expected at least {:04o}) — run: sudo scripts/setup.sh",
+                            mode, spec.min_mode
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Runtime directory ─────────────────────────────────────────────────────
+
+    let runtime = PathBuf::from("/run/pelagos");
+    if runtime.exists() {
+        let containers = runtime.join("containers");
+        if !containers.exists() {
+            issues.push(InstallIssue {
+                path: containers,
+                message: "does not exist — run: sudo pelagos run (will create on first use), \
+                          or sudo mkdir -p /run/pelagos/containers"
+                    .into(),
+            });
+        }
+    }
+    // If /run/pelagos doesn't exist yet (first boot since install, no container
+    // has run as root), that's fine — it's created lazily.
+
+    // Suppress the unused variable warnings when compiling without use.
+    let _ = dir_specs;
+
+    issues
 }
 
 #[cfg(test)]

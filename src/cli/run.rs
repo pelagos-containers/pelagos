@@ -1342,6 +1342,11 @@ fn run_interactive(
     labels: std::collections::HashMap<String, String>,
     upper_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Create the state directory before spawning so that if anything fails
+    // after spawn (state write, network info gathering) the container is not
+    // left running but invisible to `pelagos ps`.
+    std::fs::create_dir_all(containers_dir())?;
+
     let session = cmd
         .spawn_interactive()
         .map_err(|e| format!("spawn_interactive failed: {}", e))?;
@@ -1362,7 +1367,6 @@ fn run_interactive(
         .collect();
     let network_ips: std::collections::HashMap<String, String> = all_ips.iter().cloned().collect();
 
-    std::fs::create_dir_all(containers_dir())?;
     let mut state = ContainerState {
         name: name.clone(),
         rootfs,

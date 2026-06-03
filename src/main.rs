@@ -490,6 +490,22 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // Validate install invariants early so missing/misconfigured directories
+    // surface as a clear "run setup.sh" message instead of a cryptic ENOENT
+    // buried inside a subcommand.  --version and --help are handled by clap
+    // before returning from parse(), so they never reach this point.
+    {
+        let issues = pelagos::paths::validate_install();
+        if !issues.is_empty() {
+            eprintln!("pelagos: installation problems detected:");
+            for issue in &issues {
+                eprintln!("  - {}", issue);
+            }
+            eprintln!("Run: sudo scripts/setup.sh");
+            std::process::exit(1);
+        }
+    }
+
     let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         // Container lifecycle
         CliCommand::Build(args) => cli::build::cmd_build(args),
