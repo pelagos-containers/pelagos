@@ -10,3 +10,9 @@ scripts/.env
 rt-results.txt
 .DS_Store
 *.org
+
+# Accidental bind-mount artifacts (e.g. slidev run from repo dir)
+node_modules/
+package-lock.json
+package.json
+slides.md
