@@ -25821,3 +25821,266 @@ mod pid_namespace {
         );
     }
 }
+
+mod cri_phase2_security {
+    use super::*;
+
+    /// `--read-only` mounts the container rootfs read-only; writes to rootfs must fail.
+    /// Verifies CRI `securityContext.readOnlyRootFilesystem = true` wiring (issue #311).
+    #[test]
+    fn test_read_only_rootfs_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // With --read-only, writing to the rootfs should fail.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--read-only",
+                "--tmpfs",
+                "/tmp",
+                "/bin/ash",
+                "-c",
+                "echo test > /etc/readonly_test && echo WROTE || echo BLOCKED",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--read-only run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("BLOCKED"),
+            "--read-only: expected write to be blocked, got: {stdout}"
+        );
+    }
+
+    /// `--security-opt no-new-privileges` sets PR_SET_NO_NEW_PRIVS; the container
+    /// must not be able to gain privileges via setuid binaries.
+    /// Verifies CRI `securityContext.noNewPrivs = true` wiring (issue #311).
+    #[test]
+    fn test_no_new_privs_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // /proc/self/status Seccomp field is not directly relevant here; instead verify
+        // that the process reports NoNewPrivs=1 in /proc/self/status.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--security-opt",
+                "no-new-privileges",
+                "/bin/ash",
+                "-c",
+                "grep NoNewPrivs /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--security-opt no-new-privileges failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let nnp_line = stdout
+            .lines()
+            .find(|l| l.starts_with("NoNewPrivs:"))
+            .expect("NoNewPrivs: line in /proc/self/status");
+        let val: u32 = nnp_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .expect("parse NoNewPrivs");
+        assert_eq!(
+            val, 1,
+            "NoNewPrivs should be 1 with --security-opt no-new-privileges, got: {nnp_line}"
+        );
+    }
+
+    /// `--security-opt seccomp=default` enables the default seccomp profile.
+    /// Verifies CRI `securityContext.seccomp.profileType = RuntimeDefault` wiring (issue #311).
+    #[test]
+    fn test_seccomp_default_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // With the default seccomp profile, a basic command should succeed.
+        // The Seccomp field in /proc/self/status: 0=disabled, 1=strict, 2=filter.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--security-opt",
+                "seccomp=default",
+                "/bin/ash",
+                "-c",
+                "grep Seccomp /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--security-opt seccomp=default failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let seccomp_line = stdout
+            .lines()
+            .find(|l| l.starts_with("Seccomp:"))
+            .expect("Seccomp: line");
+        let val: u32 = seccomp_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .expect("parse Seccomp");
+        assert_eq!(
+            val, 2,
+            "seccomp=default should set Seccomp mode 2 (filter), got: {seccomp_line}"
+        );
+    }
+
+    /// `--security-opt seccomp=none` disables seccomp filtering.
+    /// Verifies CRI `securityContext.seccomp.profileType = Unconfined` wiring (issue #311).
+    #[test]
+    fn test_seccomp_unconfined_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--security-opt",
+                "seccomp=none",
+                "/bin/ash",
+                "-c",
+                "grep Seccomp /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--security-opt seccomp=none failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let seccomp_line = stdout
+            .lines()
+            .find(|l| l.starts_with("Seccomp:"))
+            .expect("Seccomp: line");
+        let val: u32 = seccomp_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .expect("parse Seccomp");
+        assert_eq!(
+            val, 0,
+            "seccomp=none should set Seccomp mode 0 (disabled), got: {seccomp_line}"
+        );
+    }
+
+    /// `--masked-path /proc/kcore` hides the given path inside the container.
+    /// Verifies CRI `securityContext.maskedPaths` wiring (issue #311).
+    #[test]
+    fn test_masked_path_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // /proc/kcore should be masked — /dev/null (major:minor 1:3 in hex) is bind-mounted over it.
+        // stat -c '%t:%T' prints device major:minor in hex; 1:3 means /dev/null.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--masked-path",
+                "/proc/kcore",
+                "/bin/ash",
+                "-c",
+                "stat -c '%t:%T' /proc/kcore",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--masked-path run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            stdout, "1:3",
+            "--masked-path /proc/kcore: expected /dev/null (1:3) bound over it, got: {stdout}"
+        );
+    }
+}
