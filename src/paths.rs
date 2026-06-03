@@ -409,7 +409,9 @@ pub fn validate_install() -> Vec<InstallIssue> {
                 let mode = meta.mode() & 0o7777;
                 let uid = meta.uid();
                 let gid = meta.gid();
-                let expected_gid = spec.expected_gid.unwrap_or_else(|| pelagos_gid.unwrap_or(u32::MAX));
+                let expected_gid = spec
+                    .expected_gid
+                    .unwrap_or_else(|| pelagos_gid.unwrap_or(u32::MAX));
 
                 if uid != spec.expected_uid {
                     issues.push(InstallIssue {
