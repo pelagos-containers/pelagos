@@ -47,6 +47,8 @@ jobs:
         run: cargo build -p pelagos -p pelagos-dockerd -p pelagos-cri
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Initialise pelagos data directories
+        run: sudo ./scripts/setup.sh --no-user
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run integration tests

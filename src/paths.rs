@@ -358,12 +358,11 @@ pub fn validate_install() -> Vec<InstallIssue> {
 
     let data = data_dir();
 
+    // If the system data dir doesn't exist at all, this is a fresh machine or
+    // a pure-rootless environment — not a misconfiguration.  Commands that need
+    // the dir will create it or fail with a clear ENOENT.  Only validate when
+    // the dir already exists (i.e. setup.sh has been run at least once).
     if !data.exists() {
-        issues.push(InstallIssue {
-            path: data.clone(),
-            message: "does not exist — run: sudo scripts/setup.sh".into(),
-        });
-        // Nothing else can be checked without the root dir.
         return issues;
     }
 
@@ -380,7 +379,7 @@ pub fn validate_install() -> Vec<InstallIssue> {
     let group_writable_dirs = ["images", "layers", "blobs", "build-cache"];
     let root_only_dirs = ["volumes", "networks", "rootfs"];
 
-    let mut dir_specs: Vec<DirSpec> = group_writable_dirs
+    let dir_specs: Vec<DirSpec> = group_writable_dirs
         .iter()
         .map(|&name| DirSpec {
             name,
