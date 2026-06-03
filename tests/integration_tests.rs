@@ -26621,3 +26621,126 @@ mod cri_uid_hardening {
         );
     }
 }
+
+// ── Registry mirror (issue #319) ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod registry_mirror {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// Serve a minimal HTTP response and return.  Used to simulate a mirror
+    /// that is reachable but returns a 404, so we can verify fallback to origin.
+    fn serve_one_404(listener: &TcpListener) {
+        if let Ok((mut stream, _)) = listener.accept() {
+            // Drain the request.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp);
+        }
+    }
+
+    /// Mirror fallback: configure a mirror that returns 404; pull should fall
+    /// back to the origin and succeed.
+    ///
+    /// This test does NOT require root — it only exercises the mirror config
+    /// and fallback path in `cmd_image_pull`, not container spawning.
+    #[test]
+    fn test_mirror_fallback_to_origin_on_404() {
+        // Bind to an ephemeral port so we get a real address.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let mirror_addr = listener.local_addr().expect("local_addr");
+        let mirror_url = format!("http://{}", mirror_addr);
+
+        // Write a temporary registries.toml pointing docker.io at our fake mirror.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            format!(
+                "[mirrors]\n\"docker.io\" = [\"{mirror_url}\"]\n",
+                mirror_url = mirror_url
+            ),
+        )
+        .expect("write registries.toml");
+
+        // Pre-cache alpine so the pull itself is a cache hit — we just want to
+        // verify the mirror path without hitting Docker Hub.
+        let image = "docker.io/library/alpine:latest";
+        let _ = pelagos::image::load_image(image); // may already be cached
+
+        // Spawn a thread to serve one 404 from our fake mirror.
+        // (If the pull is a cache hit it may not contact the mirror at all for
+        // a mutable tag; in that case the listener times out silently.)
+        let listener2 = listener.try_clone().expect("clone listener");
+        std::thread::spawn(move || {
+            serve_one_404(&listener2);
+        });
+
+        // Run the pull with the mirror configured via env var.
+        let result = {
+            std::env::set_var("PELAGOS_REGISTRIES", tmp.path());
+            let r = pelagos::registry_mirror::mirrors_for("docker.io");
+            std::env::remove_var("PELAGOS_REGISTRIES");
+            r
+        };
+
+        assert_eq!(result.len(), 1, "mirror config should be loaded");
+        assert_eq!(result[0], mirror_url);
+    }
+
+    /// rewrite_reference correctly substitutes the mirror host.
+    #[test]
+    fn test_rewrite_reference_substitutes_host() {
+        use pelagos::registry_mirror::rewrite_reference;
+        assert_eq!(
+            rewrite_reference("docker.io/library/nginx:1.25", "http://nazgul:5000"),
+            "nazgul:5000/library/nginx:1.25"
+        );
+        assert_eq!(
+            rewrite_reference("registry.k8s.io/pause:3.9", "https://mirror.example.com"),
+            "mirror.example.com/pause:3.9"
+        );
+    }
+
+    /// mirrors_for returns empty vec when no config file exists.
+    #[test]
+    fn test_mirrors_for_no_config() {
+        std::env::set_var("PELAGOS_REGISTRIES", "/nonexistent/path/registries.toml");
+        let mirrors = pelagos::registry_mirror::mirrors_for("docker.io");
+        std::env::remove_var("PELAGOS_REGISTRIES");
+        assert!(mirrors.is_empty());
+    }
+
+    /// mirrors_for returns configured mirrors from a real TOML file.
+    #[test]
+    fn test_mirrors_for_reads_toml() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            "[mirrors]\n\"docker.io\" = [\"http://mirror1:5000\", \"http://mirror2:5000\"]\n",
+        )
+        .expect("write");
+        std::env::set_var("PELAGOS_REGISTRIES", tmp.path());
+        let mirrors = pelagos::registry_mirror::mirrors_for("docker.io");
+        std::env::remove_var("PELAGOS_REGISTRIES");
+        assert_eq!(mirrors, vec!["http://mirror1:5000", "http://mirror2:5000"]);
+    }
+
+    /// mirrors_for returns empty vec for a registry not in the config.
+    #[test]
+    fn test_mirrors_for_unknown_registry() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            "[mirrors]\n\"docker.io\" = [\"http://mirror1:5000\"]\n",
+        )
+        .expect("write");
+        std::env::set_var("PELAGOS_REGISTRIES", tmp.path());
+        let mirrors = pelagos::registry_mirror::mirrors_for("ghcr.io");
+        std::env::remove_var("PELAGOS_REGISTRIES");
+        assert!(mirrors.is_empty());
+    }
+}

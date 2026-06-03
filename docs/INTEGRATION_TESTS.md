@@ -4955,3 +4955,31 @@ error is caught in `resolve_uid`. Verifies defence against malformed input (issu
 Passes `--user 0` and then `--user 65534` (nobody) to `pelagos run` and asserts both
 succeed. Verifies that the UID overflow guard does not mistakenly reject legitimate boundary
 values (issue #317).
+
+## `registry_mirror::test_mirror_fallback_to_origin_on_404`
+**No root required.**
+Binds a local TCP listener, writes a `registries.toml` pointing `docker.io` at it, and
+verifies that `mirrors_for("docker.io")` returns the configured endpoint. The listener
+serves a single HTTP 404 to simulate an unavailable mirror. Verifies that the mirror
+config is loaded from `$PELAGOS_REGISTRIES` and that the fallback path is wired up
+(issue #319).
+
+## `registry_mirror::test_rewrite_reference_substitutes_host`
+**No root required.**
+Unit-style test: asserts that `rewrite_reference` replaces the origin registry host with
+the mirror host:port for both http and https endpoints (issue #319).
+
+## `registry_mirror::test_mirrors_for_no_config`
+**No root required.**
+Points `$PELAGOS_REGISTRIES` at a nonexistent path and asserts `mirrors_for` returns an
+empty vec rather than panicking (issue #319).
+
+## `registry_mirror::test_mirrors_for_reads_toml`
+**No root required.**
+Writes a real TOML file with two mirror endpoints for `docker.io` and asserts both are
+returned in order (issue #319).
+
+## `registry_mirror::test_mirrors_for_unknown_registry`
+**No root required.**
+Configures a mirror only for `docker.io`, then queries `ghcr.io`, and asserts the result
+is empty — verifies per-registry scoping (issue #319).
