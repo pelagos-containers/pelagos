@@ -827,18 +827,25 @@ impl RuntimeService for RuntimeSvc {
             .unwrap_or_default();
 
         // Extract resource limits from LinuxContainerConfig.
+        // oom_score_adj is int64 in the proto but the kernel range is -1000..1000 (fits i32).
+        // Treat proto value 0 as "not set" (kernel default); use i32::MIN as our sentinel.
         let (memory_limit, cpu_period, cpu_quota, cpu_shares, oom_score_adj, memory_swap_limit) =
             config
                 .linux
                 .as_ref()
                 .and_then(|l| l.resources.as_ref())
                 .map(|r| {
+                    let oom: i32 = if r.oom_score_adj == 0 {
+                        i32::MIN // not set; keep kernel default
+                    } else {
+                        r.oom_score_adj.clamp(-1000, 1000) as i32
+                    };
                     (
                         r.memory_limit_in_bytes,
                         r.cpu_period,
                         r.cpu_quota,
                         r.cpu_shares,
-                        r.oom_score_adj,
+                        oom,
                         r.memory_swap_limit_in_bytes,
                     )
                 })
