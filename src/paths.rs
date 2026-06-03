@@ -443,26 +443,13 @@ pub fn validate_install() -> Vec<InstallIssue> {
         }
     }
 
-    // ── Runtime directory ─────────────────────────────────────────────────────
+    // The runtime dir (/run/pelagos) is intentionally not checked here.
+    // It is ephemeral (tmpfs, cleared on reboot) and its subdirs (containers/,
+    // overlay-*, dns-*) are created lazily on first use.  Checking for them
+    // at startup is fragile and produces circular errors ("run pelagos run
+    // to create /run/pelagos/containers" blocks the very command that creates it).
 
-    let runtime = PathBuf::from("/run/pelagos");
-    if runtime.exists() {
-        let containers = runtime.join("containers");
-        if !containers.exists() {
-            issues.push(InstallIssue {
-                path: containers,
-                message: "does not exist — run: sudo pelagos run (will create on first use), \
-                          or sudo mkdir -p /run/pelagos/containers"
-                    .into(),
-            });
-        }
-    }
-    // If /run/pelagos doesn't exist yet (first boot since install, no container
-    // has run as root), that's fine — it's created lazily.
-
-    // Suppress the unused variable warnings when compiling without use.
     let _ = dir_specs;
-
     issues
 }
 
