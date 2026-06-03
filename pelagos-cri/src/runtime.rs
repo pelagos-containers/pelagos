@@ -860,6 +860,37 @@ impl RuntimeService for RuntimeSvc {
             .map(|a| (a.profile_type, a.localhost_ref.clone()))
             .unwrap_or((0, String::new()));
 
+        // Extract SELinux options from LinuxContainerSecurityContext.
+        let selinux_label = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|sc| sc.selinux_options.as_ref())
+            .map(|s| {
+                // Combine user:role:type:level into a single label string.
+                format!("{}:{}:{}:{}", s.user, s.role, s.type_, s.level)
+            })
+            .filter(|s| s != ":::")
+            .unwrap_or_default();
+
+        // Extract cpuset and hugepage limits from LinuxContainerResources.
+        let (cpuset_cpus, cpuset_mems, hugepage_limits) = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.as_ref())
+            .map(|r| {
+                let hugepages = r
+                    .hugepage_limits
+                    .iter()
+                    .map(|h| (h.page_size.clone(), h.limit))
+                    .collect::<Vec<_>>();
+                (r.cpuset_cpus.clone(), r.cpuset_mems.clone(), hugepages)
+            })
+            .unwrap_or_default();
+
+        // Extract stop signal from ContainerConfig.
+        let stop_signal = config.stop_signal.clone();
+
         // Identify the termination log mount.  Kubelet passes terminationMessagePath
         // (default /dev/termination-log) as a regular bind mount; after the container
         // exits we read that host-side file and return it as ContainerStatus.message.
@@ -920,6 +951,11 @@ impl RuntimeService for RuntimeSvc {
             apparmor_profile_path,
             oom_score_adj,
             memory_swap_limit,
+            cpuset_cpus,
+            cpuset_mems,
+            stop_signal,
+            hugepage_limits,
+            selinux_label,
         };
 
         {
@@ -1198,6 +1234,34 @@ impl RuntimeService for RuntimeSvc {
         };
         if sandbox_ipc_ns_mode == 2 {
             args.push("--no-ipc-ns".into());
+        }
+
+        // cpuset affinity (resources.cpuset_cpus / cpuset_mems).
+        if !container.cpuset_cpus.is_empty() {
+            args.push("--cpuset-cpus".into());
+            args.push(container.cpuset_cpus.clone());
+        }
+        if !container.cpuset_mems.is_empty() {
+            args.push("--cpuset-mems".into());
+            args.push(container.cpuset_mems.clone());
+        }
+
+        // Custom stop signal (config.stop_signal).
+        if !container.stop_signal.is_empty() {
+            args.push("--stop-signal".into());
+            args.push(container.stop_signal.clone());
+        }
+
+        // HugePage limits (resources.hugepage_limits).
+        for (page_size, limit) in &container.hugepage_limits {
+            args.push("--hugepage-limit".into());
+            args.push(format!("{}={}", page_size, limit));
+        }
+
+        // SELinux label (securityContext.selinux_options).
+        if !container.selinux_label.is_empty() {
+            args.push("--selinux-label".into());
+            args.push(container.selinux_label.clone());
         }
 
         args.push(image);

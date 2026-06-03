@@ -26314,3 +26314,167 @@ mod cri_phase3_compat {
         }
     }
 }
+
+mod cri_phase4_compat {
+    use super::*;
+
+    /// `--cpuset-cpus 0` pins the container to CPU 0.
+    /// Reads /proc/self/status Cpus_allowed_list and asserts it is "0".
+    /// Verifies CRI `resources.cpuset_cpus` → `--cpuset-cpus` wiring (issue #315).
+    #[test]
+    fn test_cpuset_cpus_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--cpuset-cpus",
+                "0",
+                "/bin/ash",
+                "-c",
+                "grep Cpus_allowed_list /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--cpuset-cpus failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("Cpus_allowed_list:"))
+            .expect("Cpus_allowed_list: in /proc/self/status");
+        let val = line.split_whitespace().nth(1).unwrap_or("").trim();
+        assert_eq!(
+            val, "0",
+            "--cpuset-cpus 0: expected Cpus_allowed_list=0, got {val}"
+        );
+    }
+
+    /// `--stop-signal SIGQUIT` causes `pelagos stop` to send SIGQUIT instead of SIGTERM.
+    /// The container traps SIGQUIT and exits with a known code to confirm the right signal arrived.
+    /// Verifies CRI `config.stop_signal` → `--stop-signal` wiring (issue #315).
+    #[test]
+    fn test_stop_signal_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let name = "pelagos-test-stopsig";
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        // Start a container that writes "QUIT" to its log when it receives SIGQUIT.
+        let start = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--stop-signal",
+                "SIGQUIT",
+                "/bin/ash",
+                "-c",
+                "trap 'echo QUIT_RECEIVED; exit 0' QUIT; while true; do sleep 0.1; done",
+            ])
+            .output()
+            .expect("pelagos run --detach");
+
+        assert!(
+            start.status.success(),
+            "detached run failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        // Give it a moment to start, then stop it (should send SIGQUIT).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+
+        // Check logs for the trap output.
+        let logs = std::process::Command::new(bin)
+            .args(["logs", name])
+            .output()
+            .expect("pelagos logs");
+        let log_output = String::from_utf8_lossy(&logs.stdout);
+
+        let _ = std::process::Command::new(bin).args(["rm", name]).output();
+
+        assert!(
+            log_output.contains("QUIT_RECEIVED"),
+            "--stop-signal SIGQUIT: expected container to receive SIGQUIT, logs: {log_output}"
+        );
+    }
+
+    /// `--selinux-label` passes the label to the container process.
+    /// On non-SELinux systems this is silently ignored; the test only asserts
+    /// the flag is accepted and the run succeeds.
+    /// Verifies CRI `securityContext.selinux_options` → `--selinux-label` wiring (issue #315).
+    #[test]
+    fn test_selinux_label_accepted_cli() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--selinux-label",
+                "system_u:system_r:container_t:s0",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        // On non-SELinux systems the label is ignored; the run should succeed.
+        assert!(
+            out.status.success(),
+            "--selinux-label rejected or crashed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

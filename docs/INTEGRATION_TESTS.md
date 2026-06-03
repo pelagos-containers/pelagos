@@ -4906,3 +4906,33 @@ Runs `pelagos run --detach --memory 64m --memory-swap 128m` and reads `memory.sw
 from the container's cgroup directory. Asserts it equals 128 MiB. Skips if
 `memory.swap.max` is not present (swap accounting disabled in kernel). Verifies CRI
 `resources.memory_swap_limit_in_bytes` → `--memory-swap` wiring (issue #313).
+
+## CRI Phase 4 Compatibility (`mod cri_phase4_compat`)
+
+### `test_cpuset_cpus_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase4_compat`
+
+Runs `pelagos run --cpuset-cpus 0` and reads `Cpus_allowed_list` from `/proc/self/status`.
+Asserts value is `"0"` (pinned to CPU 0). Verifies CRI `resources.cpuset_cpus` →
+`--cpuset-cpus` wiring (issue #315). Failure means NUMA pinning for low-latency workloads
+is silently ignored.
+
+### `test_stop_signal_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase4_compat`
+
+Starts a detached container with `--stop-signal SIGQUIT` that traps SIGQUIT and prints
+`QUIT_RECEIVED`. Calls `pelagos stop` and checks logs for the trap output. Verifies CRI
+`config.stop_signal` → `--stop-signal` wiring (issue #315). Failure means containers
+configured with custom stop signals (nginx SIGQUIT, postgres SIGINT) receive SIGTERM and
+may not shut down cleanly.
+
+### `test_selinux_label_accepted_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase4_compat`
+
+Runs `pelagos run --selinux-label system_u:system_r:container_t:s0 /bin/true`. Asserts the
+command exits successfully. On non-SELinux systems the label is silently ignored; this test
+verifies the flag is accepted and doesn't crash. Verifies CRI
+`securityContext.selinux_options` → `--selinux-label` wiring (issue #315).

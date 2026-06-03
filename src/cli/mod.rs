@@ -230,6 +230,15 @@ pub struct SpawnConfig {
     /// Saved from `--privileged`; restored by `pelagos start`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub privileged: bool,
+    /// Signal to send when stopping the container (default: SIGTERM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    /// CPUs this container may use (cpuset, e.g. "0-3,6").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset_cpus: Option<String>,
+    /// Memory nodes this container may use (cpuset, e.g. "0-1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset_mems: Option<String>,
 }
 
 /// Persisted state for a running or exited container.
