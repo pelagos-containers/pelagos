@@ -4936,3 +4936,22 @@ Runs `pelagos run --selinux-label system_u:system_r:container_t:s0 /bin/true`. A
 command exits successfully. On non-SELinux systems the label is silently ignored; this test
 verifies the flag is accepted and doesn't crash. Verifies CRI
 `securityContext.selinux_options` → `--selinux-label` wiring (issue #315).
+
+## `cri_uid_hardening::test_uid_u32_max_rejected`
+**Requires root, requires alpine-rootfs.**
+Passes `--user 4294967295` (u32::MAX = `(uid_t)-1`) to `pelagos run` and asserts the
+command exits with an error. On Linux `setuid((uid_t)-1)` returns EINVAL; in some runtime
+implementations this silently leaves the process as root (CVE-2024-40635 class). Verifies
+the UID overflow guard in `resolve_uid` (issue #317).
+
+## `cri_uid_hardening::test_negative_uid_rejected`
+**Requires root, requires alpine-rootfs.**
+Passes `--user -1` to `pelagos run` and asserts rejection. Negative UIDs are not valid on
+Linux; `u32::parse("-1")` fails and the string is not a valid `/etc/passwd` name, so the
+error is caught in `resolve_uid`. Verifies defence against malformed input (issue #317).
+
+## `cri_uid_hardening::test_valid_uid_boundary_accepted`
+**Requires root, requires alpine-rootfs.**
+Passes `--user 0` and then `--user 65534` (nobody) to `pelagos run` and asserts both
+succeed. Verifies that the UID overflow guard does not mistakenly reject legitimate boundary
+values (issue #317).

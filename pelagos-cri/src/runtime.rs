@@ -829,6 +829,21 @@ impl RuntimeService for RuntimeSvc {
             })
             .unwrap_or((None, None));
 
+        // B′ — UID overflow/validity guard.
+        // Valid Linux UIDs are 0..=4294967294. The value 4294967295 (u32::MAX) equals
+        // (uid_t)-1; setuid(-1) is a no-op on some paths, silently leaving the process
+        // as root. This is the vector behind CVE-2024-40635 / CVE-2026-46680.
+        // Negative proto values are also nonsensical — reject them too.
+        for (label, maybe_id) in [("run_as_user", run_as_user), ("run_as_group", run_as_group)] {
+            if let Some(id) = maybe_id {
+                if !(0..=4_294_967_294).contains(&id) {
+                    return Err(Status::invalid_argument(format!(
+                        "{label} value {id} is out of the valid Linux UID/GID range (0..=4294967294)"
+                    )));
+                }
+            }
+        }
+
         // Extract security context fields from LinuxContainerSecurityContext.
         let (
             cap_add,
@@ -1074,6 +1089,22 @@ impl RuntimeService for RuntimeSvc {
         } else {
             image_cmd
         };
+
+        // B″ — Effective-UID-is-zero audit log.
+        // If the container will run as root and is not explicitly privileged, warn.
+        // We cannot know the pod's runAsNonRoot intent (the CRI proto doesn't carry it),
+        // but an unexpected effective UID 0 is worth surfacing for misconfiguration diagnosis.
+        if !container.privileged {
+            let effective_uid = container.run_as_user.unwrap_or(0);
+            if effective_uid == 0 {
+                log::warn!(
+                    "container {} ({}) will run as UID 0 (root) without privileged flag; \
+                     verify this is intentional",
+                    container.id,
+                    container.name
+                );
+            }
+        }
 
         // If the pod securityContext specifies runAsUser, override the image default user.
         // This is required for projected volume permissions (e.g. serviceaccount tokens
