@@ -4837,19 +4837,18 @@ impl Command {
                     libc::close(notif_child_sock);
                 }
 
-                // Step 4.86: Drop capabilities.
+                // Step 4.86: Drop bounding capability set.
                 //
                 // MUST come after all mount operations (masked paths, readonly
                 // paths, readonly rootfs) AND namespace joins because those
                 // require CAP_SYS_ADMIN.
-                // Two-step drop (mirrors Docker / runc):
                 //
-                // 1. PR_CAPBSET_DROP — remove unwanted caps from the bounding
-                //    set so exec() cannot re-grant them.
-                // 2. capset() — explicitly set the effective, permitted, and
-                //    inheritable kernel sets to the desired mask.  Without this
-                //    step, CapEff/CapPrm remain at their current values (full
-                //    root caps) regardless of what the bounding set says.
+                // Only PR_CAPBSET_DROP is done here; capset() (which sets
+                // effective/permitted/inheritable) is deferred to step 8.6,
+                // AFTER setuid().  Reason: capset() before setuid() zeros the
+                // effective set (including CAP_SETUID), causing the subsequent
+                // setuid(non-root) to fail with EPERM.  PR_CAPBSET_DROP does
+                // not require any capability and is safe to call here.
                 if let Some(keep_caps) = capabilities {
                     const PR_CAPBSET_DROP: i32 = 24;
                     for cap in 0..41u64 {
@@ -4863,45 +4862,6 @@ impl Command {
                                 }
                             }
                         }
-                    }
-
-                    let bits = keep_caps.bits();
-                    let lo = bits as u32;
-                    let hi = (bits >> 32) as u32;
-
-                    #[repr(C)]
-                    struct CapHeader {
-                        version: u32,
-                        pid: i32,
-                    }
-                    #[repr(C)]
-                    struct CapData {
-                        effective: u32,
-                        permitted: u32,
-                        inheritable: u32,
-                    }
-
-                    let header = CapHeader {
-                        version: 0x2008_0522,
-                        pid: 0,
-                    };
-                    let data = [
-                        CapData {
-                            effective: lo,
-                            permitted: lo,
-                            inheritable: lo,
-                        },
-                        CapData {
-                            effective: hi,
-                            permitted: hi,
-                            inheritable: hi,
-                        },
-                    ];
-
-                    let ret =
-                        libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr());
-                    if ret != 0 {
-                        return Err(io::Error::last_os_error());
                     }
                 }
 
@@ -5059,9 +5019,12 @@ impl Command {
                 // When switching to a non-root UID, setuid(2) clears both the
                 // effective and ambient capability sets.  It also clears the
                 // permitted set UNLESS PR_SET_KEEPCAPS is set beforehand.
-                // Set it so that we can re-raise ambient caps afterwards.
+                // Set it whenever a capability mask is in play (either ambient
+                // caps to re-raise or an explicit cap set to apply at step 8.6).
                 // (PR_SET_KEEPCAPS is cleared automatically on exec(2).)
-                if uid.is_some_and(|u| u != 0) && !ambient_cap_numbers.is_empty() {
+                if uid.is_some_and(|u| u != 0)
+                    && (!ambient_cap_numbers.is_empty() || capabilities.is_some())
+                {
                     const PR_SET_KEEPCAPS: i32 = 8;
                     libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
                 }
@@ -5082,6 +5045,55 @@ impl Command {
                             "setuid: {}",
                             io::Error::last_os_error()
                         )));
+                    }
+                }
+
+                // Step 8.6: Apply capability set after setuid.
+                //
+                // capset() is placed here (not at step 4.86) so that setuid()
+                // still has CAP_SETUID when it runs.  PR_SET_KEEPCAPS (step 8.5)
+                // keeps the permitted set intact through the UID switch so that
+                // we can still capset to the desired mask.  When running as root
+                // (uid == None or uid == 0), setuid is skipped and capabilities
+                // are not needed for capset, so calling it here is also correct.
+                if let Some(keep_caps) = capabilities {
+                    let bits = keep_caps.bits();
+                    let lo = bits as u32;
+                    let hi = (bits >> 32) as u32;
+
+                    #[repr(C)]
+                    struct CapHeader {
+                        version: u32,
+                        pid: i32,
+                    }
+                    #[repr(C)]
+                    struct CapData {
+                        effective: u32,
+                        permitted: u32,
+                        inheritable: u32,
+                    }
+
+                    let header = CapHeader {
+                        version: 0x2008_0522,
+                        pid: 0,
+                    };
+                    let data = [
+                        CapData {
+                            effective: lo,
+                            permitted: lo,
+                            inheritable: lo,
+                        },
+                        CapData {
+                            effective: hi,
+                            permitted: hi,
+                            inheritable: hi,
+                        },
+                    ];
+
+                    let ret =
+                        libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr());
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
 
@@ -7274,8 +7286,9 @@ impl Command {
                     libc::close(notif_child_sock_i);
                 }
 
-                // Drop capabilities after all mount operations.
-                // Same logic as step 4.86 in the chroot path.
+                // Drop bounding capability set after all mount operations.
+                // capset() is deferred to step 8.6 (after setuid) — same fix
+                // as the chroot path (spawn() step 4.86).
                 if let Some(keep_caps) = capabilities {
                     const PR_CAPBSET_DROP: i32 = 24;
                     for cap in 0..41u64 {
@@ -7289,45 +7302,6 @@ impl Command {
                                 }
                             }
                         }
-                    }
-
-                    let bits = keep_caps.bits();
-                    let lo = bits as u32;
-                    let hi = (bits >> 32) as u32;
-
-                    #[repr(C)]
-                    struct CapHeader {
-                        version: u32,
-                        pid: i32,
-                    }
-                    #[repr(C)]
-                    struct CapData {
-                        effective: u32,
-                        permitted: u32,
-                        inheritable: u32,
-                    }
-
-                    let header = CapHeader {
-                        version: 0x2008_0522,
-                        pid: 0,
-                    };
-                    let data = [
-                        CapData {
-                            effective: lo,
-                            permitted: lo,
-                            inheritable: lo,
-                        },
-                        CapData {
-                            effective: hi,
-                            permitted: hi,
-                            inheritable: hi,
-                        },
-                    ];
-
-                    let ret =
-                        libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr());
-                    if ret != 0 {
-                        return Err(io::Error::last_os_error());
                     }
                 }
 
@@ -7462,7 +7436,9 @@ impl Command {
                 }
 
                 // PR_SET_KEEPCAPS: preserve permitted caps across setuid(non-root).
-                if uid.is_some_and(|u| u != 0) && !ambient_cap_numbers.is_empty() {
+                if uid.is_some_and(|u| u != 0)
+                    && (!ambient_cap_numbers.is_empty() || capabilities.is_some())
+                {
                     const PR_SET_KEEPCAPS: i32 = 8;
                     libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
                 }
@@ -7483,6 +7459,47 @@ impl Command {
                             "setuid: {}",
                             io::Error::last_os_error()
                         )));
+                    }
+                }
+
+                // Step 8.6: Apply capability set after setuid.
+                // capset() must follow setuid() — doing it before zeroes CAP_SETUID,
+                // causing setuid(non-root) to fail with EPERM.
+                if let Some(keep_caps) = capabilities {
+                    let bits = keep_caps.bits();
+                    let lo = bits as u32;
+                    let hi = (bits >> 32) as u32;
+                    #[repr(C)]
+                    struct CapHeader {
+                        version: u32,
+                        pid: i32,
+                    }
+                    #[repr(C)]
+                    struct CapData {
+                        effective: u32,
+                        permitted: u32,
+                        inheritable: u32,
+                    }
+                    let header = CapHeader {
+                        version: 0x2008_0522,
+                        pid: 0,
+                    };
+                    let data = [
+                        CapData {
+                            effective: lo,
+                            permitted: lo,
+                            inheritable: lo,
+                        },
+                        CapData {
+                            effective: hi,
+                            permitted: hi,
+                            inheritable: hi,
+                        },
+                    ];
+                    let ret =
+                        libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr());
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
 

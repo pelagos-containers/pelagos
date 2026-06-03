@@ -25498,6 +25498,64 @@ mod privileged_mode {
         );
     }
 
+    /// Regression test for issue #308: `--cap-drop ALL --user 1000` must not EINVAL.
+    ///
+    /// Root cause: capset() before setuid() zeros CAP_SETUID → setuid(non-root) fails
+    /// EPERM → surfaces as EINVAL through the spawn error pipe.
+    /// Fix: defer capset() to after setuid(); set PR_SET_KEEPCAPS beforehand.
+    #[test]
+    fn test_cap_drop_all_with_non_root_user() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // Drop ALL caps with a non-root user — must not fail with EINVAL.
+        // CapEff should be 0 (no capabilities).
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--cap-drop",
+                "ALL",
+                "--user",
+                "1000",
+                "/bin/ash",
+                "-c",
+                "grep CapEff /proc/self/status",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--cap-drop ALL --user 1000 failed (issue #308 regression): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let cap_eff_line = stdout
+            .lines()
+            .find(|l| l.starts_with("CapEff:"))
+            .expect("CapEff:");
+        let eff_val = u64::from_str_radix(cap_eff_line.split_whitespace().nth(1).unwrap(), 16)
+            .expect("parse CapEff");
+        assert_eq!(
+            eff_val, 0,
+            "--cap-drop ALL should leave zero effective caps, got {cap_eff_line}"
+        );
+    }
+
     #[test]
     fn test_memory_limit_cli() {
         if !is_root() {
