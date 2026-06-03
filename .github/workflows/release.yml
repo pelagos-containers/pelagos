@@ -266,7 +266,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Publish to crates.io
-        run: cargo publish --no-verify || cargo publish --no-verify 2>&1 | grep -q "already exists" && echo "already published, skipping"
+        run: cargo publish --no-verify --allow-dirty || cargo publish --no-verify --allow-dirty 2>&1 | grep -q "already exists" && echo "already published, skipping"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
