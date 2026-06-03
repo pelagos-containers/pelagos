@@ -97,6 +97,9 @@ fn oci_client_config(registry: &str, insecure: bool) -> oci_client::client::Clie
 // ---------------------------------------------------------------------------
 
 /// Pull an image from an OCI registry.
+///
+/// Checks `/etc/pelagos/registries.toml` (or `$PELAGOS_REGISTRIES`) for mirror
+/// endpoints and tries them in order before falling back to the origin registry.
 pub fn cmd_image_pull(
     reference: &str,
     username: Option<&str>,
@@ -104,6 +107,8 @@ pub fn cmd_image_pull(
     password_stdin: bool,
     insecure: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use pelagos::registry_mirror::{is_insecure_endpoint, mirrors_for, rewrite_reference};
+
     let full_ref = normalise_reference(reference);
     println!("Pulling {}...", full_ref);
 
@@ -111,7 +116,53 @@ pub fn cmd_image_pull(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+
+    // Determine origin registry for mirror lookup.
+    let origin_registry = full_ref
+        .parse::<oci_client::Reference>()
+        .ok()
+        .map(|r| r.resolve_registry().to_string())
+        .unwrap_or_default();
+
+    let mirrors = mirrors_for(&origin_registry);
+
     rt.block_on(async {
+        // Try each configured mirror first.
+        for mirror_endpoint in &mirrors {
+            let mirror_ref = rewrite_reference(&full_ref, mirror_endpoint);
+            let mirror_insecure = insecure || is_insecure_endpoint(mirror_endpoint);
+            log::debug!("trying mirror {} → {}", mirror_endpoint, mirror_ref);
+            match pull_image(
+                &mirror_ref,
+                reference,
+                username,
+                resolved_password.as_deref(),
+                mirror_insecure,
+            )
+            .await
+            {
+                Ok(()) => {
+                    log::info!("pulled {} via mirror {}", full_ref, mirror_endpoint);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!(
+                        "mirror {} failed for {}: {}; trying next",
+                        mirror_endpoint,
+                        full_ref,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fall back to origin.
+        if !mirrors.is_empty() {
+            log::debug!(
+                "all mirrors failed, falling back to origin for {}",
+                full_ref
+            );
+        }
         pull_image(
             &full_ref,
             reference,
