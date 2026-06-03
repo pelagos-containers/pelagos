@@ -576,6 +576,14 @@ fn resolve_gid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u
 
 fn resolve_uid(s: &str) -> Result<u32, String> {
     if let Ok(n) = s.parse::<u32>() {
+        // u32::MAX (4294967295) == (uid_t)-1; setuid(-1) is EINVAL and in some
+        // implementations silently leaves the process as root (CVE-2024-40635 class).
+        if n == u32::MAX {
+            return Err(format!(
+                "UID {} (u32::MAX) is invalid: equals (uid_t)-1, which would not change the process UID",
+                n
+            ));
+        }
         return Ok(n);
     }
     // Symbolic name: look up via getpwnam.

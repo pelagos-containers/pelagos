@@ -26478,3 +26478,146 @@ mod cri_phase4_compat {
         );
     }
 }
+
+// ── CRI UID hardening (issue #317) ──────────────────────────────────────────
+
+#[cfg(test)]
+mod cri_uid_hardening {
+    use super::*;
+
+    /// B′: run_as_user = 4294967295 (u32::MAX) must be rejected.
+    /// (uid_t)-1 causes setuid(-1) which is a no-op, leaving the process as root.
+    /// Verifies the UID overflow guard introduced for CVE-2024-40635 / CVE-2026-46680.
+    #[test]
+    fn test_uid_u32_max_rejected() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // pelagos run validates UID range; 4294967295 must be rejected.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "4294967295",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            !out.status.success(),
+            "expected UID 4294967295 to be rejected, but run succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("4294967295") || stderr.contains("invalid") || stderr.contains("range"),
+            "expected rejection message for UID 4294967295, got: {stderr}"
+        );
+    }
+
+    /// B′: run_as_user = -1 (negative) must be rejected.
+    /// Negative UIDs are not valid on Linux and indicate malformed input.
+    #[test]
+    fn test_negative_uid_rejected() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "-1",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            !out.status.success(),
+            "expected UID -1 to be rejected, but run succeeded"
+        );
+    }
+
+    /// B′: valid boundary UIDs (0 and 65534 / nobody) must be accepted.
+    #[test]
+    fn test_valid_uid_boundary_accepted() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // UID 0 is valid (root).
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "0",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+        assert!(
+            out.status.success(),
+            "UID 0 should be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // UID 65534 (nobody) is valid.
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "65534",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+        assert!(
+            out.status.success(),
+            "UID 65534 should be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
