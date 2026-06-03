@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos"
-version = "0.65.20"
+version = "0.65.22"
 dependencies = [
  "bitflags 2.11.0",
  "bzip2",

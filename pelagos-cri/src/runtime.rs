@@ -1339,6 +1339,10 @@ impl RuntimeService for RuntimeSvc {
             args.push(container.selinux_label.clone());
         }
 
+        // `--` stops clap flag parsing so that container args beginning with `-`
+        // (signal numbers, negative values, etc.) are passed through verbatim
+        // instead of being interpreted as pelagos flags (issue #322).
+        args.push("--".into());
         args.push(image);
         args.extend(effective_entrypoint);
         args.extend(effective_cmd);

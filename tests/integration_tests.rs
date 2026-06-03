@@ -26744,3 +26744,101 @@ mod registry_mirror {
         assert!(mirrors.is_empty());
     }
 }
+
+// ── Dash-prefixed container args (issue #322 / #323) ────────────────────────
+//
+// clap treats leading `-` as flag markers. Container commands like `kill -9 1`
+// or `sh -c "..."` must pass through verbatim. The `--` separator inserted
+// before the image+args in the pelagos-cri subprocess invocation stops clap
+// from interpreting them as flags.
+//
+// These tests exercise the `pelagos run` CLI path directly (not via CRI) to
+// verify the same `trailing_var_arg` / `allow_hyphen_values` wiring that the
+// CRI relies on.
+
+#[cfg(test)]
+mod dash_prefixed_args {
+    use super::*;
+
+    /// Container command with a dash-prefixed argument (`echo -n`) must not be
+    /// mistaken for a pelagos flag. Requires root + rootfs.
+    #[test]
+    fn test_dash_prefixed_arg_echo_n() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "echo",
+                "-n",
+                "hello",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "dash-prefixed arg '-n' was treated as pelagos flag: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // echo -n suppresses the trailing newline; output should be exactly "hello"
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+            "hello",
+            "unexpected stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// Container command `sh -c "kill -0 1"` — the signal number `-0` must
+    /// not be consumed as a flag by pelagos. PID 1 always exists; kill -0
+    /// just checks liveness and exits 0. Requires root + rootfs.
+    #[test]
+    fn test_dash_prefixed_signal_number() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "/bin/sh",
+                "-c",
+                "kill -0 1",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "dash-prefixed signal number '-0' was misinterpreted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

@@ -4983,3 +4983,17 @@ returned in order (issue #319).
 **No root required.**
 Configures a mirror only for `docker.io`, then queries `ghcr.io`, and asserts the result
 is empty — verifies per-registry scoping (issue #319).
+
+## `dash_prefixed_args::test_dash_prefixed_arg_echo_n`
+**Requires root and rootfs.**
+Runs `echo -n hello` inside a container and asserts that `-n` is passed to `echo` as an
+argument (suppressing the trailing newline) rather than consumed by clap as a pelagos flag.
+Verifies the `trailing_var_arg` / `allow_hyphen_values` fix for issue #322 — without the
+fix, clap rejects `-n` as an unrecognised flag and the run fails entirely.
+
+## `dash_prefixed_args::test_dash_prefixed_signal_number`
+**Requires root and rootfs.**
+Runs `/bin/sh -c "kill -0 1"` inside a container. Signal number `-0` must be passed through
+to the shell verbatim; PID 1 always exists in a container so `kill -0 1` exits 0. Verifies
+that dash-prefixed numeric arguments (common in signal-handling scripts) are not mistaken for
+pelagos CLI flags (issue #322 / #323).
