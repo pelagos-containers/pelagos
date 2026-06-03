@@ -1,0 +1,5 @@
+[mirrors]
+"docker.io"       = ["http://192.168.89.2:5000"]
+"registry.k8s.io" = ["http://192.168.89.2:5000"]
+"ghcr.io"         = ["http://192.168.89.2:5000"]
+"public.ecr.aws"  = ["http://192.168.89.2:5000"]
