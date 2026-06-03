@@ -1969,7 +1969,7 @@ fn start_port_proxies(
 /// and terminates the worker threads.
 fn start_tcp_proxies_async(
     container_ip: Ipv4Addr,
-    ipv6_container_ip: Option<Ipv6Addr>,
+    _ipv6_container_ip: Option<Ipv6Addr>,
     tcp_forwards: &[(u16, u16)],
 ) -> tokio::runtime::Runtime {
     let workers = std::thread::available_parallelism()
@@ -1989,12 +1989,13 @@ fn start_tcp_proxies_async(
         let target4 = SocketAddr::from((container_ip, container_port));
         rt.spawn(tcp_accept_loop(host_port, target4));
 
-        // IPv6 localhost proxy: [::1]:host_port → [container_ip6]:container_port
-        // External IPv6 traffic is handled by the ip6 nftables DNAT rules.
-        if let Some(ip6) = ipv6_container_ip {
-            let target6 = SocketAddr::from(SocketAddrV6::new(ip6, container_port, 0, 0));
-            rt.spawn(tcp_accept_loop_v6(host_port, target6));
-        }
+        // IPv6 loopback proxy: [::1]:host_port → container IPv4 address.
+        // Browsers resolving 'localhost' to ::1 land here; we forward to the
+        // same IPv4 target as the main proxy.  The container's ULA IPv6 address
+        // is NOT used here — most apps only bind 0.0.0.0, not :::port, so
+        // forwarding to the IPv6 container address causes a connection reset.
+        // External IPv6 traffic is handled by nftables ip6 DNAT directly.
+        rt.spawn(tcp_accept_loop_v6(host_port, target4));
     }
 
     rt
