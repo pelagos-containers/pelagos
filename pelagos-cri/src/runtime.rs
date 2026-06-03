@@ -779,8 +779,18 @@ impl RuntimeService for RuntimeSvc {
             })
             .unwrap_or((None, None));
 
-        // Extract capabilities and privileged from LinuxContainerSecurityContext.
-        let (cap_add, cap_drop, privileged) = config
+        // Extract security context fields from LinuxContainerSecurityContext.
+        let (
+            cap_add,
+            cap_drop,
+            privileged,
+            read_only_rootfs,
+            no_new_privs,
+            masked_paths,
+            readonly_paths,
+            seccomp_profile_type,
+            seccomp_profile_path,
+        ) = config
             .linux
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
@@ -790,7 +800,22 @@ impl RuntimeService for RuntimeSvc {
                     .as_ref()
                     .map(|c| (c.add_capabilities.clone(), c.drop_capabilities.clone()))
                     .unwrap_or_default();
-                (add, drop, sc.privileged)
+                let (sec_type, sec_path) = sc
+                    .seccomp
+                    .as_ref()
+                    .map(|s| (s.profile_type, s.localhost_ref.clone()))
+                    .unwrap_or((0, String::new()));
+                (
+                    add,
+                    drop,
+                    sc.privileged,
+                    sc.readonly_rootfs,
+                    sc.no_new_privs,
+                    sc.masked_paths.clone(),
+                    sc.readonly_paths.clone(),
+                    sec_type,
+                    sec_path,
+                )
             })
             .unwrap_or_default();
 
@@ -859,6 +884,12 @@ impl RuntimeService for RuntimeSvc {
             cpu_period,
             cpu_quota,
             cpu_shares,
+            read_only_rootfs,
+            seccomp_profile_type,
+            seccomp_profile_path,
+            no_new_privs,
+            masked_paths,
+            readonly_paths,
         };
 
         {
@@ -1047,6 +1078,52 @@ impl RuntimeService for RuntimeSvc {
         if container.cpu_shares > 0 {
             args.push("--cpu-shares".into());
             args.push(container.cpu_shares.to_string());
+        }
+
+        // Read-only rootfs (securityContext.readOnlyRootFilesystem).
+        if container.read_only_rootfs {
+            args.push("--read-only".into());
+        }
+
+        // No-new-privileges (securityContext.noNewPrivs).
+        if container.no_new_privs {
+            args.push("--security-opt".into());
+            args.push("no-new-privileges".into());
+        }
+
+        // Seccomp profile (securityContext.seccomp).
+        // Profile type: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
+        match container.seccomp_profile_type {
+            0 => {
+                // RuntimeDefault — use pelagos's built-in Docker-compatible seccomp profile.
+                args.push("--security-opt".into());
+                args.push("seccomp=default".into());
+            }
+            1 => {
+                // Unconfined — disable seccomp entirely.
+                args.push("--security-opt".into());
+                args.push("seccomp=none".into());
+            }
+            2 => {
+                // Localhost — use the profile file at localhost_ref.
+                if !container.seccomp_profile_path.is_empty() {
+                    args.push("--security-opt".into());
+                    args.push(format!("seccomp={}", container.seccomp_profile_path));
+                }
+            }
+            _ => {}
+        }
+
+        // Masked paths (securityContext.maskedPaths).
+        for path in &container.masked_paths {
+            args.push("--masked-path".into());
+            args.push(path.clone());
+        }
+
+        // Readonly paths (securityContext.readonlyPaths) — bind-mount RO inside the container.
+        for path in &container.readonly_paths {
+            args.push("--bind-ro".into());
+            args.push(format!("{}:{}", path, path));
         }
 
         args.push(image);

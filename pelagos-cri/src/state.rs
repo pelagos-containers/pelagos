@@ -132,6 +132,24 @@ pub struct CriContainer {
     /// CPU shares (relative weight; 0 = not specified).
     #[serde(default)]
     pub cpu_shares: i64,
+    /// Mount the container rootfs read-only (securityContext.readOnlyRootFilesystem).
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    /// Seccomp profile type: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
+    #[serde(default)]
+    pub seccomp_profile_type: i32,
+    /// Localhost seccomp profile path (only used when seccomp_profile_type == 2).
+    #[serde(default)]
+    pub seccomp_profile_path: String,
+    /// Set PR_SET_NO_NEW_PRIVS on the container process.
+    #[serde(default)]
+    pub no_new_privs: bool,
+    /// Paths to mask inside the container (e.g. /proc/kcore, /sys/firmware).
+    #[serde(default)]
+    pub masked_paths: Vec<String>,
+    /// Paths to bind-mount read-only inside the container.
+    #[serde(default)]
+    pub readonly_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

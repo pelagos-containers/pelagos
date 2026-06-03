@@ -4829,3 +4829,45 @@ and asserts:
 2. `CapEff` from `/proc/self/status` is exactly 0 (all caps dropped).
 
 Failure means the capset/setuid ordering regression has returned.
+
+## CRI Phase 2 Security Context (`mod cri_phase2_security`)
+
+### `test_read_only_rootfs_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase2_security`
+
+Runs `pelagos run --read-only --tmpfs /tmp` and attempts to write to `/etc/`. Asserts the write
+is blocked. Verifies CRI `securityContext.readOnlyRootFilesystem = true` → `--read-only` wiring
+(issue #311). Failure means kubelet-requested read-only rootfs is silently ignored.
+
+### `test_no_new_privs_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase2_security`
+
+Runs `pelagos run --security-opt no-new-privileges` and reads `NoNewPrivs` from
+`/proc/self/status`. Asserts value is 1. Verifies CRI `securityContext.noNewPrivs = true` →
+`--security-opt no-new-privileges` wiring (issue #311).
+
+### `test_seccomp_default_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase2_security`
+
+Runs `pelagos run --security-opt seccomp=default` and reads `Seccomp` from `/proc/self/status`.
+Asserts value is 2 (filter mode). Verifies CRI `securityContext.seccomp.profileType =
+RuntimeDefault` → `seccomp=default` wiring (issue #311).
+
+### `test_seccomp_unconfined_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase2_security`
+
+Runs `pelagos run --security-opt seccomp=none` and reads `Seccomp` from `/proc/self/status`.
+Asserts value is 0 (disabled). Verifies CRI `securityContext.seccomp.profileType = Unconfined`
+→ `seccomp=none` wiring (issue #311). Note: pelagos uses `none` (not `unconfined`) to disable seccomp.
+
+### `test_masked_path_cli`
+**Requires:** root, alpine-rootfs
+**Module:** `cri_phase2_security`
+
+Runs `pelagos run --masked-path /proc/kcore` and uses `stat -c '%t:%T'` to verify the device
+is `1:3` (major:minor in hex = `/dev/null`). Verifies CRI `securityContext.maskedPaths` →
+`--masked-path` wiring (issue #311). Failure means sensitive kernel paths are exposed to containers.
