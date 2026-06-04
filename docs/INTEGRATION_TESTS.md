@@ -4997,3 +4997,17 @@ Runs `/bin/sh -c "kill -0 1"` inside a container. Signal number `-0` must be pas
 to the shell verbatim; PID 1 always exists in a container so `kill -0 1` exits 0. Verifies
 that dash-prefixed numeric arguments (common in signal-handling scripts) are not mistaken for
 pelagos CLI flags (issue #322 / #323).
+
+## `dash_prefixed_args::test_oom_score_adj_negative`
+**Requires root and rootfs.**
+Runs a container with `--oom-score-adj -997` (the value k3s sets for klipper-lb pods) and
+verifies the value is accepted by clap and applied correctly (readable via
+`/proc/self/oom_score_adj`). Without `allow_hyphen_values = true` on the arg definition,
+clap parses `-997` as short flag `-9` and rejects the run. This is the actual bug that
+broke klipper-lb in v0.65.22 and was fixed in v0.65.23 (issue #323).
+
+## `dash_prefixed_args::test_memory_swap_negative_one`
+**Requires root and rootfs.**
+Runs a container with `--memory-swap -1` (kernel sentinel meaning "unlimited swap") and
+verifies the flag is accepted without clap treating `-1` as an unknown flag. Same
+`allow_hyphen_values` fix as `--oom-score-adj` (issue #323).

@@ -26841,4 +26841,88 @@ mod dash_prefixed_args {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+
+    /// --oom-score-adj with a negative value (-997 is what k3s sets for klipper-lb)
+    /// must be accepted without clap treating the leading '-' as a flag prefix.
+    /// This is the actual bug that broke klipper-lb in v0.65.22 (issue #323).
+    #[test]
+    fn test_oom_score_adj_negative() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--oom-score-adj",
+                "-997",
+                "/bin/sh",
+                "-c",
+                "cat /proc/self/oom_score_adj",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--oom-score-adj -997 was rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "-997",
+            "oom_score_adj not applied correctly"
+        );
+    }
+
+    /// --memory-swap -1 (unlimited swap) must be accepted; -1 is a valid kernel
+    /// value meaning "no swap limit" and must not be parsed as a flag.
+    #[test]
+    fn test_memory_swap_negative_one() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--memory",
+                "64m",
+                "--memory-swap",
+                "-1",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--memory-swap -1 was rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
