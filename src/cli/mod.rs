@@ -470,8 +470,16 @@ pub fn parse_user_in_layers(
         let gid = resolve_gid_in_layers(g.trim(), layer_dirs)?;
         Ok((uid, Some(gid)))
     } else if let Ok(n) = s.trim().parse::<u32>() {
+        // Numeric UID — apply the u32::MAX guard before accepting.
+        if n == u32::MAX {
+            return Err(format!(
+                "UID {} (u32::MAX) is invalid: equals (uid_t)-1, which would not change the process UID",
+                n
+            ));
+        }
         Ok((n, None))
     } else {
+        // Symbolic name — look up (uid, primary_gid) from /etc/passwd.
         lookup_user_in_layers(s.trim(), layer_dirs)
     }
 }
