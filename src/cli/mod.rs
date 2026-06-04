@@ -446,24 +446,21 @@ pub fn parse_cpus(s: &str) -> Result<(i64, u64), String> {
     Ok((quota_us, period_us))
 }
 
-/// Parse --user "1000" or "1000:1000" → `(uid, Option<gid>)`.
-/// Resolves symbolic names against the host /etc/passwd only.
-/// Use `parse_user_in_layers` when an image rootfs is available.
-pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
-    if let Some((u, g)) = s.split_once(':') {
-        let uid = resolve_uid(u.trim())?;
-        let gid = resolve_gid(g.trim())?;
-        Ok((uid, Some(gid)))
-    } else {
-        let uid = resolve_uid(s.trim())?;
-        Ok((uid, None))
-    }
+/// Resolve a `--user` string against a container rootfs directory.
+/// Convenience wrapper around `parse_user_in_layers` for a single directory
+/// (used for `--rootfs` runs and `pelagos exec` against a running container).
+pub fn parse_user_in_rootfs(
+    s: &str,
+    rootfs: &std::path::Path,
+) -> Result<(u32, Option<u32>), String> {
+    parse_user_in_layers(s, &[rootfs.to_path_buf()])
 }
 
-/// Like `parse_user`, but for image-config users: resolves symbolic names
-/// from the container's own layer stack (/etc/passwd inside the image) before
-/// falling back to the host. When a bare username is given, also returns the
-/// primary gid from the image's /etc/passwd (matching OCI spec behaviour).
+/// Resolve a `--user` string against the container's image layer stack.
+/// Searches layers last-to-first (upper wins). When a bare username is given,
+/// also returns the primary GID from `/etc/passwd` (OCI spec behaviour).
+/// Hard error if the name is not found — does NOT fall back to the host
+/// `/etc/passwd` (OCI spec §5.1: unknown username SHOULD cause start failure).
 pub fn parse_user_in_layers(
     s: &str,
     layer_dirs: &[std::path::PathBuf],
@@ -500,22 +497,22 @@ fn lookup_user_in_layers(
             }
         }
     }
-    // Fall back to host /etc/passwd.
-    use std::ffi::CString;
-    let cname = CString::new(name).map_err(|_| format!("invalid user name: {}", name))?;
-    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if pw.is_null() {
-        Err(format!(
-            "unknown user '{}': not found in container or host /etc/passwd",
-            name
-        ))
-    } else {
-        Ok(unsafe { ((*pw).pw_uid, Some((*pw).pw_gid)) })
-    }
+    Err(format!(
+        "unknown user '{}': not found in container /etc/passwd",
+        name
+    ))
 }
 
 fn resolve_uid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u32, String> {
     if let Ok(n) = s.parse::<u32>() {
+        // u32::MAX == (uid_t)-1; setuid(-1) is EINVAL and in some implementations
+        // silently leaves the process as root (CVE-2024-40635 class).
+        if n == u32::MAX {
+            return Err(format!(
+                "UID {} (u32::MAX) is invalid: equals (uid_t)-1, which would not change the process UID",
+                n
+            ));
+        }
         return Ok(n);
     }
     for layer_dir in layer_dirs.iter().rev() {
@@ -531,17 +528,10 @@ fn resolve_uid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u
             }
         }
     }
-    use std::ffi::CString;
-    let cname = CString::new(s).map_err(|_| format!("invalid user name: {}", s))?;
-    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if pw.is_null() {
-        Err(format!(
-            "unknown user '{}': not found in container or host /etc/passwd",
-            s
-        ))
-    } else {
-        Ok(unsafe { (*pw).pw_uid })
-    }
+    Err(format!(
+        "unknown user '{}': not found in container /etc/passwd",
+        s
+    ))
 }
 
 fn resolve_gid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u32, String> {
@@ -562,54 +552,10 @@ fn resolve_gid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u
             }
         }
     }
-    use std::ffi::CString;
-    let cname = CString::new(s).map_err(|_| format!("invalid group name: {}", s))?;
-    let gr = unsafe { libc::getgrnam(cname.as_ptr()) };
-    if gr.is_null() {
-        Err(format!(
-            "unknown group '{}': not found in container or host /etc/group",
-            s
-        ))
-    } else {
-        Ok(unsafe { (*gr).gr_gid })
-    }
-}
-
-fn resolve_uid(s: &str) -> Result<u32, String> {
-    if let Ok(n) = s.parse::<u32>() {
-        // u32::MAX (4294967295) == (uid_t)-1; setuid(-1) is EINVAL and in some
-        // implementations silently leaves the process as root (CVE-2024-40635 class).
-        if n == u32::MAX {
-            return Err(format!(
-                "UID {} (u32::MAX) is invalid: equals (uid_t)-1, which would not change the process UID",
-                n
-            ));
-        }
-        return Ok(n);
-    }
-    // Symbolic name: look up via getpwnam.
-    use std::ffi::CString;
-    let name = CString::new(s).map_err(|_| format!("invalid user name: {}", s))?;
-    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
-    if pw.is_null() {
-        Err(format!("unknown user '{}': not found in /etc/passwd", s))
-    } else {
-        Ok(unsafe { (*pw).pw_uid })
-    }
-}
-
-fn resolve_gid(s: &str) -> Result<u32, String> {
-    if let Ok(n) = s.parse::<u32>() {
-        return Ok(n);
-    }
-    use std::ffi::CString;
-    let name = CString::new(s).map_err(|_| format!("invalid group name: {}", s))?;
-    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
-    if gr.is_null() {
-        Err(format!("unknown group '{}': not found in /etc/group", s))
-    } else {
-        Ok(unsafe { (*gr).gr_gid })
-    }
+    Err(format!(
+        "unknown group '{}': not found in container /etc/group",
+        s
+    ))
 }
 
 /// Parse --ulimit "nofile=1024:2048" → (resource_int, soft, hard).

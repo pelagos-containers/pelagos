@@ -1,6 +1,8 @@
 //! `pelagos exec` — run a command inside a running container.
 
-use super::{check_liveness, parse_user, read_state, verify_pid_not_recycled, ContainerStatus};
+use super::{
+    check_liveness, parse_user_in_rootfs, read_state, verify_pid_not_recycled, ContainerStatus,
+};
 use pelagos::container::{Command, Namespace, Stdio};
 use pelagos::image;
 use std::os::unix::io::AsRawFd;
@@ -227,6 +229,10 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Capture workdir for use in the pre_exec callback.
     let exec_workdir = args.workdir.clone();
 
+    // Resolve the container's merged root once — used both for entering the
+    // rootfs and for /etc/passwd lookup when --user is a symbolic name.
+    let root_pid = find_root_pid(pid);
+
     if has_mount_ns {
         // Open all namespace fds in the parent (before fork) so they are
         // inherited across fork and remain valid in the child's pre_exec.
@@ -266,7 +272,7 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         // process), which never called pivot_root — so /proc/P/root is the HOST
         // root.  Use find_root_pid() to find C (P's only child), which did
         // pivot_root and whose /proc/C/root is the container overlay root.
-        let root_pid = find_root_pid(pid);
+        // root_pid is already computed above.
         let root_path = format!("/proc/{}/root", root_pid);
         let root_file =
             std::fs::File::open(&root_path).map_err(|e| format!("open {}: {}", root_path, e))?;
@@ -317,7 +323,6 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
     } else {
         // No mount namespace to join — access rootfs via procfs.
-        let root_pid = find_root_pid(pid);
         cmd = cmd.with_chroot(format!("/proc/{}/root", root_pid));
         // For non-mount-ns exec, use the normal with_cwd mechanism.
         if let Some(ref w) = exec_workdir {
@@ -340,9 +345,12 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // User
+    // User: resolve against the running container's merged filesystem
+    // (/proc/{pid}/root) so named users (e.g. "nginx", "nobody") are looked up
+    // in the image's /etc/passwd, not the host's.
     if let Some(ref u) = args.user {
-        let (uid, gid) = parse_user(u)?;
+        let container_root = std::path::PathBuf::from(format!("/proc/{}/root", root_pid));
+        let (uid, gid) = parse_user_in_rootfs(u, &container_root)?;
 
         // Validate UID against the container's user namespace uid_map before
         // attempting to spawn.  setuid(uid) inside the user namespace fails
