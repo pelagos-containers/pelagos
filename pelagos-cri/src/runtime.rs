@@ -1286,15 +1286,15 @@ impl RuntimeService for RuntimeSvc {
 
         // OOM score adjustment (resources.oom_score_adj).
         // i32::MIN sentinel means the field was absent from the proto.
+        // Use `=` form so clap does not misparse negative values as flags.
         if container.oom_score_adj != i32::MIN {
-            args.push("--oom-score-adj".into());
-            args.push(container.oom_score_adj.to_string());
+            args.push(format!("--oom-score-adj={}", container.oom_score_adj));
         }
 
         // Memory+swap combined limit (resources.memory_swap_limit_in_bytes).
+        // -1 means "unlimited swap"; use `=` form for the same reason as above.
         if container.memory_swap_limit != 0 {
-            args.push("--memory-swap".into());
-            args.push(container.memory_swap_limit.to_string());
+            args.push(format!("--memory-swap={}", container.memory_swap_limit));
         }
 
         // Host IPC namespace mode (sandbox namespace_options.ipc == 2).

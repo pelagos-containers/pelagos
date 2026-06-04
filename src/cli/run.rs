@@ -176,11 +176,15 @@ pub struct RunArgs {
     pub apparmor_profile: Option<String>,
 
     /// OOM score adjustment written to /proc/<pid>/oom_score_adj (-1000 to 1000)
-    #[clap(long = "oom-score-adj", value_name = "SCORE")]
+    #[clap(
+        long = "oom-score-adj",
+        value_name = "SCORE",
+        allow_hyphen_values = true
+    )]
     pub oom_score_adj: Option<i32>,
 
     /// Combined memory+swap limit in bytes (0 = same as --memory, -1 = unlimited swap)
-    #[clap(long = "memory-swap", value_name = "BYTES")]
+    #[clap(long = "memory-swap", value_name = "BYTES", allow_hyphen_values = true)]
     pub memory_swap: Option<i64>,
 
     /// HugePage limit: SIZE=BYTES (e.g. "2MB=1073741824", repeatable)
