@@ -5011,3 +5011,26 @@ broke klipper-lb in v0.65.22 and was fixed in v0.65.23 (issue #323).
 Runs a container with `--memory-swap -1` (kernel sentinel meaning "unlimited swap") and
 verifies the flag is accepted without clap treating `-1` as an unknown flag. Same
 `allow_hyphen_values` fix as `--oom-score-adj` (issue #323).
+
+## `image_user_resolution::test_user_root_from_image_passwd`
+**Requires root and rootfs.**
+Runs a container with `--user root` and asserts `id -u` outputs `0`. Verifies that
+symbolic user resolution uses the container's Alpine `/etc/passwd`, not the host's (issue #321).
+
+## `image_user_resolution::test_user_nobody_from_image_passwd`
+**Requires root and rootfs.**
+Runs a container with `--user nobody` and asserts UID and GID are both 65534. Verifies
+that the primary GID is also taken from `/etc/passwd` (OCI spec: bare username implies
+the passwd-defined primary group), not defaulted or inherited (issue #321).
+
+## `image_user_resolution::test_user_nonexistent_in_image_fails`
+**Requires root and rootfs.**
+Runs a container with `--user pelagos-nonexistent-user-xyzzy` and asserts the run fails
+with a "not found" error. Verifies that resolution does NOT silently fall back to the
+host `/etc/passwd` — the hard-error behaviour required by OCI spec §5.1 (issue #321).
+
+## `image_user_resolution::test_user_numeric_uid_gid`
+**Requires root and rootfs.**
+Runs a container with `--user 1234:5678` and verifies both IDs are applied correctly.
+Ensures the numeric passthrough path still works after removing the host-lookup fallback
+(issue #321).

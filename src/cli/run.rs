@@ -25,8 +25,8 @@ extern "C" fn watcher_forward_signal(signum: libc::c_int) {
 
 use super::{
     check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
-    parse_memory, parse_ulimit, parse_user, parse_user_in_layers, rootfs_path, write_state,
-    ContainerState, ContainerStatus, HealthConfig, HealthStatus, SpawnConfig,
+    parse_memory, parse_ulimit, parse_user_in_layers, parse_user_in_rootfs, rootfs_path,
+    write_state, ContainerState, ContainerStatus, HealthConfig, HealthStatus, SpawnConfig,
 };
 use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
 use pelagos::network::NetworkMode;
@@ -696,6 +696,7 @@ fn build_image_run(
     }
 
     // Apply shared CLI options (network, volumes, security, etc.)
+    // Pass layer_dirs so --user NAME is resolved against the image's /etc/passwd.
     cmd = apply_cli_options(
         cmd,
         args,
@@ -703,6 +704,7 @@ fn build_image_run(
         network_mode,
         additional_networks,
         container_name,
+        &layer_dirs,
     )?;
 
     let health_config = manifest.config.healthcheck.clone();
@@ -748,6 +750,7 @@ fn build_command(
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         );
 
+    let rootfs_layers = vec![rootfs_dir.to_path_buf()];
     cmd = apply_cli_options(
         cmd,
         args,
@@ -755,12 +758,17 @@ fn build_command(
         network_mode,
         additional_networks,
         container_name,
+        &rootfs_layers,
     )?;
     Ok(cmd)
 }
 
 /// Apply all CLI options (network, filesystem, env, security, etc.) to a Command.
 /// Shared between the rootfs path and the --image path.
+///
+/// `layer_dirs`: the container's filesystem layers (image layers or a single-element
+/// vec containing the rootfs dir). Used to resolve symbolic `--user` names against
+/// the container's own `/etc/passwd` rather than the host's.
 fn apply_cli_options(
     mut cmd: Command,
     args: &RunArgs,
@@ -768,6 +776,7 @@ fn apply_cli_options(
     network_mode: NetworkMode,
     additional_networks: &[String],
     container_name: &str,
+    layer_dirs: &[std::path::PathBuf],
 ) -> Result<Command, Box<dyn std::error::Error>> {
     // Network
     // Sandbox: when --sandbox is given, join the sandbox's NET/IPC/UTS namespaces
@@ -951,9 +960,9 @@ fn apply_cli_options(
     // unconditionally overwrites Dockerfile `ENV PATH=...` entries that were
     // already applied before apply_cli_options is called (issue #114).
 
-    // User
+    // User: resolve against the container's own /etc/passwd, not the host's.
     if let Some(ref u) = args.user {
-        let (uid, gid) = parse_user(u)?;
+        let (uid, gid) = parse_user_in_layers(u, layer_dirs)?;
         cmd = cmd.with_uid(uid);
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);

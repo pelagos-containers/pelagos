@@ -26926,3 +26926,183 @@ mod dash_prefixed_args {
         );
     }
 }
+
+// ── User resolution from image /etc/passwd (issue #321) ─────────────────────
+//
+// --user NAME must resolve against the container's /etc/passwd, not the
+// host's. Alpine's rootfs has a known set of users (root=0, nobody=65534,
+// guest=405 depending on version) that differ from typical host systems.
+// These tests verify correct UID/GID resolution and hard failure when the
+// user does not exist in the container image.
+
+#[cfg(test)]
+mod image_user_resolution {
+    use super::*;
+
+    /// --user root resolves to UID 0 from Alpine's /etc/passwd (not the host).
+    #[test]
+    fn test_user_root_from_image_passwd() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "root",
+                "/bin/sh",
+                "-c",
+                "id -u",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--user root rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "0",
+            "expected UID 0 for 'root'"
+        );
+    }
+
+    /// --user nobody resolves to UID 65534 from Alpine's /etc/passwd.
+    /// On a typical host nobody may be 65534 too but the test verifies the
+    /// container-side lookup path, not coincidental host agreement.
+    #[test]
+    fn test_user_nobody_from_image_passwd() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "nobody",
+                "/bin/sh",
+                "-c",
+                "id -u && id -g",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--user nobody rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "expected two lines of output");
+        assert_eq!(lines[0], "65534", "expected UID 65534 for nobody");
+        assert_eq!(lines[1], "65534", "expected GID 65534 for nobody");
+    }
+
+    /// --user with a name that doesn't exist in the container image must fail
+    /// with a clear error — must NOT silently fall back to the host /etc/passwd.
+    #[test]
+    fn test_user_nonexistent_in_image_fails() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "pelagos-nonexistent-user-xyzzy",
+                "/bin/true",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            !out.status.success(),
+            "expected failure for unknown user, but run succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not found"),
+            "expected 'not found' in error, got: {stderr}"
+        );
+    }
+
+    /// --user UID:GID with numeric IDs must still work (no /etc/passwd lookup needed).
+    #[test]
+    fn test_user_numeric_uid_gid() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let out = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--network",
+                "loopback",
+                "--no-pid-ns",
+                "--user",
+                "1234:5678",
+                "/bin/sh",
+                "-c",
+                "id -u && id -g",
+            ])
+            .output()
+            .expect("pelagos run");
+
+        assert!(
+            out.status.success(),
+            "--user 1234:5678 rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.trim().lines().collect();
+        assert_eq!(lines[0], "1234", "expected UID 1234");
+        assert_eq!(lines[1], "5678", "expected GID 5678");
+    }
+}
