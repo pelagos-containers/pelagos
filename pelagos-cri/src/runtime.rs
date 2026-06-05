@@ -235,7 +235,10 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
             }),
             network: None,
             process: None,
-            containers: pod_containers.iter().map(|c| build_container_stats(c)).collect(),
+            containers: pod_containers
+                .iter()
+                .map(|c| build_container_stats(c))
+                .collect(),
             io: None,
         }),
         windows: None,
