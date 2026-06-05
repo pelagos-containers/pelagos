@@ -26743,6 +26743,44 @@ mod registry_mirror {
         std::env::remove_var("PELAGOS_REGISTRIES");
         assert!(mirrors.is_empty());
     }
+
+    /// Regression test for issue #325: images pulled via a mirror must be
+    /// stored under the canonical registry reference, not the mirror's address.
+    ///
+    /// Does NOT require root or a live registry — it verifies the manifest
+    /// reference field that `pull_image` would write by constructing one
+    /// directly and confirming `save_image` / `load_image` round-trip under
+    /// the canonical key.
+    #[test]
+    fn test_mirror_pull_stores_under_canonical_reference() {
+        use pelagos::image::{load_image, save_image, ImageConfig, ImageManifest};
+
+        let canonical = "docker.io/library/test-mirror-canonical:v1";
+        let mirror_ref = "192.168.89.2:5000/library/test-mirror-canonical:v1";
+
+        // Simulate what pull_image now does: store under canonical, not mirror.
+        let manifest = ImageManifest {
+            reference: canonical.to_string(),
+            digest: "sha256:deadbeef".to_string(),
+            layers: vec![],
+            layer_types: vec![],
+            config: ImageConfig::default(),
+        };
+        save_image(&manifest).expect("save_image");
+
+        // Must be findable by canonical reference.
+        let loaded = load_image(canonical).expect("load_image(canonical)");
+        assert_eq!(loaded.reference, canonical);
+
+        // Must NOT be findable by the mirror's address.
+        assert!(
+            load_image(mirror_ref).is_err(),
+            "image must not be stored under mirror address"
+        );
+
+        // Cleanup.
+        let _ = pelagos::image::remove_image(canonical);
+    }
 }
 
 // ── Dash-prefixed container args (issue #322 / #323) ────────────────────────

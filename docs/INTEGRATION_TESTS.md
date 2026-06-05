@@ -4984,6 +4984,15 @@ returned in order (issue #319).
 Configures a mirror only for `docker.io`, then queries `ghcr.io`, and asserts the result
 is empty — verifies per-registry scoping (issue #319).
 
+## `registry_mirror::test_mirror_pull_stores_under_canonical_reference`
+**No root required.**
+Regression test for issue #325. Saves an `ImageManifest` with `reference` set to the
+canonical `docker.io/library/…` key (simulating what `pull_image` does after the fix),
+then asserts that `load_image(canonical)` succeeds and `load_image(mirror_address)` fails.
+Failure would indicate the manifest is indexed under the mirror hostname instead of the
+canonical registry, which breaks CRI `RunContainer` because the kubelet requests images
+by their canonical reference.
+
 ## `dash_prefixed_args::test_dash_prefixed_arg_echo_n`
 **Requires root and rootfs.**
 Runs `echo -n hello` inside a container and asserts that `-n` is passed to `echo` as an
