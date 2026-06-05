@@ -9,7 +9,4 @@ services:
       - /mnt/primary_storage/zot/config:/etc/zot
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5000/v2/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      test: ["NONE"]
