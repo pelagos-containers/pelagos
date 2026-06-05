@@ -1,8 +1,13 @@
 //! Centralised path resolution for all Pelagos filesystem locations.
 //!
-//! Root mode uses system directories (`/var/lib/pelagos/`, `/run/pelagos/`).
-//! Rootless mode uses per-user XDG directories (`~/.local/share/pelagos/`,
-//! `$XDG_RUNTIME_DIR/pelagos/`).
+//! **Data (images, layers, volumes):** shared between root and rootless via
+//! `/var/lib/pelagos/` (pelagos group, mode 2775).  Non-root users in the
+//! `pelagos` group can pull and read images alongside root.
+//!
+//! **Runtime (containers, networking, DNS, compose):** per-UID.  Root uses
+//! `/run/pelagos/`; rootless uses `$XDG_RUNTIME_DIR/pelagos/`.  Execution is
+//! a security boundary — non-root users cannot see root's running containers,
+//! matching the Podman/containerd model.
 
 use std::path::PathBuf;
 
@@ -60,22 +65,20 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/pelagos-data-{}", unsafe { libc::getuid() }))
 }
 
-/// Ephemeral runtime directory.
+/// Ephemeral runtime directory (per-UID).
 ///
-/// - Root (or system runtime already initialised): `/run/pelagos/`
-/// - Rootless with no system runtime: `$XDG_RUNTIME_DIR/pelagos/`
-///   (fallback `/tmp/pelagos-<uid>/`, mode 0700)
+/// - Root: `/run/pelagos/`
+/// - Rootless: `$XDG_RUNTIME_DIR/pelagos/` (fallback `/tmp/pelagos-<uid>/`, mode 0700)
 ///
-/// If `/run/pelagos/` already exists we always use it, regardless of UID —
-/// the same policy as `data_dir()`.  This ensures that `pelagos ps` (and
-/// other read-only commands) run without sudo can still see containers that
-/// were started by root.
+/// Unlike `data_dir()`, the runtime dir is **never** shared between root and
+/// non-root users.  Execution is a security boundary: a non-root user must not
+/// be able to inspect, stop, or interact with containers started by root.
+/// This matches the Podman/containerd model.
 pub fn runtime_dir() -> PathBuf {
-    let system_dir = PathBuf::from("/run/pelagos");
-    if system_dir.exists() || !is_rootless() {
-        return system_dir;
+    if !is_rootless() {
+        return PathBuf::from("/run/pelagos");
     }
-    // Pure rootless: system runtime has never been initialised.
+    // Rootless: always use the per-user XDG runtime dir.
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         if !xdg.is_empty() {
             return PathBuf::from(xdg).join("pelagos");
@@ -83,7 +86,6 @@ pub fn runtime_dir() -> PathBuf {
     }
     let uid = unsafe { libc::getuid() };
     let fallback = PathBuf::from(format!("/tmp/pelagos-{}", uid));
-    // Best-effort create with 0700.
     if !fallback.exists() {
         let _ = std::fs::create_dir_all(&fallback);
         #[cfg(unix)]
