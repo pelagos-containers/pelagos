@@ -211,7 +211,7 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
                 name: sb.name.clone(),
                 namespace: sb.namespace.clone(),
                 attempt: 0,
-                uid: String::new(),
+                uid: sb.uid.clone(),
             }),
             labels: sb.labels.clone(),
             annotations: sb.annotations.clone(),
