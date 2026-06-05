@@ -135,6 +135,7 @@ pub fn cmd_image_pull(
             match pull_image(
                 &mirror_ref,
                 reference,
+                &full_ref,
                 username,
                 resolved_password.as_deref(),
                 mirror_insecure,
@@ -166,6 +167,7 @@ pub fn cmd_image_pull(
         pull_image(
             &full_ref,
             reference,
+            &full_ref,
             username,
             resolved_password.as_deref(),
             insecure,
@@ -358,6 +360,7 @@ fn is_dockerhub_library_not_found(
 async fn pull_image(
     reference: &str,
     original_ref: &str,
+    canonical: &str,
     username: Option<&str>,
     password: Option<&str>,
     insecure: bool,
@@ -367,11 +370,12 @@ async fn pull_image(
     // For pinned (immutable) tags, skip the network entirely if the image and
     // all its layers are already in the local store. Mutable tags like `latest`
     // must always fetch the manifest to detect upstream changes.
-    if !is_mutable_tag(reference) {
-        if let Ok(existing) = load_image(reference) {
+    // Use the canonical ref so mirror-pulled images hit the cache on re-pull.
+    if !is_mutable_tag(canonical) {
+        if let Ok(existing) = load_image(canonical) {
             let all_cached = existing.layers.iter().all(|d| layer_exists(d));
             if all_cached {
-                println!("Already present: {}", reference);
+                println!("Already present: {}", canonical);
                 return Ok(());
             }
         }
@@ -482,7 +486,8 @@ async fn pull_image(
     }
 
     let img_manifest = ImageManifest {
-        reference: reference.to_string(),
+        // Always store under the canonical reference, not the mirror URL.
+        reference: canonical.to_string(),
         digest,
         layers: layer_digests,
         layer_types,
@@ -491,7 +496,7 @@ async fn pull_image(
     save_image(&img_manifest)?;
 
     // Persist the raw OCI config JSON so push can reconstruct the manifest.
-    image::save_oci_config(reference, &config_json)?;
+    image::save_oci_config(canonical, &config_json)?;
 
     println!("Done: {} layers downloaded, {} cached", downloaded, cached);
     Ok(())

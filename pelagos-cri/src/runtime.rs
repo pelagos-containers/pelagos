@@ -9,26 +9,26 @@ use crate::cri::{
     ContainerStatsResponse, ContainerStatus as CriContainerStatus, ContainerStatusRequest,
     ContainerStatusResponse, CpuUsage, CreateContainerRequest, CreateContainerResponse,
     ExecRequest, ExecResponse, ExecSyncRequest, ExecSyncResponse, FilesystemIdentifier,
-    FilesystemUsage, GetEventsRequest, ImageSpec, LinuxPodSandboxStatus, ListContainerStatsRequest,
-    ListContainerStatsResponse, ListContainersRequest, ListContainersResponse,
-    ListMetricDescriptorsRequest, ListMetricDescriptorsResponse, ListPodSandboxMetricsRequest,
-    ListPodSandboxMetricsResponse, ListPodSandboxRequest, ListPodSandboxResponse,
-    ListPodSandboxStatsRequest, ListPodSandboxStatsResponse, MemoryUsage, Namespace,
-    NamespaceOption, PodSandbox, PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState,
-    PodSandboxStatsRequest, PodSandboxStatsResponse, PodSandboxStatus as CriPodSandboxStatus,
-    PodSandboxStatusRequest, PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse,
-    RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
-    RemovePodSandboxResponse, ReopenContainerLogRequest, ReopenContainerLogResponse,
-    RuntimeCondition, RuntimeConfigRequest, RuntimeConfigResponse, RuntimeStatus,
-    StartContainerRequest, StartContainerResponse, StatusRequest, StatusResponse,
-    StopContainerRequest, StopContainerResponse, StopPodSandboxRequest, StopPodSandboxResponse,
-    StreamContainerStatsRequest, StreamContainerStatsResponse, StreamContainersRequest,
-    StreamContainersResponse, StreamPodSandboxMetricsRequest, StreamPodSandboxMetricsResponse,
-    StreamPodSandboxStatsRequest, StreamPodSandboxStatsResponse, StreamPodSandboxesRequest,
-    StreamPodSandboxesResponse, UInt64Value, UpdateContainerResourcesRequest,
-    UpdateContainerResourcesResponse, UpdatePodSandboxResourcesRequest,
-    UpdatePodSandboxResourcesResponse, UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
-    VersionRequest, VersionResponse,
+    FilesystemUsage, GetEventsRequest, ImageSpec, LinuxPodSandboxStats, LinuxPodSandboxStatus,
+    ListContainerStatsRequest, ListContainerStatsResponse, ListContainersRequest,
+    ListContainersResponse, ListMetricDescriptorsRequest, ListMetricDescriptorsResponse,
+    ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse, ListPodSandboxRequest,
+    ListPodSandboxResponse, ListPodSandboxStatsRequest, ListPodSandboxStatsResponse, MemoryUsage,
+    Namespace, NamespaceOption, PodSandbox, PodSandboxAttributes, PodSandboxMetadata,
+    PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsRequest,
+    PodSandboxStatsResponse, PodSandboxStatus as CriPodSandboxStatus, PodSandboxStatusRequest,
+    PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse, RemoveContainerRequest,
+    RemoveContainerResponse, RemovePodSandboxRequest, RemovePodSandboxResponse,
+    ReopenContainerLogRequest, ReopenContainerLogResponse, RuntimeCondition, RuntimeConfigRequest,
+    RuntimeConfigResponse, RuntimeStatus, StartContainerRequest, StartContainerResponse,
+    StatusRequest, StatusResponse, StopContainerRequest, StopContainerResponse,
+    StopPodSandboxRequest, StopPodSandboxResponse, StreamContainerStatsRequest,
+    StreamContainerStatsResponse, StreamContainersRequest, StreamContainersResponse,
+    StreamPodSandboxMetricsRequest, StreamPodSandboxMetricsResponse, StreamPodSandboxStatsRequest,
+    StreamPodSandboxStatsResponse, StreamPodSandboxesRequest, StreamPodSandboxesResponse,
+    UInt64Value, UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
+    UpdatePodSandboxResourcesRequest, UpdatePodSandboxResourcesResponse,
+    UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
 };
 use crate::invoke::run_pelagos;
 use crate::state::{
@@ -179,6 +179,66 @@ fn build_container_stats(c: &CriContainer) -> ContainerStats {
         }),
         swap: None,
         io: None,
+    }
+}
+
+fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandboxStats {
+    let ts = now_ns();
+    // Aggregate CPU and memory across all app containers in this pod.
+    // The pause process is a namespace holder that is essentially idle;
+    // reading its stats would report near-zero for the entire pod.
+    let pod_containers: Vec<&CriContainer> = containers
+        .iter()
+        .filter(|c| c.sandbox_id == sb.id)
+        .collect();
+    let (cpu_nanos, mem_bytes) = pod_containers.iter().fold((0u64, 0u64), |(cpu, mem), c| {
+        let pid = read_pelagos_container_state(&c.pelagos_name)
+            .map(|s| s.pid)
+            .unwrap_or(0);
+        if pid > 0 {
+            (
+                cpu.saturating_add(read_proc_cpu_nanos(pid)),
+                mem.saturating_add(read_proc_mem_bytes(pid)),
+            )
+        } else {
+            (cpu, mem)
+        }
+    });
+    PodSandboxStats {
+        attributes: Some(PodSandboxAttributes {
+            id: sb.id.clone(),
+            metadata: Some(PodSandboxMetadata {
+                name: sb.name.clone(),
+                namespace: sb.namespace.clone(),
+                attempt: 0,
+                uid: String::new(),
+            }),
+            labels: sb.labels.clone(),
+            annotations: sb.annotations.clone(),
+        }),
+        linux: Some(LinuxPodSandboxStats {
+            cpu: Some(CpuUsage {
+                timestamp: ts,
+                usage_core_nano_seconds: Some(UInt64Value { value: cpu_nanos }),
+                usage_nano_cores: Some(UInt64Value { value: 0 }),
+                psi: None,
+            }),
+            memory: Some(MemoryUsage {
+                timestamp: ts,
+                working_set_bytes: Some(UInt64Value { value: mem_bytes }),
+                available_bytes: None,
+                usage_bytes: Some(UInt64Value { value: mem_bytes }),
+                rss_bytes: None,
+                page_faults: None,
+                major_page_faults: None,
+                psi: None,
+            }),
+            network: None,
+            process: None,
+            containers: pod_containers.iter().map(|c| build_container_stats(c)).collect(),
+            io: None,
+        }),
+        windows: None,
     }
 }
 
@@ -1834,16 +1894,46 @@ impl RuntimeService for RuntimeSvc {
 
     async fn pod_sandbox_stats(
         &self,
-        _request: Request<PodSandboxStatsRequest>,
+        request: Request<PodSandboxStatsRequest>,
     ) -> Result<Response<PodSandboxStatsResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let sb_id = request.into_inner().pod_sandbox_id;
+        let st = self.state.inner.lock().await;
+        let sb = st
+            .sandboxes
+            .get(&sb_id)
+            .ok_or_else(|| Status::not_found(format!("sandbox not found: {}", sb_id)))?
+            .clone();
+        let containers: Vec<CriContainer> = st.containers.values().cloned().collect();
+        Ok(Response::new(PodSandboxStatsResponse {
+            stats: Some(build_sandbox_stats(&sb, &containers)),
+        }))
     }
 
     async fn list_pod_sandbox_stats(
         &self,
-        _request: Request<ListPodSandboxStatsRequest>,
+        request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let filter = request.into_inner().filter;
+        let st = self.state.inner.lock().await;
+        let containers: Vec<CriContainer> = st.containers.values().cloned().collect();
+        let stats = st
+            .sandboxes
+            .values()
+            .filter(|sb| {
+                if let Some(ref f) = filter {
+                    if !f.id.is_empty() && sb.id != f.id {
+                        return false;
+                    }
+                    if !f.label_selector.is_empty() && !labels_match(&sb.labels, &f.label_selector)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|sb| build_sandbox_stats(sb, &containers))
+            .collect();
+        Ok(Response::new(ListPodSandboxStatsResponse { stats }))
     }
 
     async fn update_runtime_config(
