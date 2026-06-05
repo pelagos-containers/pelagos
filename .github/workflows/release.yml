@@ -394,16 +394,25 @@ jobs:
           cp pkg/aur/pelagos/PKGBUILD pkg/aur/pelagos/.SRCINFO /tmp/aur-pelagos/
           cd /tmp/aur-pelagos
           git add PKGBUILD .SRCINFO
-          git diff --staged --quiet || git commit -m "upgpkg: pelagos ${VERSION}" && git push
+          if ! git diff --staged --quiet; then
+            git commit -m "upgpkg: pelagos ${VERSION}"
+            git push
+          fi
       - name: Push pelagos-bin to AUR
         run: |
           git clone ssh://aur@aur.archlinux.org/pelagos-bin.git /tmp/aur-pelagos-bin
           cp pkg/aur/pelagos-bin/PKGBUILD pkg/aur/pelagos-bin/.SRCINFO /tmp/aur-pelagos-bin/
           cd /tmp/aur-pelagos-bin
           git add PKGBUILD .SRCINFO
-          git diff --staged --quiet || git commit -m "upgpkg: pelagos-bin ${VERSION}" && git push
+          if ! git diff --staged --quiet; then
+            git commit -m "upgpkg: pelagos-bin ${VERSION}"
+            git push
+          fi
       - name: Commit updated PKGBUILDs to main repo
         run: |
           git add pkg/aur/
-          git diff --staged --quiet || \
-            git commit -m "chore(aur): update sha256sums for v${VERSION}" && git push origin HEAD:main
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(aur): update sha256sums for v${VERSION}"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
