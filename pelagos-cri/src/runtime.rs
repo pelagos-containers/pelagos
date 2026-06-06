@@ -67,12 +67,15 @@ struct PelagosContainerState {
     #[allow(dead_code)]
     name: String,
     status: String,
-    #[allow(dead_code)]
     pid: i32,
     #[allow(dead_code)]
     started_at: String,
     #[serde(default)]
     exit_code: Option<i32>,
+    /// Cgroup path stored by `pelagos run` for CPU/memory accounting.
+    /// Relative to the cgroup root (no leading `/sys/fs/cgroup`).
+    #[serde(default)]
+    cgroup_name: Option<String>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -100,6 +103,43 @@ fn now_ns() -> i64 {
 
 // Linux CLK_TCK is 100 on virtually all architectures (jiffies).
 const CLK_TCK: u64 = 100;
+
+/// Read total CPU time in nanoseconds for a container, preferring cgroup
+/// accounting over single-PID /proc/stat.
+///
+/// /proc/{pid}/stat only accounts for one process. Containers with an init
+/// wrapper (tini, dumb-init) would show near-zero CPU for the init PID while
+/// the real workload runs as a child. Cgroup CPU accounting sums all processes
+/// in the container's cgroup subtree, matching what cAdvisor reports.
+///
+/// Priority:
+///  1. cgroup v2: /sys/fs/cgroup/{cgroup_name}/cpu.stat → usage_usec
+///  2. cgroup v1: /sys/fs/cgroup/cpuacct/{cgroup_name}/cpuacct.usage
+///  3. /proc/{pid}/stat utime+stime (fallback when no cgroup path is known)
+fn read_container_cpu_nanos(pid: i32, cgroup_name: Option<&str>) -> u64 {
+    if let Some(cg) = cgroup_name {
+        // cgroup v2: cpu.stat contains "usage_usec <N>"
+        let v2_path = format!("/sys/fs/cgroup/{}/cpu.stat", cg);
+        if let Ok(data) = std::fs::read_to_string(&v2_path) {
+            for line in data.lines() {
+                if let Some(rest) = line.strip_prefix("usage_usec ") {
+                    if let Ok(usec) = rest.trim().parse::<u64>() {
+                        return usec * 1_000; // microseconds → nanoseconds
+                    }
+                }
+            }
+        }
+        // cgroup v1: cpuacct.usage is already in nanoseconds
+        let v1_path = format!("/sys/fs/cgroup/cpuacct/{}/cpuacct.usage", cg);
+        if let Ok(data) = std::fs::read_to_string(&v1_path) {
+            if let Ok(nanos) = data.trim().parse::<u64>() {
+                return nanos;
+            }
+        }
+    }
+    // Fallback: single-process /proc stat (may under-count multi-process containers)
+    read_proc_cpu_nanos(pid)
+}
 
 fn read_proc_cpu_nanos(pid: i32) -> u64 {
     let path = format!("/proc/{}/stat", pid);
@@ -135,11 +175,14 @@ fn read_proc_mem_bytes(pid: i32) -> u64 {
 
 fn build_container_stats(c: &CriContainer) -> ContainerStats {
     let ts = now_ns();
-    let pid = read_pelagos_container_state(&c.pelagos_name)
-        .map(|s| s.pid)
-        .unwrap_or(0);
-    let (cpu_nanos, mem_bytes) = if pid > 0 {
-        (read_proc_cpu_nanos(pid), read_proc_mem_bytes(pid))
+    let state = read_pelagos_container_state(&c.pelagos_name);
+    let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
+    let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
+    let (cpu_nanos, mem_bytes) = if pid > 0 || cgroup_name.is_some() {
+        (
+            read_container_cpu_nanos(pid, cgroup_name),
+            read_proc_mem_bytes(pid),
+        )
     } else {
         (0, 0)
     };
@@ -192,12 +235,12 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
         .filter(|c| c.sandbox_id == sb.id)
         .collect();
     let (cpu_nanos, mem_bytes) = pod_containers.iter().fold((0u64, 0u64), |(cpu, mem), c| {
-        let pid = read_pelagos_container_state(&c.pelagos_name)
-            .map(|s| s.pid)
-            .unwrap_or(0);
-        if pid > 0 {
+        let state = read_pelagos_container_state(&c.pelagos_name);
+        let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
+        let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
+        if pid > 0 || cgroup_name.is_some() {
             (
-                cpu.saturating_add(read_proc_cpu_nanos(pid)),
+                cpu.saturating_add(read_container_cpu_nanos(pid, cgroup_name)),
                 mem.saturating_add(read_proc_mem_bytes(pid)),
             )
         } else {
