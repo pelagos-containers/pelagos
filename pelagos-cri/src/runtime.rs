@@ -173,18 +173,66 @@ fn read_proc_mem_bytes(pid: i32) -> u64 {
     0
 }
 
+/// Read cgroup memory stats for a container.
+///
+/// Returns `(usage_bytes, working_set_bytes)` where:
+/// - `usage_bytes`       = total cgroup memory (all processes, including page cache)
+/// - `working_set_bytes` = usage minus reclaimable page cache (inactive_file),
+///                         the value metrics-server uses for HPA
+///
+/// Priority:
+///  1. cgroup v2: memory.current minus memory.stat[inactive_file]
+///  2. cgroup v1: memory.usage_in_bytes minus memory.stat[total_inactive_file]
+///  3. /proc/{pid}/status VmRSS fallback (single process only)
+fn read_container_mem_bytes(pid: i32, cgroup_name: Option<&str>) -> (u64, u64) {
+    if let Some(cg) = cgroup_name {
+        // cgroup v2
+        let v2_current = format!("/sys/fs/cgroup/{}/memory.current", cg);
+        let v2_stat = format!("/sys/fs/cgroup/{}/memory.stat", cg);
+        if let Ok(current_str) = std::fs::read_to_string(&v2_current) {
+            if let Ok(usage) = current_str.trim().parse::<u64>() {
+                let inactive_file = std::fs::read_to_string(&v2_stat)
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|l| l.starts_with("inactive_file "))
+                    .and_then(|l| l["inactive_file ".len()..].trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                let working_set = usage.saturating_sub(inactive_file);
+                return (usage, working_set);
+            }
+        }
+        // cgroup v1
+        let v1_usage = format!("/sys/fs/cgroup/memory/{}/memory.usage_in_bytes", cg);
+        let v1_stat = format!("/sys/fs/cgroup/memory/{}/memory.stat", cg);
+        if let Ok(usage_str) = std::fs::read_to_string(&v1_usage) {
+            if let Ok(usage) = usage_str.trim().parse::<u64>() {
+                let inactive_file = std::fs::read_to_string(&v1_stat)
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|l| l.starts_with("total_inactive_file "))
+                    .and_then(|l| l["total_inactive_file ".len()..].trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                let working_set = usage.saturating_sub(inactive_file);
+                return (usage, working_set);
+            }
+        }
+    }
+    // Fallback: single-process VmRSS (under-counts multi-process containers)
+    let rss = read_proc_mem_bytes(pid);
+    (rss, rss)
+}
+
 fn build_container_stats(c: &CriContainer) -> ContainerStats {
     let ts = now_ns();
     let state = read_pelagos_container_state(&c.pelagos_name);
     let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
     let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
-    let (cpu_nanos, mem_bytes) = if pid > 0 || cgroup_name.is_some() {
-        (
-            read_container_cpu_nanos(pid, cgroup_name),
-            read_proc_mem_bytes(pid),
-        )
+    let (cpu_nanos, mem_usage, mem_working_set) = if pid > 0 || cgroup_name.is_some() {
+        let cpu = read_container_cpu_nanos(pid, cgroup_name);
+        let (usage, working_set) = read_container_mem_bytes(pid, cgroup_name);
+        (cpu, usage, working_set)
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
     ContainerStats {
         attributes: Some(ContainerAttributes {
@@ -204,9 +252,11 @@ fn build_container_stats(c: &CriContainer) -> ContainerStats {
         }),
         memory: Some(MemoryUsage {
             timestamp: ts,
-            working_set_bytes: Some(UInt64Value { value: mem_bytes }),
+            working_set_bytes: Some(UInt64Value {
+                value: mem_working_set,
+            }),
             available_bytes: None,
-            usage_bytes: Some(UInt64Value { value: mem_bytes }),
+            usage_bytes: Some(UInt64Value { value: mem_usage }),
             rss_bytes: None,
             page_faults: None,
             major_page_faults: None,
@@ -234,19 +284,24 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
         .iter()
         .filter(|c| c.sandbox_id == sb.id)
         .collect();
-    let (cpu_nanos, mem_bytes) = pod_containers.iter().fold((0u64, 0u64), |(cpu, mem), c| {
-        let state = read_pelagos_container_state(&c.pelagos_name);
-        let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
-        let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
-        if pid > 0 || cgroup_name.is_some() {
-            (
-                cpu.saturating_add(read_container_cpu_nanos(pid, cgroup_name)),
-                mem.saturating_add(read_proc_mem_bytes(pid)),
-            )
-        } else {
-            (cpu, mem)
-        }
-    });
+    let (cpu_nanos, mem_usage, mem_working_set) =
+        pod_containers
+            .iter()
+            .fold((0u64, 0u64, 0u64), |(cpu, usage, ws), c| {
+                let state = read_pelagos_container_state(&c.pelagos_name);
+                let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
+                let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
+                if pid > 0 || cgroup_name.is_some() {
+                    let (mu, mws) = read_container_mem_bytes(pid, cgroup_name);
+                    (
+                        cpu.saturating_add(read_container_cpu_nanos(pid, cgroup_name)),
+                        usage.saturating_add(mu),
+                        ws.saturating_add(mws),
+                    )
+                } else {
+                    (cpu, usage, ws)
+                }
+            });
     PodSandboxStats {
         attributes: Some(PodSandboxAttributes {
             id: sb.id.clone(),
@@ -268,9 +323,11 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
             }),
             memory: Some(MemoryUsage {
                 timestamp: ts,
-                working_set_bytes: Some(UInt64Value { value: mem_bytes }),
+                working_set_bytes: Some(UInt64Value {
+                    value: mem_working_set,
+                }),
                 available_bytes: None,
-                usage_bytes: Some(UInt64Value { value: mem_bytes }),
+                usage_bytes: Some(UInt64Value { value: mem_usage }),
                 rss_bytes: None,
                 page_faults: None,
                 major_page_faults: None,

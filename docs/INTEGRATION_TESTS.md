@@ -5063,3 +5063,27 @@ host `/etc/passwd` — the hard-error behaviour required by OCI spec §5.1 (issu
 Runs a container with `--user 1234:5678` and verifies both IDs are applied correctly.
 Ensures the numeric passthrough path still works after removing the host-lookup fallback
 (issue #321).
+
+## `cgroup_mem_and_lifecycle::test_cgroup_memory_current_reflects_workload`
+**Requires root.**
+Starts a container with `--cgroup-path` and `--tmpfs /data`. After 1 s (allowing the parent
+to complete cgroup.procs placement), runs `dd if=/dev/urandom of=/data/blob bs=1M count=8`
+inside the container, then reads `memory.current` (cgroup v2) or `memory.usage_in_bytes`
+(cgroup v1) from the stored cgroup path and asserts the result is >4 MB. Failure means
+`read_container_mem_bytes` would report the launcher's VmRSS (~1 MB) instead of the actual
+workload memory, causing `kubectl top pod` to show wrong values and memory-based HPA to
+malfunction (issue #328). Also exercises the container.rs bug fix: without the
+`parent_cgroup_procs_path` non-PID-namespace fix, the container process is never placed in
+the cgroup and the memory read returns near-zero regardless of workload.
+
+## `cgroup_mem_and_lifecycle::test_exec_lifecycle_hook_patterns`
+**Requires root.**
+Starts a detached container then exercises four `pelagos exec` patterns that mirror CRI
+`ExecSync` calls made by the kubelet for lifecycle hooks: (1) `/bin/sh -c "echo ready"`
+exits 0 and captures stdout (postStart success), (2) `/bin/sh -c "exit 1"` returns exit
+code 1 exactly (postStart failure → CrashLoopBackOff), (3) `/bin/sh -c "exit 42"` returns
+42 (arbitrary exit code preservation), (4) a preStop drain pattern writes a file and
+returns 0. Failure means postStart failures would not be detected (container not killed)
+or preStop hooks would not run (no graceful drain), breaking production workloads that
+depend on lifecycle hooks for connection draining and service-mesh deregistration (issue
+#329).
