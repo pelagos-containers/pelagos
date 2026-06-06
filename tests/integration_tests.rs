@@ -26783,6 +26783,249 @@ mod registry_mirror {
     }
 }
 
+// ── cgroup-parent CPU accounting (issue #327) ────────────────────────────────
+
+#[cfg(test)]
+mod cgroup_parent_stats {
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine:3.21"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "alpine pull failed");
+    }
+
+    fn cleanup(name: &str) {
+        let b = bin();
+        let _ = std::process::Command::new(b).args(["stop", name]).output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(b)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    fn wait_for_container(name: &str, timeout_ms: u64) -> bool {
+        let b = bin();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = std::process::Command::new(b).args(["ps"]).output() {
+                if String::from_utf8_lossy(&out.stdout).contains(name) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// Verify that `--cgroup-path` places the container process in the
+    /// specified cgroup directory under /sys/fs/cgroup.
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_cgroup_path_places_container_in_cgroup() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "cg-parent-placement-test";
+        let cgroup_path = "pelagos-test-placement";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--cgroup-path",
+                cgroup_path,
+                "--",
+                "alpine",
+                "/bin/sleep",
+                "30",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+        assert!(
+            wait_for_container(name, 5_000),
+            "container did not appear in ps"
+        );
+
+        let cgroup_dir = format!("/sys/fs/cgroup/{}", cgroup_path);
+        assert!(
+            std::path::Path::new(&cgroup_dir).exists(),
+            "cgroup directory {} not created — --cgroup-path not honoured",
+            cgroup_dir
+        );
+
+        cleanup(name);
+    }
+
+    /// Verify that state.json written by `pelagos run --cgroup-path` contains
+    /// a non-null `cgroup_name` field.  The CRI reads this field to choose the
+    /// cgroup CPU accounting path over /proc/{pid}/stat.
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_cgroup_path_written_to_state_json() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "cg-parent-state-json-test";
+        let cgroup_path = "pelagos-test-state";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--cgroup-path",
+                cgroup_path,
+                "--",
+                "alpine",
+                "/bin/sleep",
+                "30",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+        assert!(
+            wait_for_container(name, 5_000),
+            "container did not appear in ps"
+        );
+
+        let state_path = pelagos::paths::containers_dir()
+            .join(name)
+            .join("state.json");
+        let state_data = std::fs::read_to_string(&state_path).expect("state.json must exist");
+        let state: serde_json::Value =
+            serde_json::from_str(&state_data).expect("state.json must be valid JSON");
+
+        let cgroup_name = state.get("cgroup_name");
+        assert!(
+            cgroup_name.is_some() && !cgroup_name.unwrap().is_null(),
+            "cgroup_name must be non-null in state.json when --cgroup-path is used; got: {:?}",
+            cgroup_name
+        );
+        let cg = cgroup_name
+            .unwrap()
+            .as_str()
+            .expect("cgroup_name is a string");
+        assert!(
+            cg.contains(cgroup_path),
+            "cgroup_name '{}' must contain the requested path '{}'",
+            cg,
+            cgroup_path
+        );
+
+        cleanup(name);
+    }
+
+    /// Verify that the cgroup CPU accounting path returns non-zero after the
+    /// container has burned CPU.  This is the code path the CRI uses for
+    /// usageCoreNanoSeconds (issue #327).
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_cgroup_cpu_accounting_nonzero_after_work() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "cg-cpu-accounting-test";
+        let cgroup_path = "pelagos-test-cpu";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--cgroup-path",
+                cgroup_path,
+                "--",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done; sleep 30",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+        assert!(
+            wait_for_container(name, 5_000),
+            "container did not appear in ps"
+        );
+
+        // Allow the CPU loop to run.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+
+        let state_path = pelagos::paths::containers_dir()
+            .join(name)
+            .join("state.json");
+        let state_data = std::fs::read_to_string(&state_path).expect("state.json");
+        let state: serde_json::Value = serde_json::from_str(&state_data).unwrap();
+        let cgroup_name = state["cgroup_name"]
+            .as_str()
+            .expect("cgroup_name must be present in state.json");
+
+        let v2_path = format!("/sys/fs/cgroup/{}/cpu.stat", cgroup_name);
+        let v1_path = format!("/sys/fs/cgroup/cpuacct/{}/cpuacct.usage", cgroup_name);
+
+        let cpu_nanos: u64 = if let Ok(data) = std::fs::read_to_string(&v2_path) {
+            data.lines()
+                .find(|l| l.starts_with("usage_usec "))
+                .and_then(|l| l["usage_usec ".len()..].trim().parse::<u64>().ok())
+                .map(|usec| usec * 1_000)
+                .unwrap_or(0)
+        } else if let Ok(data) = std::fs::read_to_string(&v1_path) {
+            data.trim().parse::<u64>().unwrap_or(0)
+        } else {
+            panic!(
+                "neither cgroup v2 ({}) nor v1 ({}) path found",
+                v2_path, v1_path
+            );
+        };
+
+        assert!(
+            cpu_nanos > 0,
+            "cgroup CPU accounting must return >0 ns after CPU work; \
+             got 0 — cgroup_name='{}' v2='{}'",
+            cgroup_name,
+            v2_path
+        );
+
+        cleanup(name);
+    }
+}
+
 // ── Dash-prefixed container args (issue #322 / #323) ────────────────────────
 //
 // clap treats leading `-` as flag markers. Container commands like `kill -9 1`

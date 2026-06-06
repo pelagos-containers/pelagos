@@ -4984,6 +4984,26 @@ returned in order (issue #319).
 Configures a mirror only for `docker.io`, then queries `ghcr.io`, and asserts the result
 is empty — verifies per-registry scoping (issue #319).
 
+## `cgroup_parent_stats::test_cgroup_path_places_container_in_cgroup`
+**Requires root.**
+Runs a detached container with `--cgroup-path pelagos-test-placement` and asserts that
+`/sys/fs/cgroup/pelagos-test-placement` exists. Failure means `--cgroup-path` is not
+honoured or the cgroup is not created, so the CRI cgroup CPU path has nothing to read.
+
+## `cgroup_parent_stats::test_cgroup_path_written_to_state_json`
+**Requires root.**
+Runs a detached container with `--cgroup-path` and asserts `cgroup_name` in `state.json`
+is non-null and contains the requested path. Failure means `PelagosContainerState.cgroup_name`
+deserializes as `None`, causing `read_container_cpu_nanos` to fall back to `/proc/{pid}/stat`
+(returns 0 for init-wrapper containers), breaking `usageCoreNanoSeconds` (issue #327).
+
+## `cgroup_parent_stats::test_cgroup_cpu_accounting_nonzero_after_work`
+**Requires root.**
+Starts a CPU-burning container, waits 1.5 s, reads `cpu.stat usage_usec` (cgroup v2) or
+`cpuacct.usage` (cgroup v1) from the path in `state.json`, and asserts the result is >0 ns.
+This is the exact path `read_container_cpu_nanos` uses in the CRI. Failure means
+`usageCoreNanoSeconds` is 0 in `ListContainerStats`, breaking HPA (issue #327).
+
 ## `registry_mirror::test_mirror_pull_stores_under_canonical_reference`
 **No root required.**
 Regression test for issue #325. Saves an `ImageManifest` with `reference` set to the
