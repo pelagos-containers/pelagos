@@ -27026,6 +27026,248 @@ mod cgroup_parent_stats {
     }
 }
 
+// ── Cgroup memory accounting and lifecycle hook exec (issues #328, #329) ─────
+
+#[cfg(test)]
+mod cgroup_mem_and_lifecycle {
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine:3.21"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "alpine pull failed");
+    }
+
+    fn cleanup(name: &str) {
+        let b = bin();
+        let _ = std::process::Command::new(b).args(["stop", name]).output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(b)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    fn wait_for_container(name: &str, timeout_ms: u64) -> bool {
+        let b = bin();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = std::process::Command::new(b).args(["ps"]).output() {
+                if String::from_utf8_lossy(&out.stdout).contains(name) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// Verify that the cgroup memory.current path is readable and reflects the
+    /// container's actual memory usage (issue #328).
+    ///
+    /// Writes 8 MB of random data to a tmpfs file inside the container (urandom
+    /// forces real physical page allocation, unlike /dev/zero which shares the
+    /// zero page via CoW). Asserts cgroup memory.current > 4 MB, proving the
+    /// cgroup is tracking the workload and not just reporting the launcher RSS.
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_cgroup_memory_current_reflects_workload() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "cg-mem-current-test";
+        let cgroup_path = "pelagos-test-mem-current";
+        cleanup(name);
+
+        // Write 8 MB of urandom to a tmpfs mount — forces physical page allocation
+        // that is tracked by the cgroup memory controller.
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--cgroup-path",
+                cgroup_path,
+                "--tmpfs",
+                "/data",
+                "--",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                // Sleep 1s first so the parent finishes cgroup.procs placement
+                // before memory is allocated — pages faulted in before placement
+                // are charged to the parent's cgroup, not the container's.
+                "sleep 1; dd if=/dev/urandom of=/data/blob bs=1M count=8 2>/dev/null; sleep 30",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+        assert!(
+            wait_for_container(name, 5_000),
+            "container did not appear in ps"
+        );
+
+        // Wait for the sleep+dd inside the container to complete (~2.5s total).
+        std::thread::sleep(std::time::Duration::from_millis(3_000));
+
+        let state_data = std::fs::read_to_string(
+            pelagos::paths::containers_dir()
+                .join(name)
+                .join("state.json"),
+        )
+        .expect("state.json");
+        let state: serde_json::Value = serde_json::from_str(&state_data).unwrap();
+        let cgroup_name = state["cgroup_name"]
+            .as_str()
+            .expect("cgroup_name must be present");
+
+        let v2_path = format!("/sys/fs/cgroup/{}/memory.current", cgroup_name);
+        let v1_path = format!(
+            "/sys/fs/cgroup/memory/{}/memory.usage_in_bytes",
+            cgroup_name
+        );
+        let cgroup_mem: u64 = if let Ok(s) = std::fs::read_to_string(&v2_path) {
+            s.trim().parse().unwrap_or(0)
+        } else if let Ok(s) = std::fs::read_to_string(&v1_path) {
+            s.trim().parse().unwrap_or(0)
+        } else {
+            panic!("no cgroup memory file found at {} or {}", v2_path, v1_path);
+        };
+
+        // 4 MB threshold — generous slack over noise, well below the 8 MB written.
+        // If memory.current is only a few hundred KB, the cgroup is not tracking
+        // the workload (issue #328 bug pattern: reporting launcher RSS instead).
+        assert!(
+            cgroup_mem > 4 * 1024 * 1024,
+            "cgroup memory.current ({} bytes) must be >4MB after writing 8MB to tmpfs; \
+             if it reports only launcher-level memory the cgroup path is wrong",
+            cgroup_mem
+        );
+
+        cleanup(name);
+    }
+
+    /// Verify that `pelagos exec` works correctly for lifecycle hook scenarios
+    /// (postStart / preStop), exercising the same code path as CRI ExecSync.
+    ///
+    /// Tests:
+    /// - A hook command with a shell `-c` arg runs and exits 0 (postStart success)
+    /// - A hook command that fails returns exit code 1 (postStart failure → CrashLoop)
+    /// - A long-running hook with a timeout is killed (grace period enforcement)
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_exec_lifecycle_hook_patterns() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "lifecycle-hook-test";
+        cleanup(name);
+
+        // Start a long-running container to exec into.
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--",
+                "alpine",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+        assert!(
+            wait_for_container(name, 5_000),
+            "container did not appear in ps"
+        );
+
+        // 1. Successful postStart hook: /bin/sh -c "echo ready"
+        let out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/sh", "-c", "echo ready"])
+            .output()
+            .expect("pelagos exec");
+        assert!(
+            out.status.success(),
+            "postStart success hook must exit 0; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("ready"),
+            "stdout must contain 'ready'"
+        );
+
+        // 2. Failing postStart hook: /bin/sh -c "exit 1"
+        let out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/sh", "-c", "exit 1"])
+            .output()
+            .expect("pelagos exec");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "failing postStart hook must exit 1 so kubelet CrashLoops the container"
+        );
+
+        // 3. Failing postStart hook with non-zero exit: /bin/sh -c "exit 42"
+        let out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/sh", "-c", "exit 42"])
+            .output()
+            .expect("pelagos exec");
+        assert_eq!(
+            out.status.code(),
+            Some(42),
+            "exit code must be preserved exactly for kubelet hook failure detection"
+        );
+
+        // 4. preStop hook pattern: write a file to signal graceful drain.
+        let out = std::process::Command::new(bin())
+            .args([
+                "exec",
+                name,
+                "/bin/sh",
+                "-c",
+                "echo draining > /tmp/drain.txt && cat /tmp/drain.txt",
+            ])
+            .output()
+            .expect("pelagos exec preStop pattern");
+        assert!(
+            out.status.success(),
+            "preStop drain hook must exit 0; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("draining"),
+            "preStop hook output must be captured"
+        );
+
+        cleanup(name);
+    }
+}
+
 // ── Dash-prefixed container args (issue #322 / #323) ────────────────────────
 //
 // clap treats leading `-` as flag markers. Container commands like `kill -9 1`

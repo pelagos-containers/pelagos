@@ -3500,12 +3500,17 @@ impl Command {
             .as_ref()
             .and_then(|c| c.path.as_ref())
             .is_some();
-        let parent_cgroup_procs_path: Option<String> =
-            if namespaces.contains(Namespace::PID) && has_explicit_cgroup_path {
-                pre_cgroup_procs_path.clone()
-            } else {
-                None
-            };
+        // For explicit cgroup paths the parent always writes cgroup.procs after
+        // spawn, regardless of PID namespace.  For PID-namespace containers the
+        // grandchild can't write its host PID from within the new CGROUP namespace;
+        // for non-PID containers the parent write is still correct (it uses the
+        // direct child PID which is the host-namespace PID).  Generated cgroup
+        // names (no explicit path) are written by the child in pre_exec instead.
+        let parent_cgroup_procs_path: Option<String> = if has_explicit_cgroup_path {
+            pre_cgroup_procs_path.clone()
+        } else {
+            None
+        };
 
         // Install our combined pre_exec hook
         unsafe {
@@ -6179,12 +6184,11 @@ impl Command {
             .as_ref()
             .and_then(|c| c.path.as_ref())
             .is_some();
-        let parent_cgroup_procs_path_i: Option<String> =
-            if namespaces.contains(Namespace::PID) && has_explicit_cgroup_path_i {
-                pre_cgroup_procs_path_i.clone()
-            } else {
-                None
-            };
+        let parent_cgroup_procs_path_i: Option<String> = if has_explicit_cgroup_path_i {
+            pre_cgroup_procs_path_i.clone()
+        } else {
+            None
+        };
 
         unsafe {
             self.inner.pre_exec(move || {
