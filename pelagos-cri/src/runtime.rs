@@ -618,9 +618,30 @@ impl RuntimeService for RuntimeSvc {
                 }
             };
 
+            let net_arg = format!("--net={}", netns_path);
+
+            // Bring the loopback interface up in the sandbox netns.  The CNI
+            // spec requires a loopback plugin in the chain, but k3s/Flannel
+            // omit it.  Without this, lo stays DOWN and all intra-pod 127.0.0.1
+            // traffic fails — breaking the sidecar pattern (issue #331).
+            match tokio::process::Command::new("nsenter")
+                .args([net_arg.as_str(), "--", "ip", "link", "set", "lo", "up"])
+                .output()
+                .await
+            {
+                Ok(out) if !out.status.success() => {
+                    log::warn!(
+                        "bring lo up in {}: {}",
+                        ns_name,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                Err(e) => log::warn!("nsenter lo up in {}: {}", ns_name, e),
+                _ => {}
+            }
+
             // Allow non-root container processes (e.g. coredns running as "nonroot") to
             // bind privileged ports inside this netns.  This matches containerd's default.
-            let net_arg = format!("--net={}", netns_path);
             match tokio::process::Command::new("nsenter")
                 .args([
                     net_arg.as_str(),
