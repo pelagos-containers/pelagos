@@ -5087,3 +5087,20 @@ returns 0. Failure means postStart failures would not be detected (container not
 or preStop hooks would not run (no graceful drain), breaking production workloads that
 depend on lifecycle hooks for connection draining and service-mesh deregistration (issue
 #329).
+
+## `exec_netns_and_loopback::test_exec_joins_container_net_namespace`
+**Requires root.**
+Starts a container with `--network loopback` (separate NET namespace), reads the container
+main process's `/proc/self/ns/net` inode from the host, then runs `pelagos exec readlink
+/proc/self/ns/net` and asserts the exec'd process is in the same NET namespace as the
+container (not the host). Failure means `discover_namespaces` was called on the intermediate
+process P (host netns) rather than the actual container process G — the root cause of
+issue #332 where `kubectl exec` showed host interfaces (`eno1`, `cni0`) instead of the
+pod's `eth0`.
+
+## `exec_netns_and_loopback::test_loopback_is_up_in_net_namespace_container`
+**Requires root.**
+Starts a container with `--network loopback`, runs `ip link show lo` inside via exec, and
+asserts the output contains `UP` and that `127.0.0.1` is assigned. Failure means
+`bring_up_loopback()` was not called during sandbox netns setup — the root cause of
+issue #331 where intra-pod `127.0.0.1` traffic failed and the sidecar pattern was broken.

@@ -27629,3 +27629,227 @@ mod image_user_resolution {
         assert_eq!(lines[1], "5678", "expected GID 5678");
     }
 }
+
+// ── exec netns join + loopback UP (issues #331, #332) ────────────────────────
+
+#[cfg(test)]
+mod exec_netns_and_loopback {
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine") {
+            return;
+        }
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine:3.21"])
+            .status()
+            .expect("pull alpine");
+        assert!(status.success(), "alpine pull failed");
+    }
+
+    fn cleanup(name: &str) {
+        let b = bin();
+        let _ = std::process::Command::new(b).args(["stop", name]).output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(b)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    fn wait_running(name: &str, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = std::process::Command::new(bin()).args(["ps"]).output() {
+                if String::from_utf8_lossy(&out.stdout).contains(name) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// pelagos exec on a container with --network loopback (separate NET
+    /// namespace) must exec the process inside the container's NET namespace,
+    /// not the host's (issue #332).
+    ///
+    /// For PID-namespace containers, state.pid is the intermediate process P
+    /// which lives in the host netns.  discover_namespaces(find_root_pid(P))
+    /// finds the actual container process G and its sandbox netns.  Without
+    /// the fix, exec'd processes were in the host netns (wrong inode).
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_exec_joins_container_net_namespace() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "exec-netns-test";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--network",
+                "loopback",
+                "--",
+                "alpine",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "container start failed");
+        assert!(wait_running(name, 5_000), "container not in ps");
+
+        // Read the container's net ns inode from its main process.
+        let state_data = std::fs::read_to_string(
+            pelagos::paths::containers_dir()
+                .join(name)
+                .join("state.json"),
+        )
+        .expect("state.json");
+        let state: serde_json::Value = serde_json::from_str(&state_data).unwrap();
+        let container_pid = state["pid"].as_i64().unwrap_or(0) as i32;
+        assert!(container_pid > 0, "container pid must be non-zero");
+
+        // find_root_pid: if container_pid has exactly one child, use that child.
+        // That child is the actual container process in the sandbox netns.
+        let root_pid: i32 = {
+            let children_path = format!("/proc/{}/task/{}/children", container_pid, container_pid);
+            if let Ok(s) = std::fs::read_to_string(&children_path) {
+                let ch: Vec<i32> = s
+                    .split_whitespace()
+                    .filter_map(|x| x.parse().ok())
+                    .collect();
+                if ch.len() == 1 {
+                    ch[0]
+                } else {
+                    container_pid
+                }
+            } else {
+                container_pid
+            }
+        };
+
+        let container_net_inode = std::fs::read_link(format!("/proc/{}/ns/net", root_pid))
+            .expect("readlink container netns");
+        let host_net_inode = std::fs::read_link("/proc/1/ns/net").expect("readlink host netns");
+
+        // Sanity: the container must be in a DIFFERENT netns than the host.
+        assert_ne!(
+            container_net_inode, host_net_inode,
+            "container with --network loopback must have its own NET namespace"
+        );
+
+        // Run readlink /proc/self/ns/net inside the container via exec.
+        let exec_out = std::process::Command::new(bin())
+            .args(["exec", name, "readlink", "/proc/self/ns/net"])
+            .output()
+            .expect("pelagos exec");
+        assert!(
+            exec_out.status.success(),
+            "exec failed: {}",
+            String::from_utf8_lossy(&exec_out.stderr)
+        );
+        let exec_inode_str = String::from_utf8_lossy(&exec_out.stdout).trim().to_string();
+
+        assert_eq!(
+            exec_inode_str,
+            container_net_inode.to_string_lossy(),
+            "exec'd process must be in the container's NET namespace ({}), \
+             not the host ({}) — issue #332",
+            container_net_inode.display(),
+            host_net_inode.display()
+        );
+
+        cleanup(name);
+    }
+
+    /// The loopback interface inside a container with --network loopback must
+    /// be UP so that 127.0.0.1 is reachable (issue #331).
+    ///
+    /// In the CRI path the fix is an nsenter call after cni_add.  Here we
+    /// verify the CLI path (bring_up_loopback via ioctl) which exercises the
+    /// same kernel-level result: lo must be UP and 127.0.0.1 must be assigned.
+    ///
+    /// Requires root. Uses alpine image.
+    #[test]
+    fn test_loopback_is_up_in_net_namespace_container() {
+        if !is_root() {
+            eprintln!("SKIP: requires root");
+            return;
+        }
+        ensure_alpine();
+        let name = "loopback-up-test";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--network",
+                "loopback",
+                "--",
+                "alpine",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "container start failed");
+        assert!(wait_running(name, 5_000), "container not in ps");
+
+        // ip link show lo: the flags field contains UP when the interface is
+        // administratively up.  When lo is down the flags show <LOOPBACK> only.
+        let link_out = std::process::Command::new(bin())
+            .args(["exec", name, "ip", "link", "show", "lo"])
+            .output()
+            .expect("exec ip link show lo");
+        assert!(
+            link_out.status.success(),
+            "exec ip link show lo failed: {}",
+            String::from_utf8_lossy(&link_out.stderr)
+        );
+        let link_str = String::from_utf8_lossy(&link_out.stdout);
+        assert!(
+            link_str.contains("UP"),
+            "lo must be UP (got '{}') — issue #331; \
+             if this shows <LOOPBACK> without UP, bring_up_loopback was not called",
+            link_str.trim()
+        );
+
+        // Also verify 127.0.0.1 is assigned.
+        let addr_out = std::process::Command::new(bin())
+            .args(["exec", name, "ip", "addr", "show", "lo"])
+            .output()
+            .expect("exec ip addr show lo");
+        let addr_str = String::from_utf8_lossy(&addr_out.stdout);
+        assert!(
+            addr_str.contains("127.0.0.1"),
+            "lo must have 127.0.0.1 assigned; got: {}",
+            addr_str
+        );
+
+        cleanup(name);
+    }
+}

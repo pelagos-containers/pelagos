@@ -74,8 +74,13 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     //     race before we silently enter the wrong process's namespaces.
     verify_pid_not_recycled(pid, &state).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // 2b. Discover which namespaces the container has
-    let ns_entries = discover_namespaces(pid)?;
+    // 2b. Discover which namespaces the container has.
+    // Use find_root_pid(pid) rather than pid directly: for PID-namespace
+    // containers state.pid is the intermediate process P (host netns), while
+    // the actual container process G = P's sole child lives in the sandbox
+    // netns.  discover_namespaces(G) correctly picks up NET/UTS/IPC, while
+    // falling back to pid itself for non-PID-namespace containers (issue #332).
+    let ns_entries = discover_namespaces(find_root_pid(pid))?;
 
     // 3. Build the base environment for the exec'd process.
     //
@@ -460,7 +465,8 @@ pub fn exec_in_container(pid: i32, args: &[String]) -> Option<bool> {
         return None;
     }
 
-    let ns_entries = discover_namespaces(pid).ok()?;
+    let root_pid_inner = find_root_pid(pid);
+    let ns_entries = discover_namespaces(root_pid_inner).ok()?;
     // If we can't discover any namespaces the container is probably gone.
     // But allow proceeding (ns_entries may be empty if no namespaces differ).
 
@@ -537,7 +543,7 @@ pub fn exec_in_container_with_pid_sink(
         return None;
     }
 
-    let ns_entries = discover_namespaces(pid).ok()?;
+    let ns_entries = discover_namespaces(find_root_pid(pid)).ok()?;
 
     let mut cmd = Command::new(&args[0]).args(&args[1..]);
     cmd = cmd
