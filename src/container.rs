@@ -859,6 +859,71 @@ pub struct BindMount {
     pub readonly: bool,
 }
 
+/// Resolve a mount destination path within the container rootfs, following any
+/// symlinks encountered along the way — the same handling containerd and CRI-O
+/// apply when realizing mounts.
+///
+/// Mainstream base images (Alpine, Debian, Ubuntu) ship `/var/run` as a symlink
+/// to `/run`.  A naive `root.join("var/run/secrets/...")` would land the bind
+/// mount inside (or on top of) the symlink rather than at the real path the
+/// container process resolves to (`/run/secrets/...`), silently dropping the
+/// mount — most visibly the projected Kubernetes ServiceAccount token, which
+/// breaks `rest.InClusterConfig()` (see issue #334).
+///
+/// Resolution rules, confined to `root` so a symlink can never escape the rootfs:
+/// - absolute symlink targets are reinterpreted relative to `root`;
+/// - `..` is clamped at `root`;
+/// - resolution stops at the first component that does not yet exist, so a
+///   not-yet-created leaf directory is returned unresolved for the caller to
+///   `mkdir` (its already-existing symlinked parents are still resolved);
+/// - a finite link budget guards against symlink loops.
+fn resolve_mount_target_in_root(root: &std::path::Path, target: &std::path::Path) -> PathBuf {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let to_queue = |p: &std::path::Path| -> Vec<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                // RootDir / CurDir / Prefix carry no path segment to resolve.
+                _ => None,
+            })
+            .collect()
+    };
+
+    let mut pending: VecDeque<OsString> = to_queue(target).into();
+    let mut resolved = PathBuf::new(); // relative to `root`
+    let mut link_budget = 40u32;
+
+    while let Some(comp) = pending.pop_front() {
+        if comp == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&comp);
+        match std::fs::read_link(root.join(&candidate)) {
+            Ok(link) if link_budget > 0 => {
+                link_budget -= 1;
+                // An absolute target restarts from the rootfs; a relative one is
+                // resolved against the symlink's parent (`resolved`, since we
+                // have not appended `comp`).
+                if link.is_absolute() {
+                    resolved = PathBuf::new();
+                }
+                for seg in to_queue(&link).into_iter().rev() {
+                    pending.push_front(seg);
+                }
+            }
+            // Not a symlink, does not exist, or budget exhausted: accept it.
+            _ => resolved = candidate,
+        }
+    }
+
+    root.join(resolved)
+}
+
 /// A tmpfs mount inside the container.
 #[derive(Debug, Clone)]
 pub struct TmpfsMount {
@@ -4467,9 +4532,11 @@ impl Command {
                     // (chroot has not happened yet).
                     for bm in &bind_mounts {
                         use std::os::unix::ffi::OsStrExt as _;
-                        // Target inside the effective root on the host side
-                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
-                        let host_target = effective_root.join(rel);
+                        // Target inside the effective root on the host side, with any
+                        // symlinked parent dirs in the image rootfs resolved (e.g.
+                        // /var/run -> /run) so the bind lands where the container
+                        // process resolves the path. See issue #334.
+                        let host_target = resolve_mount_target_in_root(effective_root, &bm.target);
                         // Linux requires the mount target to exist and be the same type
                         // (file or directory) as the source.
                         if bm.source.is_dir() {
@@ -6994,8 +7061,9 @@ impl Command {
                     // (chroot has not happened yet).
                     for bm in &bind_mounts {
                         use std::os::unix::ffi::OsStrExt as _;
-                        let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
-                        let host_target = effective_root.join(rel);
+                        // Resolve symlinked parents in the image rootfs (e.g.
+                        // /var/run -> /run) before binding. See issue #334.
+                        let host_target = resolve_mount_target_in_root(effective_root, &bm.target);
                         if bm.source.is_dir() {
                             std::fs::create_dir_all(&host_target).map_err(|e| {
                                 io::Error::other(format!("bind mount mkdir: {}", e))
@@ -8280,6 +8348,65 @@ pub struct DeviceNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_mount_target_follows_var_run_symlink() {
+        // Image rootfs where /var/run is a symlink to /run (Alpine/Debian/Ubuntu).
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("run")).unwrap();
+        std::fs::create_dir_all(root.path().join("var")).unwrap();
+        std::os::unix::fs::symlink("/run", root.path().join("var/run")).unwrap();
+
+        // The SA-token destination must resolve through the symlink to the real
+        // /run/secrets/... path, not land inside the var/run symlink.
+        let resolved = resolve_mount_target_in_root(
+            root.path(),
+            std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount"),
+        );
+        assert_eq!(
+            resolved,
+            root.path().join("run/secrets/kubernetes.io/serviceaccount")
+        );
+    }
+
+    #[test]
+    fn test_resolve_mount_target_relative_symlink() {
+        // A relative symlink resolves against its own parent directory.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.path().join("link")).unwrap();
+
+        let resolved =
+            resolve_mount_target_in_root(root.path(), std::path::Path::new("/link/data"));
+        assert_eq!(resolved, root.path().join("real/data"));
+    }
+
+    #[test]
+    fn test_resolve_mount_target_no_symlink_passthrough() {
+        // Plain directory destinations are unchanged (leading slash stripped).
+        let root = tempfile::tempdir().unwrap();
+        let resolved = resolve_mount_target_in_root(root.path(), std::path::Path::new("/data/sub"));
+        assert_eq!(resolved, root.path().join("data/sub"));
+    }
+
+    #[test]
+    fn test_resolve_mount_target_parent_clamped_at_root() {
+        // `..` components cannot escape the rootfs.
+        let root = tempfile::tempdir().unwrap();
+        let resolved =
+            resolve_mount_target_in_root(root.path(), std::path::Path::new("/../../etc/passwd"));
+        assert_eq!(resolved, root.path().join("etc/passwd"));
+    }
+
+    #[test]
+    fn test_resolve_mount_target_symlink_loop_terminates() {
+        // A symlink cycle must not hang; resolution gives up via the link budget.
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/b", root.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("/a", root.path().join("b")).unwrap();
+        // Should return without looping forever (exact value unimportant).
+        let _ = resolve_mount_target_in_root(root.path(), std::path::Path::new("/a/x"));
+    }
 
     #[test]
     fn test_namespace_bitflags_combination() {

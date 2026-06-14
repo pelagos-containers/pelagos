@@ -5104,3 +5104,20 @@ Starts a container with `--network loopback`, runs `ip link show lo` inside via 
 asserts the output contains `UP` and that `127.0.0.1` is assigned. Failure means
 `bring_up_loopback()` was not called during sandbox netns setup — the root cause of
 issue #331 where intra-pod `127.0.0.1` traffic failed and the sidecar pattern was broken.
+
+## `issue_334_symlinked_mount_dest::test_bind_mount_resolves_symlinked_parent`
+**Requires root and the alpine-rootfs.**
+Builds an isolated `cp -a` copy of the alpine rootfs whose `/var/run` is rewritten to an
+**absolute** symlink to `/run` — exactly how mainstream OCI base images (alpine:3.20,
+debian-slim, ubuntu) ship it. A host directory standing in for the projected Kubernetes
+ServiceAccount token volume is bind-mounted at
+`/var/run/secrets/kubernetes.io/serviceaccount`, then the container `cat`s the token back
+through that path and the test asserts the exact contents are returned. Failure (empty
+stdout or a `cat` error) means the bind destination was not resolved through the image's
+`/var/run -> /run` symlink, so the mount was dropped or escaped the rootfs — the root cause
+of issue #334, where in-cluster `rest.InClusterConfig()` broke for any controller built on
+an Alpine/Debian/Ubuntu base (e.g. `rancher/local-path-provisioner` crashlooping). An
+absolute symlink is used deliberately: a relative `../run` symlink happens to stay inside
+the rootfs and would mask the bug. Complemented by the `container::tests::resolve_mount_target_*`
+unit tests, which pin the path-resolution logic (symlink following, relative targets,
+`..` clamping, loop termination) without requiring root.
