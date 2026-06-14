@@ -10,6 +10,7 @@ use crate::cri::{
 use crate::invoke::run_pelagos;
 use crate::state::AppState;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 
@@ -63,66 +64,210 @@ async fn dir_disk_usage(path: &str) -> u64 {
     0
 }
 
+/// Count inodes (files + directories) under a path via `du --inodes -s`.
+async fn count_inodes(path: &str) -> u64 {
+    let out = tokio::process::Command::new("du")
+        .args(["--inodes", "-s", path])
+        .output()
+        .await;
+    if let Ok(o) = out {
+        if o.status.success() {
+            if let Ok(s) = std::str::from_utf8(&o.stdout) {
+                if let Some(n) = s.split_whitespace().next() {
+                    return n.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Current time in nanoseconds since the Unix epoch (for CRI timestamps).
+fn now_ns() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+}
+
+/// A single on-disk image entry (one per stored reference/tag), enriched with the
+/// content-addressable **config digest** that identifies the image regardless of
+/// which tag or registry it was pulled under.
+struct StoredImage {
+    /// The stored reference, e.g. `"docker.io/library/alpine:3.20"`.
+    reference: String,
+    /// The OCI **manifest** digest (registry-specific; goes in repo_digests).
+    manifest_digest: String,
+    /// The OCI **config** digest — the stable image id (matches containerd).
+    config_digest: String,
+    /// Layer digests, for size computation.
+    layers: Vec<String>,
+    /// OCI config `User`.
+    user: String,
+}
+
+/// Lock serializing RemoveImage so concurrent removals of the same image don't
+/// race (critest "should not fail on simultaneous RemoveImage calls").
+fn remove_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// The repository part of a reference, with any `:tag` or `@digest` suffix
+/// stripped. e.g. `docker.io/library/alpine:3.20` -> `docker.io/library/alpine`.
+fn repo_of(reference: &str) -> &str {
+    let base = reference.split('@').next().unwrap_or(reference);
+    // A ':' is a tag separator only when it comes after the last '/', so a
+    // registry host:port (e.g. `localhost:5000/img`) is not mistaken for a tag.
+    match base.rfind('/') {
+        Some(slash) => match base[slash..].find(':') {
+            Some(colon) => &base[..slash + colon],
+            None => base,
+        },
+        None => match base.find(':') {
+            Some(colon) => &base[..colon],
+            None => base,
+        },
+    }
+}
+
 pub struct ImageSvc {
     pub state: AppState,
 }
 
 impl ImageSvc {
-    async fn read_manifests(&self) -> Vec<ImageManifest> {
+    /// Read every stored image entry, computing each one's config digest.
+    async fn read_stored(&self) -> Vec<StoredImage> {
         let Ok(mut rd) = tokio::fs::read_dir(IMAGES_DIR).await else {
             return Vec::new();
         };
-        let mut manifests = Vec::new();
+        let mut out = Vec::new();
         while let Ok(Some(entry)) = rd.next_entry().await {
             if !entry.path().is_dir() {
                 continue;
             }
-            let manifest_path = entry.path().join("manifest.json");
-            if let Ok(data) = tokio::fs::read_to_string(&manifest_path).await {
-                if let Ok(m) = serde_json::from_str::<ImageManifest>(&data) {
-                    manifests.push(m);
-                }
-            }
+            let dir = entry.path();
+            let Ok(data) = tokio::fs::read_to_string(dir.join("manifest.json")).await else {
+                continue;
+            };
+            let Ok(m) = serde_json::from_str::<ImageManifest>(&data) else {
+                continue;
+            };
+            // The config digest = sha256 of the raw OCI config blob, which is
+            // identical for the same image across tags and registries. Fall back
+            // to the manifest digest if the config blob isn't present (e.g. an
+            // older or locally-built image).
+            let config_digest = match tokio::fs::read(dir.join("oci-config.json")).await {
+                Ok(bytes) => format!("sha256:{:x}", Sha256::digest(&bytes)),
+                Err(_) => m.digest.clone(),
+            };
+            out.push(StoredImage {
+                reference: m.reference,
+                manifest_digest: m.digest,
+                config_digest,
+                layers: m.layers,
+                user: m.config.user,
+            });
         }
-        manifests
+        out
     }
 
-    async fn compute_image_size(manifest: &ImageManifest) -> u64 {
+    async fn layers_size(layers: &[String]) -> u64 {
         let mut total: u64 = 0;
-        for layer in &manifest.layers {
-            // Layers are stored as extracted directories; digest may carry a "sha256:" prefix.
+        for layer in layers {
             let digest = layer.strip_prefix("sha256:").unwrap_or(layer.as_str());
-            let layer_dir = format!("{}/{}", LAYERS_DIR, digest);
-            total += dir_disk_usage(&layer_dir).await;
+            total += dir_disk_usage(&format!("{}/{}", LAYERS_DIR, digest)).await;
         }
-        // Always report at least 1 byte; kubelet rejects images with Size_ == 0.
+        // kubelet rejects images with Size_ == 0.
         total.max(1)
     }
 
-    fn manifest_to_image(manifest: &ImageManifest, size: u64) -> Image {
-        // The OCI User field may be "uid", "user", "uid:gid", or "user:group".
-        // kubelet uses uid (numeric) first, then username, to evaluate runAsNonRoot.
-        let user_str = manifest.config.user.split(':').next().unwrap_or("").trim();
-        let (uid, username) = if let Ok(n) = user_str.parse::<i64>() {
-            (Some(Int64Value { value: n }), String::new())
-        } else {
-            (None, user_str.to_string())
-        };
-
-        Image {
-            id: manifest.digest.clone(),
-            repo_tags: vec![manifest.reference.clone()],
-            repo_digests: vec![manifest.digest.clone()],
-            size,
-            uid,
-            username,
-            spec: Some(ImageSpec {
-                image: manifest.reference.clone(),
-                annotations: HashMap::new(),
-                ..Default::default()
-            }),
-            pinned: false,
+    /// Aggregate stored entries by config digest into one CRI `Image` each — with
+    /// all tags collected into `repo_tags` and all `<repo>@<manifest-digest>`
+    /// forms into `repo_digests` — WITHOUT computing on-disk size (which is the
+    /// expensive part). Each image is paired with the layer digests needed to
+    /// size it lazily. Sizing every image on an ImageStatus call would be far too
+    /// slow on a node with many images (#340).
+    async fn aggregate_unsized(&self) -> Vec<(Image, Vec<String>)> {
+        let stored = self.read_stored().await;
+        // Preserve a stable grouping order keyed by config digest.
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<StoredImage>> = HashMap::new();
+        for s in stored {
+            if !groups.contains_key(&s.config_digest) {
+                order.push(s.config_digest.clone());
+            }
+            groups.entry(s.config_digest.clone()).or_default().push(s);
         }
+
+        let mut images = Vec::new();
+        for id in order {
+            let group = &groups[&id];
+            let mut repo_tags: Vec<String> = Vec::new();
+            let mut repo_digests: Vec<String> = Vec::new();
+            for s in group {
+                // Tag references (no '@') go to repo_tags; digest refs are skipped
+                // here and represented in repo_digests below.
+                if !s.reference.contains('@') && !repo_tags.contains(&s.reference) {
+                    repo_tags.push(s.reference.clone());
+                }
+                let rd = format!("{}@{}", repo_of(&s.reference), s.manifest_digest);
+                if !repo_digests.contains(&rd) {
+                    repo_digests.push(rd);
+                }
+            }
+            let user_str = group[0].user.split(':').next().unwrap_or("").trim();
+            let (uid, username) = if let Ok(n) = user_str.parse::<i64>() {
+                (Some(Int64Value { value: n }), String::new())
+            } else if user_str.is_empty() {
+                (None, String::new())
+            } else {
+                (None, user_str.to_string())
+            };
+            let image = Image {
+                id: id.clone(),
+                repo_tags,
+                repo_digests,
+                size: 0,
+                uid,
+                username,
+                spec: Some(ImageSpec {
+                    image: id,
+                    annotations: HashMap::new(),
+                    ..Default::default()
+                }),
+                pinned: false,
+            };
+            images.push((image, group[0].layers.clone()));
+        }
+        images
+    }
+
+    /// Find the aggregated image matching `r`, which may be a tag, a
+    /// `repo@digest`, the config-digest id, or a bare manifest digest.
+    fn match_image(images: &[Image], r: &str) -> Option<Image> {
+        images
+            .iter()
+            .find(|img| {
+                img.id == r
+                    || img.repo_tags.iter().any(|t| t == r)
+                    || img.repo_digests.iter().any(|d| d == r)
+                    // also accept a bare manifest digest (the `@sha256:...` part)
+                    || img
+                        .repo_digests
+                        .iter()
+                        .any(|d| d.split('@').nth(1) == Some(r))
+            })
+            .cloned()
+    }
+
+    /// Resolve `r` to its aggregated image with size filled in (sizes only the
+    /// one matched image, not the whole store).
+    async fn status_of(&self, r: &str) -> Option<Image> {
+        let entries = self.aggregate_unsized().await;
+        let idx = entries
+            .iter()
+            .position(|(img, _)| Self::match_image(std::slice::from_ref(img), r).is_some())?;
+        let (mut img, layers) = entries.into_iter().nth(idx)?;
+        img.size = Self::layers_size(&layers).await;
+        Some(img)
     }
 
     async fn get_bin(&self) -> String {
@@ -136,11 +281,10 @@ impl ImageService for ImageSvc {
         &self,
         _request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
-        let manifests = self.read_manifests().await;
         let mut images = Vec::new();
-        for m in &manifests {
-            let size = Self::compute_image_size(m).await;
-            images.push(Self::manifest_to_image(m, size));
+        for (mut img, layers) in self.aggregate_unsized().await {
+            img.size = Self::layers_size(&layers).await;
+            images.push(img);
         }
         Ok(Response::new(ListImagesResponse { images }))
     }
@@ -160,21 +304,8 @@ impl ImageService for ImageSvc {
                 info: HashMap::new(),
             }));
         }
-
-        let manifests = self.read_manifests().await;
-        let found = manifests
-            .iter()
-            .find(|m| m.reference == image_ref || m.digest == image_ref);
-
-        let image = if let Some(m) = found {
-            let size = Self::compute_image_size(m).await;
-            Some(Self::manifest_to_image(m, size))
-        } else {
-            None
-        };
-
         Ok(Response::new(ImageStatusResponse {
-            image,
+            image: self.status_of(&image_ref).await,
             info: HashMap::new(),
         }))
     }
@@ -192,9 +323,17 @@ impl ImageService for ImageSvc {
         let bin = self.get_bin().await;
         let result = run_pelagos(&bin, &["image", "pull", &image_ref]).await;
         match result {
-            Ok(out) if out.success => Ok(Response::new(PullImageResponse {
-                image_ref: image_ref.clone(),
-            })),
+            Ok(out) if out.success => {
+                // CRI requires PullImageResponse.image_ref == Image.id. Resolve the
+                // just-pulled image to its config-digest id so ListImages/
+                // ImageStatus return the same identifier (#340).
+                let entries = self.aggregate_unsized().await;
+                let images: Vec<Image> = entries.into_iter().map(|(i, _)| i).collect();
+                let id = Self::match_image(&images, &image_ref)
+                    .map(|img| img.id)
+                    .unwrap_or(image_ref);
+                Ok(Response::new(PullImageResponse { image_ref: id }))
+            }
             Ok(out) => Err(Status::internal(format!(
                 "pelagos image pull failed: {}",
                 out.stderr
@@ -216,8 +355,25 @@ impl ImageService for ImageSvc {
             return Ok(Response::new(RemoveImageResponse {}));
         }
 
+        // Serialize removals so concurrent calls for the same image are safe.
+        let _guard = remove_lock().lock().await;
         let bin = self.get_bin().await;
-        let _ = run_pelagos(&bin, &["image", "rm", &image_ref]).await;
+
+        // Per the CRI spec, removing an image by ONE tag removes the image and ALL
+        // of its tags (across registries) that resolve to the same digest. Resolve
+        // the target to its aggregated image and remove every underlying reference.
+        let entries = self.aggregate_unsized().await;
+        let images: Vec<Image> = entries.into_iter().map(|(i, _)| i).collect();
+        if let Some(img) = Self::match_image(&images, &image_ref) {
+            for r in &img.repo_tags {
+                let _ = run_pelagos(&bin, &["image", "rm", r]).await;
+            }
+            // Some refs may exist only in digest form; best-effort remove those too.
+            for d in &img.repo_digests {
+                let _ = run_pelagos(&bin, &["image", "rm", d]).await;
+            }
+        }
+        // Not found is a no-op success (idempotent), matching the CRI spec.
         Ok(Response::new(RemoveImageResponse {}))
     }
 
@@ -226,13 +382,17 @@ impl ImageService for ImageSvc {
         _request: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
         use crate::cri::{FilesystemIdentifier, FilesystemUsage, UInt64Value};
+        // Report real usage of the layer store so the kubelet's image GC works.
+        let used = dir_disk_usage(LAYERS_DIR).await;
         let usage = FilesystemUsage {
-            timestamp: 0,
+            timestamp: now_ns(),
             fs_id: Some(FilesystemIdentifier {
                 mountpoint: LAYERS_DIR.to_string(),
             }),
-            used_bytes: Some(UInt64Value { value: 0 }),
-            inodes_used: Some(UInt64Value { value: 0 }),
+            used_bytes: Some(UInt64Value { value: used }),
+            inodes_used: Some(UInt64Value {
+                value: count_inodes(LAYERS_DIR).await,
+            }),
         };
         Ok(Response::new(ImageFsInfoResponse {
             image_filesystems: vec![usage],
@@ -256,58 +416,150 @@ impl ImageService for ImageSvc {
 mod tests {
     use super::*;
 
-    fn make_manifest(user: &str) -> ImageManifest {
-        ImageManifest {
-            reference: "test/image:latest".into(),
-            digest: "sha256:abc".into(),
+    fn stored(
+        reference: &str,
+        manifest_digest: &str,
+        config_digest: &str,
+        user: &str,
+    ) -> StoredImage {
+        StoredImage {
+            reference: reference.into(),
+            manifest_digest: manifest_digest.into(),
+            config_digest: config_digest.into(),
             layers: vec![],
-            layer_types: vec![],
-            config: ImageConfig {
-                user: user.to_string(),
-                ..Default::default()
-            },
+            user: user.into(),
         }
     }
 
-    #[test]
-    fn test_numeric_user_sets_uid() {
-        let img = ImageSvc::manifest_to_image(&make_manifest("1000"), 1);
-        assert_eq!(img.uid, Some(Int64Value { value: 1000 }));
-        assert_eq!(img.username, "");
+    /// Group StoredImages exactly as ImageSvc::aggregate does (sans disk I/O for
+    /// size), so we can unit-test tag/digest aggregation deterministically.
+    fn aggregate(stored: Vec<StoredImage>) -> Vec<Image> {
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<StoredImage>> = HashMap::new();
+        for s in stored {
+            if !groups.contains_key(&s.config_digest) {
+                order.push(s.config_digest.clone());
+            }
+            groups.entry(s.config_digest.clone()).or_default().push(s);
+        }
+        let mut images = Vec::new();
+        for id in order {
+            let group = &groups[&id];
+            let mut repo_tags: Vec<String> = Vec::new();
+            let mut repo_digests: Vec<String> = Vec::new();
+            for s in group {
+                if !s.reference.contains('@') && !repo_tags.contains(&s.reference) {
+                    repo_tags.push(s.reference.clone());
+                }
+                let rd = format!("{}@{}", repo_of(&s.reference), s.manifest_digest);
+                if !repo_digests.contains(&rd) {
+                    repo_digests.push(rd);
+                }
+            }
+            let user_str = group[0].user.split(':').next().unwrap_or("").trim();
+            let (uid, username) = if let Ok(n) = user_str.parse::<i64>() {
+                (Some(Int64Value { value: n }), String::new())
+            } else if user_str.is_empty() {
+                (None, String::new())
+            } else {
+                (None, user_str.to_string())
+            };
+            images.push(Image {
+                id: id.clone(),
+                repo_tags,
+                repo_digests,
+                size: 1,
+                uid,
+                username,
+                spec: Some(ImageSpec {
+                    image: id,
+                    annotations: HashMap::new(),
+                    ..Default::default()
+                }),
+                pinned: false,
+            });
+        }
+        images
     }
 
     #[test]
-    fn test_numeric_user_with_gid_sets_uid() {
-        let img = ImageSvc::manifest_to_image(&make_manifest("1000:1000"), 1);
-        assert_eq!(img.uid, Some(Int64Value { value: 1000 }));
-        assert_eq!(img.username, "");
+    fn test_repo_of_strips_tag_and_digest() {
+        assert_eq!(repo_of("alpine:3.20"), "alpine");
+        assert_eq!(
+            repo_of("docker.io/library/alpine:latest"),
+            "docker.io/library/alpine"
+        );
+        assert_eq!(repo_of("localhost:5000/img:v1"), "localhost:5000/img");
+        assert_eq!(repo_of("alpine@sha256:deadbeef"), "alpine");
+        assert_eq!(
+            repo_of("docker.io/library/alpine"),
+            "docker.io/library/alpine"
+        );
     }
 
     #[test]
-    fn test_named_user_sets_username() {
-        let img = ImageSvc::manifest_to_image(&make_manifest("nobody"), 1);
-        assert_eq!(img.uid, None);
-        assert_eq!(img.username, "nobody");
+    fn test_multiple_tags_same_config_aggregate_to_one_image() {
+        // Three tags of the same content -> one image with three repoTags
+        // (critest: "listImage should get exactly 3 repoTags").
+        let imgs = aggregate(vec![
+            stored("alpine:3.20", "sha256:m1", "sha256:cfg", ""),
+            stored("alpine:latest", "sha256:m1", "sha256:cfg", ""),
+            stored("myalpine:test", "sha256:m1", "sha256:cfg", ""),
+        ]);
+        assert_eq!(
+            imgs.len(),
+            1,
+            "same config digest must aggregate to one image"
+        );
+        assert_eq!(imgs[0].id, "sha256:cfg");
+        assert_eq!(imgs[0].repo_tags.len(), 3);
+        assert!(imgs[0].repo_tags.contains(&"alpine:3.20".to_string()));
     }
 
     #[test]
-    fn test_named_user_with_group_sets_username() {
-        let img = ImageSvc::manifest_to_image(&make_manifest("appuser:appgroup"), 1);
-        assert_eq!(img.uid, None);
-        assert_eq!(img.username, "appuser");
+    fn test_different_registries_same_config_aggregate() {
+        // Same content from two registries -> one stable id (the config digest),
+        // both repo_digests present (critest "same identifier from different
+        // registries" / "removing from one registry removes all tags").
+        let imgs = aggregate(vec![
+            stored("registry-a.io/lib/img:v1", "sha256:ma", "sha256:cfg", ""),
+            stored("registry-b.io/lib/img:v1", "sha256:mb", "sha256:cfg", ""),
+        ]);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].id, "sha256:cfg");
+        assert_eq!(imgs[0].repo_digests.len(), 2);
+        assert!(imgs[0]
+            .repo_digests
+            .contains(&"registry-a.io/lib/img@sha256:ma".to_string()));
     }
 
     #[test]
-    fn test_empty_user_leaves_both_unset() {
-        let img = ImageSvc::manifest_to_image(&make_manifest(""), 1);
-        assert_eq!(img.uid, None);
-        assert_eq!(img.username, "");
+    fn test_match_image_by_tag_digest_and_id() {
+        let imgs = aggregate(vec![stored(
+            "alpine:3.20",
+            "sha256:m1",
+            "sha256:cfg",
+            "1000",
+        )]);
+        assert!(ImageSvc::match_image(&imgs, "alpine:3.20").is_some()); // by tag
+        assert!(ImageSvc::match_image(&imgs, "sha256:cfg").is_some()); // by id
+        assert!(ImageSvc::match_image(&imgs, "alpine@sha256:m1").is_some()); // by repo_digest
+        assert!(ImageSvc::match_image(&imgs, "sha256:m1").is_some()); // by bare manifest digest
+        assert!(ImageSvc::match_image(&imgs, "nonexistent:1").is_none());
     }
 
     #[test]
-    fn test_root_uid_zero_is_set() {
-        let img = ImageSvc::manifest_to_image(&make_manifest("0"), 1);
-        assert_eq!(img.uid, Some(Int64Value { value: 0 }));
-        assert_eq!(img.username, "");
+    fn test_uid_username_from_config_user() {
+        let numeric = aggregate(vec![stored("i:1", "sha256:m", "sha256:c1", "1000")]);
+        assert_eq!(numeric[0].uid, Some(Int64Value { value: 1000 }));
+        assert_eq!(numeric[0].username, "");
+        let named = aggregate(vec![stored("i:2", "sha256:m", "sha256:c2", "nobody")]);
+        assert_eq!(named[0].uid, None);
+        assert_eq!(named[0].username, "nobody");
+        let root = aggregate(vec![stored("i:3", "sha256:m", "sha256:c3", "0")]);
+        assert_eq!(root[0].uid, Some(Int64Value { value: 0 }));
+        let empty = aggregate(vec![stored("i:4", "sha256:m", "sha256:c4", "")]);
+        assert_eq!(empty[0].uid, None);
+        assert_eq!(empty[0].username, "");
     }
 }

@@ -5167,3 +5167,32 @@ exec'd command inside the container.
 - *crictl exec (streaming): …* — the streaming SPDY exec path completes and the
   connection closes; the stdin relay is aborted on child exit so it cannot hang. Failure
   reproduces the suite-wedging socket leak (~93 open streams).
+
+## `pelagos-cri` Image API conformance (issue #340)
+Validated by the `pelagos-cri` unit tests `image::tests::*` (run via
+`cargo test -p pelagos-cri`) and the `scripts/test-cri.sh` image section
+(root + crictl).
+
+**Unit tests (no root):**
+- `test_repo_of_strips_tag_and_digest` — the repo extraction used to build
+  `repoDigests` handles tags, `@digest`, and `host:port/repo` correctly.
+- `test_multiple_tags_same_config_aggregate_to_one_image` — three tags of the
+  same content aggregate into ONE image with three `repoTags` and the config
+  digest as the id (critest "listImage should get exactly 3 repoTags").
+- `test_different_registries_same_config_aggregate` — the same content from two
+  registries aggregates to one stable id with both `repoDigests`.
+- `test_match_image_by_tag_digest_and_id` — ImageStatus resolves a ref given as a
+  tag, a `repo@digest`, the config-digest id, or a bare manifest digest.
+- `test_uid_username_from_config_user` — `Uid`/`Username` are populated from the
+  image config `User`.
+
+**`scripts/test-cri.sh` (root + crictl):**
+- *same content under multiple tags shares one stable id* — `crictl inspecti`
+  (ImageStatus) returns the same config-digest id for two tags of one image.
+- *multiple tags aggregate under one image in ListImages*.
+- *RemoveImage by one tag removes all tags of the image* — removing one tag
+  removes the whole aggregated image (per the CRI spec).
+- *simultaneous RemoveImage of a missing image does not error* — idempotent and
+  concurrency-safe (serialized by a mutex).
+Note: `crictl img`/`images` is ListImages; `crictl inspecti` is ImageStatus —
+the assertions use the correct one for each check.
