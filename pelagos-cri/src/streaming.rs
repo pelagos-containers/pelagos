@@ -236,8 +236,17 @@ async fn handle_exec(
     tokio::time::timeout(Duration::from_secs(10), state.wait_ready()).await??;
 
     // Spawn the subprocess and relay I/O.
-    state.run(conn).await?;
+    let run_result = state.run(Arc::clone(&conn)).await;
 
+    // Always close the SPDY connection so the client's sockets are released even
+    // when it doesn't close from its side (critest leaves exec/attach streams
+    // open, leaking ~93 sockets and wedging the suite). close() enqueues GoAway
+    // on the same ordered write channel as the exit-code/FIN frames already sent
+    // by run(), so those are delivered first and exit-code reporting is preserved
+    // (#339).
+    let _ = conn.close().await;
+
+    run_result?;
     Ok(())
 }
 
@@ -397,8 +406,13 @@ impl ExecState {
         if let Some(t) = stderr_task {
             let _ = t.await;
         }
+        // The stdin relay blocks on the client's stdin stream, which may never
+        // EOF (attach, or `exec -i` where the client holds stdin open). The child
+        // has already exited so the relay is finished — abort it rather than
+        // awaiting forever, which would wedge the connection and leak its sockets
+        // (#339).
         if let Some(t) = stdin_task {
-            let _ = t.await;
+            t.abort();
         }
 
         // 1. Send error stream FIN FIRST with the exit code payload.

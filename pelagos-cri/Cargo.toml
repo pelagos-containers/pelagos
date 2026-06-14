@@ -26,6 +26,7 @@ futures-core = "0.3"
 spdystream-rs = "0.1.2"
 bytes = "1"
 http = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
