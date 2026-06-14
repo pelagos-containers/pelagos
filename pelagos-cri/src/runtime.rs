@@ -31,6 +31,7 @@ use crate::cri::{
     UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
 };
 use crate::invoke::run_pelagos;
+use crate::scope;
 use crate::state::{
     self, AppState, ContainerState as MyContainerState, CriContainer, CriMount, CriSandbox,
     SandboxState,
@@ -176,9 +177,9 @@ fn read_proc_mem_bytes(pid: i32) -> u64 {
 /// Read cgroup memory stats for a container.
 ///
 /// Returns `(usage_bytes, working_set_bytes)` where:
-/// - `usage_bytes`       = total cgroup memory (all processes, including page cache)
-/// - `working_set_bytes` = usage minus reclaimable page cache (inactive_file),
-///                         the value metrics-server uses for HPA
+/// - `usage_bytes` = total cgroup memory (all processes, including page cache)
+/// - `working_set_bytes` = usage minus reclaimable page cache (inactive_file), the
+///   value metrics-server uses for HPA
 ///
 /// Priority:
 ///  1. cgroup v2: memory.current minus memory.stat[inactive_file]
@@ -666,19 +667,63 @@ impl RuntimeService for RuntimeSvc {
 
             // Spawn pause process: joins the CNI-configured netns, unshares IPC+UTS.
             // We re-use pelagos's own `sandbox __pause__ <ns_name>` subcommand.
-            let pause = std::process::Command::new(&bin)
-                .args(["sandbox", "__pause__", &ns_name])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| Status::internal(format!("spawn pause process: {}", e)))?;
-            let pause_pid = pause.id() as i32;
-            // Intentionally leaked — killed explicitly on StopPodSandbox.
-            std::mem::forget(pause);
-
-            // Brief pause for the process to enter namespaces before containers join.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            //
+            // Under systemd the pause runs as a transient service under
+            // `pelagos.slice` (created by PID 1) so it survives a `pelagos-cri`
+            // restart and the sandbox is re-adopted rather than torn down (#336).
+            // The pause blocks forever, so it must be a backgrounded *service*
+            // (not a `--scope`, which would block); its real PID is the unit's
+            // MainPID. Off systemd we fall back to a plain leaked child.
+            let pause_pid = if scope::systemd_available() {
+                let unit = scope::sandbox_unit(&id);
+                // A re-run for the same sandbox id would collide with a lingering
+                // unit; clear any stale one first (best effort).
+                scope::stop_unit(&unit).await;
+                let argv =
+                    scope::build_service_argv(&unit, &bin, &["sandbox", "__pause__", &ns_name]);
+                let out = tokio::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .output()
+                    .await
+                    .map_err(|e| Status::internal(format!("systemd-run pause: {}", e)))?;
+                if !out.status.success() {
+                    return Err(Status::internal(format!(
+                        "systemd-run pause failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )));
+                }
+                // MainPID is populated asynchronously once systemd forks the unit.
+                let mut pid = 0;
+                for _ in 0..40 {
+                    if let Some(p) = scope::service_main_pid(&unit).await {
+                        pid = p;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                if pid <= 0 {
+                    scope::stop_unit(&unit).await;
+                    return Err(Status::internal(format!(
+                        "pause unit {} did not report a MainPID",
+                        unit
+                    )));
+                }
+                pid
+            } else {
+                let pause = std::process::Command::new(&bin)
+                    .args(["sandbox", "__pause__", &ns_name])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map_err(|e| Status::internal(format!("spawn pause process: {}", e)))?;
+                let pid = pause.id() as i32;
+                // Intentionally leaked — killed explicitly on StopPodSandbox.
+                std::mem::forget(pause);
+                // Brief pause for the process to enter namespaces before containers join.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                pid
+            };
 
             // Write pelagos-format sandbox state so `pelagos run --sandbox` works.
             state::write_pelagos_sandbox_state(&id, Some(&meta.name), pause_pid, &ns_name, &ip)
@@ -823,6 +868,11 @@ impl RuntimeService for RuntimeSvc {
                     let _ = std::process::Command::new("kill")
                         .args(["-TERM", &sb.pause_pid.to_string()])
                         .output();
+                }
+                // Tear down the transient pause service (#336); harmless if the
+                // pause was launched as a plain child on a non-systemd host.
+                if scope::systemd_available() {
+                    scope::stop_unit(&scope::sandbox_unit(&sandbox_id)).await;
                 }
                 cni::delete_netns(&sb.netns);
                 state::remove_pelagos_sandbox_state(&sandbox_id);
@@ -1532,9 +1582,25 @@ impl RuntimeService for RuntimeSvc {
         args.extend(effective_cmd);
 
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = run_pelagos(&bin, &args_ref)
-            .await
-            .map_err(|e| Status::internal(format!("exec error: {}", e)))?;
+        // Under systemd, wrap `pelagos run --detach` in a transient scope under
+        // `pelagos.slice` so the watcher it forks lives outside the
+        // `pelagos-cri.service` cgroup and survives a runtime restart (#336). The
+        // foreground `pelagos run` returns promptly after forking the watcher, so
+        // the scope (kept alive by the watcher) outlives this call. Off systemd we
+        // invoke pelagos directly, preserving prior behavior.
+        let out = if scope::systemd_available() {
+            let unit = scope::container_unit(&container.pelagos_name);
+            scope::stop_unit(&unit).await; // clear any stale unit for this name
+            let argv = scope::build_scope_argv(&unit, &bin, &args_ref);
+            let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            run_pelagos(argv_ref[0], &argv_ref[1..])
+                .await
+                .map_err(|e| Status::internal(format!("exec error: {}", e)))?
+        } else {
+            run_pelagos(&bin, &args_ref)
+                .await
+                .map_err(|e| Status::internal(format!("exec error: {}", e)))?
+        };
 
         if !out.success {
             log::error!(
@@ -1597,6 +1663,11 @@ impl RuntimeService for RuntimeSvc {
         };
 
         let _ = run_pelagos(&bin, &["stop", &pelagos_name]).await;
+        // The watcher has exited, so the transient scope is now empty; --collect
+        // reaps it, but stop it explicitly for determinism (#336).
+        if scope::systemd_available() {
+            scope::stop_unit(&scope::container_unit(&pelagos_name)).await;
+        }
 
         let mut st = self.state.inner.lock().await;
         if let Some(c) = st.containers.get_mut(&container_id) {
@@ -1624,6 +1695,9 @@ impl RuntimeService for RuntimeSvc {
 
         if let Some(name) = pelagos_name {
             let _ = run_pelagos(&bin, &["rm", &name]).await;
+            if scope::systemd_available() {
+                scope::stop_unit(&scope::container_unit(&name)).await;
+            }
         }
 
         let mut st = self.state.inner.lock().await;

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pelagos CRI container supervisors
+Documentation=https://github.com/pelagos-containers/pelagos
+Before=slices.target
+# Supervisors (the per-container `pelagos run` watcher and per-pod pause process)
+# are placed in transient scope/service units under this slice by pelagos-cri, so
+# they live outside the pelagos-cri.service cgroup and survive a runtime restart
+# (issue #336). systemd auto-creates this slice if it is not installed; shipping it
+# lets operators tune resource accounting for all pelagos workloads in one place.
+
+[Slice]

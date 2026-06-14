@@ -27942,3 +27942,181 @@ mod issue_334_symlinked_mount_dest {
         );
     }
 }
+
+/// Issue #336: a `pelagos-cri` restart must be transparent to running pods. The
+/// fix launches each per-container supervisor (the `pelagos run --detach` watcher
+/// and the per-pod pause) in its own transient systemd scope/service under
+/// `pelagos.slice`, created by systemd (PID 1), so it lives OUTSIDE the
+/// `pelagos-cri.service` cgroup and is not taken down by systemd's default
+/// `KillMode=control-group` when the runtime restarts.
+///
+/// This module validates that exact mechanism end to end with systemd, without
+/// needing a full CNI/k8s stack: a process placed in a transient scope survives
+/// when its launching service's cgroup is killed, while a control child left in
+/// that cgroup is killed — i.e. the regression is reproduced and fixed.
+mod issue_336_cri_restart_readopt {
+    use super::*;
+    use std::process::Command as Proc;
+
+    /// systemd usable iff PID 1 is systemd and systemd-run/systemctl are present.
+    fn systemd_usable() -> bool {
+        if !std::path::Path::new("/run/systemd/system").is_dir() {
+            return false;
+        }
+        let have = |b: &str| {
+            Proc::new("sh")
+                .args(["-c", &format!("command -v {b}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        have("systemd-run") && have("systemctl")
+    }
+
+    /// True iff at least one process whose command line matches `pat` is alive.
+    fn matches_alive(pat: &str) -> bool {
+        Proc::new("pgrep")
+            .args(["-f", pat])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn stop_unit(unit: &str) {
+        let _ = Proc::new("systemctl").args(["stop", unit]).output();
+        let _ = Proc::new("systemctl").args(["reset-failed", unit]).output();
+    }
+
+    /// Requires root and systemd.
+    ///
+    /// Reproduces the #336 mechanism: a parent transient service (standing in for
+    /// `pelagos-cri.service`) launches a "supervisor" sleep inside its own
+    /// `systemd-run --scope` (as the fix does for the watcher) plus a "control"
+    /// sleep left directly in the parent's cgroup. Stopping the parent service
+    /// must kill the control child (proving the cgroup kill is real) but leave the
+    /// scoped supervisor running (proving the fix makes supervisors survive a
+    /// runtime restart).
+    #[test]
+    fn test_scoped_supervisor_survives_service_kill() {
+        if !is_root() {
+            eprintln!("Skipping test_scoped_supervisor_survives_service_kill: requires root");
+            return;
+        }
+        if !systemd_usable() {
+            eprintln!("Skipping test_scoped_supervisor_survives_service_kill: systemd unavailable");
+            return;
+        }
+
+        // Unique sentinels so pgrep finds exactly our sleeps across the run.
+        let pid = std::process::id();
+        let sup_tag = format!("pelagos336sup{pid}"); // scoped supervisor marker
+        let ctrl_tag = format!("pelagos336ctl{pid}"); // control child marker
+        let parent_unit = format!("pelagos336-parent-{pid}.service");
+        let scope_unit = format!("pelagos336-sup-{pid}.scope");
+        // Flat slice name (no internal dash before the pid) so systemd does not
+        // auto-create a lingering parent slice; cleanup then removes it fully.
+        let slice = format!("pelagos336t{pid}.slice");
+
+        // Clean any stragglers from a prior aborted run.
+        stop_unit(&parent_unit);
+        stop_unit(&scope_unit);
+
+        // Carry the sentinels in the *binary name* (symlinks to sleep) rather than
+        // as args — `sleep 3600 <tag>` would be an invalid time interval. pgrep -f
+        // then matches each sleep's argv0 uniquely.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a sleep binary");
+        let sup_bin = dir.path().join(&sup_tag);
+        let ctrl_bin = dir.path().join(&ctrl_tag);
+        std::os::unix::fs::symlink(sleep_bin, &sup_bin).expect("symlink sup sleep");
+        std::os::unix::fs::symlink(sleep_bin, &ctrl_bin).expect("symlink ctrl sleep");
+
+        // The parent service's body, written to a temp script so the parent's own
+        // command line does NOT contain the sentinels (keeping pgrep unambiguous).
+        let runner = dir.path().join("runner.sh");
+        let body = format!(
+            "#!/bin/sh\n\
+             # Supervisor: launched in its OWN scope under {slice} (the fix).\n\
+             systemd-run --scope --slice={slice} --unit={scope_unit} --quiet -- \
+                 {sup} 3600 &\n\
+             # Control: stays in THIS service's cgroup, must die on stop.\n\
+             {ctrl} 3600 &\n\
+             # Keep the service active until we stop it.\n\
+             exec {sleep_bin} 3600\n",
+            sup = sup_bin.to_str().unwrap(),
+            ctrl = ctrl_bin.to_str().unwrap(),
+        );
+        std::fs::write(&runner, body).expect("write runner");
+
+        // Launch the parent service (stand-in for pelagos-cri.service).
+        let start = Proc::new("systemd-run")
+            .args([
+                "--unit",
+                &parent_unit,
+                "--quiet",
+                "--",
+                "/bin/sh",
+                runner.to_str().unwrap(),
+            ])
+            .output()
+            .expect("systemd-run parent");
+        assert!(
+            start.status.success(),
+            "failed to start parent service: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        // Wait for both children to come up (the scope launch is async).
+        let mut both_up = false;
+        for _ in 0..50 {
+            if matches_alive(&sup_tag) && matches_alive(&ctrl_tag) {
+                both_up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Only act once both are up; otherwise leave the outcome flags false so the
+        // assert below reports the real problem. Cleanup runs unconditionally.
+        let mut ctrl_dead = false;
+        let mut sup_alive = false;
+        if both_up {
+            // Stop the parent service — control-group kill takes everything still
+            // in its cgroup, exactly like `systemctl restart pelagos-cri`.
+            let _ = Proc::new("systemctl").args(["stop", &parent_unit]).output();
+
+            // Observe outcomes, polling for the control child to die.
+            for _ in 0..50 {
+                if !matches_alive(&ctrl_tag) {
+                    ctrl_dead = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            sup_alive = matches_alive(&sup_tag);
+        }
+
+        // Always clean up before asserting so no failure path leaks units/procs.
+        stop_unit(&scope_unit);
+        stop_unit(&parent_unit);
+        let _ = Proc::new("pkill").args(["-f", &sup_tag]).output();
+        let _ = Proc::new("pkill").args(["-f", &ctrl_tag]).output();
+        let _ = Proc::new("systemctl").args(["stop", &slice]).output();
+
+        assert!(
+            both_up,
+            "supervisor and control children did not both start"
+        );
+        assert!(
+            ctrl_dead,
+            "control child survived the service stop — the cgroup kill is not happening as assumed; test is not exercising #336"
+        );
+        assert!(
+            sup_alive,
+            "scoped supervisor was killed when the parent service stopped — #336 regression: supervisors must outlive a runtime restart"
+        );
+    }
+}
