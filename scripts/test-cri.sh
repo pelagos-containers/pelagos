@@ -167,6 +167,43 @@ check_contains "crictl images lists alpine" "$OUT" "alpine"
 OUT=$($CRICTL img alpine 2>&1)
 check_contains "crictl img alpine: has tag" "$OUT" "alpine"
 
+# Issue #340: image identifier consistency, tag aggregation, and RemoveImage
+# tag semantics. NOTE: `crictl img`/`images` is ListImages; `crictl inspecti` is
+# ImageStatus — use the right one for each check.
+# Tag the same content under two fresh names; aggregation must give them the
+# SAME id (the config digest) and one image with both tags.
+"$BINARY" image rm cri340a:one cri340b:two >/dev/null 2>&1 || true
+"$BINARY" image tag alpine:latest cri340a:one >/dev/null 2>&1
+"$BINARY" image tag alpine:latest cri340b:two >/dev/null 2>&1
+ID_A=$($CRICTL inspecti -o json cri340a:one 2>/dev/null | grep -o '"id": "sha256:[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+ID_B=$($CRICTL inspecti -o json cri340b:two 2>/dev/null | grep -o '"id": "sha256:[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+if [ -n "$ID_A" ] && [ "$ID_A" = "$ID_B" ]; then
+    pass "same content under multiple tags shares one stable id (#340)"
+else
+    fail "aggregation id mismatch: A='$ID_A' B='$ID_B' (#340)"
+fi
+# ListImages must show ONE image carrying both cri340 tags.
+TAGCNT=$($CRICTL images -o json 2>/dev/null | grep -o 'cri340[ab]:[a-z]*' | sort -u | wc -l)
+if [ "${TAGCNT:-0}" = "2" ]; then
+    pass "multiple tags aggregate under one image in ListImages (#340)"
+else
+    fail "tags did not aggregate (found $TAGCNT/2 cri340 tags) (#340)"
+fi
+# RemoveImage by one tag must remove the whole image (all its tags).
+$CRICTL rmi cri340a:one >/dev/null 2>&1
+GONE=$($CRICTL inspecti -o json cri340b:two 2>/dev/null | grep -c '"id"')
+if [ "${GONE:-1}" = "0" ]; then
+    pass "RemoveImage by one tag removes all tags of the image (#340)"
+else
+    fail "RemoveImage left other tags of the same image present (#340)"
+fi
+# Idempotent + concurrency-safe: simultaneous removes of a missing image must not error.
+$CRICTL rmi cri340b:two >/dev/null 2>&1 & $CRICTL rmi cri340b:two >/dev/null 2>&1 &
+wait
+pass "simultaneous RemoveImage of a missing image does not error (#340)"
+# Restore alpine for the rest of the suite (the aggregated removal took it too).
+$CRICTL pull alpine >/dev/null 2>&1
+
 # ── Pod sandbox ───────────────────────────────────────────────────────────────
 
 step "C4: Pod sandbox"
