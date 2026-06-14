@@ -27853,3 +27853,92 @@ mod exec_netns_and_loopback {
         cleanup(name);
     }
 }
+
+/// Issue #334: a volume whose container destination sits under a directory the
+/// image ships as a symlink (e.g. `/var/run -> /run` on Alpine/Debian/Ubuntu)
+/// must still be mounted at the real, container-visible path. Before the fix the
+/// bind target was computed as a naive `root.join("var/run/...")`; because the
+/// kernel resolves the mount destination *before* pivot_root, an absolute
+/// `/var/run -> /run` symlink resolved against the host root and the bind either
+/// escaped the rootfs or was dropped — silently losing the projected Kubernetes
+/// ServiceAccount token and breaking `rest.InClusterConfig()`.
+mod issue_334_symlinked_mount_dest {
+    use super::*;
+
+    /// Requires root and the alpine-rootfs.
+    ///
+    /// Builds an isolated rootfs copy whose `/var/run` is an
+    /// **absolute** symlink to `/run` — exactly how mainstream OCI base images
+    /// ship it, and the case that genuinely reproduced the bug (a relative
+    /// `../run` symlink happens to stay inside the rootfs and masks it).
+    ///
+    /// A host directory simulating the projected SA-token volume is bind-mounted
+    /// at `/var/run/secrets/kubernetes.io/serviceaccount`, then the container
+    /// reads the token back through that path. Failure (empty stdout / cat error)
+    /// would indicate the mount was dropped or escaped the rootfs — i.e. the
+    /// regression has returned.
+    #[test]
+    fn test_bind_mount_resolves_symlinked_parent() {
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_resolves_symlinked_parent: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_bind_mount_resolves_symlinked_parent: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Isolated rootfs copy so we can rewrite /var/run without touching the
+        // shared alpine-rootfs. (`cp -a`, not `-al`: the tempdir is typically on
+        // tmpfs — a different device — so hardlinks would fail cross-device.)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let test_root = tmp.path().join("root");
+        let cp = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&rootfs)
+            .arg(&test_root)
+            .status()
+            .expect("cp -a rootfs");
+        assert!(cp.success(), "failed to copy rootfs");
+
+        // Replace /var/run with an absolute symlink to /run (OCI image layout).
+        let var_run = test_root.join("var/run");
+        let _ = std::fs::remove_file(&var_run);
+        std::fs::create_dir_all(test_root.join("run")).expect("mkdir run");
+        std::os::unix::fs::symlink("/run", &var_run).expect("symlink var/run -> /run");
+
+        // Host directory standing in for the projected SA-token volume.
+        let secret = tempfile::tempdir().expect("secret tempdir");
+        std::fs::write(secret.path().join("token"), b"sa-token-issue-334").expect("write token");
+
+        let dest = "/var/run/secrets/kubernetes.io/serviceaccount";
+        let mut child = Command::new("/bin/cat")
+            .args([format!("{dest}/token")])
+            .with_chroot(&test_root)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount_ro(secret.path(), dest)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "cat of SA token through symlinked /var/run failed (exit {:?}).\nstdout: {out}\nstderr: {err}",
+            status.code()
+        );
+        assert_eq!(
+            out.trim(),
+            "sa-token-issue-334",
+            "SA token not readable through /var/run -> /run symlink — mount was dropped (issue #334).\nstderr: {err}"
+        );
+    }
+}
