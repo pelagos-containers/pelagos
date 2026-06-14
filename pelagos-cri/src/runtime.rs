@@ -95,6 +95,89 @@ fn generate_id() -> String {
     bytes.map(|b| format!("{:02x}", b)).concat()
 }
 
+/// Read `(ppid, session_id)` for a host process from `/proc/<pid>/stat`.
+///
+/// The `comm` field may contain spaces and parentheses, so we parse the fields
+/// *after* the final `)`: there, field 0 is state, 1 is ppid, 2 is pgrp, 3 is
+/// session.
+fn read_ppid_sid(pid: i32) -> Option<(i32, i32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = after.split_whitespace().collect();
+    Some((f.get(1)?.parse().ok()?, f.get(3)?.parse().ok()?))
+}
+
+/// Terminate a timed-out `pelagos exec` and the command it ran inside the
+/// container, leaving the container's own processes untouched (issue #339).
+///
+/// This is subtle because of two layers of indirection:
+///   * For a PID-namespaced container `pelagos exec` double-forks: an
+///     intermediate (host namespace, shares the runtime's session) forks the real
+///     exec'd process, which runs in the container's namespace and `setsid`s into
+///     its OWN session.
+///   * A shell that *forks* its command (`sh -c '...; sleep N'`) leaves the
+///     `sleep` reparented to container-init.
+///
+/// So neither a kill of the wrapper, nor of its direct child, nor a host-side
+/// process-group kill (the group lives inside the namespace) reaches the command.
+/// Session membership does: it survives reparenting and is visible from the host.
+///
+/// Algorithm: scan `/proc`, compute the wrapper's transitive descendants by PPID
+/// (capturing the intermediate AND the real exec'd process while the intermediate
+/// is still alive), then collect every session whose *leader is one of those
+/// descendants* — i.e. the session the exec'd process created with `setsid`.
+/// SIGKILL every process in those sessions, plus all descendants and the wrapper.
+///
+/// Only sessions led by our own descendants are killed, never a merely *shared*
+/// session — that safety property is what keeps this from taking down pelagos-cri
+/// itself or unrelated processes.
+fn kill_exec_wrapper(wrapper_pid: i32) {
+    let mut procs: Vec<(i32, i32, i32)> = Vec::new(); // (pid, ppid, sid)
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for ent in rd.flatten() {
+            if let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+                if let Some((ppid, sid)) = read_ppid_sid(pid) {
+                    procs.push((pid, ppid, sid));
+                }
+            }
+        }
+    }
+
+    // Transitive descendants of the wrapper (PPID closure).
+    let mut descendants: Vec<i32> = vec![wrapper_pid];
+    loop {
+        let mut added = false;
+        for (pid, ppid, _) in &procs {
+            if descendants.contains(ppid) && !descendants.contains(pid) {
+                descendants.push(*pid);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    // Sessions whose leader is one of those descendants (the setsid'd exec'd
+    // process / its forking shell). Never a session merely shared with the
+    // wrapper or the runtime.
+    let mut sessions: Vec<i32> = procs
+        .iter()
+        .filter(|(pid, _, sid)| *pid == *sid && *sid > 0 && descendants.contains(pid))
+        .map(|(_, _, sid)| *sid)
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+
+    for (pid, _, sid) in &procs {
+        if descendants.contains(pid) || sessions.contains(sid) {
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1877,6 +1960,7 @@ impl RuntimeService for RuntimeSvc {
         };
 
         use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
         use tokio::process::Command;
 
         let mut proc_cmd = Command::new(&bin);
@@ -1888,33 +1972,67 @@ impl RuntimeService for RuntimeSvc {
         proc_cmd.stdout(Stdio::piped());
         proc_cmd.stderr(Stdio::piped());
 
-        let child = proc_cmd
+        let mut child = proc_cmd
             .spawn()
             .map_err(|e| Status::internal(format!("spawn error: {}", e)))?;
 
-        let output = if timeout_secs > 0 {
+        // Capture the exec wrapper's PID before any await consumes the child, so
+        // we can kill its whole subtree on timeout (#339).
+        let child_pid = child.id().map(|p| p as i32);
+
+        // Drain stdout/stderr concurrently so a full pipe buffer can't deadlock
+        // the child before it exits (or before we time out).
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let out_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(s) = stdout.as_mut() {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(s) = stderr.as_mut() {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        let status = if timeout_secs > 0 {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs as u64),
-                child.wait_with_output(),
+                child.wait(),
             )
             .await
             {
-                Ok(Ok(out)) => out,
+                Ok(Ok(st)) => st,
                 Ok(Err(e)) => return Err(Status::internal(format!("wait error: {}", e))),
-                Err(_) => return Err(Status::deadline_exceeded("exec timed out")),
+                Err(_) => {
+                    // Timeout: terminate ONLY the exec'd command and its session
+                    // inside the container — leave the container itself running —
+                    // then reap the wrapper (#339).
+                    if let Some(pid) = child_pid {
+                        kill_exec_wrapper(pid);
+                    }
+                    let _ = child.wait().await;
+                    return Err(Status::deadline_exceeded("exec timed out"));
+                }
             }
         } else {
             child
-                .wait_with_output()
+                .wait()
                 .await
                 .map_err(|e| Status::internal(format!("wait error: {}", e)))?
         };
 
-        let exit_code = output.status.code().unwrap_or(1);
+        let stdout = out_task.await.unwrap_or_default();
+        let stderr = err_task.await.unwrap_or_default();
+        let exit_code = status.code().unwrap_or(1);
 
         Ok(Response::new(ExecSyncResponse {
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout,
+            stderr,
             exit_code,
         }))
     }
@@ -2379,6 +2497,71 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    fn is_alive(pid: i32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| !s.contains(") Z "))
+                .unwrap_or(false)
+    }
+
+    fn find_one(pat: &str) -> Option<i32> {
+        for ent in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            if let Ok(c) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+                if String::from_utf8_lossy(&c).replace('\0', " ").contains(pat) {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
+
+    /// kill_exec_wrapper must reap the exec'd command's whole *session* — even a
+    /// grandchild that `setsid`'d and was reparented away — while leaving the
+    /// wrapper's siblings alone (issue #339). This mirrors `pelagos exec` →
+    /// (setsid'd shell) → forked `sleep`, where the shell reparents the sleep.
+    #[test]
+    fn test_kill_exec_wrapper_reaps_setsid_session() {
+        use std::process::Command;
+        // A unique sleep DURATION acts as the sentinel (a marker *argument* would
+        // make `sleep` fail with "invalid time interval").
+        let dur = 23000 + (std::process::id() % 5000);
+        let needle = format!("sleep {dur}");
+        // wrapper -> `setsid` (new session leader) which forks the sentinel sleep
+        // and then waits, so the sleep shares the new session.
+        let mut wrapper = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("exec setsid -w /bin/sh -c 'sleep {dur} & wait'"),
+            ])
+            .spawn()
+            .expect("spawn wrapper");
+        let root = wrapper.id() as i32;
+
+        // Wait for the sentinel sleep (the session grandchild) to appear.
+        let mut sleep_pid = None;
+        for _ in 0..60 {
+            if let Some(p) = find_one(&needle) {
+                sleep_pid = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let sleep_pid = sleep_pid.expect("sentinel sleep did not start");
+
+        kill_exec_wrapper(root);
+        let _ = wrapper.wait();
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !is_alive(sleep_pid),
+            "session grandchild {sleep_pid} survived kill_exec_wrapper (#339 leak)"
+        );
+        assert!(!is_alive(root), "wrapper {root} survived kill_exec_wrapper");
+    }
 
     #[test]
     fn test_cri_now_format() {

@@ -271,6 +271,33 @@ else
     fail "crictl exec --sync: timeout did not fire (${ELAPSED}s elapsed)"
 fi
 
+# Issue #339: a timeout must terminate ONLY the exec'd command, leaving the
+# container running, and must not leak the exec'd process inside it. This
+# mirrors critest's "timeout exec process should be gone" + the cascade where
+# the follow-up exec reports "container is not running".
+STATE=$($CRICTL inspect "$CONTAINER_ID" 2>/dev/null | grep -o '"state": "[A-Z_]*"' | head -1)
+check_contains "exec timeout leaves container running (#339)" "$STATE" "CONTAINER_RUNNING"
+
+# Count the timed-out exec's leaked `sleep 30` inside the container. Match by
+# comm==sleep + first arg so the counter process (comm=sh) never matches its own
+# command line — a `case "...sleep 30..."` pattern would count itself.
+SLEEPS=$($CRICTL exec --sync "$CONTAINER_ID" /bin/sh -c 'c=0; for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = sleep ] || continue; set -- $(tr "\0" " " < $p/cmdline 2>/dev/null); [ "$2" = 30 ] && c=$((c+1)); done; echo $c' 2>&1 | tr -dc '0-9')
+if [ "${SLEEPS:-x}" = "0" ]; then
+    pass "exec timeout does not leak the exec'd process (#339)"
+else
+    fail "exec timeout leaked ${SLEEPS} 'sleep 30' process(es) in container (#339)"
+fi
+
+# Forking shell: the exec'd shell forks `sleep` as a grandchild that reparents to
+# container-init; the timeout must still reap it (kill_exec_wrapper session walk).
+$CRICTL exec --sync --timeout 2 "$CONTAINER_ID" /bin/sh -c 'sleep 31 & wait' >/dev/null 2>&1 || true
+GC=$($CRICTL exec --sync "$CONTAINER_ID" /bin/sh -c 'c=0; for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = sleep ] || continue; set -- $(tr "\0" " " < $p/cmdline 2>/dev/null); [ "$2" = 31 ] && c=$((c+1)); done; echo $c' 2>&1 | tr -dc '0-9')
+if [ "${GC:-x}" = "0" ]; then
+    pass "exec timeout reaps forked grandchild (#339)"
+else
+    fail "exec timeout leaked ${GC} forked 'sleep 31' grandchild(ren) (#339)"
+fi
+
 # ── Streaming Exec (kubectl-style) ───────────────────────────────────────────
 # Uses crictl exec WITHOUT --sync to exercise the SPDY streaming path.
 

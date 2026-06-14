@@ -5142,3 +5142,28 @@ torn down on every exit path. Complemented by the in-crate `pelagos-cri` unit te
 (`scope::tests::*` for the systemd-run argv construction and `state::tests::*` for the
 startup re-adoption policy — live pause → re-adopt, dead pause → purge, native sandbox →
 never stale).
+
+## `pelagos-cri` ExecSync timeout & streaming (issue #339)
+These are validated by the `pelagos-cri` unit test
+`runtime::tests::test_kill_exec_wrapper_reaps_setsid_session` (run via
+`cargo test -p pelagos-cri`) and by the CRI end-to-end script `scripts/test-cri.sh`
+(run as root with `crictl`).
+
+**Unit test — `test_kill_exec_wrapper_reaps_setsid_session`** (no root needed).
+Builds a wrapper → `setsid`'d shell → forked `sleep` tree (mirroring `pelagos exec`
+→ exec'd process → its forked command, where the command reparents to container-init)
+and asserts `kill_exec_wrapper` reaps the reparented grandchild via its session while
+leaving unrelated processes alone. Failure means an `ExecSync` timeout would leak the
+exec'd command inside the container.
+
+**`scripts/test-cri.sh` assertions (require root + crictl):**
+- *exec timeout leaves container running (#339)* — after `ExecSync` with a `Timeout`
+  fires, `ContainerStatus` is still `CONTAINER_RUNNING`. Failure reproduces the cascade
+  where ~34/56 critest specs fail downstream with "container is not running".
+- *exec timeout does not leak the exec'd process (#339)* — the timed-out `sleep` is gone
+  from the container (counted by `comm`, not a self-matching cmdline).
+- *exec timeout reaps forked grandchild (#339)* — a shell that *forks* its command
+  (`sh -c 'sleep N & wait'`) still has the reparented `sleep` reaped (the session walk).
+- *crictl exec (streaming): …* — the streaming SPDY exec path completes and the
+  connection closes; the stdin relay is aborted on child exit so it cannot hang. Failure
+  reproduces the suite-wedging socket leak (~93 open streams).
