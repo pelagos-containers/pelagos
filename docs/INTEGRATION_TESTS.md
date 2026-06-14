@@ -5121,3 +5121,24 @@ absolute symlink is used deliberately: a relative `../run` symlink happens to st
 the rootfs and would mask the bug. Complemented by the `container::tests::resolve_mount_target_*`
 unit tests, which pin the path-resolution logic (symlink following, relative targets,
 `..` clamping, loop termination) without requiring root.
+
+## `issue_336_cri_restart_readopt::test_scoped_supervisor_survives_service_kill`
+**Requires root and systemd** (skips gracefully when `/run/systemd/system`,
+`systemd-run`, or `systemctl` are absent).
+Validates the mechanism behind the #336 fix: per-container supervisors must outlive a
+`pelagos-cri` restart. A parent transient service stands in for `pelagos-cri.service`
+and launches two children — a "supervisor" `sleep` placed in its own
+`systemd-run --scope` under a dedicated slice (mirroring how pelagos-cri now launches
+the `pelagos run --detach` watcher and the pause), and a "control" `sleep` left directly
+in the parent service's cgroup. The test then `systemctl stop`s the parent service and
+asserts the control child is **killed** (proving systemd's default
+`KillMode=control-group` reaps everything in the service cgroup — the original bug) while
+the scoped supervisor **survives** (proving the fix moves supervisors outside the runtime's
+cgroup). Failure of the control assertion means the test is not exercising the real cgroup
+kill; failure of the supervisor assertion means the #336 regression has returned and a
+runtime restart would again kill/orphan running pods. Sentinels are carried in each sleep's
+argv0 (via symlinks) so `pgrep -f` matches uniquely, and all transient units/processes are
+torn down on every exit path. Complemented by the in-crate `pelagos-cri` unit tests
+(`scope::tests::*` for the systemd-run argv construction and `state::tests::*` for the
+startup re-adoption policy — live pause → re-adopt, dead pause → purge, native sandbox →
+never stale).

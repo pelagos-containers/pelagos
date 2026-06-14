@@ -230,27 +230,28 @@ impl AppState {
         let mut inner = StateInner::load();
         inner.pelagos_bin = pelagos_bin;
 
-        // Purge stale sandboxes whose pause process no longer exists.
-        // This happens when pelagos-cri restarts (e.g. after a system reboot or
-        // RuntimeDirectory wipe) and the in-memory /run/pelagos/ state is gone.
-        // k3s persists container IDs across its own restarts and will call
-        // StartContainer on those old IDs, hitting "sandbox not found".
-        // Removing the records here gives k3s a clean slate and causes it to
-        // recreate the pods from scratch.
-        let stale_sandbox_ids: Vec<String> = inner
-            .sandboxes
-            .values()
-            .filter(|s| {
-                if s.pause_pid <= 0 {
-                    return false;
-                }
-                // Process is alive iff /proc/<pid> exists.
-                !std::path::Path::new(&format!("/proc/{}", s.pause_pid)).exists()
-            })
-            .map(|s| s.id.clone())
-            .collect();
+        // Re-adopt running pods across a `pelagos-cri` restart (#336).
+        //
+        // CRI metadata under /run/pelagos-cri/ persists across restarts, and —
+        // because each pod's pause process now runs in its own transient systemd
+        // unit under `pelagos.slice` (see `scope`) — the pause survives the
+        // runtime restart too. So a sandbox whose pause is still alive is simply
+        // re-adopted: its metadata is kept and the kubelet's view is unchanged.
+        //
+        // Only sandboxes whose pause is genuinely gone (crash, reboot before the
+        // unit came back, or a legacy non-scoped pause killed with the old
+        // runtime) are purged, taking their containers with them, so the kubelet
+        // recreates just those pods rather than every pod on the node.
+        let stale = stale_sandbox_ids(&inner.sandboxes, |pid| {
+            std::path::Path::new(&format!("/proc/{}", pid)).exists()
+        });
 
-        for sid in &stale_sandbox_ids {
+        let adopted = inner.sandboxes.len() - stale.len();
+        if adopted > 0 {
+            log::info!("startup: re-adopting {adopted} running sandbox(es) across restart");
+        }
+
+        for sid in &stale {
             log::info!("startup: removing stale sandbox {sid} (pause process gone)");
             // Remove all containers that belonged to this sandbox.
             let stale_ctrs: Vec<String> = inner
@@ -272,6 +273,24 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
         }
     }
+}
+
+/// Identify sandboxes whose supervisor (pause process) is gone and must be purged
+/// on startup. `is_alive(pid)` reports whether a given pause PID is still running.
+///
+/// Sandboxes created on the native (non-CNI) path have `pause_pid <= 0` and no
+/// pause process to check, so they are never treated as stale here. Pulled out as
+/// a pure function so the re-adoption policy can be unit-tested without touching
+/// `/proc` (#336).
+pub(crate) fn stale_sandbox_ids<F: Fn(i32) -> bool>(
+    sandboxes: &HashMap<String, CriSandbox>,
+    is_alive: F,
+) -> Vec<String> {
+    sandboxes
+        .values()
+        .filter(|s| s.pause_pid > 0 && !is_alive(s.pause_pid))
+        .map(|s| s.id.clone())
+        .collect()
 }
 
 // ── Disk helpers ─────────────────────────────────────────────────────────────
@@ -372,4 +391,56 @@ fn load_all_containers() -> HashMap<String, CriContainer> {
         })
         .map(|c| (c.id.clone(), c))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a CriSandbox with the given id and pause_pid via JSON so we don't
+    /// have to spell out every (mostly `#[serde(default)]`) field.
+    fn sandbox(id: &str, pause_pid: i32) -> CriSandbox {
+        let json = format!(
+            r#"{{"id":"{id}","name":"n","namespace":"ns","uid":"u","attempt":0,
+                 "labels":{{}},"annotations":{{}},"created_at_ns":0,"state":"Running",
+                 "pause_pid":{pause_pid}}}"#
+        );
+        serde_json::from_str(&json).expect("valid sandbox json")
+    }
+
+    fn map(items: Vec<CriSandbox>) -> HashMap<String, CriSandbox> {
+        items.into_iter().map(|s| (s.id.clone(), s)).collect()
+    }
+
+    #[test]
+    fn live_pause_sandboxes_are_re_adopted_not_purged() {
+        // Two CNI sandboxes whose pause processes are still alive must survive a
+        // restart untouched (#336): stale set is empty.
+        let sandboxes = map(vec![sandbox("alive1", 1001), sandbox("alive2", 1002)]);
+        let stale = stale_sandbox_ids(&sandboxes, |_pid| true);
+        assert!(
+            stale.is_empty(),
+            "live sandboxes must be re-adopted: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn dead_pause_sandboxes_are_purged() {
+        // Only the sandbox whose pause is gone is purged; the live one is kept.
+        let sandboxes = map(vec![sandbox("alive", 1001), sandbox("dead", 1002)]);
+        let stale = stale_sandbox_ids(&sandboxes, |pid| pid == 1001);
+        assert_eq!(stale, vec!["dead".to_string()]);
+    }
+
+    #[test]
+    fn native_sandboxes_without_pause_are_never_stale() {
+        // pause_pid <= 0 (native bridge path) has no pause to check; such a
+        // sandbox must not be purged even though `is_alive` would say "dead".
+        let sandboxes = map(vec![sandbox("native", 0), sandbox("native_neg", -1)]);
+        let stale = stale_sandbox_ids(&sandboxes, |_pid| false);
+        assert!(
+            stale.is_empty(),
+            "native sandboxes must never be stale: {stale:?}"
+        );
+    }
 }

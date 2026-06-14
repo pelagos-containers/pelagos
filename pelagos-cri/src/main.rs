@@ -9,6 +9,7 @@ mod cni;
 mod image;
 mod invoke;
 mod runtime;
+mod scope;
 mod state;
 mod streaming;
 
