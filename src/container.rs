@@ -4197,7 +4197,10 @@ impl Command {
                     // Because Namespace::MOUNT is required, the bind mount is scoped to this
                     // container's private mount namespace — the host's rootfs is never touched.
                     if let Some(ref dns_src) = dns_temp_file_cstring {
-                        let etc_host = effective_root.join("etc");
+                        let etc_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/etc"),
+                        );
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| pre_exec_err("dns mkdir /etc", e))?;
                         let resolv_host = etc_host.join("resolv.conf");
@@ -4238,8 +4241,14 @@ impl Command {
                     // Non-overlay case (static rootfs): bind-mount as before.
                     if let Some(ref ca_src) = pasta_ca_cert_cstring {
                         if overlay_merged.is_none() {
-                            let ssl_dir = effective_root.join("etc/ssl/certs");
-                            let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
+                            let ssl_dir = resolve_mount_target_in_root(
+                                effective_root,
+                                std::path::Path::new("/etc/ssl/certs"),
+                            );
+                            let ca_tgt = resolve_mount_target_in_root(
+                                effective_root,
+                                std::path::Path::new("/etc/ssl/certs/ca-certificates.crt"),
+                            );
                             std::fs::create_dir_all(&ssl_dir)
                                 .map_err(|e| pre_exec_err("ca mkdir", e))?;
                             let tgt_c =
@@ -4271,7 +4280,10 @@ impl Command {
                     // Hosts: bind-mount the per-container hosts file over /etc/hosts.
                     // Same mechanism as DNS — scoped to this container's mount namespace.
                     if let Some(ref hosts_src) = hosts_temp_file_cstring {
-                        let etc_host = effective_root.join("etc");
+                        let etc_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/etc"),
+                        );
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| pre_exec_err("hosts mkdir /etc", e))?;
                         let hosts_host = etc_host.join("hosts");
@@ -4325,8 +4337,7 @@ impl Command {
                     // runtimetest's validatePosixMounts checks OCI-config order.
                     for km in &kernel_mounts {
                         use std::os::unix::ffi::OsStrExt as _;
-                        let rel = km.target.strip_prefix("/").unwrap_or(&km.target);
-                        let host_target = effective_root.join(rel);
+                        let host_target = resolve_mount_target_in_root(effective_root, &km.target);
                         std::fs::create_dir_all(&host_target).map_err(|e| {
                             io::Error::other(format!(
                                 "kernel mount mkdir {}: {}",
@@ -4364,7 +4375,10 @@ impl Command {
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
-                        let dev_host = effective_root.join("dev");
+                        let dev_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/dev"),
+                        );
                         std::fs::create_dir_all(&dev_host)
                             .map_err(|e| pre_exec_err("mkdir /dev", e))?;
                         let dev_host_c = CString::new(dev_host.as_os_str().as_bytes()).unwrap();
@@ -4498,8 +4512,7 @@ impl Command {
                             if !host_src.exists() {
                                 continue; // no matching host device — skip
                             }
-                            let rel = dev.path.strip_prefix("/").unwrap_or(&dev.path);
-                            let target = effective_root.join(rel);
+                            let target = resolve_mount_target_in_root(effective_root, &dev.path);
                             if let Some(parent) = target.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
@@ -6754,7 +6767,10 @@ impl Command {
 
                     // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
                     if let Some(ref dns_src) = dns_temp_file_cstring {
-                        let etc_host = effective_root.join("etc");
+                        let etc_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/etc"),
+                        );
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| pre_exec_err("dns mkdir /etc", e))?;
                         let resolv_host = etc_host.join("resolv.conf");
@@ -6788,8 +6804,14 @@ impl Command {
                     // Non-overlay case (static rootfs): bind-mount as before.
                     if let Some(ref ca_src) = pasta_ca_cert_cstring {
                         if overlay_merged.is_none() {
-                            let ssl_dir = effective_root.join("etc/ssl/certs");
-                            let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
+                            let ssl_dir = resolve_mount_target_in_root(
+                                effective_root,
+                                std::path::Path::new("/etc/ssl/certs"),
+                            );
+                            let ca_tgt = resolve_mount_target_in_root(
+                                effective_root,
+                                std::path::Path::new("/etc/ssl/certs/ca-certificates.crt"),
+                            );
                             std::fs::create_dir_all(&ssl_dir)
                                 .map_err(|e| pre_exec_err("ca mkdir", e))?;
                             let tgt_c =
@@ -6820,7 +6842,10 @@ impl Command {
 
                     // Hosts: bind-mount the per-container hosts file over /etc/hosts.
                     if let Some(ref hosts_src) = hosts_temp_file_cstring {
-                        let etc_host = effective_root.join("etc");
+                        let etc_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/etc"),
+                        );
                         std::fs::create_dir_all(&etc_host)
                             .map_err(|e| pre_exec_err("hosts mkdir /etc", e))?;
                         let hosts_host = etc_host.join("hosts");
@@ -6867,8 +6892,7 @@ impl Command {
                     // Mount kernel filesystems BEFORE chroot (same ordering fix as spawn()).
                     for km in &kernel_mounts {
                         use std::os::unix::ffi::OsStrExt as _;
-                        let rel = km.target.strip_prefix("/").unwrap_or(&km.target);
-                        let host_target = effective_root.join(rel);
+                        let host_target = resolve_mount_target_in_root(effective_root, &km.target);
                         std::fs::create_dir_all(&host_target).map_err(|e| {
                             io::Error::other(format!(
                                 "kernel mount mkdir {}: {}",
@@ -6906,7 +6930,10 @@ impl Command {
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
-                        let dev_host = effective_root.join("dev");
+                        let dev_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/dev"),
+                        );
                         std::fs::create_dir_all(&dev_host)
                             .map_err(|e| pre_exec_err("mkdir /dev", e))?;
                         let dev_host_c = CString::new(dev_host.as_os_str().as_bytes()).unwrap();
@@ -7028,8 +7055,7 @@ impl Command {
                             if !host_src.exists() {
                                 continue;
                             }
-                            let rel = dev.path.strip_prefix("/").unwrap_or(&dev.path);
-                            let target = effective_root.join(rel);
+                            let target = resolve_mount_target_in_root(effective_root, &dev.path);
                             if let Some(parent) = target.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
@@ -8403,6 +8429,42 @@ mod tests {
         let resolved =
             resolve_mount_target_in_root(root.path(), std::path::Path::new("/../../etc/passwd"));
         assert_eq!(resolved, root.path().join("etc/passwd"));
+    }
+
+    #[test]
+    fn test_resolve_mount_target_absolute_symlink_cannot_escape_root() {
+        // #349: a malicious image ships `/etc` as an ABSOLUTE symlink pointing at a
+        // host path (e.g. `/etc -> /` or `/etc -> /var/lib/pelagos`). Before the
+        // pre-pivot mount setup routed targets through this helper, an
+        // `effective_root.join("etc")` would be a symlink the kernel dereferences to
+        // the HOST path during create_dir_all/mount — letting an image redirect
+        // /proc, /sys, /dev or /etc writes onto the host filesystem before pivot_root.
+        // The helper must re-root the absolute symlink target back inside the rootfs.
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/var/lib/pelagos", root.path().join("etc")).unwrap();
+
+        let resolved = resolve_mount_target_in_root(root.path(), std::path::Path::new("/etc"));
+        // Resolves to root/var/lib/pelagos — INSIDE the rootfs, never the host path.
+        assert_eq!(resolved, root.path().join("var/lib/pelagos"));
+        assert!(
+            resolved.starts_with(root.path()),
+            "resolved target {resolved:?} escaped rootfs {:?}",
+            root.path()
+        );
+    }
+
+    #[test]
+    fn test_resolve_mount_target_nested_symlink_target_stays_in_root() {
+        // #349: `/dev` is an absolute symlink whose target itself contains another
+        // absolute symlink. Every hop must be re-rooted; the final path stays inside.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("real-dev")).unwrap();
+        std::os::unix::fs::symlink("/stage1", root.path().join("dev")).unwrap();
+        std::os::unix::fs::symlink("/real-dev", root.path().join("stage1")).unwrap();
+
+        let resolved = resolve_mount_target_in_root(root.path(), std::path::Path::new("/dev"));
+        assert_eq!(resolved, root.path().join("real-dev"));
+        assert!(resolved.starts_with(root.path()));
     }
 
     #[test]
