@@ -51,8 +51,15 @@ pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    // Reject an empty/separator-laden name before building a removal path: an
+    // empty name makes `container_dir("")` resolve to the containers parent dir
+    // (wiping ALL containers), and a `/`-leading name escapes it entirely (#347).
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(format!("invalid container name '{}'", name).into());
+    }
     let dir = container_dir(name);
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {}", dir.display(), e))?;
+    pelagos::paths::guarded_remove_dir_all(&dir)
+        .map_err(|e| format!("remove {}: {}", dir.display(), e))?;
 
     Ok(())
 }

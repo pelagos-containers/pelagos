@@ -311,7 +311,19 @@ pub fn save_container(c: &CriContainer) -> std::io::Result<()> {
     std::fs::write(path, json)
 }
 
+/// A CRI id must be a non-empty, single path component (our ids are 64-char
+/// hex). Reject anything else so a corrupted/empty id from an inconsistent
+/// ("phantom") sandbox can never make a removal escape its directory or wipe a
+/// whole parent dir (#347).
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\0')
+}
+
 pub fn remove_sandbox_file(id: &str) {
+    if !valid_id(id) {
+        log::error!("remove_sandbox_file: refusing invalid id {id:?} (#347)");
+        return;
+    }
     let _ = std::fs::remove_file(format!("{}/{}.json", SANDBOXES_DIR, id));
 }
 
@@ -353,11 +365,19 @@ pub fn write_pelagos_sandbox_state(
 
 /// Remove the pelagos-format sandbox state directory.
 pub fn remove_pelagos_sandbox_state(id: &str) {
+    if !valid_id(id) {
+        log::error!("remove_pelagos_sandbox_state: refusing invalid id {id:?} (#347)");
+        return;
+    }
     let dir = format!("{}/{}", PELAGOS_SANDBOXES_DIR, id);
     let _ = std::fs::remove_dir_all(dir);
 }
 
 pub fn remove_container_file(id: &str) {
+    if !valid_id(id) {
+        log::error!("remove_container_file: refusing invalid id {id:?} (#347)");
+        return;
+    }
     let _ = std::fs::remove_file(format!("{}/{}.json", CONTAINERS_DIR, id));
 }
 

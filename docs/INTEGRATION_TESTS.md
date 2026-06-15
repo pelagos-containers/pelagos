@@ -5196,3 +5196,17 @@ Validated by the `pelagos-cri` unit tests `image::tests::*` (run via
   concurrency-safe (serialized by a mutex).
 Note: `crictl img`/`images` is ListImages; `crictl inspecti` is ImageStatus —
 the assertions use the correct one for each check.
+
+## `issue_347_no_host_destruction::test_rm_refuses_path_like_names_and_spares_host_bin`
+**Does NOT require root.**
+Regression guard for the CRITICAL host-destructive bug #347, where an inconsistent
+("phantom") sandbox caused pelagos to `unlink` the host `/bin` symlink during GC — a
+removal whose base path resolved outside pelagos's managed directories. Runs the
+`pelagos` binary with empty and path-like names (`/bin`, `/usr`, `../../../bin`, ``, `.`)
+and asserts each `pelagos rm` **fails** and that the host `/bin` still exists afterward.
+Failure means the CLI accepted a name that could escape pelagos's managed dirs and a
+removal touched the host filesystem. Complemented by the unit tests
+`paths::tests::test_guard_*` (which pin `is_safe_to_remove`: rejects `/`, `/bin`, the
+managed roots and wholesale parent dirs, and `join`/`..` escapes; accepts legitimate
+container/sandbox/overlay/image subpaths) and `test_guarded_remove_refuses_unmanaged_dir`
+(functional proof that `guarded_remove_dir_all` leaves an out-of-tree directory intact).

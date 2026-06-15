@@ -253,6 +253,12 @@ pub fn create_sandbox(name: Option<&str>) -> io::Result<SandboxState> {
 /// Remove a sandbox: SIGTERM the pause process, tear down the network namespace,
 /// and clean up the state directory.
 pub fn remove_sandbox(id: &str) -> io::Result<()> {
+    // Reject an empty/separator-laden id before any path is built from it: an
+    // empty id makes `sandbox_dir("")` resolve to the sandboxes parent dir, and
+    // a `/`-leading id escapes the runtime dir entirely (#347).
+    if id.is_empty() || id.contains('/') || id == "." || id == ".." {
+        return Err(io::Error::other(format!("invalid sandbox id '{}'", id)));
+    }
     let state = SandboxState::load(id)?;
 
     // Send SIGTERM to the pause process.
@@ -274,10 +280,10 @@ pub fn remove_sandbox(id: &str) -> io::Result<()> {
     let _ = crate::netlink::link_del(&veth_host);
     let _ = crate::netlink::netns_del(&state.ns_name);
 
-    // Remove the state directory.
+    // Remove the state directory (guarded against any path outside the runtime dir).
     let dir = crate::paths::sandbox_dir(id);
     if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
+        crate::paths::guarded_remove_dir_all(&dir)?;
     }
 
     Ok(())

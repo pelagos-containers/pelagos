@@ -28120,3 +28120,43 @@ mod issue_336_cri_restart_readopt {
         );
     }
 }
+
+/// Issue #347 (CRITICAL host-destructive): an inconsistent/"phantom" sandbox made
+/// pelagos delete the host `/bin` symlink during GC, via a removal whose base path
+/// resolved outside pelagos's managed dirs. The fix guards every dynamic-path
+/// removal (`paths::guarded_remove_dir_all`) and rejects empty/path-like ids at
+/// the CLI. This test proves the binary refuses such names without touching the host.
+mod issue_347_no_host_destruction {
+    use super::*;
+    use std::process::Command as Proc;
+
+    fn pelagos_bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    /// Does NOT require root. `pelagos rm` with an empty or path-like name must
+    /// fail and must NOT remove the host `/bin` (or any host path).
+    #[test]
+    fn test_rm_refuses_path_like_names_and_spares_host_bin() {
+        // Precondition: the host has /bin (usr-merge symlink on modern distros).
+        assert!(
+            std::path::Path::new("/bin").exists(),
+            "test precondition: /bin must exist"
+        );
+        for bad in ["/bin", "/usr", "../../../bin", "", "."] {
+            let out = Proc::new(pelagos_bin())
+                .args(["rm", bad])
+                .output()
+                .expect("run pelagos rm");
+            assert!(
+                !out.status.success(),
+                "pelagos rm {bad:?} must fail, not succeed (#347)"
+            );
+        }
+        // The whole point: the host filesystem is untouched.
+        assert!(
+            std::path::Path::new("/bin").exists(),
+            "#347 regression: /bin was removed by `pelagos rm`"
+        );
+    }
+}
