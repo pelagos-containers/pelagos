@@ -1432,22 +1432,14 @@ impl RuntimeService for RuntimeSvc {
         // Kubelet may pass the sha256 digest form rather than the tag; resolve to a known tag.
         let image = Self::resolve_image_ref(&container.image).await;
 
-        // CRI entrypoint semantics:
-        //   container.entrypoint (CRI "command") overrides the image ENTRYPOINT when non-empty.
-        //   container.args (CRI "args") overrides the image CMD when non-empty.
-        //   When entrypoint is empty the image's default ENTRYPOINT must be used — omitting it
-        //   would cause `pelagos run` to exec the first arg as the binary, which is wrong.
+        // CRI entrypoint/cmd resolution — see `resolve_container_argv` (#358).
         let (image_entrypoint, image_cmd) = Self::load_image_defaults(&image).await;
-        let effective_entrypoint: Vec<String> = if !container.entrypoint.is_empty() {
-            container.entrypoint.clone()
-        } else {
-            image_entrypoint
-        };
-        let effective_cmd: Vec<String> = if !container.args.is_empty() {
-            container.args.clone()
-        } else {
-            image_cmd
-        };
+        let (effective_entrypoint, effective_cmd) = resolve_container_argv(
+            &container.entrypoint,
+            &container.args,
+            image_entrypoint,
+            image_cmd,
+        );
 
         // B″ — Effective-UID-is-zero audit log.
         // If the container will run as root and is not explicitly privileged, warn.
@@ -2422,6 +2414,43 @@ impl RuntimeService for RuntimeSvc {
     }
 }
 
+/// Resolve the container's effective `(entrypoint, cmd)` from the CRI request and
+/// the image defaults, per Kubernetes/CRI/OCI semantics (#358):
+///
+/// | CRI command | CRI args | entrypoint | cmd          |
+/// |-------------|----------|------------|--------------|
+/// | empty       | empty    | image EP   | image CMD    |
+/// | empty       | [args]   | image EP   | args         |
+/// | [cmd]       | empty    | cmd        | (none)       |  ← image CMD DROPPED
+/// | [cmd]       | [args]   | cmd        | args         |
+///
+/// The critical rule: a CRI `command` overrides the entrypoint AND drops the image
+/// CMD. The old code appended the image CMD whenever `args` was empty — even when
+/// `command` was set — producing e.g. `sleep 3600 sh` (image CMD `sh` appended),
+/// which exits immediately and breaks every verify-by-exec conformance spec.
+fn resolve_container_argv(
+    cri_command: &[String],
+    cri_args: &[String],
+    image_entrypoint: Vec<String>,
+    image_cmd: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let entrypoint = if cri_command.is_empty() {
+        image_entrypoint
+    } else {
+        cri_command.to_vec()
+    };
+    let cmd = if !cri_args.is_empty() {
+        cri_args.to_vec()
+    } else if cri_command.is_empty() {
+        // Only inherit the image CMD when the CRI command did NOT override the
+        // entrypoint; otherwise the CRI command is the full argv.
+        image_cmd
+    } else {
+        Vec::new()
+    };
+    (entrypoint, cmd)
+}
+
 // ── CRI log relay ─────────────────────────────────────────────────────────────
 
 /// Format current time as RFC3339 with nanosecond precision for the CRI log format.
@@ -2652,6 +2681,36 @@ mod tests {
         ] {
             assert!(effective_cri_log_path(dir, path, "pcri-x").starts_with('/'));
         }
+    }
+
+    /// #358: the four-cell entrypoint/cmd table. The keystone case is row 3 —
+    /// CRI command set + no args must DROP the image CMD (not append it), which is
+    /// what broke critest containers (`sleep 3600` → `sleep 3600 sh` → exit 1).
+    #[test]
+    fn test_resolve_container_argv() {
+        let ep = || vec!["/img-ep".to_string()];
+        let cmd = || vec!["img-cmd".to_string()];
+
+        // command empty, args empty → image EP + image CMD.
+        assert_eq!(
+            resolve_container_argv(&[], &[], ep(), cmd()),
+            (vec!["/img-ep".into()], vec!["img-cmd".into()])
+        );
+        // command empty, args set → image EP + args (image CMD dropped).
+        assert_eq!(
+            resolve_container_argv(&[], &["a".into()], ep(), cmd()),
+            (vec!["/img-ep".into()], vec!["a".into()])
+        );
+        // command set, args empty → command only; IMAGE CMD DROPPED (the bug).
+        assert_eq!(
+            resolve_container_argv(&["sleep".into(), "3600".into()], &[], ep(), cmd()),
+            (vec!["sleep".into(), "3600".into()], vec![])
+        );
+        // command set, args set → command + args.
+        assert_eq!(
+            resolve_container_argv(&["sleep".into()], &["3600".into()], ep(), cmd()),
+            (vec!["sleep".into()], vec!["3600".into()])
+        );
     }
 
     #[test]
