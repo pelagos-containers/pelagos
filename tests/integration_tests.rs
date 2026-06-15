@@ -18207,8 +18207,8 @@ fn test_default_caps_hex_value() {
         .unwrap_or("missing");
 
     assert_eq!(
-        capeff_val, "00000000800405fb",
-        "DEFAULT_CAPS CapEff mismatch — expected 00000000800405fb (11-cap set), got {capeff_val}"
+        capeff_val, "00000000a80425fb",
+        "DEFAULT_CAPS CapEff mismatch — expected 00000000a80425fb (OCI default 14-cap set), got {capeff_val}"
     );
 }
 
@@ -18220,15 +18220,17 @@ fn test_default_caps_hex_value() {
 /// hex value — CHOWN must work (so postgres-style images start cleanly) and MKNOD
 /// must fail (so device-node creation attacks are blocked).
 #[test]
-fn test_default_caps_allows_chown_denies_mknod() {
+fn test_default_caps_allows_chown_denies_sys_admin() {
     if !is_root() {
-        eprintln!("SKIP: test_default_caps_allows_chown_denies_mknod requires root");
+        eprintln!("SKIP: test_default_caps_allows_chown_denies_sys_admin requires root");
         return;
     }
     let rootfs = match get_test_rootfs() {
         Some(p) => p,
         None => {
-            eprintln!("SKIP: test_default_caps_allows_chown_denies_mknod requires alpine-rootfs");
+            eprintln!(
+                "SKIP: test_default_caps_allows_chown_denies_sys_admin requires alpine-rootfs"
+            );
             return;
         }
     };
@@ -18237,7 +18239,7 @@ fn test_default_caps_allows_chown_denies_mknod() {
         .args([
             "-c",
             "chown nobody /tmp && echo CHOWN=OK || echo CHOWN=FAIL; \
-             mknod /tmp/testdev c 1 1 2>/dev/null && echo MKNOD=OK || echo MKNOD=FAIL",
+             mount -t tmpfs none /mnt 2>/dev/null && echo MOUNT=OK || echo MOUNT=FAIL",
         ])
         .with_chroot(&rootfs)
         .with_proc_mount()
@@ -18252,13 +18254,15 @@ fn test_default_caps_allows_chown_denies_mknod() {
     let (_, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
     let stdout = String::from_utf8_lossy(&stdout_bytes);
 
+    // CHOWN is in the OCI default 14-cap set; SYS_ADMIN (mount) is NOT — the key
+    // boundary: a default container can do ordinary file ops but not privileged ones.
     assert!(
         stdout.contains("CHOWN=OK"),
         "CHOWN should succeed with DEFAULT_CAPS; stdout={stdout:?}"
     );
     assert!(
-        stdout.contains("MKNOD=FAIL"),
-        "MKNOD should fail with DEFAULT_CAPS (not in default set); stdout={stdout:?}"
+        stdout.contains("MOUNT=FAIL"),
+        "mount (CAP_SYS_ADMIN) must fail with DEFAULT_CAPS (not in default set); stdout={stdout:?}"
     );
 }
 

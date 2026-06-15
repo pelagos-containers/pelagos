@@ -745,12 +745,17 @@ impl Capability {
     /// or `with_capabilities(Capability::DEFAULT_CAPS - dropped + added)` for
     /// fine-grained control.
     pub const DEFAULT_CAPS: Capability = Capability::from_bits_retain(
+        // The OCI/Docker default capability set (14 caps). Non-privileged
+        // containers get exactly these — notably NOT NET_ADMIN/SYS_ADMIN/etc.
         Capability::CHOWN.bits()
             | Capability::DAC_OVERRIDE.bits()
             | Capability::FOWNER.bits()
             | Capability::FSETID.bits()
             | Capability::KILL.bits()
             | Capability::NET_BIND_SERVICE.bits()
+            | Capability::NET_RAW.bits()
+            | Capability::MKNOD.bits()
+            | Capability::AUDIT_WRITE.bits()
             | Capability::SETFCAP.bits()
             | Capability::SETGID.bits()
             | Capability::SETPCAP.bits()

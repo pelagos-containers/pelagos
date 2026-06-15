@@ -1042,9 +1042,12 @@ fn apply_cli_options(
         cmd = cmd.with_privileged();
     }
 
-    // Capabilities: start from DEFAULT_CAPS, apply --cap-drop then --cap-add.
+    // Capabilities: a non-privileged container runs with the DEFAULT_CAPS set
+    // (the OCI default 14), modified by --cap-drop then --cap-add — NOT full root
+    // caps. Without this a "privileged: false" container could still e.g. create a
+    // bridge (CAP_NET_ADMIN). Privileged containers (handled above) keep all caps.
     // --cap-drop ALL zeros the baseline; individual --cap-drop NAME removes one cap.
-    if !args.cap_drop.is_empty() || !args.cap_add.is_empty() {
+    if !args.privileged {
         let drop_all = args.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"));
         let mut effective = if drop_all {
             Capability::empty()
