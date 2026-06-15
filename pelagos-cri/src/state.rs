@@ -214,6 +214,39 @@ impl StateInner {
             pelagos_bin: String::new(),
         }
     }
+
+    /// Reap sandboxes whose pause process is gone, taking their containers with
+    /// them; returns the reaped sandbox ids. `is_alive(pid)` reports whether a
+    /// pause pid is still live.
+    ///
+    /// A sandbox with a dead pause is unusable — its network namespace and
+    /// processes are gone. Pelagos has always reaped these at startup; the same
+    /// pass runs periodically (see [`AppState::reconcile_stale_sandboxes`]) so a
+    /// dead "phantom" sandbox is removed within one interval instead of lingering
+    /// in the live listing until the next restart. A lingering phantom is exactly
+    /// what the kubelet discovers as an orphan and garbage-collects — the path
+    /// that deleted the host `/bin` (#347). Keys on pause-liveness, not the
+    /// recorded `state`, so it reaps both Ready-but-dead and NotReady-but-dead.
+    pub(crate) fn reap_stale_sandboxes<F: Fn(i32) -> bool>(&mut self, is_alive: F) -> Vec<String> {
+        let stale = stale_sandbox_ids(&self.sandboxes, is_alive);
+        for sid in &stale {
+            // Remove all containers that belonged to this sandbox.
+            let stale_ctrs: Vec<String> = self
+                .containers
+                .values()
+                .filter(|c| &c.sandbox_id == sid)
+                .map(|c| c.id.clone())
+                .collect();
+            for cid in stale_ctrs {
+                self.containers.remove(&cid);
+                remove_container_file(&cid);
+            }
+            self.sandboxes.remove(sid);
+            remove_sandbox_file(sid);
+            remove_pelagos_sandbox_state(sid);
+        }
+        stale
+    }
 }
 
 // ── AppState ─────────────────────────────────────────────────────────────────
@@ -242,35 +275,35 @@ impl AppState {
         // unit came back, or a legacy non-scoped pause killed with the old
         // runtime) are purged, taking their containers with them, so the kubelet
         // recreates just those pods rather than every pod on the node.
-        let stale = stale_sandbox_ids(&inner.sandboxes, |pid| {
-            std::path::Path::new(&format!("/proc/{}", pid)).exists()
-        });
+        let total_before = inner.sandboxes.len();
+        let stale = inner
+            .reap_stale_sandboxes(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists());
 
-        let adopted = inner.sandboxes.len() - stale.len();
+        let adopted = total_before - stale.len();
         if adopted > 0 {
             log::info!("startup: re-adopting {adopted} running sandbox(es) across restart");
         }
-
         for sid in &stale {
             log::info!("startup: removing stale sandbox {sid} (pause process gone)");
-            // Remove all containers that belonged to this sandbox.
-            let stale_ctrs: Vec<String> = inner
-                .containers
-                .values()
-                .filter(|c| &c.sandbox_id == sid)
-                .map(|c| c.id.clone())
-                .collect();
-            for cid in stale_ctrs {
-                inner.containers.remove(&cid);
-                remove_container_file(&cid);
-            }
-            inner.sandboxes.remove(sid);
-            remove_sandbox_file(sid);
-            remove_pelagos_sandbox_state(sid);
         }
 
         AppState {
             inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Reap dead-pause ("phantom") sandboxes from the live state. Intended to run
+    /// on a timer (see `main`) so a phantom is removed within one interval rather
+    /// than lingering in `list_pod_sandbox` until the next restart — otherwise the
+    /// kubelet discovers it as an orphan and garbage-collects it, the path that
+    /// deleted the host `/bin` (#347). Mirrors the startup reconciliation.
+    pub async fn reconcile_stale_sandboxes(&self) {
+        let reaped = {
+            let mut st = self.inner.lock().await;
+            st.reap_stale_sandboxes(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
+        };
+        for sid in &reaped {
+            log::info!("reconcile: removed stale sandbox {sid} (pause process gone)");
         }
     }
 }
@@ -461,6 +494,60 @@ mod tests {
         assert!(
             stale.is_empty(),
             "native sandboxes must never be stale: {stale:?}"
+        );
+    }
+
+    /// Build a minimal CriContainer attached to a sandbox via JSON.
+    fn container(id: &str, sandbox_id: &str) -> CriContainer {
+        let json = format!(
+            r#"{{"id":"{id}","sandbox_id":"{sandbox_id}","pelagos_name":"pcri-{id}",
+                 "name":"c","image":"img","entrypoint":[],"args":[],"envs":[],
+                 "working_dir":"","mounts":[],"labels":{{}},"annotations":{{}},
+                 "created_at_ns":0,"started_at_ns":0,"finished_at_ns":0,
+                 "state":"Running","exit_code":0}}"#
+        );
+        serde_json::from_str(&json).expect("valid container json")
+    }
+
+    /// #347 follow-up: reaping a dead-pause "phantom" sandbox must drop it from the
+    /// live state AND take its containers with it, while leaving live sandboxes (and
+    /// their containers) untouched. This is what stops us from continuing to present
+    /// the kubelet an orphan to GC between restarts.
+    #[test]
+    fn reap_removes_dead_phantom_sandbox_and_its_containers() {
+        let mut inner = StateInner {
+            sandboxes: map(vec![sandbox("alive", 1001), sandbox("dead", 1002)]),
+            containers: vec![
+                container("c-alive", "alive"),
+                container("c-dead1", "dead"),
+                container("c-dead2", "dead"),
+            ]
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect(),
+            pelagos_bin: String::new(),
+        };
+
+        // pid 1001 (alive) is live; 1002 (dead) is gone.
+        let reaped = inner.reap_stale_sandboxes(|pid| pid == 1001);
+
+        assert_eq!(
+            reaped,
+            vec!["dead".to_string()],
+            "only the dead sandbox reaped"
+        );
+        assert!(inner.sandboxes.contains_key("alive"), "live sandbox kept");
+        assert!(
+            !inner.sandboxes.contains_key("dead"),
+            "dead sandbox removed"
+        );
+        assert!(
+            inner.containers.contains_key("c-alive"),
+            "live container kept"
+        );
+        assert!(
+            !inner.containers.contains_key("c-dead1") && !inner.containers.contains_key("c-dead2"),
+            "the phantom's containers must be removed with it"
         );
     }
 }

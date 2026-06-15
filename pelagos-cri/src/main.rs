@@ -69,6 +69,21 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_state = AppState::new(args.pelagos_bin.clone());
 
+    // Periodically reap dead-pause ("phantom") sandboxes so we never keep
+    // presenting the kubelet an orphaned, un-operable sandbox to garbage-collect
+    // — the path that deleted the host /bin (#347). Without this, a phantom
+    // lingers in the live listing until the next restart's reconciliation.
+    {
+        let reaper_state = app_state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                reaper_state.reconcile_stale_sandboxes().await;
+            }
+        });
+    }
+
     let runtime_svc = RuntimeSvc {
         state: app_state.clone(),
         streaming_base_url: streaming_base_url.clone(),
