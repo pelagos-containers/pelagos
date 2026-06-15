@@ -413,6 +413,17 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Inherit the container's bounding capability set so exec'd processes are
+    // restricted exactly like the container (e.g. a dropped NET_RAW makes `ping`
+    // fail with EPERM) — `docker exec` semantics. Root exec only: rootless exec
+    // has its own constrained capability handling. Applied late in pre_exec, after
+    // the privileged setns/chroot, so exec setup still has the caps it needs.
+    if !is_rootless {
+        if let Some(capbnd) = container_cap_bnd(root_pid) {
+            cmd = cmd.with_capabilities(pelagos::container::Capability::from_bits_truncate(capbnd));
+        }
+    }
+
     // 5. Join PID namespace in the parent thread before fork (root exec only).
     //
     // setns(CLONE_NEWPID) updates this thread's pid_for_children to the
@@ -758,6 +769,22 @@ fn container_process_creds(pid: i32) -> Option<(u32, u32, Vec<u32>)> {
     parse_proc_status_creds(&std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?)
 }
 
+/// Parse the `CapBnd:` (bounding capability set) hex mask from `/proc/<pid>/status`.
+/// `Capability` bit positions match the kernel cap numbers, so the raw mask maps
+/// directly. Used so `exec` inherits the container's capabilities (a dropped cap
+/// like NET_RAW must also be dropped for exec'd processes — `docker exec` semantics).
+fn container_cap_bnd(pid: i32) -> Option<u64> {
+    parse_cap_bnd(&std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?)
+}
+
+/// Parse the `CapBnd:` hex mask from `/proc/<pid>/status` text.
+fn parse_cap_bnd(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapBnd:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+}
+
 /// Read `/proc/{pid}/environ` — NUL-separated KEY=VALUE pairs.
 fn read_proc_environ(pid: i32) -> Vec<(String, String)> {
     let path = format!("/proc/{}/environ", pid);
@@ -796,7 +823,21 @@ fn uid_in_ns_map(uid: u32, uid_map: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_proc_status_creds;
+    use super::{parse_cap_bnd, parse_proc_status_creds};
+
+    /// #352 capabilities: exec inherits the container's CapBnd hex mask (bit
+    /// positions = kernel cap numbers), so dropped caps stay dropped for exec.
+    #[test]
+    fn test_parse_cap_bnd() {
+        // Full default-ish set.
+        assert_eq!(
+            parse_cap_bnd("Name:\tsh\nCapBnd:\t00000000a80425fb\nSeccomp:\t2\n"),
+            Some(0x0000_0000_a804_25fb)
+        );
+        // Dropped all caps.
+        assert_eq!(parse_cap_bnd("CapBnd:\t0000000000000000\n"), Some(0));
+        assert_eq!(parse_cap_bnd("Uid:\t0\t0\t0\t0\n"), None);
+    }
 
     /// #352 RunAsUser/Group/SupplementalGroups: exec defaults to the container's
     /// own creds, parsed from /proc/<pid>/status (real uid/gid + Groups).
