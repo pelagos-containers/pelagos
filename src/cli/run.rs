@@ -1210,7 +1210,7 @@ fn prepare_persistent_upper(
 
     // Work dir must be empty at mount time — recreate it every run.
     let work = container_d.join("work");
-    let _ = std::fs::remove_dir_all(&work);
+    let _ = pelagos::paths::guarded_remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
     let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755));
 
@@ -1330,7 +1330,7 @@ fn run_foreground(
     if auto_remove {
         // Remove state directory immediately; ignore errors (best-effort).
         let dir = super::container_dir(&name);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = pelagos::paths::guarded_remove_dir_all(&dir);
     } else {
         state.status = ContainerStatus::Exited;
         state.exit_code = Some(code);
@@ -1419,7 +1419,7 @@ fn run_interactive(
 
     if auto_remove {
         let dir = super::container_dir(&name);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = pelagos::paths::guarded_remove_dir_all(&dir);
     } else {
         state.status = ContainerStatus::Exited;
         state.exit_code = Some(code);
@@ -1577,7 +1577,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => {
                     // Remove the state directory so a failed spawn doesn't leave a ghost
                     // container showing as "running" in `pelagos ps`.
-                    let _ = std::fs::remove_dir_all(&dir);
+                    let _ = pelagos::paths::guarded_remove_dir_all(&dir);
                     // Write the error message to the sync pipe so the parent can surface it,
                     // then close the pipe and exit.  The parent distinguishes success (\x00)
                     // from error (any other bytes) by reading more than 1 byte.

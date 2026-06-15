@@ -455,9 +455,166 @@ pub fn validate_install() -> Vec<InstallIssue> {
     issues
 }
 
+// ── Host-destructive-removal guard (issue #347) ─────────────────────────────
+
+/// Lexically normalize an absolute path: collapse `.`, `..`, and repeated
+/// separators WITHOUT touching the filesystem (no symlink resolution, no
+/// existence requirement). Returns `None` for a non-absolute path.
+fn normalize_abs(path: &std::path::Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::from("/");
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Directories pelagos manages but must NEVER remove wholesale — removing one of
+/// these would wipe every container/sandbox/image/layer/volume at once (e.g. an
+/// empty container name making `containers_dir().join("")` resolve to
+/// `containers_dir()` itself).
+fn protected_parent_dirs() -> Vec<PathBuf> {
+    [
+        containers_dir(),
+        sandboxes_dir(),
+        images_dir(),
+        layers_dir(),
+        volumes_dir(),
+        runtime_dir(),
+        data_dir(),
+    ]
+    .into_iter()
+    .filter_map(|p| normalize_abs(&p))
+    .collect()
+}
+
+/// True iff `path` is safe for pelagos to recursively remove: an absolute,
+/// lexically-normalized path that is a **strict descendant** of a managed root
+/// (`/run/pelagos`, `/var/lib/pelagos`, or the rootless equivalents) and is not
+/// one of the wholesale parent dirs.
+///
+/// Guards against issue #347 — a host-destructive bug where an inconsistent
+/// ("phantom") sandbox/container yielded an empty or absolute base path that
+/// `PathBuf::join` resolved OUTSIDE pelagos's directories (e.g. to the host
+/// `/bin` symlink), and a teardown `remove_dir_all`/unlink then deleted it.
+pub fn is_safe_to_remove(path: &std::path::Path) -> bool {
+    let Some(norm) = normalize_abs(path) else {
+        return false;
+    };
+    // Never a managed parent dir itself.
+    if protected_parent_dirs().contains(&norm) {
+        return false;
+    }
+    // Must be a strict descendant of a managed root.
+    [runtime_dir(), data_dir()]
+        .iter()
+        .filter_map(|r| normalize_abs(r))
+        .any(|root| norm.starts_with(&root) && norm != root)
+}
+
+/// `remove_dir_all`, but refuses (logs an error and returns `Ok`) for any path
+/// not strictly under a pelagos-managed root — a belt-and-suspenders guard
+/// against host-destructive removals (#347). `NotFound` is treated as success.
+pub fn guarded_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    if !is_safe_to_remove(path) {
+        log::error!(
+            "refusing to remove path outside pelagos-managed dirs: {} (#347 guard)",
+            path.display()
+        );
+        return Ok(());
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `remove_file`/unlink with the same managed-root guard as
+/// [`guarded_remove_dir_all`].
+pub fn guarded_remove_file(path: &std::path::Path) -> std::io::Result<()> {
+    if !is_safe_to_remove(path) {
+        log::error!(
+            "refusing to unlink path outside pelagos-managed dirs: {} (#347 guard)",
+            path.display()
+        );
+        return Ok(());
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_guard_rejects_host_and_root_paths() {
+        // Host system paths — the #347 destruction targets.
+        assert!(!is_safe_to_remove(std::path::Path::new("/")));
+        assert!(!is_safe_to_remove(std::path::Path::new("/bin")));
+        assert!(!is_safe_to_remove(std::path::Path::new("/usr/bin")));
+        assert!(!is_safe_to_remove(std::path::Path::new("/etc")));
+        // Non-absolute / empty.
+        assert!(!is_safe_to_remove(std::path::Path::new("")));
+        assert!(!is_safe_to_remove(std::path::Path::new("relative/path")));
+        // The managed roots and wholesale parent dirs themselves.
+        assert!(!is_safe_to_remove(&runtime_dir()));
+        assert!(!is_safe_to_remove(&data_dir()));
+        assert!(!is_safe_to_remove(&containers_dir()));
+        assert!(!is_safe_to_remove(&sandboxes_dir()));
+        assert!(!is_safe_to_remove(&images_dir()));
+        assert!(!is_safe_to_remove(&layers_dir()));
+    }
+
+    #[test]
+    fn test_guard_allows_managed_subpaths() {
+        assert!(is_safe_to_remove(&containers_dir().join("pcri-abc123")));
+        assert!(is_safe_to_remove(&sandbox_dir("0123456789abcdef")));
+        assert!(is_safe_to_remove(&runtime_dir().join("overlay-1234-5")));
+        assert!(is_safe_to_remove(&images_dir().join("alpine_latest")));
+        assert!(is_safe_to_remove(&layers_dir().join("deadbeef")));
+    }
+
+    #[test]
+    fn test_guarded_remove_refuses_unmanaged_dir() {
+        // A real directory OUTSIDE pelagos's managed roots must NOT be removed by
+        // the guarded wrapper — it returns Ok (refusal logged) and the dir
+        // survives. This is the functional proof that the #347 guard prevents
+        // host-destructive removals.
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("not-pelagos");
+        std::fs::create_dir_all(&victim).unwrap();
+        assert!(!is_safe_to_remove(&victim));
+        guarded_remove_dir_all(&victim).unwrap();
+        assert!(victim.exists(), "guard must not remove an unmanaged dir");
+    }
+
+    #[test]
+    fn test_guard_blocks_join_and_traversal_escapes() {
+        // PathBuf::join with an absolute component replaces the base -> escapes.
+        assert!(!is_safe_to_remove(&containers_dir().join("/bin")));
+        assert!(!is_safe_to_remove(&sandbox_dir("/bin")));
+        // `..` traversal out of the managed root.
+        assert!(!is_safe_to_remove(
+            &containers_dir().join("../../../../bin")
+        ));
+        // Empty id collapses to the protected parent dir.
+        assert!(!is_safe_to_remove(&containers_dir().join("")));
+        assert!(!is_safe_to_remove(&sandbox_dir("")));
+    }
 
     #[test]
     fn test_is_rootless_returns_bool() {

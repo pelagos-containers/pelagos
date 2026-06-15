@@ -8150,15 +8150,17 @@ impl Child {
         if !preserve_overlay {
             if let Some(ref merged) = self.overlay_merged_dir.take() {
                 if let Some(parent) = merged.parent() {
-                    let _ = std::fs::remove_dir_all(parent);
+                    // Guarded: never remove a path outside pelagos-managed dirs,
+                    // even if the overlay base were somehow mis-computed (#347).
+                    let _ = crate::paths::guarded_remove_dir_all(parent);
                 }
             }
         }
         if let Some(ref dir) = self.dns_temp_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
+            let _ = crate::paths::guarded_remove_dir_all(dir);
         }
         if let Some(ref dir) = self.hosts_temp_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
+            let _ = crate::paths::guarded_remove_dir_all(dir);
         }
         // Join the user_notif supervisor thread (it exits when the notif_fd is closed,
         // which happens when the child process exits and the kernel drops the fd).

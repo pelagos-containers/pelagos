@@ -2389,7 +2389,7 @@ pub fn cmd_delete(id: &str) -> io::Result<()> {
 
     // Load config before removing state dir so we can run poststop hooks.
     let bundle_path = state.bundle.clone();
-    fs::remove_dir_all(state_dir(id))?;
+    crate::paths::guarded_remove_dir_all(&state_dir(id))?;
 
     // Run poststop hooks (best-effort — state dir is already gone).
     if let Ok(config) = config_from_bundle(std::path::Path::new(&bundle_path)) {
