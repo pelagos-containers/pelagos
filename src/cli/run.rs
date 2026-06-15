@@ -1057,7 +1057,12 @@ fn apply_cli_options(
             }
         }
         for cap_name in &args.cap_add {
-            effective |= parse_capability(cap_name)?;
+            // CRI/Docker "ALL" means every capability (mirrors `--cap-drop ALL`).
+            if cap_name.eq_ignore_ascii_case("ALL") {
+                effective |= Capability::all();
+            } else {
+                effective |= parse_capability(cap_name)?;
+            }
         }
         cmd = cmd.with_capabilities(effective);
     }
