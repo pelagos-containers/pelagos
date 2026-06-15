@@ -1202,7 +1202,7 @@ impl RuntimeService for RuntimeSvc {
             .collect();
 
         // Extract runAsUser/runAsGroup from the Linux security context.
-        let (run_as_user, run_as_group) = config
+        let (run_as_user, run_as_group, run_as_username) = config
             .linux
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
@@ -1210,9 +1210,19 @@ impl RuntimeService for RuntimeSvc {
                 (
                     sc.run_as_user.as_ref().map(|v| v.value),
                     sc.run_as_group.as_ref().map(|v| v.value),
+                    sc.run_as_username.clone(),
                 )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, String::new()));
+
+        // CRI requires RunAsUser (or RunAsUserName) whenever RunAsGroup is set —
+        // a group with no user is rejected (critest: "should return error if
+        // RunAsGroup is set without RunAsUser").
+        if run_as_group.is_some() && run_as_user.is_none() && run_as_username.is_empty() {
+            return Err(Status::invalid_argument(
+                "RunAsGroup is set without RunAsUser/RunAsUserName",
+            ));
+        }
 
         // B′ — UID overflow/validity guard.
         // Valid Linux UIDs are 0..=4294967294. The value 4294967295 (u32::MAX) equals
@@ -1370,6 +1380,7 @@ impl RuntimeService for RuntimeSvc {
             exit_code: 0,
             run_as_user,
             run_as_group,
+            run_as_username,
             termination_log_host_path,
             log_path: config.log_path.clone(),
             supplemental_groups: config
@@ -1497,6 +1508,11 @@ impl RuntimeService for RuntimeSvc {
                     args.push(uid.to_string());
                 }
             }
+        } else if !container.run_as_username.is_empty() {
+            // RunAsUserName: pass the name so `pelagos run` resolves it against the
+            // image's /etc/passwd (e.g. "nobody" → its uid:gid).
+            args.push("--user".into());
+            args.push(container.run_as_username.clone());
         }
 
         // Supplemental groups: merge sandbox-level (fsGroup) and container-level groups.

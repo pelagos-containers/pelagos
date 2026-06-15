@@ -398,6 +398,19 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
             cmd = cmd.with_gid(g);
         }
         cmd = cmd.with_uid(uid);
+    } else {
+        // No explicit --user: default to the container's OWN process credentials
+        // (uid/gid/supplementary groups), matching `docker exec`/containerd. The
+        // CRI ExecSync path relies on this — critest verifies RunAsUser/RunAsGroup/
+        // SupplementalGroups by exec'ing `id` and expects the container's user, not
+        // root. Creds are read from the container's main (chroot'd) process, so they
+        // are by definition valid in its user namespace (no uid_map check needed).
+        if let Some((uid, gid, groups)) = container_process_creds(root_pid) {
+            if !groups.is_empty() {
+                cmd = cmd.with_additional_gids(&groups);
+            }
+            cmd = cmd.with_gid(gid).with_uid(uid);
+        }
     }
 
     // 5. Join PID namespace in the parent thread before fork (root exec only).
@@ -717,6 +730,34 @@ pub fn discover_namespaces(
     Ok(result)
 }
 
+/// Parse the real uid, real gid, and supplementary groups from the text of a
+/// `/proc/<pid>/status` file. Returns `None` if Uid/Gid lines are missing.
+fn parse_proc_status_creds(status: &str) -> Option<(u32, u32, Vec<u32>)> {
+    let mut uid = None;
+    let mut gid = None;
+    let mut groups = Vec::new();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            uid = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Gid:") {
+            gid = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Groups:") {
+            groups = rest
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+        }
+    }
+    Some((uid?, gid?, groups))
+}
+
+/// Read the container main process's real uid/gid + supplementary groups from
+/// `/proc/<pid>/status`, so `exec` without `--user` defaults to the container's
+/// own user (matching `docker exec`/containerd).
+fn container_process_creds(pid: i32) -> Option<(u32, u32, Vec<u32>)> {
+    parse_proc_status_creds(&std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?)
+}
+
 /// Read `/proc/{pid}/environ` — NUL-separated KEY=VALUE pairs.
 fn read_proc_environ(pid: i32) -> Vec<(String, String)> {
     let path = format!("/proc/{}/environ", pid);
@@ -751,4 +792,27 @@ fn uid_in_ns_map(uid: u32, uid_map: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_proc_status_creds;
+
+    /// #352 RunAsUser/Group/SupplementalGroups: exec defaults to the container's
+    /// own creds, parsed from /proc/<pid>/status (real uid/gid + Groups).
+    #[test]
+    fn test_parse_proc_status_creds() {
+        let status = "Name:\tsh\nUid:\t1000\t1000\t1000\t1000\nGid:\t2000\t2000\t2000\t2000\nGroups:\t3000 4000 \n";
+        assert_eq!(
+            parse_proc_status_creds(status),
+            Some((1000, 2000, vec![3000, 4000]))
+        );
+
+        // Root container, no supplementary groups.
+        let root = "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nGroups:\t\n";
+        assert_eq!(parse_proc_status_creds(root), Some((0, 0, vec![])));
+
+        // Missing Uid line → None.
+        assert_eq!(parse_proc_status_creds("Gid:\t0\t0\t0\t0\n"), None);
+    }
 }
