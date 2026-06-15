@@ -86,6 +86,36 @@ struct PelagosContainerState {
 /// 32 bytes from the OS CSPRNG encoded as hex — identical to the format used
 /// by containerd and CRI-O.  The 64-char length is a de facto standard
 /// hardcoded in SPIRE, Fluentd, Fluent Bit, OTel, Datadog, Falco, and cAdvisor.
+/// The absolute filesystem path where a container's CRI-format log is written AND
+/// that `ContainerStatus.log_path` reports back to the kubelet. The log relay
+/// (writer) and ContainerStatus (reporter) both call this, so the reported path
+/// always has a real log file behind it — it is never a dangling placeholder.
+///
+/// Every container gets a real, absolute path — never empty, never relative:
+///   * the client supplied a log directory + path (the kubelet always does) →
+///     honor `<log_directory>/<log_path>`;
+///   * the client supplied neither (e.g. a direct CRI client such as critest) →
+///     synthesize one inside pelagos's own runtime dir and relay the container's
+///     stdout/stderr there anyway, so `crictl logs` still works and the path is
+///     both meaningful and contained.
+///
+/// Why never empty/relative (issue #347): the kubelet derives its container-log
+/// cleanup path from this value. An empty or relative LogPath collapses on the
+/// kubelet side — `filepath.Dir("")` is `"."`, and with the kubelet's working
+/// directory at `/` a subsequent `os.RemoveAll` walks the HOST ROOT and unlinks
+/// entries like the usr-merge `/bin` symlink, breaking the node. Proven on a
+/// disposable cluster node: the k3s kubelet does `unlinkat(AT_FDCWD</>, "bin")`
+/// when GC'ing an orphaned sandbox whose container reported an empty log path.
+fn effective_cri_log_path(log_directory: &str, log_path: &str, pelagos_name: &str) -> String {
+    if !log_directory.is_empty() && !log_path.is_empty() {
+        let joined = format!("{}/{}", log_directory, log_path);
+        if joined.starts_with('/') {
+            return joined;
+        }
+    }
+    format!("/run/pelagos/containers/{}/cri.log", pelagos_name)
+}
+
 fn generate_id() -> String {
     use std::io::Read;
     let mut bytes = [0u8; 32];
@@ -1721,11 +1751,16 @@ impl RuntimeService for RuntimeSvc {
         }
         drop(st);
 
-        if !log_directory.is_empty() && !log_path_rel.is_empty() {
-            let cri_log_path = format!("{}/{}", log_directory, log_path_rel);
-            let pelagos_name = container.pelagos_name.clone();
-            tokio::spawn(relay_container_logs(pelagos_name, cri_log_path));
-        }
+        // Always relay logs to an absolute, pelagos-reported path — even when the
+        // CRI client supplied no log dir/path — so the container has a real CRI
+        // log and ContainerStatus.LogPath never points at a missing file or
+        // collapses to the host root (#347).
+        let log_dest =
+            effective_cri_log_path(&log_directory, &log_path_rel, &container.pelagos_name);
+        tokio::spawn(relay_container_logs(
+            container.pelagos_name.clone(),
+            log_dest,
+        ));
 
         Ok(Response::new(StartContainerResponse {}))
     }
@@ -1883,15 +1918,19 @@ impl RuntimeService for RuntimeSvc {
 
         let cstate = cri_container_state_val(&container.state);
 
-        let full_log_path = if !container.log_path.is_empty() {
-            st.sandboxes
-                .get(&container.sandbox_id)
-                .filter(|s| !s.log_directory.is_empty())
-                .map(|s| format!("{}/{}", s.log_directory, container.log_path))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        // Report the SAME absolute path the log relay writes to (see
+        // effective_cri_log_path / StartContainer), so the reported LogPath always
+        // has a real file behind it and never collapses to the host root (#347).
+        let sandbox_log_dir = st
+            .sandboxes
+            .get(&container.sandbox_id)
+            .map(|s| s.log_directory.clone())
+            .unwrap_or_default();
+        let full_log_path = effective_cri_log_path(
+            &sandbox_log_dir,
+            &container.log_path,
+            &container.pelagos_name,
+        );
 
         // Read termination message (up to 4096 bytes per CRI convention).
         let message = if !container.termination_log_host_path.is_empty() {
@@ -2561,6 +2600,46 @@ mod tests {
             "session grandchild {sleep_pid} survived kill_exec_wrapper (#339 leak)"
         );
         assert!(!is_alive(root), "wrapper {root} survived kill_exec_wrapper");
+    }
+
+    /// #347: the path the relay writes AND ContainerStatus.log_path reports must
+    /// never be empty or relative — an empty LogPath makes the kubelet RemoveAll
+    /// the host root (deleting /bin). Proven on a disposable node; this pins the
+    /// contract. Because the relay and the reporter call the same function, the
+    /// reported path always has a real log file behind it.
+    #[test]
+    fn test_effective_cri_log_path_never_empty_or_relative() {
+        // No client-supplied log dir/path -> synthesized absolute path under pelagos's
+        // runtime dir, where the relay will actually write the log.
+        assert_eq!(
+            effective_cri_log_path("", "", "pcri-abc123"),
+            "/run/pelagos/containers/pcri-abc123/cri.log"
+        );
+        // log_path present but no log_directory -> can't honor a bare relative path
+        // (would collapse to "." with cwd "/") -> fall back.
+        assert_eq!(
+            effective_cri_log_path("", "node-exporter/0.log", "pcri-xyz"),
+            "/run/pelagos/containers/pcri-xyz/cri.log"
+        );
+        // Kubelet-supplied absolute dir + path -> honored verbatim.
+        assert_eq!(
+            effective_cri_log_path("/var/log/pods/ns_name_uid/ctr", "0.log", "pcri-abc"),
+            "/var/log/pods/ns_name_uid/ctr/0.log"
+        );
+        // A (defensive) relative log_directory must never be honored -> fall back.
+        assert_eq!(
+            effective_cri_log_path("var/log/pods/x", "0.log", "pcri-def"),
+            "/run/pelagos/containers/pcri-def/cri.log"
+        );
+        // The result is ALWAYS absolute, for every combination (the safety invariant).
+        for (dir, path) in [
+            ("", ""),
+            ("", "a/b.log"),
+            ("rel/dir", "0.log"),
+            ("/abs", "0.log"),
+        ] {
+            assert!(effective_cri_log_path(dir, path, "pcri-x").starts_with('/'));
+        }
     }
 
     #[test]
