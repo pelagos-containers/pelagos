@@ -2194,6 +2194,67 @@ mod cgroups {
     }
 
     #[test]
+    fn test_oom_killed_flag_set() {
+        // #343: when the kernel OOM killer terminates a container, `wait()` must
+        // report `ExitStatus::oom_killed() == true` (read from the cgroup
+        // `memory.events` oom_kill counter before teardown). The CRI shim relies
+        // on this to surface `reason: OOMKilled` to Kubernetes.
+        if !is_root() {
+            eprintln!("Skipping test_oom_killed_flag_set: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_oom_killed_flag_set: alpine-rootfs not found");
+            return;
+        };
+
+        // Write 100 MB to tmpfs against a 16 MB hard memory limit (swap disabled):
+        // the cgroup OOM killer fires and SIGKILLs the writer.
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "dd if=/dev/zero of=/tmp/fill bs=1M count=100 2>/dev/null; echo done",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(16 * 1024 * 1024)
+            .with_cgroup_memory_swap(0)
+            .with_tmpfs("/tmp", "")
+            .with_dev_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup memory limit");
+
+        let status = child.wait().expect("Failed to wait for child");
+        assert!(
+            status.oom_killed(),
+            "oom_killed() should be true after a cgroup OOM kill (signal={:?}, code={:?})",
+            status.signal(),
+            status.code()
+        );
+        // A non-OOM clean exit must NOT set the flag.
+        let mut ok = Command::new("/bin/ash")
+            .args(["-c", "echo hi"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(64 * 1024 * 1024)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn clean container");
+        let ok_status = ok.wait().expect("Failed to wait for clean child");
+        assert!(
+            !ok_status.oom_killed(),
+            "oom_killed() must be false for a container that exits cleanly"
+        );
+    }
+
+    #[test]
     fn test_cgroup_pids_limit() {
         if !is_root() {
             eprintln!("Skipping test_cgroup_pids_limit: requires root");

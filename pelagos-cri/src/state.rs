@@ -118,6 +118,10 @@ pub struct CriContainer {
     pub finished_at_ns: i64,
     pub state: ContainerState,
     pub exit_code: i32,
+    /// True if the kernel OOM killer terminated the container (#343). Reported as
+    /// `reason: OOMKilled` in ContainerStatus.
+    #[serde(default)]
+    pub oom_killed: bool,
     /// Override UID from pod securityContext.runAsUser (None = use image default).
     #[serde(default)]
     pub run_as_user: Option<i64>,

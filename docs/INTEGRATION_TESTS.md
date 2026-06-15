@@ -412,6 +412,22 @@ writing 100 MB into a tmpfs. If the memory limit is not enforced, dd completes s
 (exit 0). A correctly working limit OOM-kills the container (non-zero exit / signal). Failure
 would indicate the cgroup setup race has regressed.
 
+### `test_oom_killed_flag_set`
+**Requires:** root, rootfs
+
+Verifies the #343 OOM-reporting mechanism: `ExitStatus::oom_killed()` is read from
+the cgroup-v2 `memory.events` `oom_kill` counter in `wait()` **before** the cgroup is
+torn down. Runs `dd if=/dev/zero of=/tmp/fill bs=1M count=100` against a 16 MB hard
+memory limit (`with_cgroup_memory_swap(0)`) so the kernel OOM killer SIGKILLs the
+writer, then asserts `status.oom_killed() == true`. A second container that exits
+cleanly (`echo hi`) must report `oom_killed() == false`.
+
+Failure of the first assertion would mean the OOM signal was lost (e.g. the counter
+was read after teardown removed the cgroup, or the wrong cgroup path was read),
+causing the CRI shim to misreport an OOM kill as a generic `Error` instead of
+`OOMKilled` — the exact debuggability regression #343 targets. Failure of the second
+would mean we falsely flag clean exits as OOM kills.
+
 ### `test_cgroup_pids_limit`
 **Requires:** root, rootfs
 

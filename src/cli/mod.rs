@@ -266,6 +266,11 @@ pub struct ContainerState {
     pub started_at: String,
     /// Exit code, populated when status == exited.
     pub exit_code: Option<i32>,
+    /// True if the kernel OOM killer terminated the container (#343). Read from
+    /// the cgroup `memory.events` at reap time and surfaced by the CRI shim as
+    /// `reason: OOMKilled` in ContainerStatus.
+    #[serde(default)]
+    pub oom_killed: bool,
     /// The command run inside the container.
     pub command: Vec<String>,
     /// Path to captured stdout log (detached mode only).
@@ -868,6 +873,7 @@ mod tests {
                 watcher_pid: 0,
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 exit_code: None,
+                oom_killed: false,
                 command: vec!["/bin/sh".to_string()],
                 stdout_log: None,
                 stderr_log: None,
@@ -934,6 +940,7 @@ mod tests {
             watcher_pid: 0,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             exit_code: None,
+            oom_killed: false,
             command: vec!["/bin/sh".to_string()],
             stdout_log: None,
             stderr_log: None,

@@ -8026,8 +8026,16 @@ impl Child {
     /// If a cgroup was configured, it is deleted after the child exits.
     pub fn wait(&mut self) -> Result<ExitStatus, Error> {
         let status = self.wait_inner()?;
+        // Read the OOM-kill counter from the cgroup BEFORE teardown removes it (#343).
+        let oom_killed = self
+            .cgroup_path()
+            .map(|p| cgroup_oom_killed(&p))
+            .unwrap_or(false);
         self.teardown_resources(false);
-        Ok(ExitStatus { inner: status })
+        Ok(ExitStatus {
+            inner: status,
+            oom_killed,
+        })
     }
 
     /// Wait for the child process to exit, preserving the overlay base directory.
@@ -8046,7 +8054,13 @@ impl Child {
             .as_ref()
             .and_then(|merged| merged.parent().map(|p| p.to_path_buf()));
         self.teardown_resources(true);
-        Ok((ExitStatus { inner: status }, overlay_base))
+        Ok((
+            ExitStatus {
+                inner: status,
+                oom_killed: false,
+            },
+            overlay_base,
+        ))
     }
 
     /// Wait for the child to exit and collect all output.
@@ -8079,8 +8093,19 @@ impl Child {
             }
         }
         let status = self.wait_inner()?;
+        let oom_killed = self
+            .cgroup_path()
+            .map(|p| cgroup_oom_killed(&p))
+            .unwrap_or(false);
         self.teardown_resources(false);
-        Ok((ExitStatus { inner: status }, stdout_buf, stderr_buf))
+        Ok((
+            ExitStatus {
+                inner: status,
+                oom_killed,
+            },
+            stdout_buf,
+            stderr_buf,
+        ))
     }
 
     /// Read current resource usage from the container's cgroup.
@@ -8225,6 +8250,11 @@ impl Drop for Child {
 #[derive(Debug, Clone)]
 pub struct ExitStatus {
     inner: StdExitStatus,
+    /// True if the kernel OOM killer terminated a process in the container's
+    /// cgroup. Captured in `wait()` from `memory.events` before the cgroup is
+    /// torn down, so callers (CRI `OOMKilled` reporting, #343) can distinguish
+    /// an out-of-memory kill from an ordinary SIGKILL.
+    oom_killed: bool,
 }
 
 impl ExitStatus {
@@ -8242,6 +8272,40 @@ impl ExitStatus {
     pub fn signal(&self) -> Option<i32> {
         self.inner.signal()
     }
+
+    /// Returns true if the container was killed by the kernel OOM killer.
+    ///
+    /// Detected from the cgroup-v2 `memory.events` `oom_kill` counter at reap
+    /// time. Always false for OOM-incapable runs (no cgroup, rootless) or when
+    /// the counter could not be read.
+    pub fn oom_killed(&self) -> bool {
+        self.oom_killed
+    }
+}
+
+/// Read the cgroup-v2 `memory.events` OOM-kill counters for a relative cgroup
+/// path (e.g. `"kubepods/podXXX/cYYY"`). Returns true if the kernel OOM killer
+/// has killed at least one process in this cgroup. Best-effort: any missing
+/// file or parse failure returns false (the container simply isn't reported as
+/// OOM-killed). Must be read before the cgroup directory is removed.
+fn cgroup_oom_killed(rel_path: &str) -> bool {
+    let path = format!(
+        "/sys/fs/cgroup/{}/memory.events",
+        rel_path.trim_start_matches('/')
+    );
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    for line in data.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(key), Some(val)) = (it.next(), it.next()) {
+            if (key == "oom_kill" || key == "oom_group_kill") && val.parse::<u64>().unwrap_or(0) > 0
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Errors that can occur during container operations.

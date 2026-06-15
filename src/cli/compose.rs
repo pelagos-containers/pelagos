@@ -776,6 +776,7 @@ fn spawn_service(
         watcher_pid: unsafe { libc::getpid() },
         started_at: now_iso8601(),
         exit_code: None,
+        oom_killed: false,
         command: exe_and_args.clone(),
         stdout_log: Some(stdout_log.to_string_lossy().into_owned()),
         stderr_log: Some(stderr_log.to_string_lossy().into_owned()),
