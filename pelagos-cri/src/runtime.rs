@@ -713,6 +713,15 @@ impl RuntimeService for RuntimeSvc {
         let uid = meta.uid.clone();
         let bin = self.bin().await;
 
+        // Pod-level settings applied to the pause's (container-shared) namespaces
+        // once the pause exists: hostname → UTS ns, sysctls → net/ipc/uts ns (#354/#355).
+        let sandbox_hostname = config.hostname.clone();
+        let sandbox_sysctls = config
+            .linux
+            .as_ref()
+            .map(|l| l.sysctls.clone())
+            .unwrap_or_default();
+
         // Try CNI networking first; fall back to pelagos native if no config is present.
         let (sandbox_id, netns, ip, cni_conf, pause_pid) = if let Some(conf_path) =
             cni::find_cni_conf()
@@ -841,6 +850,23 @@ impl RuntimeService for RuntimeSvc {
             // Write pelagos-format sandbox state so `pelagos run --sandbox` works.
             state::write_pelagos_sandbox_state(&id, Some(&meta.name), pause_pid, &ns_name, &ip)
                 .map_err(|e| Status::internal(format!("write sandbox state: {}", e)))?;
+
+            // Apply pod hostname + sysctls into the pause namespaces — but ONLY after
+            // confirming the pause has unshared UTS/IPC, so nsenter targets the POD
+            // namespaces and never the host (containers join these namespaces and
+            // inherit the values: #354 set-hostname, #355 sysctls).
+            if (!sandbox_hostname.is_empty() || !sandbox_sysctls.is_empty())
+                && wait_for_pause_ns_unshare(pause_pid).await
+            {
+                apply_pod_hostname(pause_pid, &sandbox_hostname).await;
+                apply_sandbox_sysctls(&netns_path, pause_pid, &sandbox_sysctls).await;
+            } else if !sandbox_hostname.is_empty() || !sandbox_sysctls.is_empty() {
+                log::warn!(
+                    "pause {} did not unshare UTS/IPC in time; skipping pod hostname/sysctls \
+                     to avoid mutating the host",
+                    pause_pid
+                );
+            }
 
             log::info!(
                 "CNI sandbox {} created: netns={} ip={} conf={}",
@@ -2451,6 +2477,100 @@ fn resolve_container_argv(
     (entrypoint, cmd)
 }
 
+// ── Pod-level settings applied to the pause namespaces (#354/#355) ─────────────
+
+/// Wait until the pause process has actually unshared its UTS **and** IPC
+/// namespaces — i.e. they differ from this (host) process's namespaces. Returns
+/// false on timeout.
+///
+/// CRITICAL: pod hostname/sysctls are applied via `nsenter /proc/<pause>/ns/*`.
+/// If applied before the pause finishes unsharing, `/proc/<pause>/ns/uts` still
+/// resolves to the HOST UTS namespace and `hostname <pod>` renames the HOST
+/// (observed: node hostname changed to the pod's). Likewise a sysctl set pre-unshare
+/// lands on a namespace the pause then discards, so the value never reaches the pod.
+/// Gating on this both fixes the apply and guarantees we never mutate the host: if
+/// the pause never unshares (e.g. a host-namespace pod), we skip the apply.
+async fn wait_for_pause_ns_unshare(pause_pid: i32) -> bool {
+    let host_uts = std::fs::read_link("/proc/self/ns/uts").ok();
+    let host_ipc = std::fs::read_link("/proc/self/ns/ipc").ok();
+    for _ in 0..40 {
+        let p_uts = std::fs::read_link(format!("/proc/{}/ns/uts", pause_pid)).ok();
+        let p_ipc = std::fs::read_link(format!("/proc/{}/ns/ipc", pause_pid)).ok();
+        if p_uts.is_some() && p_uts != host_uts && p_ipc.is_some() && p_ipc != host_ipc {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Set the pod hostname inside the pause's UTS namespace (which containers join),
+/// so `hostname` resolves to the pod name (#354 set-hostname). Best-effort; no-op
+/// when empty.
+async fn apply_pod_hostname(pause_pid: i32, hostname: &str) {
+    if hostname.is_empty() {
+        return;
+    }
+    let uts = format!("--uts=/proc/{}/ns/uts", pause_pid);
+    match tokio::process::Command::new("nsenter")
+        .args([uts.as_str(), "--", "hostname", hostname])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => log::info!("pod hostname set to {}", hostname),
+        Ok(out) => log::warn!(
+            "set pod hostname {}: {}",
+            hostname,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log::warn!("nsenter hostname {}: {}", hostname, e),
+    }
+}
+
+/// Build the `nsenter` argv that applies one pod-level sysctl inside a sandbox's
+/// namespaces. `net.*` keys live in the network namespace; `kernel.*`/`fs.*` live
+/// in the IPC/UTS namespaces held by the pause — so we enter all three and let
+/// `sysctl -w` write to whichever `/proc/sys` the key belongs to.
+fn sandbox_sysctl_argv(netns_path: &str, pause_pid: i32, key: &str, value: &str) -> Vec<String> {
+    vec![
+        format!("--net={}", netns_path),
+        format!("--ipc=/proc/{}/ns/ipc", pause_pid),
+        format!("--uts=/proc/{}/ns/uts", pause_pid),
+        "--".to_string(),
+        "sysctl".to_string(),
+        "-w".to_string(),
+        format!("{}={}", key, value),
+    ]
+}
+
+/// Apply the sandbox's configured sysctls (safe + unsafe; the kubelet has already
+/// gate-kept which are permitted) to its pod namespaces. Best-effort per key.
+async fn apply_sandbox_sysctls(
+    netns_path: &str,
+    pause_pid: i32,
+    sysctls: &HashMap<String, String>,
+) {
+    for (key, value) in sysctls {
+        let argv = sandbox_sysctl_argv(netns_path, pause_pid, key, value);
+        match tokio::process::Command::new("nsenter")
+            .args(&argv)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                log::info!("sandbox sysctl {}={} applied", key, value)
+            }
+            Ok(out) => log::warn!(
+                "sandbox sysctl {}={}: {}",
+                key,
+                value,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => log::warn!("nsenter sysctl {}={}: {}", key, value, e),
+        }
+    }
+}
+
 // ── CRI log relay ─────────────────────────────────────────────────────────────
 
 /// Format current time as RFC3339 with nanosecond precision for the CRI log format.
@@ -2710,6 +2830,30 @@ mod tests {
         assert_eq!(
             resolve_container_argv(&["sleep".into()], &["3600".into()], ep(), cmd()),
             (vec!["sleep".into()], vec!["3600".into()])
+        );
+    }
+
+    /// #355: a pod-level sysctl is applied inside ALL THREE pod namespaces — net
+    /// (net.*), ipc + uts (kernel.*/fs.*) — so `sysctl -w` lands in whichever
+    /// /proc/sys the key belongs to. Values with spaces survive as one argv element.
+    #[test]
+    fn test_sandbox_sysctl_argv() {
+        assert_eq!(
+            sandbox_sysctl_argv(
+                "/run/netns/pcri-abc",
+                4242,
+                "net.ipv4.ping_group_range",
+                "0 2147483647"
+            ),
+            vec![
+                "--net=/run/netns/pcri-abc",
+                "--ipc=/proc/4242/ns/ipc",
+                "--uts=/proc/4242/ns/uts",
+                "--",
+                "sysctl",
+                "-w",
+                "net.ipv4.ping_group_range=0 2147483647",
+            ]
         );
     }
 

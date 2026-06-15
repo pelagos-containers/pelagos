@@ -58,8 +58,9 @@ echo "=== [dns] exec cat /etc/resolv.conf ==="
 $CR exec "$CID" cat /etc/resolv.conf 2>&1 || true
 
 echo "=== [ns sharing] container vs pause IPC/UTS/NET inodes ==="
-CPID=$($CR inspect "$CID" 2>/dev/null | grep -oE '"pid": *[0-9]+' | head -1 | grep -oE '[0-9]+')
-PAUSE=$(pgrep -f "sandbox __pause__" | head -1)
+# Container pid from the pelagos state file; pause pid from THIS sandbox's CRI state.
+CPID=$(sudo grep -oE '"pid":[ ]*[0-9]+' "/run/pelagos/containers/$PN/state.json" 2>/dev/null | head -1 | grep -oE '[0-9]+')
+PAUSE=$(sudo grep -oE '"pause_pid":[ ]*[0-9]+' "/run/pelagos-cri/sandboxes/$POD.json" 2>/dev/null | head -1 | grep -oE '[0-9]+')
 echo "container pid=$CPID  pause pid=$PAUSE"
 for ns in ipc uts net; do
   c=$(sudo readlink "/proc/$CPID/ns/$ns" 2>/dev/null)
