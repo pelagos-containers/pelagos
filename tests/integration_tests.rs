@@ -18228,7 +18228,9 @@ fn test_default_caps_allows_chown_denies_sys_admin() {
     let rootfs = match get_test_rootfs() {
         Some(p) => p,
         None => {
-            eprintln!("SKIP: test_default_caps_allows_chown_denies_sys_admin requires alpine-rootfs");
+            eprintln!(
+                "SKIP: test_default_caps_allows_chown_denies_sys_admin requires alpine-rootfs"
+            );
             return;
         }
     };
