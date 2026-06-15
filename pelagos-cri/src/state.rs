@@ -273,6 +273,12 @@ impl StateInner {
 #[derive(Clone)]
 pub struct AppState {
     pub inner: Arc<Mutex<StateInner>>,
+    /// Per-container "CRI log finalized" flags, set by the log relay once it has
+    /// drained and stopped after the container exits. `container_status` waits on
+    /// this at the Running→Exited transition so a client (e.g. critest) that reads
+    /// the log right after seeing the container exited gets the COMPLETE log, not a
+    /// partially-flushed one (#344). Keyed by pelagos_name; not persisted.
+    pub log_done: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 impl AppState {
@@ -308,6 +314,7 @@ impl AppState {
 
         AppState {
             inner: Arc::new(Mutex::new(inner)),
+            log_done: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

@@ -1823,9 +1823,23 @@ impl RuntimeService for RuntimeSvc {
         // collapses to the host root (#347).
         let log_dest =
             effective_cri_log_path(&log_directory, &log_path_rel, &container.pelagos_name);
+        // Create the log file SYNCHRONOUSLY before StartContainer returns: a client
+        // that reads it immediately (e.g. critest) must not get ENOENT just because
+        // the async relay task has not been scheduled yet (#344).
+        ensure_cri_log_file(&log_dest);
+        // Register a "log finalized" flag the relay sets once it has drained and
+        // stopped after the container exits; container_status waits on it so a
+        // client never reads a partially-flushed log right after seeing exit (#344).
+        let log_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.state
+            .log_done
+            .lock()
+            .await
+            .insert(container.pelagos_name.clone(), log_done.clone());
         tokio::spawn(relay_container_logs(
             container.pelagos_name.clone(),
             log_dest,
+            log_done,
         ));
 
         Ok(Response::new(StartContainerResponse {}))
@@ -1882,6 +1896,7 @@ impl RuntimeService for RuntimeSvc {
             if scope::systemd_available() {
                 scope::stop_unit(&scope::container_unit(&name)).await;
             }
+            self.state.log_done.lock().await.remove(&name); // drop the #344 finalize flag
         }
 
         let mut st = self.state.inner.lock().await;
@@ -1953,6 +1968,33 @@ impl RuntimeService for RuntimeSvc {
         request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
         let container_id = request.into_inner().container_id;
+
+        // If the container has exited, wait (bounded) for the log relay to finish
+        // writing the CRI log before we report its status. critest (and the kubelet)
+        // read the log right after seeing the container exited, so it must be
+        // complete — otherwise the read races the relay's final flush (#344).
+        let pname_state = {
+            let st = self.state.inner.lock().await;
+            st.containers
+                .get(&container_id)
+                .map(|c| (c.pelagos_name.clone(), c.state.clone()))
+        };
+        if let Some((pname, cstate)) = pname_state {
+            let exited = cstate == MyContainerState::Exited
+                || read_pelagos_container_state(&pname)
+                    .map(|l| l.status == "exited")
+                    .unwrap_or(false);
+            if exited {
+                if let Some(flag) = self.state.log_done.lock().await.get(&pname).cloned() {
+                    for _ in 0..100 {
+                        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
 
         let mut st = self.state.inner.lock().await;
         let container = st
@@ -2153,8 +2195,25 @@ impl RuntimeService for RuntimeSvc {
 
     async fn reopen_container_log(
         &self,
-        _request: Request<ReopenContainerLogRequest>,
+        request: Request<ReopenContainerLogRequest>,
     ) -> Result<Response<ReopenContainerLogResponse>, Status> {
+        // The kubelet rotated the log (renamed <logPath> → <logPath>.<ts>) and now
+        // asks us to reopen it. (Re)create a fresh file at the ORIGINAL path so the
+        // relay's next per-flush append lands there — not in the renamed file (#344).
+        // (The relay opens the path per write, so no fd needs reopening.)
+        let container_id = request.into_inner().container_id;
+        let st = self.state.inner.lock().await;
+        if let Some(container) = st.containers.get(&container_id) {
+            let log_dir = st
+                .sandboxes
+                .get(&container.sandbox_id)
+                .map(|s| s.log_directory.clone())
+                .unwrap_or_default();
+            let cri_log_path =
+                effective_cri_log_path(&log_dir, &container.log_path, &container.pelagos_name);
+            drop(st);
+            ensure_cri_log_file(&cri_log_path);
+        }
         Ok(Response::new(ReopenContainerLogResponse {}))
     }
 
@@ -2663,12 +2722,32 @@ async fn flush_lines(buf: &mut String, dest: &str, stream: &str) {
 }
 
 /// Background task: tail pelagos container log files and write to the CRI log file.
-async fn relay_container_logs(pelagos_name: String, cri_log_path: String) {
+/// Create the CRI log file (and its parent dir) if absent — synchronous so the
+/// file exists the moment StartContainer returns. Idempotent (`create+append`
+/// never truncates), so the relay calling it again is harmless.
+fn ensure_cri_log_file(path: &str) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+}
+
+async fn relay_container_logs(
+    pelagos_name: String,
+    cri_log_path: String,
+    log_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     // No startup delay: a short-lived container can output and exit in well under
     // the old 300 ms, and a client (e.g. critest) reads the log as soon as the
     // container finishes — so the relay must write it promptly (#344).
     let container_dir = format!("/run/pelagos/containers/{}", pelagos_name);
     relay_logs_from_dir(container_dir, cri_log_path).await;
+    // The relay returns only after the container has exited and the log is fully
+    // drained — signal container_status that the CRI log is complete (#344).
+    log_done.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Core relay loop: polls stdout/stderr log files in `container_dir` and writes
@@ -3094,6 +3173,23 @@ mod tests {
             entries.iter().any(|e| e.contains(" stderr F ")),
             "no stderr entries"
         );
+    }
+
+    /// #344: ensure_cri_log_file creates the parent dir and the file (idempotently),
+    /// so StartContainer/ReopenContainerLog can guarantee the path exists.
+    #[test]
+    fn test_ensure_cri_log_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a/b/0.log").to_str().unwrap().to_string();
+        ensure_cri_log_file(&path);
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "log file + parents created"
+        );
+        // Idempotent + non-truncating: write content, call again, content preserved.
+        std::fs::write(&path, b"keep\n").unwrap();
+        ensure_cri_log_file(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep\n");
     }
 
     /// #344: a short-lived container that produces NO output before exiting must
