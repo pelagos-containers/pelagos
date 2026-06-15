@@ -622,6 +622,38 @@ pub fn parse_capability(s: &str) -> Result<pelagos::container::Capability, Strin
     })
 }
 
+/// Apply a `seccomp=<value>` security-opt to `cmd`: a named profile
+/// (default/minimal/iouring/none) or an absolute path to an OCI seccomp profile
+/// JSON (a Kubernetes "Localhost" profile). Shared by `pelagos run` and
+/// `pelagos exec` so an exec'd process is filtered exactly like the container (#352).
+pub fn apply_seccomp_opt(
+    cmd: pelagos::container::Command,
+    val: &str,
+) -> Result<pelagos::container::Command, String> {
+    Ok(match val {
+        "default" | "" => cmd.with_seccomp_default(),
+        "minimal" => cmd.with_seccomp_minimal(),
+        "iouring" | "io-uring" => cmd.with_seccomp_allow_io_uring(),
+        "none" | "unconfined" => cmd,
+        path if path.starts_with('/') => {
+            let data = std::fs::read_to_string(path)
+                .map_err(|e| format!("read seccomp profile '{}': {}", path, e))?;
+            let oci: pelagos::oci::OciSeccomp = serde_json::from_str(&data)
+                .map_err(|e| format!("parse seccomp profile '{}': {}", path, e))?;
+            let prog = pelagos::seccomp::filter_from_oci(&oci)
+                .map_err(|e| format!("compile seccomp profile '{}': {}", path, e))?;
+            cmd.with_seccomp_program(prog)
+        }
+        other => {
+            return Err(format!(
+                "unknown seccomp profile '{}' (use: default, minimal, iouring, none, \
+                 or an absolute path to a seccomp profile JSON)",
+                other
+            ))
+        }
+    })
+}
+
 /// Format a duration in seconds as a human-readable "X minutes ago" string.
 pub fn format_age(started_at_iso: &str) -> String {
     // Parse back to epoch seconds (best-effort).

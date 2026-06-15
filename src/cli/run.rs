@@ -1074,19 +1074,7 @@ fn apply_cli_options(
     for opt in &args.security_opt {
         let (key, val) = opt.split_once('=').unwrap_or((opt.as_str(), ""));
         match key {
-            "seccomp" => match val {
-                "default" | "" => cmd = cmd.with_seccomp_default(),
-                "minimal" => cmd = cmd.with_seccomp_minimal(),
-                "iouring" | "io-uring" => cmd = cmd.with_seccomp_allow_io_uring(),
-                "none" => {}
-                other => {
-                    return Err(format!(
-                        "unknown seccomp profile '{}' (use: default, minimal, iouring, none)",
-                        other
-                    )
-                    .into())
-                }
-            },
+            "seccomp" => cmd = super::apply_seccomp_opt(cmd, val)?,
             "no-new-privileges" => cmd = cmd.with_no_new_privileges(true),
             other => return Err(format!("unknown --security-opt '{}'", other).into()),
         }

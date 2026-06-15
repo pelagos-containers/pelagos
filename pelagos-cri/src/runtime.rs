@@ -1280,11 +1280,14 @@ impl RuntimeService for RuntimeSvc {
                     .as_ref()
                     .map(|c| (c.add_capabilities.clone(), c.drop_capabilities.clone()))
                     .unwrap_or_default();
+                // CRI ProfileType: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
+                // A NIL seccomp field means UNCONFINED (1), not RuntimeDefault — the
+                // kubelet sets RuntimeDefault explicitly when it wants it (#352).
                 let (sec_type, sec_path) = sc
                     .seccomp
                     .as_ref()
                     .map(|s| (s.profile_type, s.localhost_ref.clone()))
-                    .unwrap_or((0, String::new()));
+                    .unwrap_or((1, String::new()));
                 (
                     add,
                     drop,
@@ -1647,7 +1650,13 @@ impl RuntimeService for RuntimeSvc {
 
         // Seccomp profile (securityContext.seccomp).
         // Profile type: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
-        match container.seccomp_profile_type {
+        // A PRIVILEGED container ignores any seccomp profile — it runs unconfined
+        // (critest "ignore a seccomp profile ... when privileged", #352).
+        match if container.privileged {
+            1 // force Unconfined
+        } else {
+            container.seccomp_profile_type
+        } {
             0 => {
                 // RuntimeDefault — use pelagos's built-in Docker-compatible seccomp profile.
                 args.push("--security-opt".into());
