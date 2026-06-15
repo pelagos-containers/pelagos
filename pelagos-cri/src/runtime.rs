@@ -353,7 +353,7 @@ fn build_container_stats(c: &CriContainer) -> ContainerStats {
             id: c.id.clone(),
             metadata: Some(ContainerMetadata {
                 name: c.name.clone(),
-                attempt: 0,
+                attempt: c.attempt,
             }),
             labels: c.labels.clone(),
             annotations: c.annotations.clone(),
@@ -563,7 +563,7 @@ fn container_to_proto(c: &CriContainer) -> crate::cri::Container {
         pod_sandbox_id: c.sandbox_id.clone(),
         metadata: Some(ContainerMetadata {
             name: c.name.clone(),
-            attempt: 0,
+            attempt: c.attempt,
         }),
         image: Some(ImageSpec {
             image: c.image.clone(),
@@ -1388,6 +1388,7 @@ impl RuntimeService for RuntimeSvc {
             sandbox_id,
             pelagos_name,
             name: meta.name.clone(),
+            attempt: meta.attempt,
             image: image_ref,
             entrypoint: config.command.clone(),
             args: config.args.clone(),
@@ -2069,7 +2070,7 @@ impl RuntimeService for RuntimeSvc {
             id: container.id.clone(),
             metadata: Some(ContainerMetadata {
                 name: container.name.clone(),
-                attempt: 0,
+                attempt: container.attempt,
             }),
             state: cstate,
             created_at: container.created_at_ns,

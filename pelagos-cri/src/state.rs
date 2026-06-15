@@ -99,6 +99,10 @@ pub struct CriContainer {
     pub sandbox_id: String,
     pub pelagos_name: String,
     pub name: String,
+    /// CRI metadata.attempt — the container's restart attempt counter; must be
+    /// preserved and reported back in ContainerStatus/ListContainers (#357).
+    #[serde(default)]
+    pub attempt: u32,
     pub image: String,
     /// CRI `command` field — overrides image ENTRYPOINT.
     pub entrypoint: Vec<String>,
