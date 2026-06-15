@@ -722,6 +722,19 @@ impl RuntimeService for RuntimeSvc {
             .map(|l| l.sysctls.clone())
             .unwrap_or_default();
 
+        // Host port mappings → CNI portmap plugin capability args (#354).
+        let sandbox_port_mappings: Vec<state::CriPortMapping> = config
+            .port_mappings
+            .iter()
+            .map(|p| state::CriPortMapping {
+                protocol: p.protocol,
+                container_port: p.container_port,
+                host_port: p.host_port,
+                host_ip: p.host_ip.clone(),
+            })
+            .collect();
+        let cni_cap_args = cni::port_mapping_cap_args(&sandbox_port_mappings);
+
         // Try CNI networking first; fall back to pelagos native if no config is present.
         let (sandbox_id, netns, ip, cni_conf, pause_pid) = if let Some(conf_path) =
             cni::find_cni_conf()
@@ -733,7 +746,7 @@ impl RuntimeService for RuntimeSvc {
             let netns_path = cni::create_netns(&ns_name)
                 .map_err(|e| Status::internal(format!("create netns for CNI sandbox: {}", e)))?;
 
-            let ip = match cni::cni_add(&id, &netns_path, &conf_path) {
+            let ip = match cni::cni_add(&id, &netns_path, &conf_path, &cni_cap_args) {
                 Ok(ip) => ip,
                 Err(e) => {
                     cni::delete_netns(&ns_name);
@@ -955,6 +968,7 @@ impl RuntimeService for RuntimeSvc {
                 .and_then(|sc| sc.namespace_options.as_ref())
                 .map(|no| no.ipc)
                 .unwrap_or(0),
+            port_mappings: sandbox_port_mappings,
         };
 
         {
@@ -1001,7 +1015,13 @@ impl RuntimeService for RuntimeSvc {
                 // ── CNI teardown ───────────────────────────────────────────────
                 let netns_path = format!("/run/netns/{}", sb.netns);
                 if !sb.cni_conf.is_empty() {
-                    cni::cni_del(&sandbox_id, &netns_path, std::path::Path::new(&sb.cni_conf));
+                    let cap_args = cni::port_mapping_cap_args(&sb.port_mappings);
+                    cni::cni_del(
+                        &sandbox_id,
+                        &netns_path,
+                        std::path::Path::new(&sb.cni_conf),
+                        &cap_args,
+                    );
                 }
                 if sb.pause_pid > 0 {
                     let _ = std::process::Command::new("kill")
@@ -3086,6 +3106,7 @@ mod tests {
             dns_options: vec!["ndots:5".into()],
             pid_namespace_mode: 0,
             ipc_namespace_mode: 0,
+            port_mappings: vec![],
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -3125,6 +3146,7 @@ mod tests {
             dns_options: vec![],
             pid_namespace_mode: 0,
             ipc_namespace_mode: 0,
+            port_mappings: vec![],
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");

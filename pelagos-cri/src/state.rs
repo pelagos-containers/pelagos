@@ -61,6 +61,21 @@ pub struct CriSandbox {
     ///   0 = POD (isolated, default), 1 = CONTAINER (isolated), 2 = NODE (host IPC namespace).
     #[serde(default)]
     pub ipc_namespace_mode: i32,
+    /// Host port mappings (PodSandboxConfig.port_mappings) — passed to the CNI
+    /// portmap plugin as capability args at ADD and (for cleanup) at DEL.
+    #[serde(default)]
+    pub port_mappings: Vec<CriPortMapping>,
+}
+
+/// A CRI `PortMapping` (host_port → container_port) persisted with the sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriPortMapping {
+    /// Protocol: 0=TCP, 1=UDP, 2=SCTP (matches the CRI proto enum).
+    pub protocol: i32,
+    pub container_port: i32,
+    pub host_port: i32,
+    #[serde(default)]
+    pub host_ip: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
