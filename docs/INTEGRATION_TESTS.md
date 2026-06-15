@@ -3405,22 +3405,23 @@ into is not enforced.
 **Requires:** root, rootfs
 
 Runs a container with exactly `Capability::DEFAULT_CAPS` and reads `CapEff`
-from `/proc/self/status`.  Asserts the value is `00000000800405fb` — the 11-cap
-set (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID, SETPCAP,
-NET_BIND_SERVICE, SYS_CHROOT, SETFCAP).
+from `/proc/self/status`.  Asserts the value is `00000000a80425fb` — the OCI
+default 14-cap set (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID,
+SETPCAP, NET_BIND_SERVICE, NET_RAW, MKNOD, AUDIT_WRITE, SYS_CHROOT, SETFCAP).
 
 Failure means the `DEFAULT_CAPS` constant was modified without updating this
 test — any bit added or removed changes the hex value.
 
-### `test_default_caps_allows_chown_denies_mknod`
+### `test_default_caps_allows_chown_denies_sys_admin`
 **Requires:** root, rootfs
 
-Runs a container with `DEFAULT_CAPS` and executes both `chown nobody /tmp` and
-`mknod /tmp/testdev c 1 1`.  Asserts `CHOWN=OK` and `MKNOD=FAIL`.
+Runs a container with `DEFAULT_CAPS` and executes `chown nobody /tmp` and
+`mount -t tmpfs none /mnt`.  Asserts `CHOWN=OK` (in the OCI default set) and
+`MOUNT=FAIL` (CAP_SYS_ADMIN is NOT in the default set).
 
-Failure indicates either: CHOWN was removed from `DEFAULT_CAPS` (postgres-style
-images would break), or MKNOD was accidentally added (device-node creation
-attack surface opened).
+Failure indicates either: CHOWN was removed from `DEFAULT_CAPS` (breaking standard
+images), or SYS_ADMIN was accidentally added (a major privilege-escalation attack
+surface — mount, namespace ops, etc.).
 
 ### `test_cap_drop_all_zeros_caps`
 **Requires:** root, rootfs
