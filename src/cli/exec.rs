@@ -424,6 +424,28 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Inherit the container's seccomp profile so exec'd processes are filtered the
+    // same way (a profile that blocks chmod/sethostname must block them for exec
+    // too) — `docker exec` semantics. The profile is recorded in the container's
+    // security-opt at spawn time (#352). Root exec only.
+    if !is_rootless {
+        if let Some(val) = state.spawn_config.as_ref().and_then(|sc| {
+            sc.security_opt
+                .iter()
+                .find_map(|o| o.strip_prefix("seccomp="))
+        }) {
+            // "none"/"unconfined" → no filter (and no NNP needed).
+            if !matches!(val, "none" | "unconfined") {
+                // Set NO_NEW_PRIVS so the seccomp filter installs WITHOUT requiring
+                // CAP_SYS_ADMIN — exec runs with the container's reduced capability
+                // set, which usually lacks it, so without NNP the install EPERMs.
+                cmd = cmd.with_no_new_privileges(true);
+                cmd = super::apply_seccomp_opt(cmd, val)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            }
+        }
+    }
+
     // 5. Join PID namespace in the parent thread before fork (root exec only).
     //
     // setns(CLONE_NEWPID) updates this thread's pid_for_children to the

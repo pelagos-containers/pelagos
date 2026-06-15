@@ -540,6 +540,14 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
                         }
                     }
                 }
+            } else {
+                // Unknown to our (hand-maintained) syscall table: the rule is dropped,
+                // which for a deny rule silently fails OPEN. Warn so the gap is visible
+                // rather than a silent hole — names should be added to syscall_number.
+                log::warn!(
+                    "seccomp: syscall '{}' not in the syscall-number table — rule NOT applied",
+                    name
+                );
             }
         }
     }
@@ -622,6 +630,10 @@ pub fn syscall_number(name: &str) -> Result<i64, io::Error> {
         // User/group
         "setuid" => Ok(105),
         "setgid" => Ok(106),
+
+        // Hostname / domain (CAP_SYS_ADMIN ops a seccomp profile may block)
+        "sethostname" => Ok(170),
+        "setdomainname" => Ok(171),
 
         // Personality
         "personality" => Ok(135),
@@ -1030,6 +1042,10 @@ pub fn syscall_number(name: &str) -> Result<i64, io::Error> {
         "setuid" => Ok(146),
         "setgid" => Ok(144),
 
+        // Hostname / domain (CAP_SYS_ADMIN ops a seccomp profile may block)
+        "sethostname" => Ok(161),
+        "setdomainname" => Ok(162),
+
         // Personality
         "personality" => Ok(92),
 
@@ -1279,6 +1295,18 @@ mod tests {
         assert!(syscall_number("io_uring_setup").is_ok());
         assert!(syscall_number("io_uring_enter").is_ok());
         assert!(syscall_number("io_uring_register").is_ok());
+    }
+
+    /// #352: a Kubernetes "Localhost" seccomp profile that blocks `sethostname`
+    /// must resolve — previously it was missing from the syscall table and the
+    /// deny rule was silently dropped (failed open).
+    #[test]
+    fn test_sethostname_syscall_known() {
+        assert!(
+            syscall_number("sethostname").is_ok(),
+            "sethostname must resolve so seccomp profiles can block it"
+        );
+        assert!(syscall_number("setdomainname").is_ok());
     }
 
     #[test]
