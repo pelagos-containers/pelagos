@@ -1866,7 +1866,12 @@ impl RuntimeService for RuntimeSvc {
             st.containers
                 .get(&container_id)
                 .map(|c| c.pelagos_name.clone())
-                .ok_or_else(|| Status::not_found("container not found"))?
+        };
+        // StopContainer must be IDEMPOTENT: stopping a container the runtime no
+        // longer knows about (already removed, or never existed) is a no-op
+        // success, not an error — the kubelet relies on this (critest #342).
+        let Some(pelagos_name) = pelagos_name else {
+            return Ok(Response::new(StopContainerResponse {}));
         };
 
         let _ = run_pelagos(&bin, &["stop", &pelagos_name]).await;
