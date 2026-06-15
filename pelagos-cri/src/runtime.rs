@@ -2664,9 +2664,9 @@ async fn flush_lines(buf: &mut String, dest: &str, stream: &str) {
 
 /// Background task: tail pelagos container log files and write to the CRI log file.
 async fn relay_container_logs(pelagos_name: String, cri_log_path: String) {
-    // Wait for log files to appear (container may take a moment to start writing).
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
+    // No startup delay: a short-lived container can output and exit in well under
+    // the old 300 ms, and a client (e.g. critest) reads the log as soon as the
+    // container finishes — so the relay must write it promptly (#344).
     let container_dir = format!("/run/pelagos/containers/{}", pelagos_name);
     relay_logs_from_dir(container_dir, cri_log_path).await;
 }
@@ -2681,10 +2681,17 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
     let stderr_src = format!("{}/stderr.log", container_dir);
     let state_file = format!("{}/state.json", container_dir);
 
-    // Ensure CRI log parent directory exists.
+    // Ensure CRI log parent directory exists, then create the log file UP FRONT so
+    // it always exists — a client reading it before any output is written gets an
+    // empty file, not ENOENT (the #344 failure for short-lived containers).
     if let Some(parent) = std::path::Path::new(&cri_log_path).parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
+    let _ = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cri_log_path)
+        .await;
 
     let mut stdout_off: u64 = 0;
     let mut stderr_off: u64 = 0;
@@ -2692,14 +2699,13 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
     let mut stderr_buf = String::new();
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
+        // Read + flush FIRST (before sleeping) so output reaches the CRI log
+        // promptly even when the container exits almost immediately.
         if let Some((data, new_off)) = read_from_offset(&stdout_src, stdout_off).await {
             stdout_off = new_off;
             stdout_buf.push_str(&String::from_utf8_lossy(&data));
             flush_lines(&mut stdout_buf, &cri_log_path, "stdout").await;
         }
-
         if let Some((data, new_off)) = read_from_offset(&stderr_src, stderr_off).await {
             stderr_off = new_off;
             stderr_buf.push_str(&String::from_utf8_lossy(&data));
@@ -2711,7 +2717,15 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
             Ok(data) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                     if v["status"].as_str() == Some("exited") {
-                        // Final drain including any partial line.
+                        // Final read to catch anything written between the last
+                        // poll and the exit, then drain any partial line. (We break
+                        // right after, so the offsets need not be updated.)
+                        if let Some((data, _)) = read_from_offset(&stdout_src, stdout_off).await {
+                            stdout_buf.push_str(&String::from_utf8_lossy(&data));
+                        }
+                        if let Some((data, _)) = read_from_offset(&stderr_src, stderr_off).await {
+                            stderr_buf.push_str(&String::from_utf8_lossy(&data));
+                        }
                         if !stdout_buf.is_empty() {
                             stdout_buf.push('\n');
                             flush_lines(&mut stdout_buf, &cri_log_path, "stdout").await;
@@ -2726,6 +2740,8 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
             }
             Err(_) => break, // Container removed.
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -3077,6 +3093,36 @@ mod tests {
         assert!(
             entries.iter().any(|e| e.contains(" stderr F ")),
             "no stderr entries"
+        );
+    }
+
+    /// #344: a short-lived container that produces NO output before exiting must
+    /// still leave the CRI log FILE present (empty), not ENOENT — a client reading
+    /// it (e.g. critest) gets an empty file rather than "no such file or directory".
+    #[tokio::test]
+    async fn test_relay_creates_log_file_even_with_no_output() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // Container already exited with no stdout/stderr written.
+        std::fs::write(dir.path().join("state.json"), r#"{"status":"exited"}"#).unwrap();
+
+        let cri_log_dir = TempDir::new().unwrap();
+        let cri_log_path = cri_log_dir
+            .path()
+            .join("sub/0.log") // parent dir does not exist yet — relay must create it
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        relay_logs_from_dir(
+            dir.path().to_str().unwrap().to_string(),
+            cri_log_path.clone(),
+        )
+        .await;
+
+        assert!(
+            std::path::Path::new(&cri_log_path).exists(),
+            "CRI log file must exist even with no container output (#344)"
         );
     }
 
