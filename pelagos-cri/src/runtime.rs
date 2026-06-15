@@ -1094,7 +1094,19 @@ impl RuntimeService for RuntimeSvc {
         request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
         let filter = request.into_inner().filter;
-        let st = self.state.inner.lock().await;
+        let mut st = self.state.inner.lock().await;
+
+        // Self-heal at the point of observation: never return a dead-pause
+        // ("phantom") sandbox. The kubelet discovers GC targets via this list, so
+        // reaping dead sandboxes here — synchronously, under the same lock that
+        // builds the response — means it can never see one to garbage-collect.
+        // The periodic reaper (see `main`) only *bounds* that window; doing it on
+        // read *closes* it (the path that deleted the host /bin, #347/#351).
+        let reaped =
+            st.reap_stale_sandboxes(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists());
+        for sid in &reaped {
+            log::info!("list_pod_sandbox: reaped stale sandbox {sid} (pause process gone)");
+        }
 
         let items: Vec<PodSandbox> = st
             .sandboxes
