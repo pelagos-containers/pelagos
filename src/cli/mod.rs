@@ -772,6 +772,7 @@ mod tests {
             no_nat: false,
             labels: vec!["env=staging".to_string(), "managed=true".to_string()],
             tmpfs: vec!["/run".to_string(), "/tmp:size=64m".to_string()],
+            ..Default::default()
         };
         let json = serde_json::to_string(&sc).unwrap();
         let decoded: SpawnConfig = serde_json::from_str(&json).unwrap();

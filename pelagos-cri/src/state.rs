@@ -105,6 +105,10 @@ pub struct CriContainer {
     /// Override GID from pod securityContext.runAsGroup (None = use image default).
     #[serde(default)]
     pub run_as_group: Option<i64>,
+    /// Username from securityContext.runAsUsername, resolved to a uid against the
+    /// image's /etc/passwd at run time (used when run_as_user is None). Empty = unset.
+    #[serde(default)]
+    pub run_as_username: String,
     /// Host-side path of the termination log file (empty when not set).
     /// Populated from the mount whose container_path matches terminationMessagePath.
     #[serde(default)]
