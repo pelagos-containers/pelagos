@@ -470,6 +470,38 @@ fn read_pelagos_sandbox_ip(sandbox_id: &str) -> Option<String> {
     Some(st.container_ip)
 }
 
+/// Resolve the AppArmor `(profile_type, profile_name)` for a container (#353).
+/// The new `apparmor` SecurityProfile (passed as `(profile_type, localhost_ref)`)
+/// takes precedence over the deprecated `apparmor_profile` string. critest sends
+/// the profile name with a `"localhost/"` prefix in both forms; strip it so the
+/// bare name reaches the kernel. Types: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
+fn resolve_apparmor(apparmor: Option<(i32, &str)>, deprecated: &str) -> (i32, String) {
+    if let Some((ptype, localhost_ref)) = apparmor {
+        let name = localhost_ref
+            .strip_prefix("localhost/")
+            .unwrap_or(localhost_ref)
+            .to_string();
+        (ptype, name)
+    } else {
+        match deprecated {
+            "" | "runtime/default" => (0, String::new()),
+            "unconfined" => (1, String::new()),
+            s => (2, s.strip_prefix("localhost/").unwrap_or(s).to_string()),
+        }
+    }
+}
+
+/// Whether an AppArmor profile of the given name is currently loaded into the
+/// kernel (#353). The securityfs file lists one `"<name> (<mode>)"` per line.
+/// If securityfs/AppArmor is unavailable we cannot validate, so assume loaded
+/// (don't reject) — the apply-time write surfaces any real error.
+fn apparmor_profile_loaded(name: &str) -> bool {
+    match std::fs::read_to_string("/sys/kernel/security/apparmor/profiles") {
+        Ok(data) => data.lines().any(|l| l.split(" (").next() == Some(name)),
+        Err(_) => true,
+    }
+}
+
 fn read_pelagos_container_state(pelagos_name: &str) -> Option<PelagosContainerState> {
     let path = format!("{}/{}/state.json", PELAGOS_CONTAINERS_DIR, pelagos_name);
     let data = std::fs::read_to_string(&path).ok()?;
@@ -1333,14 +1365,38 @@ impl RuntimeService for RuntimeSvc {
                 })
                 .unwrap_or((0, 0, 0, 0, i32::MIN, 0));
 
-        // Extract AppArmor profile from LinuxContainerSecurityContext.
-        let (apparmor_profile_type, apparmor_profile_path) = config
-            .linux
-            .as_ref()
-            .and_then(|l| l.security_context.as_ref())
-            .and_then(|sc| sc.apparmor.as_ref())
-            .map(|a| (a.profile_type, a.localhost_ref.clone()))
-            .unwrap_or((0, String::new()));
+        // Extract AppArmor profile from LinuxContainerSecurityContext (#353).
+        // The new `apparmor` SecurityProfile takes precedence over the deprecated
+        // `apparmor_profile` string. critest sends the profile name with a
+        // "localhost/" prefix in BOTH forms; strip it so the bare name reaches the
+        // kernel (a prefixed name is not a loaded profile → ENOENT at exec).
+        // Types: 0=RuntimeDefault, 1=Unconfined, 2=Localhost.
+        let (apparmor_profile_type, apparmor_profile_path) = {
+            let sc = config
+                .linux
+                .as_ref()
+                .and_then(|l| l.security_context.as_ref());
+            let new = sc
+                .and_then(|sc| sc.apparmor.as_ref())
+                .map(|a| (a.profile_type, a.localhost_ref.as_str()));
+            // The deprecated `apparmor_profile` field is intentionally read for
+            // backwards compatibility (critest exercises it); silence the lint.
+            #[allow(deprecated)]
+            let deprecated = sc.map(|sc| sc.apparmor_profile.as_str()).unwrap_or("");
+            resolve_apparmor(new, deprecated)
+        };
+        // Reject a Localhost profile that isn't loaded into the kernel — critest's
+        // "should fail with an unloaded apparmor_profile" expects CreateContainer to
+        // error rather than the container failing to start later.
+        if apparmor_profile_type == 2
+            && !apparmor_profile_path.is_empty()
+            && !apparmor_profile_loaded(&apparmor_profile_path)
+        {
+            return Err(Status::invalid_argument(format!(
+                "apparmor profile {:?} is not loaded",
+                apparmor_profile_path
+            )));
+        }
 
         // Extract SELinux options from LinuxContainerSecurityContext.
         let selinux_label = config
@@ -2883,6 +2939,34 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_resolve_apparmor() {
+        // New field strips the "localhost/" prefix critest includes.
+        assert_eq!(
+            resolve_apparmor(Some((2, "localhost/p")), ""),
+            (2, "p".to_string())
+        );
+        // New field takes precedence over the deprecated annotation.
+        assert_eq!(
+            resolve_apparmor(Some((2, "localhost/new")), "localhost/old"),
+            (2, "new".to_string())
+        );
+        // Deprecated localhost profile (new field absent).
+        assert_eq!(
+            resolve_apparmor(None, "localhost/dep"),
+            (2, "dep".to_string())
+        );
+        // Deprecated runtime/default, unconfined, and empty map to type 0/1/0.
+        assert_eq!(
+            resolve_apparmor(None, "runtime/default"),
+            (0, String::new())
+        );
+        assert_eq!(resolve_apparmor(None, "unconfined"), (1, String::new()));
+        assert_eq!(resolve_apparmor(None, ""), (0, String::new()));
+        // New Unconfined (type 1) ignores the (empty) ref.
+        assert_eq!(resolve_apparmor(Some((1, "")), ""), (1, String::new()));
+    }
 
     fn is_alive(pid: i32) -> bool {
         std::path::Path::new(&format!("/proc/{pid}")).exists()

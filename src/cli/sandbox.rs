@@ -145,8 +145,15 @@ fn cmd_sandbox_pause(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unshare IPC/UTS: {}", std::io::Error::last_os_error()).into());
     }
 
-    // Sleep until signalled. pause() returns on any signal delivery.
-    unsafe { libc::pause() };
-
-    Ok(())
+    // Block until terminated. `pause()` returns on ANY caught signal — a stray
+    // SIGCHLD/SIGURG/SIGWINCH or a handler the runtime installs — so calling it
+    // once would let the first such signal exit the pause, orphaning the
+    // sandbox's IPC/UTS namespaces and tripping the phantom-sandbox reaper, which
+    // then yanks still-live containers out from under the kubelet (root cause of
+    // #351; surfaced as flaky AppArmor/lifecycle failures in #353). Loop so only a
+    // real termination signal (SIGTERM from `pelagos sandbox rm` / systemd
+    // KillMode, which terminates the process regardless) ends the pause.
+    loop {
+        unsafe { libc::pause() };
+    }
 }
