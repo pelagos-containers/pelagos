@@ -28557,4 +28557,96 @@ mod issue_347_no_host_destruction {
             "#347 regression: /bin was removed by `pelagos rm`"
         );
     }
+
+    /// test_sandbox_pause_host_ipc_shares_host_namespace
+    ///
+    /// Requires: root (creates a named netns, unshares namespaces).
+    ///
+    /// Spawns the internal `sandbox __pause__` process twice over a named netns —
+    /// once with `--host-ipc` and once without — and compares each pause's
+    /// `/proc/<pid>/ns/ipc` inode against the host's `/proc/self/ns/ipc`.
+    ///
+    /// Asserts the inode EQUALS the host's with `--host-ipc` (the pod shares the
+    /// host IPC namespace, `hostIPC: true`) and DIFFERS without it (the default
+    /// private pod IPC namespace). Failure of the equal case means a hostIPC pod
+    /// still gets a private IPC namespace, so host System V IPC objects are
+    /// invisible inside the pod — the CRI "HostIpc is true" conformance failure
+    /// this fixes (#386 / #352).
+    #[test]
+    fn test_sandbox_pause_host_ipc_shares_host_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_sandbox_pause_host_ipc_shares_host_namespace: requires root");
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let host_ipc_inode = std::fs::metadata("/proc/self/ns/ipc")
+            .expect("stat /proc/self/ns/ipc")
+            .ino();
+
+        // Create a named netns and spawn the pause (optionally with --host-ipc).
+        // The plain `pelagos sandbox __pause__` runs in the spawned process itself
+        // (no double-fork), so /proc/<child>/ns/ipc is the pause's IPC namespace.
+        fn spawn_pause(bin: &str, tag: &str, host_ipc: bool) -> (std::process::Child, String) {
+            let ns = format!("pel-hipc-{}-{}", tag, std::process::id());
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", &ns])
+                .status();
+            let added = std::process::Command::new("ip")
+                .args(["netns", "add", &ns])
+                .status()
+                .expect("ip netns add");
+            assert!(added.success(), "ip netns add {} failed", ns);
+
+            let mut args = vec!["sandbox", "__pause__", ns.as_str()];
+            if host_ipc {
+                args.push("--host-ipc");
+            }
+            let child = std::process::Command::new(bin)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn pause");
+            (child, ns)
+        }
+
+        let (mut host_child, host_ns) = spawn_pause(bin, "host", true);
+        let (mut priv_child, priv_ns) = spawn_pause(bin, "priv", false);
+
+        // Allow the pauses to setns into the netns and (not) unshare IPC.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let host_pause_inode = std::fs::metadata(format!("/proc/{}/ns/ipc", host_child.id()))
+            .expect("stat host-ipc pause ns/ipc")
+            .ino();
+        let priv_pause_inode = std::fs::metadata(format!("/proc/{}/ns/ipc", priv_child.id()))
+            .expect("stat private pause ns/ipc")
+            .ino();
+
+        // Tear down before asserting so a failure still cleans up.
+        let _ = host_child.kill();
+        let _ = priv_child.kill();
+        let _ = host_child.wait();
+        let _ = priv_child.wait();
+        for ns in [&host_ns, &priv_ns] {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", ns])
+                .status();
+        }
+
+        assert_eq!(
+            host_pause_inode, host_ipc_inode,
+            "pause --host-ipc should keep the host IPC namespace (inode {}), got {}",
+            host_ipc_inode, host_pause_inode
+        );
+        assert_ne!(
+            priv_pause_inode, host_ipc_inode,
+            "pause without --host-ipc should unshare a private IPC namespace, \
+             but its inode matches the host's ({})",
+            host_ipc_inode
+        );
+    }
 }
