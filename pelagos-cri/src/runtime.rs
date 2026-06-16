@@ -1490,11 +1490,19 @@ impl RuntimeService for RuntimeSvc {
 
         for m in &container.mounts {
             args.push("-v".into());
+            let mut spec = format!("{}:{}", m.host_path, m.container_path);
             if m.readonly {
-                args.push(format!("{}:{}:ro", m.host_path, m.container_path));
-            } else {
-                args.push(format!("{}:{}", m.host_path, m.container_path));
+                spec.push_str(":ro");
             }
+            // CRI MountPropagation → pelagos -v suffix (#341):
+            // 1 = HOST_TO_CONTAINER (rslave), 2 = BIDIRECTIONAL (rshared),
+            // 0 = PRIVATE (default, no suffix).
+            match m.propagation {
+                1 => spec.push_str(":rslave"),
+                2 => spec.push_str(":rshared"),
+                _ => {}
+            }
+            args.push(spec);
         }
 
         // Kubelet may pass the sha256 digest form rather than the tag; resolve to a known tag.

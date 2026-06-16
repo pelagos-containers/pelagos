@@ -895,29 +895,45 @@ fn apply_cli_options(
         cmd = cmd.with_readonly_rootfs(true);
     }
     for v in &args.volume {
-        if let Some((src, rest)) = v.split_once(':') {
-            // Support "src:tgt" and "src:tgt:ro" (Docker compat).
-            let (tgt, readonly) = match rest.rsplit_once(':') {
-                Some((t, "ro")) => (t, true),
-                Some((t, "rw")) => (t, false),
-                _ => (rest, false),
-            };
-            if src.starts_with('/') {
-                if readonly {
-                    cmd = cmd.with_bind_mount_ro(src, tgt);
-                } else {
-                    cmd = cmd.with_bind_mount(src, tgt);
-                }
-            } else {
-                let vol = Volume::open(src).or_else(|_| Volume::create(src))?;
-                cmd = cmd.with_volume(&vol, tgt);
-            }
-        } else {
+        // Format: src:tgt[:opt[:opt...]] where opt ∈ {ro, rw, rprivate, rslave,
+        // rshared} (and the non-recursive aliases private/slave/shared). The
+        // propagation options (#341) map to CRI MountPropagation: rprivate =
+        // PRIVATE, rslave = HOST_TO_CONTAINER, rshared = BIDIRECTIONAL.
+        let parts: Vec<&str> = v.split(':').collect();
+        if parts.len() < 2 {
             return Err(format!(
-                "invalid --volume '{}': expected NAME:/path or /host:/path[:ro|:rw]",
+                "invalid --volume '{}': expected NAME:/path or \
+                 /host:/path[:ro|:rw][:rprivate|:rslave|:rshared]",
                 v
             )
             .into());
+        }
+        let (src, tgt) = (parts[0], parts[1]);
+        let mut readonly = false;
+        let mut propagation = pelagos::container::MountPropagation::Private;
+        for opt in &parts[2..] {
+            match *opt {
+                "ro" => readonly = true,
+                "rw" => readonly = false,
+                "rprivate" | "private" => {
+                    propagation = pelagos::container::MountPropagation::Private
+                }
+                "rslave" | "slave" => {
+                    propagation = pelagos::container::MountPropagation::HostToContainer
+                }
+                "rshared" | "shared" => {
+                    propagation = pelagos::container::MountPropagation::Bidirectional
+                }
+                other => {
+                    return Err(format!("invalid --volume option '{}' in '{}'", other, v).into())
+                }
+            }
+        }
+        if src.starts_with('/') {
+            cmd = cmd.with_bind_mount_propagated(src, tgt, readonly, propagation);
+        } else {
+            let vol = Volume::open(src).or_else(|_| Volume::create(src))?;
+            cmd = cmd.with_volume(&vol, tgt);
         }
     }
     for b in &args.bind {

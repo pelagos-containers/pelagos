@@ -853,6 +853,22 @@ pub enum OciMountEntry {
     Bind(BindMount),
 }
 
+/// Mount propagation mode for a bind mount (#341), mirroring the CRI
+/// `MountPropagation` enum / the OCI `rprivate`/`rslave`/`rshared` options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MountPropagation {
+    /// `rprivate` — no propagation in either direction (the default, full isolation).
+    #[default]
+    Private,
+    /// `rslave` — mounts created on the host under the source propagate INTO the
+    /// container, but not vice versa (CRI `PROPAGATION_HOST_TO_CONTAINER`).
+    HostToContainer,
+    /// `rshared` — mounts propagate BOTH ways (CRI `PROPAGATION_BIDIRECTIONAL`).
+    /// Required by CSI drivers to publish volumes into pods; lets the container
+    /// create mounts visible on the host, so the source must be a shared mount.
+    Bidirectional,
+}
+
 /// A bind mount that maps a host directory into the container.
 #[derive(Debug, Clone)]
 pub struct BindMount {
@@ -862,6 +878,31 @@ pub struct BindMount {
     pub target: PathBuf,
     /// If true, the bind mount is read-only inside the container.
     pub readonly: bool,
+    /// Mount propagation mode (#341). Defaults to `Private`.
+    pub propagation: MountPropagation,
+}
+
+/// Default propagation flags for the container's root mount when
+/// `linux.rootfsPropagation` is not explicitly set (#341).
+///
+/// Normally `rprivate` (`MS_PRIVATE | MS_REC`) for full isolation. But if any
+/// bind requests host→container (`rslave`) or bidirectional (`rshared`)
+/// propagation we instead make `/` a NON-recursive slave: a recursive
+/// private/slave would sever every bind source from its host peer group *before*
+/// the bind mounts run, so host↔container propagation could never be
+/// established. A non-recursive slave on `/` leaves the inherited submounts
+/// (the bind sources) in their peer groups, which is exactly what lets a
+/// propagated bind join the host's peer group; each bind then gets its own
+/// explicit propagation applied after it is established.
+fn default_rootfs_propagation(bind_mounts: &[BindMount]) -> libc::c_ulong {
+    let needs_propagation = bind_mounts
+        .iter()
+        .any(|b| b.propagation != MountPropagation::Private);
+    if needs_propagation {
+        libc::MS_REC | libc::MS_SLAVE
+    } else {
+        libc::MS_REC | libc::MS_PRIVATE
+    }
 }
 
 /// Resolve a mount destination path within the container rootfs, following any
@@ -2612,6 +2653,7 @@ impl Command {
             source: source.into(),
             target: target.into(),
             readonly: false,
+            propagation: MountPropagation::Private,
         });
         self
     }
@@ -2628,6 +2670,28 @@ impl Command {
             source: source.into(),
             target: target.into(),
             readonly: true,
+            propagation: MountPropagation::Private,
+        });
+        self
+    }
+
+    /// Add a bind mount with an explicit [`MountPropagation`] mode (#341).
+    pub fn with_bind_mount_propagated<P1, P2>(
+        mut self,
+        source: P1,
+        target: P2,
+        readonly: bool,
+        propagation: MountPropagation,
+    ) -> Self
+    where
+        P1: Into<PathBuf>,
+        P2: Into<PathBuf>,
+    {
+        self.bind_mounts.push(BindMount {
+            source: source.into(),
+            target: target.into(),
+            readonly,
+            propagation,
         });
         self
     }
@@ -3774,8 +3838,8 @@ impl Command {
                     if namespaces.contains(Namespace::MOUNT) {
                         use std::ptr;
 
-                        let prop_flags =
-                            rootfs_propagation.unwrap_or(libc::MS_REC | libc::MS_PRIVATE);
+                        let prop_flags = rootfs_propagation
+                            .unwrap_or_else(|| default_rootfs_propagation(&bind_mounts));
                         let root = c"/";
                         let result = libc::mount(
                             ptr::null(),   // source: NULL (remount)
@@ -4589,6 +4653,20 @@ impl Command {
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        // #341: for bidirectional propagation the SOURCE must be a shared
+                        // mount (member of a peer group) so the bind joins that group and
+                        // mounts the container creates propagate back to the host. The
+                        // kubelet marks the host path shared for bidirectional mounts;
+                        // re-assert it here (best-effort) before binding.
+                        if bm.propagation == MountPropagation::Bidirectional {
+                            let _ = libc::mount(
+                                ptr::null(),
+                                src_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_SHARED | libc::MS_REC,
+                                ptr::null(),
+                            );
+                        }
                         // Step 1: establish the bind. Use a RECURSIVE bind so any
                         // submounts under the source (e.g. a tmpfs the caller mounted
                         // inside the volume) are carried into the container. The
@@ -4628,6 +4706,22 @@ impl Command {
                                 )));
                             }
                         }
+                        // Step 3 (#341): apply the requested mount propagation on the
+                        // target. Best-effort — under a user namespace the kernel locks
+                        // inherited mounts (EINVAL on propagation changes); the new mount
+                        // namespace already isolates by default, so don't fail startup.
+                        let prop_flags = match bm.propagation {
+                            MountPropagation::Private => libc::MS_PRIVATE | libc::MS_REC,
+                            MountPropagation::HostToContainer => libc::MS_SLAVE | libc::MS_REC,
+                            MountPropagation::Bidirectional => libc::MS_SHARED | libc::MS_REC,
+                        };
+                        let _ = libc::mount(
+                            ptr::null(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            prop_flags,
+                            ptr::null(),
+                        );
                     }
 
                     // Normal path: pivot_root atomically makes new_root the
@@ -6461,8 +6555,8 @@ impl Command {
 
                     // linux.rootfsPropagation overrides the default MS_PRIVATE|MS_REC.
                     if namespaces.contains(Namespace::MOUNT) {
-                        let prop_flags =
-                            rootfs_propagation.unwrap_or(libc::MS_REC | libc::MS_PRIVATE);
+                        let prop_flags = rootfs_propagation
+                            .unwrap_or_else(|| default_rootfs_propagation(&bind_mounts));
                         let root = c"/";
                         let result = libc::mount(
                             ptr::null(),
@@ -7141,6 +7235,16 @@ impl Command {
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        // #341: bidirectional needs the source to be a shared mount.
+                        if bm.propagation == MountPropagation::Bidirectional {
+                            let _ = libc::mount(
+                                ptr::null(),
+                                src_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_SHARED | libc::MS_REC,
+                                ptr::null(),
+                            );
+                        }
                         // Recursive bind so submounts under the source are carried in;
                         // the readonly remount below stays non-recursive (#356).
                         let r = libc::mount(
@@ -7174,6 +7278,19 @@ impl Command {
                                 )));
                             }
                         }
+                        // #341: apply requested propagation on the target (best-effort).
+                        let prop_flags = match bm.propagation {
+                            MountPropagation::Private => libc::MS_PRIVATE | libc::MS_REC,
+                            MountPropagation::HostToContainer => libc::MS_SLAVE | libc::MS_REC,
+                            MountPropagation::Bidirectional => libc::MS_SHARED | libc::MS_REC,
+                        };
+                        let _ = libc::mount(
+                            ptr::null(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            prop_flags,
+                            ptr::null(),
+                        );
                     }
 
                     // Normal path: pivot_root atomically makes new_root the
@@ -8559,6 +8676,44 @@ mod tests {
         let resolved = resolve_mount_target_in_root(root.path(), std::path::Path::new("/dev"));
         assert_eq!(resolved, root.path().join("real-dev"));
         assert!(resolved.starts_with(root.path()));
+    }
+
+    #[test]
+    fn test_default_rootfs_propagation() {
+        // #341: with no propagation mounts, the root stays fully isolated
+        // (rprivate); if any mount requests slave/shared propagation, the root
+        // becomes a recursive SLAVE instead — a recursive private/slave applied
+        // before the binds would sever their sources from the host peer groups.
+        let bm = |p: MountPropagation| BindMount {
+            source: PathBuf::from("/h"),
+            target: PathBuf::from("/c"),
+            readonly: false,
+            propagation: p,
+        };
+        assert_eq!(
+            default_rootfs_propagation(&[]),
+            libc::MS_REC | libc::MS_PRIVATE
+        );
+        assert_eq!(
+            default_rootfs_propagation(&[bm(MountPropagation::Private)]),
+            libc::MS_REC | libc::MS_PRIVATE
+        );
+        assert_eq!(
+            default_rootfs_propagation(&[bm(MountPropagation::HostToContainer)]),
+            libc::MS_REC | libc::MS_SLAVE
+        );
+        assert_eq!(
+            default_rootfs_propagation(&[bm(MountPropagation::Bidirectional)]),
+            libc::MS_REC | libc::MS_SLAVE
+        );
+        // Mixed: any non-private mount triggers the slave root.
+        assert_eq!(
+            default_rootfs_propagation(&[
+                bm(MountPropagation::Private),
+                bm(MountPropagation::HostToContainer)
+            ]),
+            libc::MS_REC | libc::MS_SLAVE
+        );
     }
 
     #[test]
