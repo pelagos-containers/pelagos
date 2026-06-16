@@ -629,8 +629,25 @@ impl RuntimeSvc {
         self.state.inner.lock().await.pelagos_bin.clone()
     }
 
+    /// The config digest (image id) of a stored image dir: sha256 of its raw
+    /// `oci-config.json` blob (matches containerd's image id and what PullImage/
+    /// ImageStatus report). Falls back to the manifest digest when the config
+    /// blob isn't present (older/locally-built images). #382.
+    async fn config_digest_of(dir: &std::path::Path, manifest_digest: &str) -> String {
+        match tokio::fs::read(dir.join("oci-config.json")).await {
+            Ok(bytes) => {
+                use sha2::Digest as _;
+                format!("sha256:{:x}", sha2::Sha256::digest(&bytes))
+            }
+            Err(_) => manifest_digest.to_string(),
+        }
+    }
+
     /// Resolve a digest-form image ref (sha256:...) to a repo tag by scanning the image store.
-    /// Kubelet may pass the digest it received from ImageStatus rather than the original tag.
+    /// The kubelet creates containers using the image **id** (config digest) it received from
+    /// PullImage/ImageStatus, not the original tag — so match the config digest as well as the
+    /// manifest digest, otherwise `pelagos run` would try to pull `docker.io/library/sha256:…`
+    /// and fail (#382).
     async fn resolve_image_ref(image_ref: &str) -> String {
         if !image_ref.starts_with("sha256:") {
             return image_ref.to_string();
@@ -639,10 +656,12 @@ impl RuntimeSvc {
             return image_ref.to_string();
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
-            let manifest_path = entry.path().join("manifest.json");
-            if let Ok(data) = tokio::fs::read_to_string(&manifest_path).await {
+            let dir = entry.path();
+            if let Ok(data) = tokio::fs::read_to_string(dir.join("manifest.json")).await {
                 if let Ok(m) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if m["digest"].as_str() == Some(image_ref) {
+                    let manifest_digest = m["digest"].as_str().unwrap_or("");
+                    let config_digest = Self::config_digest_of(&dir, manifest_digest).await;
+                    if config_digest == image_ref || manifest_digest == image_ref {
                         if let Some(tag) = m["reference"].as_str() {
                             return tag.to_string();
                         }
@@ -660,14 +679,18 @@ impl RuntimeSvc {
             return (vec![], vec![]);
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
-            let manifest_path = entry.path().join("manifest.json");
-            let Ok(data) = tokio::fs::read_to_string(&manifest_path).await else {
+            let dir = entry.path();
+            let Ok(data) = tokio::fs::read_to_string(dir.join("manifest.json")).await else {
                 continue;
             };
             let Ok(m) = serde_json::from_str::<serde_json::Value>(&data) else {
                 continue;
             };
-            if m["reference"].as_str() == Some(image_ref) || m["digest"].as_str() == Some(image_ref)
+            let manifest_digest = m["digest"].as_str().unwrap_or("");
+            let config_digest = Self::config_digest_of(&dir, manifest_digest).await;
+            if m["reference"].as_str() == Some(image_ref)
+                || manifest_digest == image_ref
+                || config_digest == image_ref
             {
                 let ep = m["config"]["entrypoint"]
                     .as_array()
