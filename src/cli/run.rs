@@ -1002,7 +1002,12 @@ fn apply_cli_options(
         }
     }
     if let Some(swap) = args.memory_swap {
-        cmd = cmd.with_cgroup_memory_swap(swap);
+        let mem = args
+            .memory
+            .as_deref()
+            .and_then(|m| parse_memory(m).ok())
+            .unwrap_or(0);
+        cmd = cmd.with_cgroup_memory_swap(combined_swap_to_v2_swap_only(swap, mem));
     }
     if let Some(ref c) = args.cpus {
         let (quota, period) = parse_cpus(c)?;
@@ -1842,9 +1847,40 @@ fn deregister_dns(container_name: &str, network_ips: &[(String, String)]) {
     }
 }
 
+/// Convert a Docker-style **combined** memory+swap limit (`--memory-swap`) into
+/// the cgroup v2 swap-ONLY value for `memory.swap.max`.
+///
+/// Docker/CRI express the limit as memory+swap combined; cgroup v2 wants the
+/// swap portion alone (`swap.max = combined - memory`). Kubernetes sets the
+/// combined limit equal to the memory limit when swap is disabled (the default),
+/// which must yield `swap.max = 0` so the OOM killer fires at the memory limit
+/// instead of paging to host swap (#343). `-1` (unlimited swap) passes through.
+fn combined_swap_to_v2_swap_only(memory_swap: i64, memory_bytes: i64) -> i64 {
+    if memory_swap < 0 {
+        memory_swap
+    } else {
+        (memory_swap - memory_bytes).max(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_combined_swap_to_v2_swap_only() {
+        let mb = 1 << 20;
+        // Kubernetes swap-disabled: combined == memory -> no swap.
+        assert_eq!(combined_swap_to_v2_swap_only(15 * mb, 15 * mb), 0);
+        // Combined above memory -> the extra is swap.
+        assert_eq!(combined_swap_to_v2_swap_only(30 * mb, 15 * mb), 15 * mb);
+        // Unlimited swap passes through unchanged.
+        assert_eq!(combined_swap_to_v2_swap_only(-1, 15 * mb), -1);
+        // Defensive: combined below memory clamps to 0 (never negative swap.max).
+        assert_eq!(combined_swap_to_v2_swap_only(10 * mb, 15 * mb), 0);
+        // No memory limit -> treat the value as swap-only.
+        assert_eq!(combined_swap_to_v2_swap_only(20 * mb, 0), 20 * mb);
+    }
 
     #[test]
     fn test_parse_port_forwards_tcp_default() {

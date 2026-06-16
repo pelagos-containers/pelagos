@@ -3621,16 +3621,30 @@ impl Command {
                 // runs shortly after and supersedes this; everywhere else pgid == pid.
                 libc::setpgid(0, 0);
 
-                // Step 0: For non-PID-namespace containers (single fork), add ourselves
-                // to the pre-created cgroup immediately so all subsequent memory
-                // allocations (including from exec'd code) are charged to it.
-                // For PID-namespace containers, this happens in the grandchild at step 1.65.
-                if !namespaces.contains(Namespace::PID) {
-                    if let Some(ref procs_path) = pre_cgroup_procs_path {
+                // Step 0: Add ourselves to the pre-created cgroup BEFORE unshare and
+                // exec, so all subsequent memory allocations (including the exec'd
+                // workload's) are charged to it and the OOM killer fires at the limit
+                // (#343). cgroup v2 does NOT migrate existing charges on move, so a
+                // late assignment leaves memory the workload already faulted charged to
+                // the wrong cgroup — the limit never bites.
+                if let Some(ref procs_path) = pre_cgroup_procs_path {
+                    if !namespaces.contains(Namespace::PID) {
+                        // Single-fork: our own (host) PID identifies us, and the path is
+                        // still visible (no CGROUP-namespace unshare yet).
                         let pid = libc::getpid();
                         let pid_str = format!("{}\n", pid);
                         std::fs::write(procs_path, pid_str.as_bytes())
                             .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
+                    } else if has_explicit_cgroup_path {
+                        // PID-namespace + explicit (kubepods-style) path: the grandchild
+                        // can't write this host-anchored path after unshare(CLONE_NEWCGROUP)
+                        // (step 1.65 skips it for explicit paths). Join HERE instead, before
+                        // the unshare hides the path: "0" tells the kernel to move the
+                        // calling process; the PID-ns intermediate and the container
+                        // grandchild both inherit this cgroup. Best-effort — the host-side
+                        // parent's post-spawn cgroup.procs write remains the fallback, so a
+                        // race here never breaks startup.
+                        let _ = std::fs::write(procs_path, b"0\n");
                     }
                 }
 
@@ -6310,14 +6324,22 @@ impl Command {
                 }
                 libc::close(slave_raw_fd);
 
-                // For non-PID-namespace containers, add ourselves to the pre-created
-                // cgroup immediately (same pattern as spawn() Step 0).
-                if !namespaces.contains(Namespace::PID) {
-                    if let Some(ref procs_path) = pre_cgroup_procs_path_i {
+                // Add ourselves to the pre-created cgroup immediately (same pattern as
+                // spawn() Step 0): join BEFORE unshare/exec so the workload's memory
+                // charges to the limit cgroup and the OOM killer fires at the limit (#343).
+                if let Some(ref procs_path) = pre_cgroup_procs_path_i {
+                    if !namespaces.contains(Namespace::PID) {
                         let pid = libc::getpid();
                         let pid_str = format!("{}\n", pid);
                         std::fs::write(procs_path, pid_str.as_bytes())
                             .map_err(|e| pre_exec_err("cgroup self-assign", e))?;
+                    } else if has_explicit_cgroup_path_i {
+                        // PID-namespace + explicit (kubepods-style) path: join here, before
+                        // unshare(CLONE_NEWCGROUP) hides the host-anchored path. "0" moves
+                        // the calling process; the PID-ns intermediate and grandchild
+                        // inherit it. Best-effort — the parent's post-spawn write is the
+                        // fallback.
+                        let _ = std::fs::write(procs_path, b"0\n");
                     }
                 }
 
