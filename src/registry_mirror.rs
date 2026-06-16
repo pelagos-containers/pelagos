@@ -112,6 +112,26 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_reference_ecr_public_path_prefix() {
+        // ECR Public mirrors Docker Hub official images under a `/docker` path
+        // prefix (public.ecr.aws/docker/library/<image>). A mirror endpoint with
+        // a path component must be preserved so the rewritten reference resolves
+        // to the correct ECR repository. This is what the CI mirror config relies
+        // on (ci/registries.toml, issue #388).
+        let out = rewrite_reference(
+            "docker.io/library/alpine:latest",
+            "https://public.ecr.aws/docker",
+        );
+        assert_eq!(out, "public.ecr.aws/docker/library/alpine:latest");
+        // Trailing slash on the endpoint must not double up.
+        let out = rewrite_reference(
+            "docker.io/library/busybox:1.36",
+            "https://public.ecr.aws/docker/",
+        );
+        assert_eq!(out, "public.ecr.aws/docker/library/busybox:1.36");
+    }
+
+    #[test]
     fn test_is_insecure_endpoint() {
         assert!(is_insecure_endpoint("http://nazgul:5000"));
         assert!(!is_insecure_endpoint("https://mirror.example.com"));
