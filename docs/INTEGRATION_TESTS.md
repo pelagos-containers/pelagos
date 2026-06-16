@@ -355,6 +355,19 @@ host, binds `outer` read-only at `/mnt/ro`, then asserts `touch /mnt/ro/inner/su
 submount wasn't carried in (non-recursive bind) or the readonly remount was applied
 recursively — both of which break the CRI `recursive_read_only=false` contract.
 
+### `test_bind_mount_recursive_ro_submount_readonly`
+**Requires:** root, rootfs
+
+Verifies the #356 `recursive_read_only` semantics (the inverse of the non-recursive
+test): a recursive readonly bind
+(`with_bind_mount_propagated(..., readonly=true, recursive_readonly=true, ...)`)
+applies `MOUNT_ATTR_RDONLY` to the top mount **and every submount** via
+`mount_setattr(AT_RECURSIVE)` (kernel ≥ 5.12). With a tmpfs at `outer/inner` bound
+recursively-readonly at `/mnt/rro`, asserts `touch /mnt/rro/inner/sub` **fails**
+(`sub=1`, submount read-only) and `touch /mnt/rro/top` **fails** (`top=1`). Failure of
+the submount assertion would mean the readonly attribute wasn't applied recursively —
+breaking the CRI `recursive_read_only=true` contract.
+
 ### `test_bind_mount_propagation_host_to_container`
 **Requires:** root, rootfs
 

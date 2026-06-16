@@ -20,15 +20,16 @@ use crate::cri::{
     PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse, RemoveContainerRequest,
     RemoveContainerResponse, RemovePodSandboxRequest, RemovePodSandboxResponse,
     ReopenContainerLogRequest, ReopenContainerLogResponse, RuntimeCondition, RuntimeConfigRequest,
-    RuntimeConfigResponse, RuntimeStatus, StartContainerRequest, StartContainerResponse,
-    StatusRequest, StatusResponse, StopContainerRequest, StopContainerResponse,
-    StopPodSandboxRequest, StopPodSandboxResponse, StreamContainerStatsRequest,
-    StreamContainerStatsResponse, StreamContainersRequest, StreamContainersResponse,
-    StreamPodSandboxMetricsRequest, StreamPodSandboxMetricsResponse, StreamPodSandboxStatsRequest,
-    StreamPodSandboxStatsResponse, StreamPodSandboxesRequest, StreamPodSandboxesResponse,
-    UInt64Value, UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
-    UpdatePodSandboxResourcesRequest, UpdatePodSandboxResourcesResponse,
-    UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
+    RuntimeConfigResponse, RuntimeHandler, RuntimeHandlerFeatures, RuntimeStatus,
+    StartContainerRequest, StartContainerResponse, StatusRequest, StatusResponse,
+    StopContainerRequest, StopContainerResponse, StopPodSandboxRequest, StopPodSandboxResponse,
+    StreamContainerStatsRequest, StreamContainerStatsResponse, StreamContainersRequest,
+    StreamContainersResponse, StreamPodSandboxMetricsRequest, StreamPodSandboxMetricsResponse,
+    StreamPodSandboxStatsRequest, StreamPodSandboxStatsResponse, StreamPodSandboxesRequest,
+    StreamPodSandboxesResponse, UInt64Value, UpdateContainerResourcesRequest,
+    UpdateContainerResourcesResponse, UpdatePodSandboxResourcesRequest,
+    UpdatePodSandboxResourcesResponse, UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
+    VersionRequest, VersionResponse,
 };
 use crate::invoke::run_pelagos;
 use crate::scope;
@@ -729,7 +730,15 @@ impl RuntimeService for RuntimeSvc {
                 ],
             }),
             info: HashMap::new(),
-            runtime_handlers: vec![],
+            // Advertise recursive read-only mount support (#356) on the default
+            // handler so the kubelet/critest will request and exercise it.
+            runtime_handlers: vec![RuntimeHandler {
+                name: String::new(),
+                features: Some(RuntimeHandlerFeatures {
+                    recursive_read_only_mounts: true,
+                    ..Default::default()
+                }),
+            }],
             features: None,
         }))
     }
@@ -1247,6 +1256,25 @@ impl RuntimeService for RuntimeSvc {
             })
             .collect();
 
+        // Validate recursive_read_only constraints (#356): the CRI spec requires a
+        // recursive readonly mount to also be readonly and have PRIVATE propagation.
+        // critest expects CreateContainer to reject violations.
+        for m in &config.mounts {
+            if m.recursive_read_only {
+                if !m.readonly {
+                    return Err(Status::invalid_argument(format!(
+                        "recursive_read_only mount {:?} requires readonly=true",
+                        m.container_path
+                    )));
+                }
+                if m.propagation != 0 {
+                    return Err(Status::invalid_argument(format!(
+                        "recursive_read_only mount {:?} requires PRIVATE propagation",
+                        m.container_path
+                    )));
+                }
+            }
+        }
         let mounts: Vec<CriMount> = config
             .mounts
             .iter()
@@ -1547,7 +1575,11 @@ impl RuntimeService for RuntimeSvc {
         for m in &container.mounts {
             args.push("-v".into());
             let mut spec = format!("{}:{}", m.host_path, m.container_path);
-            if m.readonly {
+            // recursive_read_only (#356) → :rro (mount_setattr AT_RECURSIVE);
+            // plain readonly → :ro (non-recursive, top mount only).
+            if m.recursive_read_only {
+                spec.push_str(":rro");
+            } else if m.readonly {
                 spec.push_str(":ro");
             }
             // CRI MountPropagation → pelagos -v suffix (#341):

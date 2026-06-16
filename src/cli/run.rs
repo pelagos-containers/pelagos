@@ -910,11 +910,18 @@ fn apply_cli_options(
         }
         let (src, tgt) = (parts[0], parts[1]);
         let mut readonly = false;
+        let mut recursive_readonly = false;
         let mut propagation = pelagos::container::MountPropagation::Private;
         for opt in &parts[2..] {
             match *opt {
                 "ro" => readonly = true,
                 "rw" => readonly = false,
+                // `rro` = recursive read-only (#356): readonly applied to all
+                // submounts via mount_setattr(AT_RECURSIVE).
+                "rro" => {
+                    readonly = true;
+                    recursive_readonly = true;
+                }
                 "rprivate" | "private" => {
                     propagation = pelagos::container::MountPropagation::Private
                 }
@@ -930,7 +937,8 @@ fn apply_cli_options(
             }
         }
         if src.starts_with('/') {
-            cmd = cmd.with_bind_mount_propagated(src, tgt, readonly, propagation);
+            cmd =
+                cmd.with_bind_mount_propagated(src, tgt, readonly, recursive_readonly, propagation);
         } else {
             let vol = Volume::open(src).or_else(|_| Volume::create(src))?;
             cmd = cmd.with_volume(&vol, tgt);

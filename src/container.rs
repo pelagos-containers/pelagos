@@ -878,8 +878,49 @@ pub struct BindMount {
     pub target: PathBuf,
     /// If true, the bind mount is read-only inside the container.
     pub readonly: bool,
+    /// If true (and `readonly`), the read-only attribute is applied RECURSIVELY
+    /// to every submount via `mount_setattr(AT_RECURSIVE)` — the CRI
+    /// `recursive_read_only` semantics. When false, `readonly` is non-recursive
+    /// (top mount only; submounts stay writable, see #356). Defaults to false.
+    pub recursive_readonly: bool,
     /// Mount propagation mode (#341). Defaults to `Private`.
     pub propagation: MountPropagation,
+}
+
+/// Apply `MOUNT_ATTR_RDONLY` recursively (`AT_RECURSIVE`) to the mount at
+/// `target` via `mount_setattr(2)` — the CRI `recursive_read_only` semantics
+/// (#356 follow-up). Returns true on success; false (so the caller can fall back
+/// to a non-recursive remount) on `ENOSYS`/older kernels (mount_setattr needs
+/// kernel ≥ 5.12). Allocation-free, safe to call from the pre-exec hook.
+fn mount_setattr_rdonly_recursive(target: &std::ffi::CStr) -> bool {
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    // __NR_mount_setattr is 442 on both x86_64 and aarch64.
+    const SYS_MOUNT_SETATTR: libc::c_long = 442;
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let rc = unsafe {
+        libc::syscall(
+            SYS_MOUNT_SETATTR,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            AT_RECURSIVE,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    rc == 0
 }
 
 /// Default propagation flags for the container's root mount when
@@ -2653,6 +2694,7 @@ impl Command {
             source: source.into(),
             target: target.into(),
             readonly: false,
+            recursive_readonly: false,
             propagation: MountPropagation::Private,
         });
         self
@@ -2670,17 +2712,20 @@ impl Command {
             source: source.into(),
             target: target.into(),
             readonly: true,
+            recursive_readonly: false,
             propagation: MountPropagation::Private,
         });
         self
     }
 
-    /// Add a bind mount with an explicit [`MountPropagation`] mode (#341).
+    /// Add a bind mount with an explicit [`MountPropagation`] mode (#341) and
+    /// optional recursive read-only (#356 `recursive_read_only`).
     pub fn with_bind_mount_propagated<P1, P2>(
         mut self,
         source: P1,
         target: P2,
         readonly: bool,
+        recursive_readonly: bool,
         propagation: MountPropagation,
     ) -> Self
     where
@@ -2691,6 +2736,7 @@ impl Command {
             source: source.into(),
             target: target.into(),
             readonly,
+            recursive_readonly,
             propagation,
         });
         self
@@ -4689,21 +4735,31 @@ impl Command {
                                 io::Error::last_os_error()
                             )));
                         }
-                        // Step 2 (if readonly): remount read-only — Linux requires two calls
+                        // Step 2 (if readonly): make the mount read-only.
                         if bm.readonly {
-                            let r2 = libc::mount(
-                                ptr::null(),
-                                tgt_c.as_ptr(),
-                                ptr::null(),
-                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                                ptr::null(),
-                            );
-                            if r2 != 0 {
-                                return Err(io::Error::other(format!(
-                                    "bind mount remount ro {}: {}",
-                                    host_target.display(),
-                                    io::Error::last_os_error()
-                                )));
+                            // Recursive RO (#356 recursive_read_only): mount_setattr
+                            // with AT_RECURSIVE marks the top mount AND every submount
+                            // read-only. Falls through to the non-recursive remount on
+                            // older kernels (mount_setattr needs ≥5.12).
+                            let did_recursive =
+                                bm.recursive_readonly && mount_setattr_rdonly_recursive(&tgt_c);
+                            if !did_recursive {
+                                // Non-recursive: remount the top mount RO (submounts stay
+                                // writable — #356). Linux requires the two-call remount.
+                                let r2 = libc::mount(
+                                    ptr::null(),
+                                    tgt_c.as_ptr(),
+                                    ptr::null(),
+                                    libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                    ptr::null(),
+                                );
+                                if r2 != 0 {
+                                    return Err(io::Error::other(format!(
+                                        "bind mount remount ro {}: {}",
+                                        host_target.display(),
+                                        io::Error::last_os_error()
+                                    )));
+                                }
                             }
                         }
                         // Step 3 (#341): apply the requested mount propagation on the
@@ -7263,19 +7319,25 @@ impl Command {
                             )));
                         }
                         if bm.readonly {
-                            let r2 = libc::mount(
-                                ptr::null(),
-                                tgt_c.as_ptr(),
-                                ptr::null(),
-                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                                ptr::null(),
-                            );
-                            if r2 != 0 {
-                                return Err(io::Error::other(format!(
-                                    "bind mount remount ro {}: {}",
-                                    host_target.display(),
-                                    io::Error::last_os_error()
-                                )));
+                            // Recursive RO (#356) via mount_setattr(AT_RECURSIVE);
+                            // fall back to a non-recursive remount on older kernels.
+                            let did_recursive =
+                                bm.recursive_readonly && mount_setattr_rdonly_recursive(&tgt_c);
+                            if !did_recursive {
+                                let r2 = libc::mount(
+                                    ptr::null(),
+                                    tgt_c.as_ptr(),
+                                    ptr::null(),
+                                    libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                    ptr::null(),
+                                );
+                                if r2 != 0 {
+                                    return Err(io::Error::other(format!(
+                                        "bind mount remount ro {}: {}",
+                                        host_target.display(),
+                                        io::Error::last_os_error()
+                                    )));
+                                }
                             }
                         }
                         // #341: apply requested propagation on the target (best-effort).
@@ -8688,6 +8750,7 @@ mod tests {
             source: PathBuf::from("/h"),
             target: PathBuf::from("/c"),
             readonly: false,
+            recursive_readonly: false,
             propagation: p,
         };
         assert_eq!(
