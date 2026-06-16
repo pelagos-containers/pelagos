@@ -321,8 +321,20 @@ pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
     ensure_image_dirs()?;
     let rootless = crate::paths::is_rootless();
     let dest = layer_dir(digest);
+    // A rootless (non-CAP_FSETID) unpack silently strips setuid/setgid bits, so a
+    // layer extracted rootless degrades any ROOT container that later reuses it —
+    // setuid binaries stop escalating (#384). Mark rootless extractions and, when
+    // a root extraction finds such a degraded layer in the shared cache, re-extract
+    // it with full fidelity rather than reusing it. The marker is a sibling file,
+    // never inside the layer dir (which becomes a container rootfs layer).
+    let rootless_marker = dest.with_extension("rootless");
     if dest.is_dir() {
-        return Ok(dest);
+        if rootless || !rootless_marker.exists() {
+            return Ok(dest); // rootless reuse, or root reusing a root-extracted layer
+        }
+        // Root extraction over a rootless-degraded layer: re-extract from scratch.
+        std::fs::remove_dir_all(&dest)?;
+        let _ = std::fs::remove_file(&rootless_marker);
     }
 
     // Extract to a temporary sibling, then rename atomically.
@@ -378,6 +390,14 @@ pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
     // Ensure parent dir exists and rename partial → final.
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&partial, &dest)?;
+
+    // Record that this layer was extracted rootless (setuid/setgid bits stripped),
+    // so a later ROOT extraction re-extracts it with full fidelity (#384).
+    if rootless {
+        let _ = std::fs::File::create(&rootless_marker);
+    } else {
+        let _ = std::fs::remove_file(&rootless_marker);
+    }
 
     Ok(dest)
 }

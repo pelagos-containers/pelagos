@@ -7994,6 +7994,85 @@ mod linking {
 mod images {
     use super::*;
 
+    #[test]
+    fn test_extract_layer_reextracts_rootless_degraded_layer() {
+        // #384: a rootless (non-CAP_FSETID) unpack strips setuid bits, and the
+        // shared content-addressable cache would serve that degraded layer to a
+        // ROOT container — breaking setuid escalation (the NoNewPrivs spec). A root
+        // extraction must RE-extract a layer previously marked rootless, restoring
+        // full fidelity. Verify the marker drives the re-extraction.
+        use std::os::unix::fs::PermissionsExt;
+        if !is_root() {
+            eprintln!(
+                "Skipping test_extract_layer_reextracts_rootless_degraded_layer: requires root"
+            );
+            return;
+        }
+
+        // Build a layer tarball containing a setuid-root binary (tar as root
+        // captures the suid bit).
+        let work = tempfile::tempdir().expect("tempdir");
+        let src = work.path().join("layer");
+        std::fs::create_dir_all(src.join("usr/bin")).unwrap();
+        let bin = src.join("usr/bin/suidtool");
+        std::fs::write(&bin, b"x").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let tar_gz = work.path().join("layer.tar.gz");
+        let st = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                tar_gz.to_str().unwrap(),
+                "-C",
+                src.to_str().unwrap(),
+                ".",
+            ])
+            .status()
+            .expect("tar");
+        assert!(st.success(), "tar build failed");
+
+        // A unique digest so the test never collides with a real layer; clean any
+        // prior state from a previous run.
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000384";
+        let dir = pelagos::image::layer_dir(digest);
+        let marker = dir.with_extension("rootless");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&marker);
+
+        // Root extract: suid preserved, no rootless marker.
+        let layer = pelagos::image::extract_layer(digest, &tar_gz).expect("extract");
+        let suidtool = layer.join("usr/bin/suidtool");
+        let mode1 = std::fs::metadata(&suidtool).unwrap().permissions().mode();
+        assert_eq!(mode1 & 0o4000, 0o4000, "root extract must preserve suid");
+        assert!(
+            !marker.exists(),
+            "root extract must not write a rootless marker"
+        );
+
+        // Simulate a prior ROOTLESS-degraded layer in the cache: strip suid + mark.
+        std::fs::set_permissions(&suidtool, std::fs::Permissions::from_mode(0o0755)).unwrap();
+        std::fs::File::create(&marker).unwrap();
+
+        // Root re-extract: the marker must trigger a full re-extraction that
+        // restores the suid bit and clears the marker.
+        let layer2 = pelagos::image::extract_layer(digest, &tar_gz).expect("re-extract");
+        let mode2 = std::fs::metadata(layer2.join("usr/bin/suidtool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode2 & 0o4000,
+            0o4000,
+            "root re-extract over a rootless-degraded layer must restore suid"
+        );
+        assert!(
+            !marker.exists(),
+            "rootless marker must be cleared after root re-extract"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&marker);
+    }
+
     /// Copy the rootfs into a temp directory, excluding pseudo-filesystem
     /// contents (/sys, /proc, /dev) that can't be copied from a live mount.
     /// Re-creates the empty mount-point directories afterward.
