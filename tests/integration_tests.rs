@@ -1675,6 +1675,82 @@ mod filesystem {
         );
     }
 
+    #[test]
+    fn test_bind_mount_ro_non_recursive_submount_writable() {
+        // #356: a readonly bind mount is established RECURSIVELY (MS_REC) so any
+        // submount under the source is carried into the container, but the
+        // readonly remount is NON-recursive (top mount only) — so a submount
+        // stays writable. This is the CRI non-recursive readonly-mount semantics
+        // verified by critest (`touch <submount>/file` must succeed while the top
+        // is read-only).
+        use std::os::unix::ffi::OsStrExt as _;
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_ro_non_recursive_submount_writable: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bind_mount_ro_non_recursive_submount_writable: no rootfs");
+            return;
+        };
+
+        let outer = tempfile::tempdir().expect("failed to create temp dir");
+        let inner = outer.path().join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir inner");
+
+        // Mount a tmpfs at outer/inner on the host so it is a submount of the bind source.
+        let inner_c = std::ffi::CString::new(inner.as_os_str().as_bytes()).unwrap();
+        let tmpfs_c = std::ffi::CString::new("tmpfs").unwrap();
+        let rc = unsafe {
+            libc::mount(
+                tmpfs_c.as_ptr(),
+                inner_c.as_ptr(),
+                tmpfs_c.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "host tmpfs mount failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "touch /mnt/ro/inner/sub 2>/dev/null; echo sub=$?; \
+                 touch /mnt/ro/top 2>/dev/null; echo top=$?",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_bind_mount_ro(outer.path(), "/mnt/ro")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with read-only bind mount + submount");
+
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        // Unmount the host tmpfs before assertions so the TempDir can be cleaned up.
+        unsafe {
+            libc::umount(inner_c.as_ptr());
+        }
+        assert!(status.success(), "Shell should exit cleanly");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("sub=0"),
+            "submount under a non-recursive readonly bind must be writable, got: {}",
+            out
+        );
+        assert!(
+            out.contains("top=1"),
+            "top of a readonly bind must be read-only, got: {}",
+            out
+        );
+    }
+
     /// test_cli_volume_flag_ro
     ///
     /// Requires: root, rootfs.

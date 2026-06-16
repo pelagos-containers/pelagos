@@ -14,7 +14,7 @@ use crate::cri::{
     ListContainersResponse, ListMetricDescriptorsRequest, ListMetricDescriptorsResponse,
     ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse, ListPodSandboxRequest,
     ListPodSandboxResponse, ListPodSandboxStatsRequest, ListPodSandboxStatsResponse, MemoryUsage,
-    Namespace, NamespaceOption, PodSandbox, PodSandboxAttributes, PodSandboxMetadata,
+    Mount, Namespace, NamespaceOption, PodSandbox, PodSandboxAttributes, PodSandboxMetadata,
     PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsRequest,
     PodSandboxStatsResponse, PodSandboxStatus as CriPodSandboxStatus, PodSandboxStatusRequest,
     PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse, RemoveContainerRequest,
@@ -1222,6 +1222,8 @@ impl RuntimeService for RuntimeSvc {
                 host_path: m.host_path.clone(),
                 container_path: m.container_path.clone(),
                 readonly: m.readonly,
+                recursive_read_only: m.recursive_read_only,
+                propagation: m.propagation,
             })
             .collect();
 
@@ -2102,7 +2104,22 @@ impl RuntimeService for RuntimeSvc {
             message,
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
-            mounts: vec![],
+            // Report the container's mounts with their readonly / recursive_read_only
+            // attributes so the kubelet and critest can confirm the runtime honored the
+            // request (#356). Was hardcoded empty, which failed the non-recursive
+            // readonly-mount conformance spec (it inspects ContainerStatus.mounts).
+            mounts: container
+                .mounts
+                .iter()
+                .map(|m| Mount {
+                    container_path: m.container_path.clone(),
+                    host_path: m.host_path.clone(),
+                    readonly: m.readonly,
+                    recursive_read_only: m.recursive_read_only,
+                    propagation: m.propagation,
+                    ..Default::default()
+                })
+                .collect(),
             log_path: full_log_path,
             resources: None,
             image_id: container.image.clone(),

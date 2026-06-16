@@ -91,6 +91,14 @@ pub struct CriMount {
     pub host_path: String,
     pub container_path: String,
     pub readonly: bool,
+    /// CRI Mount.recursive_read_only (#356). Reported back in ContainerStatus so
+    /// the kubelet/critest can confirm the runtime honored the request. `false`
+    /// = non-recursive readonly (top mount only); `true` = recursive readonly.
+    #[serde(default)]
+    pub recursive_read_only: bool,
+    /// CRI Mount.propagation enum value (0=PRIVATE, 1=HOST_TO_CONTAINER, 2=BIDIRECTIONAL).
+    #[serde(default)]
+    pub propagation: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
