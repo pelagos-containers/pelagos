@@ -1261,6 +1261,7 @@ fn run_foreground(
         watcher_pid: 0,
         started_at: super::now_iso8601(),
         exit_code: None,
+        oom_killed: false,
         command: command.clone(),
         stdout_log: None,
         stderr_log: None,
@@ -1384,6 +1385,7 @@ fn run_interactive(
         watcher_pid: 0,
         started_at: super::now_iso8601(),
         exit_code: None,
+        oom_killed: false,
         command: command.clone(),
         stdout_log: None,
         stderr_log: None,
@@ -1471,6 +1473,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         watcher_pid: 0,
         started_at: super::now_iso8601(),
         exit_code: None,
+        oom_killed: false,
         command: command.clone(),
         stdout_log: Some(stdout_log.to_string_lossy().into_owned()),
         stderr_log: Some(stderr_log.to_string_lossy().into_owned()),
@@ -1688,7 +1691,15 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             // Update final state.
             updated.status = ContainerStatus::Exited;
-            updated.exit_code = exit.code();
+            updated.oom_killed = exit.oom_killed();
+            // A container killed by a signal has no normal exit code. Report the
+            // conventional 128+signal value (137 for the SIGKILL the OOM killer
+            // sends) so the CRI shim and `pelagos ps` surface 137/OOMKilled (#343)
+            // instead of a misleading 0.
+            updated.exit_code = exit
+                .code()
+                .or_else(|| exit.signal().map(|s| 128 + s))
+                .or(Some(0));
             let _ = write_state(&updated);
 
             unsafe { libc::_exit(0) };

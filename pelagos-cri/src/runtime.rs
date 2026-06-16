@@ -77,6 +77,10 @@ struct PelagosContainerState {
     /// Relative to the cgroup root (no leading `/sys/fs/cgroup`).
     #[serde(default)]
     cgroup_name: Option<String>,
+    /// True if the kernel OOM killer terminated the container (#343). Surfaced
+    /// as `reason: OOMKilled` in ContainerStatus.
+    #[serde(default)]
+    oom_killed: bool,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1402,6 +1406,7 @@ impl RuntimeService for RuntimeSvc {
             finished_at_ns: 0,
             state: MyContainerState::Created,
             exit_code: 0,
+            oom_killed: false,
             run_as_user,
             run_as_group,
             run_as_username,
@@ -1939,6 +1944,7 @@ impl RuntimeService for RuntimeSvc {
                             if let Some(c) = st.containers.get_mut(&id) {
                                 c.state = MyContainerState::Exited;
                                 c.exit_code = live.exit_code.unwrap_or(0);
+                                c.oom_killed = live.oom_killed;
                                 c.finished_at_ns = now_ns();
                                 let _ = state::save_container(c);
                             }
@@ -2025,6 +2031,7 @@ impl RuntimeService for RuntimeSvc {
                     if let Some(c) = st.containers.get_mut(&container_id) {
                         c.state = MyContainerState::Exited;
                         c.exit_code = live.exit_code.unwrap_or(0);
+                        c.oom_killed = live.oom_killed;
                         c.finished_at_ns = now_ns();
                         let _ = state::save_container(c);
                     }
@@ -2083,7 +2090,15 @@ impl RuntimeService for RuntimeSvc {
                 ..Default::default()
             }),
             image_ref: container.image.clone(),
-            reason: String::new(),
+            // Kubernetes surfaces this verbatim (pod status, `kubectl describe`).
+            // An OOM-killed container must report "OOMKilled" (#343); otherwise the
+            // kill is misattributed to a generic Error and memory-limit debugging
+            // breaks. Exit code 137 (128+SIGKILL) is carried in exit_code above.
+            reason: if container.oom_killed {
+                "OOMKilled".to_string()
+            } else {
+                String::new()
+            },
             message,
             labels: container.labels.clone(),
             annotations: container.annotations.clone(),
