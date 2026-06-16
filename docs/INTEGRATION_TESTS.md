@@ -132,6 +132,20 @@ Applies the minimal seccomp profile and attempts `exit 0`. Does not assert succe
 failure — the minimal profile may be too strict for even `ash` to start. Verifies
 only that the filter compiles and can be applied without a Rust error.
 
+### `test_seccomp_minimal_allows_process_with_cap_drop`
+**Requires:** root, rootfs
+
+Regression test for #390. pelagos installs the seccomp filter while still holding
+`CAP_SYS_ADMIN` (so it need not set `no_new_privs` — see `apply_filter_no_nnp`) and then
+drops capabilities with `capset(2)` **after** the filter is active. Runs `/bin/echo` under
+the minimal profile **with `drop_all_capabilities()`** and asserts the process succeeds and
+prints `seccomp-min-ok`. Failure (spawn returns `Operation not permitted`) means
+`minimal_filter()` is missing `capset`, so the post-seccomp cap drop is denied and *every*
+spawn under the minimal profile fails — the bug that broke
+`pelagos run --security-opt seccomp=minimal` and the e2e suite. Unlike
+`test_seccomp_minimal_is_restrictive` (no cap drop, tolerates failure), this test exercises
+the post-seccomp `capset` path and asserts success.
+
 ### `test_seccomp_profile_api`
 **Type:** API-only
 

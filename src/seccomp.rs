@@ -281,7 +281,9 @@ pub fn minimal_filter() -> Result<BpfProgram, io::Error> {
 
     // Only allow essential syscalls for basic process execution.
     // This is restrictive but sufficient to run simple statically- or
-    // dynamically-linked binaries (e.g. /bin/echo on Alpine/musl).
+    // dynamically-linked binaries (e.g. /bin/echo on Alpine/musl), including
+    // the capability syscalls pelagos itself invokes after installing the
+    // filter (see the Capabilities note below).
     let allowed_syscalls = vec![
         // Process lifecycle
         "exit",
@@ -386,6 +388,14 @@ pub fn minimal_filter() -> Result<BpfProgram, io::Error> {
         "getresgid",
         "getrlimit",
         "prlimit64",
+        // Capabilities. pelagos applies the seccomp filter while still holding
+        // CAP_SYS_ADMIN (so it can install the filter without setting
+        // no_new_privs — see apply_filter_no_nnp), then drops to the final
+        // capability set with capset(2) *after* the filter is active. The
+        // profile must therefore allow capset/capget or every spawn under the
+        // minimal profile fails with EPERM at that post-seccomp cap drop (#390).
+        "capset",
+        "capget",
         // Arch-specific / thread setup
         "arch_prctl",
         "set_tid_address",
