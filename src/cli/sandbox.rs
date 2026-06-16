@@ -40,6 +40,9 @@ pub enum SandboxCmd {
     Pause {
         /// Network namespace name
         ns_name: String,
+        /// Don't unshare IPC — the pod shares the host IPC namespace (hostIPC: true).
+        #[clap(long = "host-ipc")]
+        host_ipc: bool,
     },
 }
 
@@ -50,7 +53,7 @@ pub fn cmd_sandbox(cmd: SandboxCmd) -> Result<(), Box<dyn std::error::Error>> {
         SandboxCmd::Create { name } => cmd_sandbox_create(name.as_deref()),
         SandboxCmd::Ls { json } => cmd_sandbox_ls(json),
         SandboxCmd::Rm { id } => cmd_sandbox_rm(&id),
-        SandboxCmd::Pause { ns_name } => cmd_sandbox_pause(&ns_name),
+        SandboxCmd::Pause { ns_name, host_ipc } => cmd_sandbox_pause(&ns_name, host_ipc),
     }
 }
 
@@ -113,7 +116,12 @@ fn cmd_sandbox_rm(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// The pause process purpose is to keep the IPC and UTS namespaces alive even
 /// after containers in the sandbox exit.  The NET namespace is the named netns
 /// `/run/netns/<ns_name>` which persists independently.
-fn cmd_sandbox_pause(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// When `host_ipc` is set (pod `hostIPC: true`, `namespace_options.ipc == NODE`)
+/// the pause does **not** unshare IPC, so `/proc/<pause>/ns/ipc` is the host IPC
+/// namespace.  Containers join that namespace via `with_sandbox()`, making host
+/// System V IPC objects visible inside the pod (CRI conformance #386 / #352).
+fn cmd_sandbox_pause(ns_name: &str, host_ipc: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Join the named network namespace.
     let netns_path = format!("/run/netns/{}", ns_name);
     let netns_c = std::ffi::CString::new(netns_path.as_bytes())
@@ -139,10 +147,18 @@ fn cmd_sandbox_pause(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Unshare IPC and UTS namespaces so containers in the sandbox share them.
-    let rc = unsafe { libc::unshare(libc::CLONE_NEWIPC | libc::CLONE_NEWUTS) };
+    // Unshare UTS (pod hostname) and — unless the pod requested host IPC — IPC,
+    // so containers in the sandbox share a private IPC namespace.  For a hostIPC
+    // pod we skip the IPC unshare so the pause (and every container joining it)
+    // stays in the host IPC namespace.
+    let unshare_flags = if host_ipc {
+        libc::CLONE_NEWUTS
+    } else {
+        libc::CLONE_NEWIPC | libc::CLONE_NEWUTS
+    };
+    let rc = unsafe { libc::unshare(unshare_flags) };
     if rc != 0 {
-        return Err(format!("unshare IPC/UTS: {}", std::io::Error::last_os_error()).into());
+        return Err(format!("unshare UTS/IPC: {}", std::io::Error::last_os_error()).into());
     }
 
     // Block until terminated. `pause()` returns on ANY caught signal — a stray

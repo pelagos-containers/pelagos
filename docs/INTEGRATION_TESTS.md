@@ -5280,3 +5280,16 @@ removal touched the host filesystem. Complemented by the unit tests
 managed roots and wholesale parent dirs, and `join`/`..` escapes; accepts legitimate
 container/sandbox/overlay/image subpaths) and `test_guarded_remove_refuses_unmanaged_dir`
 (functional proof that `guarded_remove_dir_all` leaves an out-of-tree directory intact).
+
+## `issue_347_no_host_destruction::test_sandbox_pause_host_ipc_shares_host_namespace`
+**Requires root** (creates a named netns, unshares namespaces).
+CRI hostIPC conformance (#386 / #352). Spawns the internal `sandbox __pause__` process
+twice over a named netns — once with `--host-ipc` and once without — and compares each
+pause's `/proc/<pid>/ns/ipc` inode against the host's `/proc/self/ns/ipc`. Asserts the
+inode **equals** the host's with `--host-ipc` (the pod shares the host IPC namespace,
+`hostIPC: true`) and **differs** without it (the default private pod IPC namespace).
+Failure of the equal case means a hostIPC pod still gets a private IPC namespace, so host
+System V IPC objects stay invisible inside the pod — exactly the critest "HostIpc is true"
+failure (`Expected '' to contain '6'`) this fixes. The pause is what `RunPodSandbox` spawns
+to hold pod namespaces open; CreateContainer passes `--host-ipc` to it when the sandbox's
+`namespace_options.ipc == NODE`.

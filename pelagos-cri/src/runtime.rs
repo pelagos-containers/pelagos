@@ -803,6 +803,19 @@ impl RuntimeService for RuntimeSvc {
             .collect();
         let cni_cap_args = cni::port_mapping_cap_args(&sandbox_port_mappings);
 
+        // Host IPC namespace mode (namespace_options.ipc == NODE). When set, the
+        // pause must not unshare IPC so the pod shares the host IPC namespace
+        // (hostIPC: true — #386). Read it up front: the pause is spawned before
+        // the CriSandbox struct (which also records this) is built.
+        let sandbox_ipc_ns_mode = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|sc| sc.namespace_options.as_ref())
+            .map(|no| no.ipc)
+            .unwrap_or(0);
+        let host_ipc = sandbox_ipc_ns_mode == 2;
+
         // Try CNI networking first; fall back to pelagos native if no config is present.
         let (sandbox_id, netns, ip, cni_conf, pause_pid) = if let Some(conf_path) =
             cni::find_cni_conf()
@@ -877,13 +890,18 @@ impl RuntimeService for RuntimeSvc {
             // The pause blocks forever, so it must be a backgrounded *service*
             // (not a `--scope`, which would block); its real PID is the unit's
             // MainPID. Off systemd we fall back to a plain leaked child.
+            // pause argv: hostIPC pods append --host-ipc so the pause keeps the
+            // host IPC namespace instead of unsharing a private one (#386).
+            let mut pause_argv: Vec<&str> = vec!["sandbox", "__pause__", &ns_name];
+            if host_ipc {
+                pause_argv.push("--host-ipc");
+            }
             let pause_pid = if scope::systemd_available() {
                 let unit = scope::sandbox_unit(&id);
                 // A re-run for the same sandbox id would collide with a lingering
                 // unit; clear any stale one first (best effort).
                 scope::stop_unit(&unit).await;
-                let argv =
-                    scope::build_service_argv(&unit, &bin, &["sandbox", "__pause__", &ns_name]);
+                let argv = scope::build_service_argv(&unit, &bin, &pause_argv);
                 let out = tokio::process::Command::new(&argv[0])
                     .args(&argv[1..])
                     .output()
@@ -914,7 +932,7 @@ impl RuntimeService for RuntimeSvc {
                 pid
             } else {
                 let pause = std::process::Command::new(&bin)
-                    .args(["sandbox", "__pause__", &ns_name])
+                    .args(&pause_argv)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
