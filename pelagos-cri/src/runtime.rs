@@ -803,18 +803,19 @@ impl RuntimeService for RuntimeSvc {
             .collect();
         let cni_cap_args = cni::port_mapping_cap_args(&sandbox_port_mappings);
 
-        // Host IPC namespace mode (namespace_options.ipc == NODE). When set, the
-        // pause must not unshare IPC so the pod shares the host IPC namespace
-        // (hostIPC: true — #386). Read it up front: the pause is spawned before
-        // the CriSandbox struct (which also records this) is built.
-        let sandbox_ipc_ns_mode = config
+        // Network / PID / IPC namespace sharing modes — read from the pod's
+        // NamespaceOption exactly once here, then reused for the pause flags and
+        // stored in the sandbox state (rather than re-derived in several places).
+        // Read up front because the pause is spawned before the CriSandbox struct.
+        let namespaces = config
             .linux
             .as_ref()
             .and_then(|l| l.security_context.as_ref())
             .and_then(|sc| sc.namespace_options.as_ref())
-            .map(|no| no.ipc)
-            .unwrap_or(0);
-        let host_ipc = sandbox_ipc_ns_mode == 2;
+            .map(|no| state::NamespaceModes::from_cri(no.network, no.pid, no.ipc))
+            .unwrap_or_default();
+        // hostIPC (#386): the pause skips unshare(IPC) so the pod shares host IPC.
+        let host_ipc = namespaces.host_ipc();
 
         // Try CNI networking first; fall back to pelagos native if no config is present.
         let (sandbox_id, netns, ip, cni_conf, pause_pid) = if let Some(conf_path) =
@@ -947,8 +948,15 @@ impl RuntimeService for RuntimeSvc {
             };
 
             // Write pelagos-format sandbox state so `pelagos run --sandbox` works.
-            state::write_pelagos_sandbox_state(&id, Some(&meta.name), pause_pid, &ns_name, &ip)
-                .map_err(|e| Status::internal(format!("write sandbox state: {}", e)))?;
+            state::write_pelagos_sandbox_state(
+                &id,
+                Some(&meta.name),
+                pause_pid,
+                &ns_name,
+                &ip,
+                namespaces,
+            )
+            .map_err(|e| Status::internal(format!("write sandbox state: {}", e)))?;
 
             // Apply pod hostname + sysctls into the pause namespaces — but ONLY after
             // confirming the pause has unshared UTS/IPC, so nsenter targets the POD
@@ -1040,20 +1048,7 @@ impl RuntimeService for RuntimeSvc {
                 .as_ref()
                 .map(|d| d.options.clone())
                 .unwrap_or_default(),
-            pid_namespace_mode: config
-                .linux
-                .as_ref()
-                .and_then(|l| l.security_context.as_ref())
-                .and_then(|sc| sc.namespace_options.as_ref())
-                .map(|no| no.pid)
-                .unwrap_or(0),
-            ipc_namespace_mode: config
-                .linux
-                .as_ref()
-                .and_then(|l| l.security_context.as_ref())
-                .and_then(|sc| sc.namespace_options.as_ref())
-                .map(|no| no.ipc)
-                .unwrap_or(0),
+            namespaces,
             port_mappings: sandbox_port_mappings,
         };
 
@@ -1702,13 +1697,13 @@ impl RuntimeService for RuntimeSvc {
             args.push(g.to_string());
         }
 
-        // DNS config, cgroup placement, and PID namespace mode from the pod sandbox.
+        // DNS config, cgroup placement, and host-PID flag from the pod sandbox.
         let (
             sandbox_dns_servers,
             sandbox_dns_searches,
             sandbox_dns_options,
             sandbox_cgroup_parent,
-            sandbox_pid_ns_mode,
+            sandbox_host_pid,
         ) = {
             let st = self.state.inner.lock().await;
             st.sandboxes
@@ -1719,7 +1714,7 @@ impl RuntimeService for RuntimeSvc {
                         s.dns_searches.clone(),
                         s.dns_options.clone(),
                         s.cgroup_parent.clone(),
-                        s.pid_namespace_mode,
+                        s.namespaces.host_pid(),
                     )
                 })
                 .unwrap_or_default()
@@ -1738,7 +1733,7 @@ impl RuntimeService for RuntimeSvc {
         }
         // NODE PID namespace mode (hostPID: true): run in the host PID namespace so
         // the SPIRE agent can attest workloads via SO_PEERCRED (PID 0 is never returned).
-        if sandbox_pid_ns_mode == 2 {
+        if sandbox_host_pid {
             args.push("--no-pid-ns".into());
         }
 
@@ -1864,17 +1859,17 @@ impl RuntimeService for RuntimeSvc {
             args.push(format!("--memory-swap={}", container.memory_swap_limit));
         }
 
-        // Host IPC namespace mode (sandbox namespace_options.ipc == 2).
+        // Host IPC namespace mode (sandbox namespace_options.ipc == NODE).
         // Pass --no-ipc-ns to skip IPC namespace unsharing so the container
         // shares the host IPC namespace (hostIPC: true in the pod spec).
-        let sandbox_ipc_ns_mode = {
+        let sandbox_host_ipc = {
             let st = self.state.inner.lock().await;
             st.sandboxes
                 .get(&container.sandbox_id)
-                .map(|s| s.ipc_namespace_mode)
-                .unwrap_or(0)
+                .map(|s| s.namespaces.host_ipc())
+                .unwrap_or(false)
         };
-        if sandbox_ipc_ns_mode == 2 {
+        if sandbox_host_ipc {
             args.push("--no-ipc-ns".into());
         }
 
@@ -3458,8 +3453,7 @@ mod tests {
             dns_servers: vec!["10.96.0.10".into()],
             dns_searches: vec!["default.svc.cluster.local".into(), "cluster.local".into()],
             dns_options: vec!["ndots:5".into()],
-            pid_namespace_mode: 0,
-            ipc_namespace_mode: 0,
+            namespaces: state::NamespaceModes::default(),
             port_mappings: vec![],
         };
 
@@ -3498,8 +3492,7 @@ mod tests {
             dns_servers: vec![],
             dns_searches: vec![],
             dns_options: vec![],
-            pid_namespace_mode: 0,
-            ipc_namespace_mode: 0,
+            namespaces: state::NamespaceModes::default(),
             port_mappings: vec![],
         };
 

@@ -56,6 +56,70 @@ impl From<io::Error> for SandboxError {
     }
 }
 
+// ── Namespace modes ──────────────────────────────────────────────────────────
+
+/// How a single Linux namespace is shared for a sandbox, mirroring the CRI
+/// `NamespaceMode` enum (runtime.v1): `Pod` (0), `Container` (1), `Node` (2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NsMode {
+    /// Isolated namespace shared among the pod's containers (CRI `POD`).
+    #[default]
+    Pod,
+    /// Per-container isolated namespace (CRI `CONTAINER`).
+    Container,
+    /// The host namespace — no isolation (CRI `NODE`, e.g. `hostNetwork`).
+    Node,
+}
+
+impl NsMode {
+    /// Convert a CRI `NamespaceMode` i32 (0=`POD`, 1=`CONTAINER`, 2=`NODE`).
+    pub fn from_cri(mode: i32) -> Self {
+        match mode {
+            2 => NsMode::Node,
+            1 => NsMode::Container,
+            _ => NsMode::Pod,
+        }
+    }
+
+    /// True if this is the host namespace (CRI `NODE`).
+    pub fn is_host(self) -> bool {
+        matches!(self, NsMode::Node)
+    }
+}
+
+/// The network / PID / IPC namespace sharing modes for a sandbox.
+///
+/// Read from the CRI `NamespaceOption` exactly once (in `RunPodSandbox`) and
+/// carried through sandbox state, so the pause, container join, and teardown all
+/// consult one source of truth rather than re-deriving from scattered fields.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct NamespaceModes {
+    /// Network namespace mode (`hostNetwork: true` ⇒ `Node`).
+    #[serde(default)]
+    pub network: NsMode,
+    /// PID namespace mode (`hostPID: true` ⇒ `Node`).
+    #[serde(default)]
+    pub pid: NsMode,
+    /// IPC namespace mode (`hostIPC: true` ⇒ `Node`).
+    #[serde(default)]
+    pub ipc: NsMode,
+}
+
+impl NamespaceModes {
+    /// True when the pod shares the host network namespace.
+    pub fn host_network(&self) -> bool {
+        self.network.is_host()
+    }
+    /// True when the pod shares the host IPC namespace.
+    pub fn host_ipc(&self) -> bool {
+        self.ipc.is_host()
+    }
+    /// True when the pod shares the host PID namespace.
+    pub fn host_pid(&self) -> bool {
+        self.pid.is_host()
+    }
+}
+
 // ── SandboxState ─────────────────────────────────────────────────────────────
 
 /// Persistent state for a running sandbox.
@@ -73,6 +137,11 @@ pub struct SandboxState {
     pub veth_host: String,
     /// Container IP assigned to the sandbox's eth0.
     pub container_ip: String,
+    /// Network / PID / IPC namespace sharing modes for the sandbox.
+    /// `#[serde(default)]` keeps state written before this field existed
+    /// loadable (defaults to all-`Pod`, i.e. the previous behaviour).
+    #[serde(default)]
+    pub namespaces: NamespaceModes,
 }
 
 impl SandboxState {
@@ -225,6 +294,8 @@ pub fn create_sandbox(name: Option<&str>) -> io::Result<SandboxState> {
         ns_name: ns_name.clone(),
         veth_host,
         container_ip,
+        // `pelagos sandbox create` (non-CRI) always uses isolated pod namespaces.
+        namespaces: NamespaceModes::default(),
     };
     state.save()?;
 
@@ -287,4 +358,59 @@ pub fn remove_sandbox(id: &str) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nsmode_from_cri() {
+        assert_eq!(NsMode::from_cri(0), NsMode::Pod);
+        assert_eq!(NsMode::from_cri(1), NsMode::Container);
+        assert_eq!(NsMode::from_cri(2), NsMode::Node);
+        // Unknown values default to the safe isolated Pod mode.
+        assert_eq!(NsMode::from_cri(99), NsMode::Pod);
+        assert!(NsMode::Node.is_host());
+        assert!(!NsMode::Pod.is_host());
+        assert!(!NsMode::Container.is_host());
+    }
+
+    #[test]
+    fn test_namespace_modes_host_helpers() {
+        let m = NamespaceModes {
+            network: NsMode::Node,
+            pid: NsMode::Pod,
+            ipc: NsMode::Node,
+        };
+        assert!(m.host_network());
+        assert!(!m.host_pid());
+        assert!(m.host_ipc());
+        // Default (all Pod) = fully isolated, the pre-refactor behaviour.
+        let d = NamespaceModes::default();
+        assert!(!d.host_network() && !d.host_pid() && !d.host_ipc());
+    }
+
+    #[test]
+    fn test_namespace_modes_serde_contract() {
+        // pelagos-cri serialises its mirror NamespaceModes into the sandbox-state
+        // JSON; the library must deserialise it back. The wire form is the unit
+        // variant names "Pod"/"Container"/"Node" — pin that so the two crates
+        // can't silently drift apart.
+        let m = NamespaceModes {
+            network: NsMode::Node,
+            pid: NsMode::Container,
+            ipc: NsMode::Pod,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"network":"Node","pid":"Container","ipc":"Pod"}"#);
+        let back: NamespaceModes = serde_json::from_str(&json).unwrap();
+        assert!(back.host_network() && !back.host_pid() && !back.host_ipc());
+        // A state blob written before this field existed still loads (serde default).
+        let legacy: SandboxState = serde_json::from_str(
+            r#"{"id":"x","name":null,"pause_pid":1,"ns_name":"n","veth_host":"","container_ip":"1.2.3.4"}"#,
+        )
+        .unwrap();
+        assert!(!legacy.namespaces.host_network());
+    }
 }

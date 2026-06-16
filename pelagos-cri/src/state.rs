@@ -8,6 +8,85 @@ use tokio::sync::Mutex;
 const SANDBOXES_DIR: &str = "/run/pelagos-cri/sandboxes";
 const CONTAINERS_DIR: &str = "/run/pelagos-cri/containers";
 
+// ── Namespace modes ──────────────────────────────────────────────────────────
+//
+// Mirror of `pelagos::sandbox::{NsMode, NamespaceModes}`. pelagos-cri is a lean
+// CRI shim that shells out to the `pelagos` binary rather than linking the
+// runtime library (which would pull in cgroups-rs/seccompiler/oci-client/...), so
+// the type is duplicated here. The two stay compatible through the sandbox-state
+// JSON contract: serde serialises the `NsMode` unit variants as the strings
+// "Pod"/"Container"/"Node", which the library deserialises back into its own enum.
+
+/// How a single Linux namespace is shared for a sandbox, mirroring the CRI
+/// `NamespaceMode` enum: `Pod` (0), `Container` (1), `Node` (2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NsMode {
+    /// Isolated namespace shared among the pod's containers (CRI `POD`).
+    #[default]
+    Pod,
+    /// Per-container isolated namespace (CRI `CONTAINER`).
+    Container,
+    /// The host namespace — no isolation (CRI `NODE`, e.g. `hostNetwork`).
+    Node,
+}
+
+impl NsMode {
+    /// Convert a CRI `NamespaceMode` i32 (0=`POD`, 1=`CONTAINER`, 2=`NODE`).
+    pub fn from_cri(mode: i32) -> Self {
+        match mode {
+            2 => NsMode::Node,
+            1 => NsMode::Container,
+            _ => NsMode::Pod,
+        }
+    }
+
+    /// True if this is the host namespace (CRI `NODE`).
+    pub fn is_host(self) -> bool {
+        matches!(self, NsMode::Node)
+    }
+}
+
+/// Network / PID / IPC namespace sharing modes for a sandbox, read from the pod's
+/// CRI `NamespaceOption` exactly once and carried through sandbox state.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct NamespaceModes {
+    /// Network namespace mode (`hostNetwork: true` ⇒ `Node`).
+    #[serde(default)]
+    pub network: NsMode,
+    /// PID namespace mode (`hostPID: true` ⇒ `Node`).
+    #[serde(default)]
+    pub pid: NsMode,
+    /// IPC namespace mode (`hostIPC: true` ⇒ `Node`).
+    #[serde(default)]
+    pub ipc: NsMode,
+}
+
+impl NamespaceModes {
+    /// Build from a CRI `NamespaceOption`'s (network, pid, ipc) i32 modes.
+    pub fn from_cri(network: i32, pid: i32, ipc: i32) -> Self {
+        NamespaceModes {
+            network: NsMode::from_cri(network),
+            pid: NsMode::from_cri(pid),
+            ipc: NsMode::from_cri(ipc),
+        }
+    }
+    /// True when the pod shares the host network namespace.
+    // Consumed by the HostNetwork branch (#394); the `network` mode is already
+    // captured and persisted here so that work only adds the call site.
+    #[allow(dead_code)]
+    pub fn host_network(&self) -> bool {
+        self.network.is_host()
+    }
+    /// True when the pod shares the host IPC namespace.
+    pub fn host_ipc(&self) -> bool {
+        self.ipc.is_host()
+    }
+    /// True when the pod shares the host PID namespace.
+    pub fn host_pid(&self) -> bool {
+        self.pid.is_host()
+    }
+}
+
 // ── CRI sandbox metadata ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,14 +132,11 @@ pub struct CriSandbox {
     /// DNS resolver options from the pod DNS config.
     #[serde(default)]
     pub dns_options: Vec<String>,
-    /// PID namespace mode from namespace_options.pid:
-    ///   0 = POD (isolated, default), 1 = CONTAINER (isolated), 2 = NODE (host PID namespace).
+    /// Network / PID / IPC namespace sharing modes, read once from the pod's
+    /// `NamespaceOption` (POD / CONTAINER / NODE). Replaces the former separate
+    /// `pid_namespace_mode` / `ipc_namespace_mode` i32 fields and adds `network`.
     #[serde(default)]
-    pub pid_namespace_mode: i32,
-    /// IPC namespace mode from namespace_options.ipc:
-    ///   0 = POD (isolated, default), 1 = CONTAINER (isolated), 2 = NODE (host IPC namespace).
-    #[serde(default)]
-    pub ipc_namespace_mode: i32,
+    pub namespaces: NamespaceModes,
     /// Host port mappings (PodSandboxConfig.port_mappings) — passed to the CNI
     /// portmap plugin as capability args at ADD and (for cleanup) at DEL.
     #[serde(default)]
@@ -416,6 +492,7 @@ pub fn write_pelagos_sandbox_state(
     pause_pid: i32,
     ns_name: &str,
     container_ip: &str,
+    namespaces: NamespaceModes,
 ) -> std::io::Result<()> {
     let dir = format!("{}/{}", PELAGOS_SANDBOXES_DIR, id);
     std::fs::create_dir_all(&dir)?;
@@ -427,6 +504,7 @@ pub fn write_pelagos_sandbox_state(
         "ns_name": ns_name,
         "veth_host": "",        // CNI owns its own veth — pelagos must not delete it
         "container_ip": container_ip,
+        "namespaces": namespaces,
     });
     std::fs::write(
         format!("{}/state.json", dir),
