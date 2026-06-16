@@ -661,6 +661,64 @@ mod security {
         // Test passes if we got here (seccomp was applied)
     }
 
+    /// test_seccomp_minimal_allows_process_with_cap_drop
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Regression test for #390. pelagos installs the seccomp filter while still
+    /// holding CAP_SYS_ADMIN (so it need not set no_new_privs — see
+    /// apply_filter_no_nnp) and then drops capabilities with capset(2) *after*
+    /// the filter is active. If the minimal profile does not permit capset, that
+    /// post-seccomp cap drop returns EPERM and EVERY spawn under the minimal
+    /// profile fails with "spawn failed: Operation not permitted" — the symptom
+    /// that broke `pelagos run --security-opt seccomp=minimal` and the e2e suite.
+    ///
+    /// Runs /bin/echo under the minimal profile WITH a full capability drop and
+    /// asserts the process runs and prints its output, which only holds if
+    /// capset is in minimal_filter()'s allow-list. The pre-existing
+    /// test_seccomp_minimal_is_restrictive does not drop caps and tolerates
+    /// spawn failure, so it never exercised this path.
+    #[test]
+    fn test_seccomp_minimal_allows_process_with_cap_drop() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_minimal_allows_process_with_cap_drop: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_seccomp_minimal_allows_process_with_cap_drop: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let mut child = Command::new("/bin/echo")
+            .args(["seccomp-min-ok"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .drop_all_capabilities()
+            .with_seccomp_minimal()
+            .spawn()
+            .expect("spawn under minimal seccomp + cap drop must not fail (capset allowed — #390)");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait_with_output");
+
+        assert!(
+            status.success(),
+            "process under minimal seccomp + cap drop should succeed; stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("seccomp-min-ok"),
+            "expected 'seccomp-min-ok' in stdout, got: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
+
     #[test]
     fn test_seccomp_without_flag_works() {
         if !is_root() {
