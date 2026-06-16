@@ -5307,3 +5307,17 @@ System V IPC objects stay invisible inside the pod — exactly the critest "Host
 failure (`Expected '' to contain '6'`) this fixes. The pause is what `RunPodSandbox` spawns
 to hold pod namespaces open; CreateContainer passes `--host-ipc` to it when the sandbox's
 `namespace_options.ipc == NODE`.
+
+## `issue_347_no_host_destruction::test_sandbox_pause_host_net_shares_host_namespace`
+**Requires root** (spawns pauses; creates a named netns).
+CRI hostNetwork conformance (#394 / #352). Spawns the internal `sandbox __pause__` process
+with `--host-net` (and a normal one that joins a named netns) and compares each pause's
+`/proc/<pid>/ns/net` inode against the host's `/proc/self/ns/net`. Asserts the inode
+**equals** the host's with `--host-net` (the pause stays in the host network namespace,
+`hostNetwork: true`) and **differs** for the normal pause (which `setns`-joins its own
+netns). Failure of the equal case means a hostNetwork pod's pause got an isolated netns, so
+containers joining the sandbox would not share the host network — the critest "HostNetwork
+is true" behaviour this implements. `RunPodSandbox` takes a dedicated hostNetwork branch
+(skip CNI/netns, report the node IP, spawn the pause with `--host-net`); `with_sandbox()`
+reads `SandboxState.namespaces.host_network()` to skip the container's NET join so it stays
+in the host netns too; `StopPodSandbox` auto-skips CNI teardown because `netns` is empty.

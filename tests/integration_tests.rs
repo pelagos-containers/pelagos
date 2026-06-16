@@ -28707,4 +28707,95 @@ mod issue_347_no_host_destruction {
             host_ipc_inode
         );
     }
+
+    /// test_sandbox_pause_host_net_shares_host_namespace
+    ///
+    /// Requires: root (spawns pauses; creates a named netns).
+    ///
+    /// Spawns the internal `sandbox __pause__` process with `--host-net` (and a
+    /// normal one that joins a named netns) and compares each pause's
+    /// `/proc/<pid>/ns/net` inode against the host's `/proc/self/ns/net`.
+    ///
+    /// Asserts the inode **equals** the host's with `--host-net` (the pause stays
+    /// in the host network namespace, `hostNetwork: true`) and **differs** for the
+    /// normal pause (which `setns`-joins its own netns). Failure of the equal case
+    /// means a hostNetwork pod's pause got an isolated netns, so containers joining
+    /// the sandbox would not share the host network — the CRI "HostNetwork is true"
+    /// conformance behaviour this implements (#394 / #352). `with_sandbox()` reads
+    /// `SandboxState.namespaces.host_network()` to skip the NET join so containers
+    /// stay in the host netns too.
+    #[test]
+    fn test_sandbox_pause_host_net_shares_host_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_sandbox_pause_host_net_shares_host_namespace: requires root");
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let host_net_inode = std::fs::metadata("/proc/self/ns/net")
+            .expect("stat /proc/self/ns/net")
+            .ino();
+
+        // host-net pause: --host-net skips the netns setns, so no netns is needed.
+        let mut host_child = std::process::Command::new(bin)
+            .args(["sandbox", "__pause__", "", "--host-net"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn host-net pause");
+
+        // normal pause: needs a named netns to setns into.
+        let ns = format!("pel-hnet-{}", std::process::id());
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", &ns])
+            .status();
+        assert!(
+            std::process::Command::new("ip")
+                .args(["netns", "add", &ns])
+                .status()
+                .expect("ip netns add")
+                .success(),
+            "ip netns add {} failed",
+            ns
+        );
+        let mut priv_child = std::process::Command::new(bin)
+            .args(["sandbox", "__pause__", &ns])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn netns pause");
+
+        // Allow the pauses to (not) setns and unshare.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let host_pause_inode = std::fs::metadata(format!("/proc/{}/ns/net", host_child.id()))
+            .expect("stat host-net pause ns/net")
+            .ino();
+        let priv_pause_inode = std::fs::metadata(format!("/proc/{}/ns/net", priv_child.id()))
+            .expect("stat netns pause ns/net")
+            .ino();
+
+        // Tear down before asserting so a failure still cleans up.
+        let _ = host_child.kill();
+        let _ = priv_child.kill();
+        let _ = host_child.wait();
+        let _ = priv_child.wait();
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", &ns])
+            .status();
+
+        assert_eq!(
+            host_pause_inode, host_net_inode,
+            "pause --host-net should keep the host network namespace (inode {}), got {}",
+            host_net_inode, host_pause_inode
+        );
+        assert_ne!(
+            priv_pause_inode, host_net_inode,
+            "normal pause should join its own netns, but its inode matches the host's ({})",
+            host_net_inode
+        );
+    }
 }

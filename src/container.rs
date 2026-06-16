@@ -1622,14 +1622,26 @@ impl Command {
             ));
         }
 
-        let net_ns = state.net_ns_path();
         let ipc_ns = state.ipc_ns_path();
         let uts_ns = state.uts_ns_path();
 
-        Ok(self
-            .with_namespace_join(net_ns, Namespace::NET)
+        // IPC and UTS are always joined (the pause holds the pod's — or, for
+        // hostIPC, the host's — IPC/UTS namespace open).
+        let mut cmd = self
             .with_namespace_join(ipc_ns, Namespace::IPC)
-            .with_namespace_join(uts_ns, Namespace::UTS))
+            .with_namespace_join(uts_ns, Namespace::UTS);
+
+        // NET: for a hostNetwork pod there is no named netns and the pause stays
+        // in the host network namespace. The container already inherits the host
+        // netns (it does not unshare NET and `--sandbox` skips standard net
+        // setup), so we must NOT join anything — joining the empty
+        // `/run/netns/` path would fail. For a normal pod, join the sandbox's
+        // named netns so the container gets the pod IP (#394).
+        if !state.namespaces.host_network() {
+            cmd = cmd.with_namespace_join(state.net_ns_path(), Namespace::NET);
+        }
+
+        Ok(cmd)
     }
 
     /// Automatically mount /proc filesystem after chroot.
