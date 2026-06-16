@@ -4589,12 +4589,18 @@ impl Command {
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
-                        // Step 1: establish the bind
+                        // Step 1: establish the bind. Use a RECURSIVE bind so any
+                        // submounts under the source (e.g. a tmpfs the caller mounted
+                        // inside the volume) are carried into the container. The
+                        // readonly remount below is non-recursive (top mount only), so
+                        // those submounts stay writable — the CRI non-recursive
+                        // readonly-mount semantics (#356). For a plain directory or file
+                        // with no submounts, MS_REC is a harmless no-op.
                         let r = libc::mount(
                             src_c.as_ptr(),
                             tgt_c.as_ptr(),
                             ptr::null(),
-                            libc::MS_BIND,
+                            libc::MS_BIND | libc::MS_REC,
                             ptr::null(),
                         );
                         if r != 0 {
@@ -7135,11 +7141,13 @@ impl Command {
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+                        // Recursive bind so submounts under the source are carried in;
+                        // the readonly remount below stays non-recursive (#356).
                         let r = libc::mount(
                             src_c.as_ptr(),
                             tgt_c.as_ptr(),
                             ptr::null(),
-                            libc::MS_BIND,
+                            libc::MS_BIND | libc::MS_REC,
                             ptr::null(),
                         );
                         if r != 0 {

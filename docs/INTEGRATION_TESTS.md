@@ -342,6 +342,19 @@ Runs `touch /mnt/ro/newfile` and captures the exit code. Verifies `exit=1` — t
 write is rejected because the mount is read-only. The `MS_BIND | MS_RDONLY` remount
 is required by the Linux kernel (two calls: bind, then remount-ro).
 
+### `test_bind_mount_ro_non_recursive_submount_writable`
+**Requires:** root, rootfs
+
+Verifies the #356 non-recursive readonly-mount semantics: a readonly bind is
+established **recursively** (`MS_BIND | MS_REC`) so submounts under the source are
+carried into the container, but the readonly remount is **non-recursive** (top mount
+only) so submounts stay writable. The test mounts a tmpfs at `outer/inner` on the
+host, binds `outer` read-only at `/mnt/ro`, then asserts `touch /mnt/ro/inner/sub`
+**succeeds** (`sub=0`, submount writable) while `touch /mnt/ro/top` **fails**
+(`top=1`, top read-only). Failure of the submount write would mean either the
+submount wasn't carried in (non-recursive bind) or the readonly remount was applied
+recursively — both of which break the CRI `recursive_read_only=false` contract.
+
 ### `test_cli_volume_flag_ro`
 **Requires:** root, rootfs
 
