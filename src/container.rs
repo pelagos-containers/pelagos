@@ -1641,6 +1641,16 @@ impl Command {
             cmd = cmd.with_namespace_join(state.net_ns_path(), Namespace::NET);
         }
 
+        // PID: for a shared-PID pod (shareProcessNamespace) join the pod PID
+        // namespace held by the pause's PID-1 child, so containers see each
+        // other's processes and the pause is PID 1. The caller must NOT also
+        // unshare PID (CreateContainer passes --no-pid-ns); the spawn's existing
+        // setns(CLONE_NEWPID)+fork path puts the container into the pod PID ns as
+        // a non-1 PID. Container/Node PID modes don't join here (#398).
+        if state.namespaces.shared_pid() {
+            cmd = cmd.with_namespace_join(state.pid_ns_path(), Namespace::PID);
+        }
+
         Ok(cmd)
     }
 

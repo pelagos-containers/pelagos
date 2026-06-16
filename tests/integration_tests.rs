@@ -28798,4 +28798,83 @@ mod issue_347_no_host_destruction {
             host_net_inode
         );
     }
+
+    /// test_sandbox_pause_pod_pid_forks_init
+    ///
+    /// Requires: root (unshares a PID namespace; forks).
+    ///
+    /// Spawns the pause with `--pod-pid` (+`--host-net` to avoid needing a netns).
+    /// Asserts the spawned process forks exactly one child — the PID-1 init of a
+    /// **new** PID namespace (its `/proc/<child>/ns/pid` inode differs from the
+    /// host's) — and that killing that PID-1 child cascades: the parent's
+    /// `waitpid` returns and it exits. This is the shareProcessNamespace machinery
+    /// (#398 / #352): the pause becomes PID 1 of a shared pod PID namespace that
+    /// containers join via `with_sandbox()`, so the container is never PID 1.
+    #[test]
+    fn test_sandbox_pause_pod_pid_forks_init() {
+        if !is_root() {
+            eprintln!("Skipping test_sandbox_pause_pod_pid_forks_init: requires root");
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+        let host_pid_ns = std::fs::metadata("/proc/self/ns/pid")
+            .expect("stat /proc/self/ns/pid")
+            .ino();
+
+        let mut parent = std::process::Command::new(bin)
+            .args(["sandbox", "__pause__", "", "--host-net", "--pod-pid"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pod-pid pause");
+
+        // Wait for the parent to unshare PID + fork the init child.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let children = std::fs::read_to_string(format!(
+            "/proc/{}/task/{}/children",
+            parent.id(),
+            parent.id()
+        ))
+        .unwrap_or_default();
+        let child_pid: i32 = children
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("pod-pid pause should fork a PID-1 init child");
+
+        let child_pid_ns = std::fs::metadata(format!("/proc/{}/ns/pid", child_pid))
+            .expect("stat init child ns/pid")
+            .ino();
+
+        // Kill the PID-1 child; it should cascade — the parent waitpid()s on it
+        // and exits. Poll try_wait() for up to ~1.5s without hanging.
+        let _ = unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        let mut parent_exited = false;
+        for _ in 0..30 {
+            if let Ok(Some(_)) = parent.try_wait() {
+                parent_exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Best-effort teardown if the cascade assertion is about to fail.
+        let _ = parent.kill();
+        let _ = parent.wait();
+
+        assert_ne!(
+            child_pid_ns, host_pid_ns,
+            "pod-pid pause child should be PID 1 of a NEW pid namespace, \
+             but its inode matches the host's ({})",
+            host_pid_ns
+        );
+        assert!(
+            parent_exited,
+            "killing the PID-1 init child should cascade — the supervising parent should exit"
+        );
+    }
 }

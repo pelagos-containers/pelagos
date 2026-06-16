@@ -5321,3 +5321,15 @@ is true" behaviour this implements. `RunPodSandbox` takes a dedicated hostNetwor
 (skip CNI/netns, report the node IP, spawn the pause with `--host-net`); `with_sandbox()`
 reads `SandboxState.namespaces.host_network()` to skip the container's NET join so it stays
 in the host netns too; `StopPodSandbox` auto-skips CNI teardown because `netns` is empty.
+
+## `issue_347_no_host_destruction::test_sandbox_pause_pod_pid_forks_init`
+**Requires root** (unshares a PID namespace; forks).
+CRI shareProcessNamespace / PodPID conformance (#398 / #352). Spawns the internal
+`sandbox __pause__` with `--pod-pid` (+`--host-net` to avoid needing a netns) and asserts the
+spawned process forks exactly one child — the **PID-1 init of a new PID namespace** (its
+`/proc/<child>/ns/pid` inode differs from the host's) — and that killing that PID-1 child
+**cascades**: the supervising parent's `waitpid` returns and it exits. This is the machinery
+behind the critest "PodPID" spec: the pause is PID 1 of a shared pod PID namespace that
+containers join via `with_sandbox()` (`SandboxState.namespaces.shared_pid()` adds a PID join;
+`CreateContainer` passes `--no-pid-ns` so the container does not unshare its own), so the
+container is never PID 1 and `cat /proc/1/cmdline` shows the pause, not the workload.

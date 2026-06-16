@@ -87,22 +87,43 @@ impl NsMode {
     }
 }
 
+/// Default PID namespace mode: `Container` (per-container isolation), **not**
+/// `Pod`. This matches Kubernetes/CRI semantics — network and IPC are pod-shared
+/// by default, but the PID namespace is per-container unless a pod explicitly
+/// sets `shareProcessNamespace` (CRI `pid == POD`). Using `Container` as the
+/// default means an absent `NamespaceOption` (and legacy sandbox state) never
+/// accidentally enables PID sharing (#398).
+fn default_pid_mode() -> NsMode {
+    NsMode::Container
+}
+
 /// The network / PID / IPC namespace sharing modes for a sandbox.
 ///
 /// Read from the CRI `NamespaceOption` exactly once (in `RunPodSandbox`) and
 /// carried through sandbox state, so the pause, container join, and teardown all
 /// consult one source of truth rather than re-deriving from scattered fields.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NamespaceModes {
     /// Network namespace mode (`hostNetwork: true` ⇒ `Node`).
     #[serde(default)]
     pub network: NsMode,
-    /// PID namespace mode (`hostPID: true` ⇒ `Node`).
-    #[serde(default)]
+    /// PID namespace mode: `Pod` (shared, `shareProcessNamespace`), `Container`
+    /// (per-container, the default), or `Node` (`hostPID: true`).
+    #[serde(default = "default_pid_mode")]
     pub pid: NsMode,
     /// IPC namespace mode (`hostIPC: true` ⇒ `Node`).
     #[serde(default)]
     pub ipc: NsMode,
+}
+
+impl Default for NamespaceModes {
+    fn default() -> Self {
+        NamespaceModes {
+            network: NsMode::Pod,
+            pid: default_pid_mode(),
+            ipc: NsMode::Pod,
+        }
+    }
 }
 
 impl NamespaceModes {
@@ -117,6 +138,12 @@ impl NamespaceModes {
     /// True when the pod shares the host PID namespace.
     pub fn host_pid(&self) -> bool {
         self.pid.is_host()
+    }
+    /// True when the pod containers share a single pod PID namespace
+    /// (`shareProcessNamespace: true`, explicit CRI `pid == POD`). The pause is
+    /// PID 1 of that namespace and containers join it (#398).
+    pub fn shared_pid(&self) -> bool {
+        matches!(self.pid, NsMode::Pod)
     }
 }
 
@@ -175,6 +202,13 @@ impl SandboxState {
     /// Returns `/proc/<pause_pid>/ns/uts` path.
     pub fn uts_ns_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/{}/ns/uts", self.pause_pid))
+    }
+
+    /// Returns `/proc/<pause_pid>/ns/pid` path. For a shared-PID sandbox the
+    /// `pause_pid` is the PID-1 child of the pod PID namespace, so containers
+    /// joining this path land in the pod's PID namespace (#398).
+    pub fn pid_ns_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/{}/ns/pid", self.pause_pid))
     }
 
     /// Returns true if the pause process is still alive.
@@ -386,9 +420,20 @@ mod tests {
         assert!(m.host_network());
         assert!(!m.host_pid());
         assert!(m.host_ipc());
-        // Default (all Pod) = fully isolated, the pre-refactor behaviour.
+        assert!(m.shared_pid()); // pid == Pod ⇒ shared
+                                 // Default: net/ipc are pod-shared, but PID defaults to Container
+                                 // (per-container isolation) — NOT shared — so an absent NamespaceOption
+                                 // never accidentally enables shareProcessNamespace (#398).
         let d = NamespaceModes::default();
         assert!(!d.host_network() && !d.host_pid() && !d.host_ipc());
+        assert!(!d.shared_pid());
+        assert!(matches!(d.pid, NsMode::Container));
+        // shared_pid only for an EXPLICIT pid == POD.
+        let shared = NamespaceModes {
+            pid: NsMode::Pod,
+            ..Default::default()
+        };
+        assert!(shared.shared_pid() && !shared.host_pid());
     }
 
     #[test]
@@ -406,11 +451,23 @@ mod tests {
         assert_eq!(json, r#"{"network":"Node","pid":"Container","ipc":"Pod"}"#);
         let back: NamespaceModes = serde_json::from_str(&json).unwrap();
         assert!(back.host_network() && !back.host_pid() && !back.host_ipc());
-        // A state blob written before this field existed still loads (serde default).
+        // A state blob written before this field existed still loads (serde
+        // default) and — critically — does NOT enable PID sharing: the `pid`
+        // field defaults to Container, so legacy sandboxes stay isolated (#398).
         let legacy: SandboxState = serde_json::from_str(
             r#"{"id":"x","name":null,"pause_pid":1,"ns_name":"n","veth_host":"","container_ip":"1.2.3.4"}"#,
         )
         .unwrap();
         assert!(!legacy.namespaces.host_network());
+        assert!(!legacy.namespaces.shared_pid());
+        assert!(matches!(legacy.namespaces.pid, NsMode::Container));
+        // Explicit pid==POD round-trips and is detected as shared.
+        let shared = NamespaceModes {
+            pid: NsMode::Pod,
+            ..Default::default()
+        };
+        let back: NamespaceModes =
+            serde_json::from_str(&serde_json::to_string(&shared).unwrap()).unwrap();
+        assert!(back.shared_pid());
     }
 }
