@@ -1752,6 +1752,84 @@ mod filesystem {
     }
 
     #[test]
+    fn test_bind_mount_recursive_ro_submount_readonly() {
+        // #356 recursive_read_only: a RECURSIVE readonly bind
+        // (with_bind_mount_propagated(..., recursive_readonly=true, ...)) applies
+        // MOUNT_ATTR_RDONLY to the top mount AND every submount via
+        // mount_setattr(AT_RECURSIVE) — so a submount is also read-only (the
+        // opposite of the non-recursive case). `touch <submount>/file` must FAIL.
+        use std::os::unix::ffi::OsStrExt as _;
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_recursive_ro_submount_readonly: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bind_mount_recursive_ro_submount_readonly: no rootfs");
+            return;
+        };
+
+        let outer = tempfile::tempdir().expect("failed to create temp dir");
+        let inner = outer.path().join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir inner");
+        let inner_c = std::ffi::CString::new(inner.as_os_str().as_bytes()).unwrap();
+        let tmpfs_c = std::ffi::CString::new("tmpfs").unwrap();
+        let rc = unsafe {
+            libc::mount(
+                tmpfs_c.as_ptr(),
+                inner_c.as_ptr(),
+                tmpfs_c.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "host tmpfs mount failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "touch /mnt/rro/inner/sub 2>/dev/null; echo sub=$?; \
+                 touch /mnt/rro/top 2>/dev/null; echo top=$?",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_bind_mount_propagated(
+                outer.path(),
+                "/mnt/rro",
+                true,
+                true,
+                MountPropagation::Private,
+            )
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with recursive readonly bind mount");
+
+        let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        unsafe {
+            libc::umount(inner_c.as_ptr());
+        }
+        assert!(status.success(), "Shell should exit cleanly");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("sub=1"),
+            "submount under a RECURSIVE readonly bind must be read-only, got: {}",
+            out
+        );
+        assert!(
+            out.contains("top=1"),
+            "top of a recursive readonly bind must be read-only, got: {}",
+            out
+        );
+    }
+
+    #[test]
     fn test_bind_mount_propagation_host_to_container() {
         // #341: an `rslave` (HOST_TO_CONTAINER) bind propagates mounts created on
         // the host under the source INTO the container after it has started. We
@@ -1802,7 +1880,13 @@ mod filesystem {
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_chroot(&rootfs)
             .env("PATH", ALPINE_PATH)
-            .with_bind_mount_propagated(&src_path, "/mnt", false, MountPropagation::HostToContainer)
+            .with_bind_mount_propagated(
+                &src_path,
+                "/mnt",
+                false,
+                false,
+                MountPropagation::HostToContainer,
+            )
             .stdin(Stdio::Null)
             .stdout(Stdio::Piped)
             .stderr(Stdio::Piped)
