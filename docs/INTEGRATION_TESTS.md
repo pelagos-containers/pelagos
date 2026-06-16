@@ -1497,6 +1497,19 @@ it via `image::extract_layer()`, and verifies the files exist with correct conte
 the content-addressable layer store. Failure indicates the tar+gzip extraction pipeline
 or layer store layout is broken.
 
+### `test_extract_layer_reextracts_rootless_degraded_layer`
+**Requires:** root
+
+Verifies the #384 fix: a rootless (non-`CAP_FSETID`) unpack silently strips setuid/setgid
+bits, and the shared content-addressable layer cache must not serve such a degraded layer
+to a **root** container (it would break setuid escalation — the NoNewPrivs spec). Builds a
+tar.gz with a `0o4755` (setuid-root) file, extracts it as root (suid preserved, no marker),
+then simulates a prior rootless-degraded layer (strips the suid bit + writes the
+`<digest>.rootless` marker) and extracts again. The second root extraction must **re-extract**
+(driven by the marker), restoring the suid bit and clearing the marker. Failure means a
+rootless pull would permanently degrade setuid binaries for every root container reusing the
+layer.
+
 ### `test_multi_layer_overlay_merge`
 **Requires:** root, rootfs
 
