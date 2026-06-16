@@ -103,6 +103,8 @@ jobs:
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
       - name: Build pelagos
         run: cargo build
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
       - name: Run Wasm e2e tests
         run: sudo -E env "PATH=$PATH" bash scripts/test-wasm-e2e.sh
 
@@ -119,5 +121,7 @@ jobs:
         run: |
           curl -fsSL https://wasmtime.dev/install.sh | bash
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
       - name: Run embedded Wasm e2e tests
         run: sudo -E env "PATH=$PATH" bash scripts/test-wasm-embedded-e2e.sh
