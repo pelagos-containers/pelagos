@@ -43,6 +43,10 @@ pub enum SandboxCmd {
         /// Don't unshare IPC — the pod shares the host IPC namespace (hostIPC: true).
         #[clap(long = "host-ipc")]
         host_ipc: bool,
+        /// Don't join a netns — the pod shares the host network namespace
+        /// (hostNetwork: true). `ns_name` is ignored for the network join.
+        #[clap(long = "host-net")]
+        host_net: bool,
     },
 }
 
@@ -53,7 +57,11 @@ pub fn cmd_sandbox(cmd: SandboxCmd) -> Result<(), Box<dyn std::error::Error>> {
         SandboxCmd::Create { name } => cmd_sandbox_create(name.as_deref()),
         SandboxCmd::Ls { json } => cmd_sandbox_ls(json),
         SandboxCmd::Rm { id } => cmd_sandbox_rm(&id),
-        SandboxCmd::Pause { ns_name, host_ipc } => cmd_sandbox_pause(&ns_name, host_ipc),
+        SandboxCmd::Pause {
+            ns_name,
+            host_ipc,
+            host_net,
+        } => cmd_sandbox_pause(&ns_name, host_ipc, host_net),
     }
 }
 
@@ -121,30 +129,42 @@ fn cmd_sandbox_rm(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// the pause does **not** unshare IPC, so `/proc/<pause>/ns/ipc` is the host IPC
 /// namespace.  Containers join that namespace via `with_sandbox()`, making host
 /// System V IPC objects visible inside the pod (CRI conformance #386 / #352).
-fn cmd_sandbox_pause(ns_name: &str, host_ipc: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Join the named network namespace.
-    let netns_path = format!("/run/netns/{}", ns_name);
-    let netns_c = std::ffi::CString::new(netns_path.as_bytes())
-        .map_err(|e| format!("invalid netns path: {}", e))?;
+///
+/// When `host_net` is set (pod `hostNetwork: true`, `namespace_options.network ==
+/// NODE`) the pause does **not** `setns` into a netns — it stays in the host
+/// network namespace, and `with_sandbox()` skips the NET join so containers stay
+/// in the host netns too (CRI conformance #394 / #352).
+fn cmd_sandbox_pause(
+    ns_name: &str,
+    host_ipc: bool,
+    host_net: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Join the named network namespace — unless this is a hostNetwork pod, in
+    // which case there is no named netns and the pause stays in the host netns.
+    if !host_net {
+        let netns_path = format!("/run/netns/{}", ns_name);
+        let netns_c = std::ffi::CString::new(netns_path.as_bytes())
+            .map_err(|e| format!("invalid netns path: {}", e))?;
 
-    let fd = unsafe { libc::open(netns_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(format!(
-            "open netns '{}': {}",
-            netns_path,
-            std::io::Error::last_os_error()
-        )
-        .into());
-    }
-    let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-    unsafe { libc::close(fd) };
-    if rc != 0 {
-        return Err(format!(
-            "setns netns '{}': {}",
-            netns_path,
-            std::io::Error::last_os_error()
-        )
-        .into());
+        let fd = unsafe { libc::open(netns_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(format!(
+                "open netns '{}': {}",
+                netns_path,
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+        unsafe { libc::close(fd) };
+        if rc != 0 {
+            return Err(format!(
+                "setns netns '{}': {}",
+                netns_path,
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
     }
 
     // Unshare UTS (pod hostname) and — unless the pod requested host IPC — IPC,
