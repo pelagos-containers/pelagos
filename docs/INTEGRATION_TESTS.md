@@ -355,6 +355,20 @@ host, binds `outer` read-only at `/mnt/ro`, then asserts `touch /mnt/ro/inner/su
 submount wasn't carried in (non-recursive bind) or the readonly remount was applied
 recursively — both of which break the CRI `recursive_read_only=false` contract.
 
+### `test_bind_mount_propagation_host_to_container`
+**Requires:** root, rootfs
+
+Verifies #341 `rslave` (CRI `PROPAGATION_HOST_TO_CONTAINER`) mount propagation: a
+mount created on the host under the bind source after the container starts must
+appear inside the container. The test makes the source a shared mount on the host,
+starts a container (`with_bind_mount_propagated(..., HostToContainer)`) that polls for
+`/mnt/dyn/flag`, then — after a delay so the container's bind is established — mounts a
+tmpfs at `<source>/dyn` on the host and touches the flag. The container must print
+`PROPAGATED` (not `TIMEOUT`). Failure means slave propagation isn't reaching the
+container — i.e. the root was recursively privatized (severing the peer group) or the
+per-mount `MS_SLAVE` wasn't applied. Container→host (bidirectional/`rshared`) is a
+separate, deferred follow-up.
+
 ### `test_cli_volume_flag_ro`
 **Requires:** root, rootfs
 

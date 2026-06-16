@@ -15,7 +15,7 @@
 
 use pelagos::cgroup::ResourceStats;
 use pelagos::container::{
-    Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume,
+    Capability, Command, GidMap, MountPropagation, Namespace, SeccompProfile, Stdio, UidMap, Volume,
 };
 use pelagos::network::NetworkMode;
 use serial_test::serial;
@@ -1747,6 +1747,100 @@ mod filesystem {
         assert!(
             out.contains("top=1"),
             "top of a readonly bind must be read-only, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_bind_mount_propagation_host_to_container() {
+        // #341: an `rslave` (HOST_TO_CONTAINER) bind propagates mounts created on
+        // the host under the source INTO the container after it has started. We
+        // make the source a shared mount on the host, start a container that polls
+        // for /mnt/dyn/flag, then mount a tmpfs at <source>/dyn on the host — it
+        // must appear inside the container via slave propagation.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::ptr;
+        if !is_root() {
+            eprintln!("Skipping test_bind_mount_propagation_host_to_container: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bind_mount_propagation_host_to_container: no rootfs");
+            return;
+        };
+
+        let src = tempfile::tempdir().expect("tempdir");
+        let src_path = src.path().to_path_buf();
+        let src_c = CString::new(src_path.as_os_str().as_bytes()).unwrap();
+        // Make the source a shared mount (its own peer group) on the host.
+        unsafe {
+            libc::mount(
+                src_c.as_ptr(),
+                src_c.as_ptr(),
+                ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                ptr::null(),
+            );
+            libc::mount(
+                ptr::null(),
+                src_c.as_ptr(),
+                ptr::null(),
+                libc::MS_SHARED | libc::MS_REC,
+                ptr::null(),
+            );
+        }
+        let dyn_dir = src_path.join("dyn");
+        std::fs::create_dir_all(&dyn_dir).expect("mkdir dyn");
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "for i in $(seq 1 40); do [ -e /mnt/dyn/flag ] && { echo PROPAGATED; exit 0; }; \
+                 sleep 0.25; done; echo TIMEOUT",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_bind_mount_propagated(&src_path, "/mnt", false, MountPropagation::HostToContainer)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn with rslave bind mount");
+
+        // Let the container establish its bind, then mount a tmpfs under the source
+        // on the host — it must propagate INTO the container.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let dyn_c = CString::new(dyn_dir.as_os_str().as_bytes()).unwrap();
+        let tmpfs_c = CString::new("tmpfs").unwrap();
+        let rc = unsafe {
+            libc::mount(
+                tmpfs_c.as_ptr(),
+                dyn_c.as_ptr(),
+                tmpfs_c.as_ptr(),
+                0,
+                ptr::null(),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "host tmpfs mount failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::write(dyn_dir.join("flag"), b"x").expect("write flag");
+
+        let (_status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+        // Cleanup host mounts before TempDir drop.
+        unsafe {
+            libc::umount(dyn_c.as_ptr());
+            libc::umount2(src_c.as_ptr(), libc::MNT_DETACH);
+        }
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("PROPAGATED"),
+            "host->container (rslave) propagation failed; container output: {}",
             out
         );
     }
