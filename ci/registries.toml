@@ -1,0 +1,15 @@
+# Registry mirror config for CI (installed to /etc/pelagos/registries.toml).
+#
+# GitHub Actions runners are cloud-hosted and share IPs, so anonymous Docker Hub
+# pulls hit the per-IP rate limit and fail the integration/e2e jobs. The nazgul
+# Zot cache (docs/ZOT_MIRROR_SETUP.md) can't help — it lives on the home LAN
+# (192.168.89.2), unreachable from the runners.
+#
+# AWS ECR Public mirrors the Docker Hub official images at
+# public.ecr.aws/docker/<repo> and is internet-reachable without the Docker Hub
+# per-IP limit. pelagos (src/registry_mirror.rs, #319) rewrites
+# docker.io/<repo> -> public.ecr.aws/docker/<repo>, stores the image under its
+# canonical ref (so `pelagos run alpine` is unchanged), and falls back to
+# docker.io if ECR is unavailable.
+[mirrors]
+"docker.io" = ["https://public.ecr.aws/docker"]

@@ -52,6 +52,12 @@ jobs:
         run: cargo build -p pelagos -p pelagos-dockerd -p pelagos-cri
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
+      - name: Configure registry mirror (ECR Public — avoid Docker Hub rate limits)
+        run: |
+          sudo install -d /etc/pelagos
+          sudo install -m 0644 ci/registries.toml /etc/pelagos/registries.toml
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run integration tests
@@ -71,6 +77,12 @@ jobs:
           sudo apt-get install -y nftables iproute2 passt
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
+      - name: Configure registry mirror (ECR Public — avoid Docker Hub rate limits)
+        run: |
+          sudo install -d /etc/pelagos
+          sudo install -m 0644 ci/registries.toml /etc/pelagos/registries.toml
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run e2e tests
