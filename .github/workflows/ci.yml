@@ -52,6 +52,8 @@ jobs:
         run: cargo build -p pelagos -p pelagos-dockerd -p pelagos-cri
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
       - name: Configure registry mirror (ECR Public — avoid Docker Hub rate limits)
         run: |
           sudo install -d /etc/pelagos
@@ -75,6 +77,8 @@ jobs:
           sudo apt-get install -y nftables iproute2 passt
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
       - name: Configure registry mirror (ECR Public — avoid Docker Hub rate limits)
         run: |
           sudo install -d /etc/pelagos
