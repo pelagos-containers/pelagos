@@ -151,19 +151,34 @@ impl ImageSvc {
                 continue;
             };
             // The config digest = sha256 of the raw OCI config blob, which is
-            // identical for the same image across tags and registries. Fall back
-            // to the manifest digest if the config blob isn't present (e.g. an
-            // older or locally-built image).
-            let config_digest = match tokio::fs::read(dir.join("oci-config.json")).await {
-                Ok(bytes) => format!("sha256:{:x}", Sha256::digest(&bytes)),
-                Err(_) => m.digest.clone(),
+            // identical for the same image across tags and registries. Also read
+            // the OCI config's `User` straight from that blob — the authoritative
+            // source — so ImageStatus reports uid/username even when the stored
+            // manifest didn't capture it (#382). Fall back to the manifest digest
+            // and manifest config.user if the config blob isn't present.
+            let (config_digest, oci_user) = match tokio::fs::read(dir.join("oci-config.json")).await
+            {
+                Ok(bytes) => {
+                    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+                    let user = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| v["config"]["User"].as_str().map(String::from))
+                        .unwrap_or_default();
+                    (digest, user)
+                }
+                Err(_) => (m.digest.clone(), String::new()),
+            };
+            let user = if oci_user.is_empty() {
+                m.config.user
+            } else {
+                oci_user
             };
             out.push(StoredImage {
                 reference: m.reference,
                 manifest_digest: m.digest,
                 config_digest,
                 layers: m.layers,
-                user: m.config.user,
+                user,
             });
         }
         out
@@ -243,11 +258,17 @@ impl ImageSvc {
     /// Find the aggregated image matching `r`, which may be a tag, a
     /// `repo@digest`, the config-digest id, or a bare manifest digest.
     fn match_image(images: &[Image], r: &str) -> Option<Image> {
+        // A bare repo reference (no `:tag`, no `@digest`) defaults to `:latest`,
+        // so `ImageStatus("repo")` finds the image pulled as `repo:latest` (#382).
+        let r_latest = (!r.contains('@') && repo_of(r) == r).then(|| format!("{}:latest", r));
         images
             .iter()
             .find(|img| {
                 img.id == r
                     || img.repo_tags.iter().any(|t| t == r)
+                    || r_latest
+                        .as_deref()
+                        .is_some_and(|rl| img.repo_tags.iter().any(|t| t == rl))
                     || img.repo_digests.iter().any(|d| d == r)
                     // also accept a bare manifest digest (the `@sha256:...` part)
                     || img
@@ -546,6 +567,24 @@ mod tests {
         assert!(ImageSvc::match_image(&imgs, "alpine@sha256:m1").is_some()); // by repo_digest
         assert!(ImageSvc::match_image(&imgs, "sha256:m1").is_some()); // by bare manifest digest
         assert!(ImageSvc::match_image(&imgs, "nonexistent:1").is_none());
+    }
+
+    #[test]
+    fn test_match_image_bare_repo_defaults_latest() {
+        // #382: ImageStatus("repo") with no tag must find the image pulled as
+        // "repo:latest" (note the repo name itself ends in "-latest" to guard the
+        // tag-vs-repo parsing).
+        let imgs = aggregate(vec![stored(
+            "gcr.io/x/test-image-latest:latest",
+            "sha256:m",
+            "sha256:c",
+            "",
+        )]);
+        assert!(ImageSvc::match_image(&imgs, "gcr.io/x/test-image-latest").is_some());
+        assert!(ImageSvc::match_image(&imgs, "gcr.io/x/test-image-latest:latest").is_some());
+        // A bare repo not pulled as :latest must NOT match (no implicit cross-tag).
+        let other = aggregate(vec![stored("repo:v1", "sha256:m", "sha256:c2", "")]);
+        assert!(ImageSvc::match_image(&other, "repo").is_none());
     }
 
     #[test]
