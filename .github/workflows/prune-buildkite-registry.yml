@@ -31,7 +31,10 @@ jobs:
     steps:
       - name: Prune old packages
         env:
-          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+          # PACKAGECLOUD_CLEANUP_TOKEN carries read + write + delete_packages so it
+          # serves every Buildkite registry op (the old PACKAGECLOUD_TOKEN lacked
+          # delete_packages). Internal var name kept as PACKAGECLOUD_TOKEN.
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_CLEANUP_TOKEN }}
           KEEP: ${{ inputs.keep_versions }}
           MODE: ${{ inputs.mode }}
         run: |

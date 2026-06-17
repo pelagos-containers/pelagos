@@ -220,7 +220,8 @@ jobs:
           path: dist/packages
       - name: Publish to Buildkite package registry
         env:
-          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+          # Single token for all Buildkite registry ops (read + write + delete).
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_CLEANUP_TOKEN }}
         run: |
           BASE_URL="https://api.buildkite.com/v2/packages/organizations/christopher-brown/registries/pelagos/packages"
           upload() {
