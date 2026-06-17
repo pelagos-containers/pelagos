@@ -46,19 +46,36 @@ impl NsMode {
     }
 }
 
+/// Default PID namespace mode: `Container`, not `Pod` — PID is per-container
+/// unless a pod sets `shareProcessNamespace` (mirrors `pelagos::sandbox`; #398).
+fn default_pid_mode() -> NsMode {
+    NsMode::Container
+}
+
 /// Network / PID / IPC namespace sharing modes for a sandbox, read from the pod's
 /// CRI `NamespaceOption` exactly once and carried through sandbox state.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NamespaceModes {
     /// Network namespace mode (`hostNetwork: true` ⇒ `Node`).
     #[serde(default)]
     pub network: NsMode,
-    /// PID namespace mode (`hostPID: true` ⇒ `Node`).
-    #[serde(default)]
+    /// PID namespace mode: `Pod` (shared), `Container` (per-container, default),
+    /// or `Node` (`hostPID`).
+    #[serde(default = "default_pid_mode")]
     pub pid: NsMode,
     /// IPC namespace mode (`hostIPC: true` ⇒ `Node`).
     #[serde(default)]
     pub ipc: NsMode,
+}
+
+impl Default for NamespaceModes {
+    fn default() -> Self {
+        NamespaceModes {
+            network: NsMode::Pod,
+            pid: default_pid_mode(),
+            ipc: NsMode::Pod,
+        }
+    }
 }
 
 impl NamespaceModes {
@@ -71,9 +88,6 @@ impl NamespaceModes {
         }
     }
     /// True when the pod shares the host network namespace.
-    // Consumed by the HostNetwork branch (#394); the `network` mode is already
-    // captured and persisted here so that work only adds the call site.
-    #[allow(dead_code)]
     pub fn host_network(&self) -> bool {
         self.network.is_host()
     }
@@ -84,6 +98,11 @@ impl NamespaceModes {
     /// True when the pod shares the host PID namespace.
     pub fn host_pid(&self) -> bool {
         self.pid.is_host()
+    }
+    /// True when the pod containers share a single pod PID namespace
+    /// (`shareProcessNamespace`, explicit CRI `pid == POD`; #398).
+    pub fn shared_pid(&self) -> bool {
+        matches!(self.pid, NsMode::Pod)
     }
 }
 

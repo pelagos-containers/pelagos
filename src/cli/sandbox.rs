@@ -47,6 +47,10 @@ pub enum SandboxCmd {
         /// (hostNetwork: true). `ns_name` is ignored for the network join.
         #[clap(long = "host-net")]
         host_net: bool,
+        /// Become PID 1 of a shared pod PID namespace (shareProcessNamespace:
+        /// true) by unsharing PID and forking an init child.
+        #[clap(long = "pod-pid")]
+        pod_pid: bool,
     },
 }
 
@@ -61,7 +65,8 @@ pub fn cmd_sandbox(cmd: SandboxCmd) -> Result<(), Box<dyn std::error::Error>> {
             ns_name,
             host_ipc,
             host_net,
-        } => cmd_sandbox_pause(&ns_name, host_ipc, host_net),
+            pod_pid,
+        } => cmd_sandbox_pause(&ns_name, host_ipc, host_net, pod_pid),
     }
 }
 
@@ -134,10 +139,18 @@ fn cmd_sandbox_rm(id: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// NODE`) the pause does **not** `setns` into a netns — it stays in the host
 /// network namespace, and `with_sandbox()` skips the NET join so containers stay
 /// in the host netns too (CRI conformance #394 / #352).
+///
+/// When `pod_pid` is set (pod `shareProcessNamespace: true`,
+/// `namespace_options.pid == POD`) the pause becomes the PID-1 init of a shared
+/// pod PID namespace: it `unshare(CLONE_NEWPID)`s and forks, the **child** is
+/// PID 1 (reaps zombies, exits on SIGTERM) and the **parent** supervises it
+/// (so the systemd MainPID stays stable, preserving #336 restart-survival).
+/// Containers join `/proc/<child>/ns/pid` via `with_sandbox()` (#398 / #352).
 fn cmd_sandbox_pause(
     ns_name: &str,
     host_ipc: bool,
     host_net: bool,
+    pod_pid: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Join the named network namespace — unless this is a hostNetwork pod, in
     // which case there is no named netns and the pause stays in the host netns.
@@ -181,6 +194,39 @@ fn cmd_sandbox_pause(
         return Err(format!("unshare UTS/IPC: {}", std::io::Error::last_os_error()).into());
     }
 
+    // Shared pod PID namespace (shareProcessNamespace). A process can't put
+    // *itself* into a new PID namespace — unshare(CLONE_NEWPID) only places future
+    // children there — so we unshare and fork: the child is PID 1 of the pod PID
+    // namespace, the parent supervises it (keeping the spawned/MainPID stable).
+    if pod_pid {
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWPID) };
+        if rc != 0 {
+            return Err(format!("unshare PID: {}", std::io::Error::last_os_error()).into());
+        }
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return Err(format!("fork pod-pid init: {}", std::io::Error::last_os_error()).into());
+        }
+        if child == 0 {
+            // ── Child: PID 1 of the pod PID namespace (the real pause/init) ──
+            // run_pid1_init_loop() diverges (it is the init's forever-loop).
+            run_pid1_init_loop();
+        }
+        // ── Parent: supervise the PID-1 child; exit when it does so the systemd
+        // unit / leaked child cleanly finishes (teardown SIGKILLs the cgroup,
+        // which includes the child; killing PID 1 tears the pod PID ns down). ──
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = unsafe { libc::waitpid(child, &mut status, 0) };
+            if r == child
+                || (r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+            {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
     // Block until terminated. `pause()` returns on ANY caught signal — a stray
     // SIGCHLD/SIGURG/SIGWINCH or a handler the runtime installs — so calling it
     // once would let the first such signal exit the pause, orphaning the
@@ -190,6 +236,38 @@ fn cmd_sandbox_pause(
     // real termination signal (SIGTERM from `pelagos sandbox rm` / systemd
     // KillMode, which terminates the process regardless) ends the pause.
     loop {
+        unsafe { libc::pause() };
+    }
+}
+
+/// PID-1 init loop for a shared pod PID namespace (#398). Runs in the pause's
+/// child after `unshare(CLONE_NEWPID)` + `fork`. PID 1 has two init duties:
+///   - **Reap** orphaned zombies (pod container processes are reparented here on
+///     exit) — otherwise they accumulate in the pod PID namespace.
+///   - **Exit on SIGTERM** — the kernel ignores default-action signals for PID 1,
+///     so without a handler `systemctl stop` could only SIGKILL it after the stop
+///     timeout. A SIGTERM handler makes teardown prompt (and, since PID 1 exiting
+///     tears the namespace down, also kills any lingering container processes).
+fn run_pid1_init_loop() -> ! {
+    use nix::sys::signal::{signal, SigHandler, Signal};
+
+    extern "C" fn on_term(_: libc::c_int) {
+        // PID 1 exiting collapses the pod PID namespace.
+        unsafe { libc::_exit(0) };
+    }
+    // A no-op SIGCHLD handler ensures `pause()` returns so we can reap.
+    extern "C" fn on_chld(_: libc::c_int) {}
+
+    unsafe {
+        let _ = signal(Signal::SIGTERM, SigHandler::Handler(on_term));
+        let _ = signal(Signal::SIGCHLD, SigHandler::Handler(on_chld));
+    }
+
+    loop {
+        // Reap every dead child without blocking.
+        let mut status: libc::c_int = 0;
+        while unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } > 0 {}
+        // Sleep until the next signal (SIGCHLD to reap, SIGTERM to exit).
         unsafe { libc::pause() };
     }
 }

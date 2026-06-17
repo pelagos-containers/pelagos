@@ -5321,3 +5321,31 @@ is true" behaviour this implements. `RunPodSandbox` takes a dedicated hostNetwor
 (skip CNI/netns, report the node IP, spawn the pause with `--host-net`); `with_sandbox()`
 reads `SandboxState.namespaces.host_network()` to skip the container's NET join so it stays
 in the host netns too; `StopPodSandbox` auto-skips CNI teardown because `netns` is empty.
+
+## `issue_347_no_host_destruction::test_sandbox_pause_pod_pid_forks_init`
+**Requires root** (unshares a PID namespace; forks).
+CRI shareProcessNamespace / PodPID conformance (#398 / #352). Spawns the internal
+`sandbox __pause__` with `--pod-pid` (+`--host-net` to avoid needing a netns) and asserts the
+spawned process forks exactly one child — the **PID-1 init of a new PID namespace** (its
+`/proc/<child>/ns/pid` inode differs from the host's) — and that killing that PID-1 child
+**cascades**: the supervising parent's `waitpid` returns and it exits. This is the machinery
+behind the critest "PodPID" spec: the pause is PID 1 of a shared pod PID namespace that
+containers join via `with_sandbox()` (`SandboxState.namespaces.shared_pid()` adds a PID join;
+`CreateContainer` passes `--no-pid-ns` so the container does not unshare its own), so the
+container is never PID 1 and `cat /proc/1/cmdline` shows the pause, not the workload.
+
+## `issue_347_no_host_destruction::test_sandbox_pause_pod_pid_drains_with_shared_grandchild`
+**Requires root** and `nsenter` (util-linux); skipped if either is missing.
+Regression guard for the PodPID teardown deadlock (#399 / #400). Spawns the `--pod-pid` pause,
+then uses `nsenter --pid` to join the pause's PID namespace and leave **lingering grandchildren**
+(backgrounded `sleep`s whose launcher exits) — mimicking a container's worker processes that
+outlive their master and get reparented to the pause. It then SIGTERMs the pause's PID-1 init
+(what `StopPodSandbox` does) and asserts the pause **drains within ~3s**: the namespace collapse
+SIGKILLs and reaps the lingering grandchildren and the supervising parent exits. **Why it matters:**
+`pelagos-cri` SIGTERMs the pause and *drains it to full exit before* asking systemd to stop the
+pause's transient unit. If the pause could not collapse promptly with shared processes present,
+the subsequent `systemctl stop` would block host **PID 1** uninterruptibly in `cgroup_drain_dying`
+(waiting for the pause cgroup to empty) and wedge the entire node — ICMP still answers but every
+`fork`/SSH-session hangs. A failure here means the namespace-collapse invariant the drain relies on
+is broken. (The systemd-ordering half — drain-before-`systemctl stop` — is covered end-to-end by
+the critest `NamespaceOption` conformance bucket, which hung indefinitely before this fix.)

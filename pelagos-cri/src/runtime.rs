@@ -819,6 +819,9 @@ impl RuntimeService for RuntimeSvc {
         // hostNetwork (#394): the pod uses the host network namespace — no CNI,
         // no netns; the pause stays in host net and containers skip the NET join.
         let host_network = namespaces.host_network();
+        // shareProcessNamespace (#398): the pause forks a PID-1 init holding a
+        // shared pod PID namespace that containers join.
+        let pod_pid = namespaces.shared_pid();
 
         // hostNetwork takes a dedicated branch (no CNI); otherwise try CNI first
         // and fall back to pelagos native bridge networking.
@@ -828,13 +831,17 @@ impl RuntimeService for RuntimeSvc {
             let ip = node_primary_ipv4();
 
             // Pause: --host-net keeps it in host net (skips the netns setns);
-            // --host-ipc additionally keeps host IPC. ns_name is unused by the
-            // pause in this mode, so pass an empty placeholder.
+            // --host-ipc additionally keeps host IPC; --pod-pid makes it a PID-1
+            // init for a shared pod PID namespace. ns_name is unused by the pause
+            // in this mode, so pass an empty placeholder.
             let mut pause_argv: Vec<&str> = vec!["sandbox", "__pause__", "", "--host-net"];
             if host_ipc {
                 pause_argv.push("--host-ipc");
             }
-            let pause_pid = spawn_sandbox_pause(&bin, &id, &pause_argv).await?;
+            if pod_pid {
+                pause_argv.push("--pod-pid");
+            }
+            let pause_pid = spawn_sandbox_pause(&bin, &id, &pause_argv, pod_pid).await?;
 
             // Store ns_name="" so StopPodSandbox skips CNI/netns teardown.
             state::write_pelagos_sandbox_state(
@@ -932,13 +939,16 @@ impl RuntimeService for RuntimeSvc {
             // The pause blocks forever, so it must be a backgrounded *service*
             // (not a `--scope`, which would block); its real PID is the unit's
             // MainPID. Off systemd we fall back to a plain leaked child.
-            // pause argv: hostIPC pods append --host-ipc so the pause keeps the
-            // host IPC namespace instead of unsharing a private one (#386).
+            // pause argv: --host-ipc keeps host IPC (#386); --pod-pid makes the
+            // pause a PID-1 init for a shared pod PID namespace (#398).
             let mut pause_argv: Vec<&str> = vec!["sandbox", "__pause__", &ns_name];
             if host_ipc {
                 pause_argv.push("--host-ipc");
             }
-            let pause_pid = spawn_sandbox_pause(&bin, &id, &pause_argv).await?;
+            if pod_pid {
+                pause_argv.push("--pod-pid");
+            }
+            let pause_pid = spawn_sandbox_pause(&bin, &id, &pause_argv, pod_pid).await?;
 
             // Write pelagos-format sandbox state so `pelagos run --sandbox` works.
             state::write_pelagos_sandbox_state(
@@ -1063,6 +1073,7 @@ impl RuntimeService for RuntimeSvc {
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
         let sandbox_id = request.into_inner().pod_sandbox_id;
         let bin = self.bin().await;
+        log::debug!("StopPodSandbox {} BEGIN", sandbox_id);
 
         let containers_to_stop: Vec<(String, MyContainerState)> = {
             let st = self.state.inner.lock().await;
@@ -1075,7 +1086,17 @@ impl RuntimeService for RuntimeSvc {
 
         for (pelagos_name, cstate) in &containers_to_stop {
             if *cstate == MyContainerState::Running {
+                log::debug!(
+                    "StopPodSandbox {} step=stop-container {}",
+                    sandbox_id,
+                    pelagos_name
+                );
                 let _ = run_pelagos(&bin, &["stop", pelagos_name]).await;
+                log::debug!(
+                    "StopPodSandbox {} step=stop-container {} DONE",
+                    sandbox_id,
+                    pelagos_name
+                );
             }
         }
 
@@ -1087,27 +1108,92 @@ impl RuntimeService for RuntimeSvc {
         if let Some(ref sb) = sandbox {
             if !sb.netns.is_empty() {
                 // ── CNI teardown ───────────────────────────────────────────────
+                // ORDER MATTERS, and the killer subtlety is systemd, not the network.
+                //
+                // The pause is PID 1 of the pod's PID namespace. Killing it collapses
+                // that namespace: the kernel SIGKILLs and reaps every process sharing
+                // it (the pause runs `zap_pid_ns_processes`). For a
+                // shareProcessNamespace (pid=POD) pod a container's workers outlive
+                // `pelagos stop` — the master dying does not reap them; they are
+                // reparented to the pause — so this collapse has real work to do.
+                //
+                // If we ask systemd to stop the pause's transient unit WHILE that
+                // collapse is in flight, systemd (host PID 1) blocks UNINTERRUPTIBLY
+                // in `cgroup_drain_dying` waiting for the pause cgroup to empty — but
+                // the pause can't leave the cgroup until its exit completes, and that
+                // exit deadlocks against the very cgroup teardown systemd is holding.
+                // PID 1 stuck in D wedges the ENTIRE host: ICMP still answers but every
+                // fork/SSH-session hangs (#399 PodPID teardown / #400). Confirmed via
+                // live `ps -o stat,wchan` capture of the hung node.
+                //
+                // So: SIGTERM the pause and WAIT for it to fully exit (drain) FIRST.
+                // Only once it is gone — cgroup already empty — is it safe to let
+                // systemd reap the unit. If the pause refuses to die, SKIP the systemd
+                // stop entirely: leaking a transient unit (it self-collects via
+                // --collect once it eventually dies) is infinitely preferable to
+                // hanging PID 1. Network teardown happens last, on a quiesced netns.
                 let netns_path = format!("/run/netns/{}", sb.netns);
+                let mut pause_drained = true;
+                if sb.pause_pid > 0 {
+                    log::debug!(
+                        "StopPodSandbox {} step=kill-pause pid={}",
+                        sandbox_id,
+                        sb.pause_pid
+                    );
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &sb.pause_pid.to_string()])
+                        .output();
+                    pause_drained = false;
+                    // Bounded drain (~5s): poll until the pause is gone (ESRCH).
+                    for _ in 0..100 {
+                        if unsafe { libc::kill(sb.pause_pid, 0) } != 0 {
+                            pause_drained = true;
+                            break; // pause gone, pod PID ns fully collapsed
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    log::debug!(
+                        "StopPodSandbox {} step=kill-pause DONE drained={}",
+                        sandbox_id,
+                        pause_drained
+                    );
+                }
+                // Tear down the transient pause service (#336) — but ONLY after the
+                // pause has actually exited, so systemd's cgroup teardown finds an
+                // empty cgroup and cannot block PID 1. Skip it on a stuck pause.
+                if scope::systemd_available() {
+                    if pause_drained {
+                        log::debug!("StopPodSandbox {} step=stop_unit", sandbox_id);
+                        scope::stop_unit(&scope::sandbox_unit(&sandbox_id)).await;
+                        log::debug!("StopPodSandbox {} step=stop_unit DONE", sandbox_id);
+                    } else {
+                        log::warn!(
+                            "StopPodSandbox {} pause {} did not exit within drain window; \
+                             skipping `systemctl stop` to avoid wedging PID 1 — the transient \
+                             unit will self-collect (--collect) once the pause dies",
+                            sandbox_id,
+                            sb.pause_pid
+                        );
+                    }
+                }
                 if !sb.cni_conf.is_empty() {
                     let cap_args = cni::port_mapping_cap_args(&sb.port_mappings);
+                    log::debug!(
+                        "StopPodSandbox {} step=cni_del netns={}",
+                        sandbox_id,
+                        sb.netns
+                    );
                     cni::cni_del(
                         &sandbox_id,
                         &netns_path,
                         std::path::Path::new(&sb.cni_conf),
                         &cap_args,
                     );
+                    log::debug!("StopPodSandbox {} step=cni_del DONE", sandbox_id);
                 }
-                if sb.pause_pid > 0 {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-TERM", &sb.pause_pid.to_string()])
-                        .output();
-                }
-                // Tear down the transient pause service (#336); harmless if the
-                // pause was launched as a plain child on a non-systemd host.
-                if scope::systemd_available() {
-                    scope::stop_unit(&scope::sandbox_unit(&sandbox_id)).await;
-                }
+                log::debug!("StopPodSandbox {} step=delete_netns", sandbox_id);
                 cni::delete_netns(&sb.netns);
+                log::debug!("StopPodSandbox {} step=delete_netns DONE", sandbox_id);
                 state::remove_pelagos_sandbox_state(&sandbox_id);
             } else {
                 // ── Pelagos native teardown ────────────────────────────────────
@@ -1120,6 +1206,7 @@ impl RuntimeService for RuntimeSvc {
             s.state = SandboxState::NotReady;
             let _ = state::save_sandbox(s);
         }
+        log::debug!("StopPodSandbox {} END", sandbox_id);
 
         Ok(Response::new(StopPodSandboxResponse {}))
     }
@@ -1696,7 +1783,7 @@ impl RuntimeService for RuntimeSvc {
             sandbox_dns_searches,
             sandbox_dns_options,
             sandbox_cgroup_parent,
-            sandbox_host_pid,
+            sandbox_ns,
         ) = {
             let st = self.state.inner.lock().await;
             st.sandboxes
@@ -1707,7 +1794,7 @@ impl RuntimeService for RuntimeSvc {
                         s.dns_searches.clone(),
                         s.dns_options.clone(),
                         s.cgroup_parent.clone(),
-                        s.namespaces.host_pid(),
+                        s.namespaces,
                     )
                 })
                 .unwrap_or_default()
@@ -1724,9 +1811,12 @@ impl RuntimeService for RuntimeSvc {
             args.push("--dns-option".into());
             args.push(opt.clone());
         }
-        // NODE PID namespace mode (hostPID: true): run in the host PID namespace so
-        // the SPIRE agent can attest workloads via SO_PEERCRED (PID 0 is never returned).
-        if sandbox_host_pid {
+        // The container must not unshare its own PID namespace when the pod uses
+        // the host PID namespace (hostPID/NODE — for SPIRE SO_PEERCRED attestation)
+        // or a shared pod PID namespace (shareProcessNamespace/POD — #398). In the
+        // shared case `with_sandbox` then joins the pod's PID namespace; in the
+        // host case the container simply stays in the host PID namespace.
+        if sandbox_ns.host_pid() || sandbox_ns.shared_pid() {
             args.push("--no-pid-ns".into());
         }
 
@@ -2746,7 +2836,45 @@ fn resolve_container_argv(
 
 // ── Sandbox pause spawn + host networking helpers ─────────────────────────────
 
-/// Spawn the sandbox pause process and return its PID.
+/// Spawn the sandbox pause and return the PID that **holds the pod namespaces**
+/// (the one containers join via `with_sandbox()`).
+///
+/// For a shared-PID pod (`pod_pid`, `--pod-pid`) the pause forks a PID-1 init
+/// child that actually holds the pod PID namespace; the spawned (MainPID) process
+/// is its parent/supervisor. We resolve and return the **child** pid in that case
+/// via `/proc/<parent>/task/<parent>/children`. Otherwise the spawned pid is the
+/// namespace holder.
+async fn spawn_sandbox_pause(
+    bin: &str,
+    id: &str,
+    pause_argv: &[&str],
+    pod_pid: bool,
+) -> Result<i32, Status> {
+    let parent = spawn_sandbox_pause_proc(bin, id, pause_argv).await?;
+    if !pod_pid {
+        return Ok(parent);
+    }
+    // The PID-1 init is the parent's only child; poll until it appears.
+    for _ in 0..80 {
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", parent, parent))
+        {
+            if let Some(child) = s
+                .split_whitespace()
+                .next()
+                .and_then(|p| p.parse::<i32>().ok())
+            {
+                return Ok(child);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    Err(Status::internal(format!(
+        "pod-pid pause {} did not fork a PID-1 init child",
+        parent
+    )))
+}
+
+/// Spawn the pause process and return the spawned (MainPID/parent) PID.
 ///
 /// Under systemd the pause runs as a transient service under `pelagos.slice`
 /// (created by PID 1) so it survives a `pelagos-cri` restart and the sandbox is
@@ -2754,8 +2882,8 @@ fn resolve_container_argv(
 /// be a backgrounded *service* (not a `--scope`, which would block); its real PID
 /// is the unit's MainPID. Off systemd we fall back to a plain leaked child
 /// (killed explicitly on StopPodSandbox). `pause_argv` carries the namespace
-/// flags (`--host-ipc` / `--host-net`).
-async fn spawn_sandbox_pause(bin: &str, id: &str, pause_argv: &[&str]) -> Result<i32, Status> {
+/// flags (`--host-ipc` / `--host-net` / `--pod-pid`).
+async fn spawn_sandbox_pause_proc(bin: &str, id: &str, pause_argv: &[&str]) -> Result<i32, Status> {
     if scope::systemd_available() {
         let unit = scope::sandbox_unit(id);
         // A re-run for the same sandbox id would collide with a lingering unit;
