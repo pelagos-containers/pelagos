@@ -28877,4 +28877,113 @@ mod issue_347_no_host_destruction {
             "killing the PID-1 init child should cascade — the supervising parent should exit"
         );
     }
+
+    /// test_sandbox_pause_pod_pid_drains_with_shared_grandchild
+    ///
+    /// Requires: root, `nsenter` (util-linux).
+    ///
+    /// Regression guard for the PodPID teardown deadlock (#399 / #400). A real
+    /// shareProcessNamespace pod has *other* processes in the pause's PID
+    /// namespace — a container whose worker children outlive their master and get
+    /// reparented to the pause. When the sandbox is torn down, the pause (PID 1)
+    /// must collapse the namespace and exit *promptly*: `pelagos-cri` SIGTERMs the
+    /// pause and then drains (waits for it to exit) BEFORE asking systemd to reap
+    /// the pause's transient unit. If the pause could not drain with a lingering
+    /// shared process present, the subsequent `systemctl stop` would block host
+    /// PID 1 uninterruptibly in `cgroup_drain_dying` and wedge the whole node.
+    ///
+    /// This asserts the runtime-level invariant the drain depends on: with a
+    /// grandchild joined into the pause's PID namespace (mimicking an orphaned
+    /// worker), SIGTERM-ing the pause's PID-1 init still tears the namespace down
+    /// and the pause exits within a bounded window — it never hangs. (The
+    /// systemd-ordering half of the fix is covered end-to-end by the critest
+    /// `NamespaceOption`/`PodPID` conformance bucket.)
+    #[test]
+    fn test_sandbox_pause_pod_pid_drains_with_shared_grandchild() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_sandbox_pause_pod_pid_drains_with_shared_grandchild: requires root"
+            );
+            return;
+        }
+        let nsenter_ok = std::process::Command::new("nsenter")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !nsenter_ok {
+            eprintln!(
+                "Skipping test_sandbox_pause_pod_pid_drains_with_shared_grandchild: nsenter not found"
+            );
+            return;
+        }
+
+        let bin = env!("CARGO_BIN_EXE_pelagos");
+
+        // 1. Pod-pid pause: parent unshares PID + forks a PID-1 init child.
+        let mut parent = std::process::Command::new(bin)
+            .args(["sandbox", "__pause__", "", "--host-net", "--pod-pid"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pod-pid pause");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let child_pid: i32 = std::fs::read_to_string(format!(
+            "/proc/{}/task/{}/children",
+            parent.id(),
+            parent.id()
+        ))
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("pod-pid pause should fork a PID-1 init child");
+
+        // 2. Join the pause's PID namespace and leave a lingering grandchild
+        //    behind (a backgrounded sleep), mimicking an orphaned container
+        //    worker reparented to the pause. `nsenter --pid` makes the spawned
+        //    command's children land in the pause's PID namespace.
+        let _joiner = std::process::Command::new("nsenter")
+            .args([
+                &format!("--pid=/proc/{}/ns/pid", child_pid),
+                "--",
+                "sh",
+                "-c",
+                "sleep 600 & sleep 600 & exit 0",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // 3. SIGTERM the PID-1 init (what StopPodSandbox does). It must collapse
+        //    the namespace (SIGKILL + reap the lingering grandchildren) and exit
+        //    promptly — the parent waitpid()s on it and returns. Poll, bounded.
+        let _ = unsafe { libc::kill(child_pid, libc::SIGTERM) };
+        let mut drained = false;
+        for _ in 0..60 {
+            if let Ok(Some(_)) = parent.try_wait() {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Best-effort cleanup before asserting.
+        let _ = unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        let _ = parent.kill();
+        let _ = parent.wait();
+
+        assert!(
+            drained,
+            "pod-pid pause with a lingering shared grandchild must drain within ~3s \
+             when its PID-1 init is signalled — a stuck collapse here is what wedges \
+             host PID 1 during StopPodSandbox (#399/#400)"
+        );
+    }
 }

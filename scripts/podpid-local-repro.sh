@@ -66,4 +66,10 @@ echo "exec exit=$RC  (124 = HUNG at EXEC)"
 echo "exec output (NUL->space): $(printf '%s' "$OUT" | tr '\0' ' ')"
 if [ $RC -eq 124 ]; then echo ">>> HANG IS AT EXEC (cat /proc/1/cmdline)"; fi
 
-echo "=== DONE (no hang at start or exec if we got here) ==="
+echo "=== 5. graceful 'pelagos stop' (what StopPodSandbox does — timeout 20) ==="
+timeout 20 "$BIN" stop "$CNAME"
+RC=$?
+echo "stop exit=$RC  (124 = HUNG at STOP — this is the StopPodSandbox teardown hang)"
+if [ $RC -eq 124 ]; then echo ">>> CONFIRMED: graceful stop of a shared-PID container HANGS"; fi
+
+echo "=== DONE ==="

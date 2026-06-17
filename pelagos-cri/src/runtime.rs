@@ -1073,6 +1073,7 @@ impl RuntimeService for RuntimeSvc {
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
         let sandbox_id = request.into_inner().pod_sandbox_id;
         let bin = self.bin().await;
+        log::debug!("StopPodSandbox {} BEGIN", sandbox_id);
 
         let containers_to_stop: Vec<(String, MyContainerState)> = {
             let st = self.state.inner.lock().await;
@@ -1085,7 +1086,17 @@ impl RuntimeService for RuntimeSvc {
 
         for (pelagos_name, cstate) in &containers_to_stop {
             if *cstate == MyContainerState::Running {
+                log::debug!(
+                    "StopPodSandbox {} step=stop-container {}",
+                    sandbox_id,
+                    pelagos_name
+                );
                 let _ = run_pelagos(&bin, &["stop", pelagos_name]).await;
+                log::debug!(
+                    "StopPodSandbox {} step=stop-container {} DONE",
+                    sandbox_id,
+                    pelagos_name
+                );
             }
         }
 
@@ -1097,27 +1108,92 @@ impl RuntimeService for RuntimeSvc {
         if let Some(ref sb) = sandbox {
             if !sb.netns.is_empty() {
                 // ── CNI teardown ───────────────────────────────────────────────
+                // ORDER MATTERS, and the killer subtlety is systemd, not the network.
+                //
+                // The pause is PID 1 of the pod's PID namespace. Killing it collapses
+                // that namespace: the kernel SIGKILLs and reaps every process sharing
+                // it (the pause runs `zap_pid_ns_processes`). For a
+                // shareProcessNamespace (pid=POD) pod a container's workers outlive
+                // `pelagos stop` — the master dying does not reap them; they are
+                // reparented to the pause — so this collapse has real work to do.
+                //
+                // If we ask systemd to stop the pause's transient unit WHILE that
+                // collapse is in flight, systemd (host PID 1) blocks UNINTERRUPTIBLY
+                // in `cgroup_drain_dying` waiting for the pause cgroup to empty — but
+                // the pause can't leave the cgroup until its exit completes, and that
+                // exit deadlocks against the very cgroup teardown systemd is holding.
+                // PID 1 stuck in D wedges the ENTIRE host: ICMP still answers but every
+                // fork/SSH-session hangs (#399 PodPID teardown / #400). Confirmed via
+                // live `ps -o stat,wchan` capture of the hung node.
+                //
+                // So: SIGTERM the pause and WAIT for it to fully exit (drain) FIRST.
+                // Only once it is gone — cgroup already empty — is it safe to let
+                // systemd reap the unit. If the pause refuses to die, SKIP the systemd
+                // stop entirely: leaking a transient unit (it self-collects via
+                // --collect once it eventually dies) is infinitely preferable to
+                // hanging PID 1. Network teardown happens last, on a quiesced netns.
                 let netns_path = format!("/run/netns/{}", sb.netns);
+                let mut pause_drained = true;
+                if sb.pause_pid > 0 {
+                    log::debug!(
+                        "StopPodSandbox {} step=kill-pause pid={}",
+                        sandbox_id,
+                        sb.pause_pid
+                    );
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &sb.pause_pid.to_string()])
+                        .output();
+                    pause_drained = false;
+                    // Bounded drain (~5s): poll until the pause is gone (ESRCH).
+                    for _ in 0..100 {
+                        if unsafe { libc::kill(sb.pause_pid, 0) } != 0 {
+                            pause_drained = true;
+                            break; // pause gone, pod PID ns fully collapsed
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    log::debug!(
+                        "StopPodSandbox {} step=kill-pause DONE drained={}",
+                        sandbox_id,
+                        pause_drained
+                    );
+                }
+                // Tear down the transient pause service (#336) — but ONLY after the
+                // pause has actually exited, so systemd's cgroup teardown finds an
+                // empty cgroup and cannot block PID 1. Skip it on a stuck pause.
+                if scope::systemd_available() {
+                    if pause_drained {
+                        log::debug!("StopPodSandbox {} step=stop_unit", sandbox_id);
+                        scope::stop_unit(&scope::sandbox_unit(&sandbox_id)).await;
+                        log::debug!("StopPodSandbox {} step=stop_unit DONE", sandbox_id);
+                    } else {
+                        log::warn!(
+                            "StopPodSandbox {} pause {} did not exit within drain window; \
+                             skipping `systemctl stop` to avoid wedging PID 1 — the transient \
+                             unit will self-collect (--collect) once the pause dies",
+                            sandbox_id,
+                            sb.pause_pid
+                        );
+                    }
+                }
                 if !sb.cni_conf.is_empty() {
                     let cap_args = cni::port_mapping_cap_args(&sb.port_mappings);
+                    log::debug!(
+                        "StopPodSandbox {} step=cni_del netns={}",
+                        sandbox_id,
+                        sb.netns
+                    );
                     cni::cni_del(
                         &sandbox_id,
                         &netns_path,
                         std::path::Path::new(&sb.cni_conf),
                         &cap_args,
                     );
+                    log::debug!("StopPodSandbox {} step=cni_del DONE", sandbox_id);
                 }
-                if sb.pause_pid > 0 {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-TERM", &sb.pause_pid.to_string()])
-                        .output();
-                }
-                // Tear down the transient pause service (#336); harmless if the
-                // pause was launched as a plain child on a non-systemd host.
-                if scope::systemd_available() {
-                    scope::stop_unit(&scope::sandbox_unit(&sandbox_id)).await;
-                }
+                log::debug!("StopPodSandbox {} step=delete_netns", sandbox_id);
                 cni::delete_netns(&sb.netns);
+                log::debug!("StopPodSandbox {} step=delete_netns DONE", sandbox_id);
                 state::remove_pelagos_sandbox_state(&sandbox_id);
             } else {
                 // ── Pelagos native teardown ────────────────────────────────────
@@ -1130,6 +1206,7 @@ impl RuntimeService for RuntimeSvc {
             s.state = SandboxState::NotReady;
             let _ = state::save_sandbox(s);
         }
+        log::debug!("StopPodSandbox {} END", sandbox_id);
 
         Ok(Response::new(StopPodSandboxResponse {}))
     }
