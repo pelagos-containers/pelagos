@@ -1,51 +1,78 @@
-# Manually-triggered pruner for the Buildkite package registry.
+# Manually-triggered admin tool for the Buildkite package registry.
 #
-# The registry hit its plan's resource limit ("Resource limit reached. Please
-# contact support@buildkite.com to upgrade." — HTTP 403 on upload), which is why
-# .deb publishing stopped around v0.65.36. The token is fine; the registry is just
-# full. This deletes old package versions to get back under the cap.
+# Background: the registry hit its plan resource limit ("Resource limit reached")
+# around v0.65.36 — uploads 403'd because it was FULL, not because of a bad token.
+# This workflow can prune old versions to free space and (re)upload a release's
+# .debs. All ops use PACKAGECLOUD_CLEANUP_TOKEN (read + write + delete_packages).
 #
-# SAFE BY DEFAULT: runs in `dry-run` mode (lists what *would* be deleted, deletes
-# nothing). Re-run with mode=delete to actually prune. Deletion requires the
-# PACKAGECLOUD_TOKEN to have the `delete_packages` scope; if it doesn't, the dry
-# run still works (read-only) and the delete calls will report 403 — add the scope
-# to the token then.
-name: Prune Buildkite Registry
+# Modes:
+#   dry-run  list which versions WOULD be pruned (default; deletes nothing)
+#   delete   prune all but the newest `keep_versions` versions
+#   upload   download a release's .debs from GitHub and push them to the registry
+name: Buildkite Registry Admin
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "dry-run = list prune plan; delete = prune old versions; upload = push a release's .debs"
+        type: choice
+        options: [dry-run, delete, upload]
+        default: dry-run
       keep_versions:
-        description: "Number of most-recent versions to keep (each version ≈ 2 .debs)"
+        description: "[prune] number of most-recent versions to keep (each ≈ 2 .debs)"
         default: "10"
         required: true
-      mode:
-        description: "dry-run = list only; delete = actually remove old versions"
-        type: choice
-        options: [dry-run, delete]
-        default: dry-run
+      release_tag:
+        description: "[upload] release tag to push (e.g. v0.65.39); blank = latest release"
+        default: ""
 
 jobs:
-  prune:
+  registry:
     runs-on: ubuntu-latest
     steps:
-      - name: Prune old packages
+      - name: Manage Buildkite registry
         env:
-          # PACKAGECLOUD_CLEANUP_TOKEN carries read + write + delete_packages so it
-          # serves every Buildkite registry op (the old PACKAGECLOUD_TOKEN lacked
-          # delete_packages). Internal var name kept as PACKAGECLOUD_TOKEN.
+          # Single token for every Buildkite registry op (read + write + delete).
           PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_CLEANUP_TOKEN }}
-          KEEP: ${{ inputs.keep_versions }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ inputs.mode }}
+          KEEP: ${{ inputs.keep_versions }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           ORG=christopher-brown
           REG=pelagos
           BASE="https://api.buildkite.com/v2/packages/organizations/${ORG}/registries/${REG}/packages"
 
-          # 1. Fetch every package entry. The list endpoint wraps results in
-          #    {"items":[...]} and returns them OLDEST-first, so we sort by version
-          #    ourselves below rather than trusting the order.
+          # ── upload mode ────────────────────────────────────────────────────────
+          if [ "${MODE}" = "upload" ]; then
+            TAG="${RELEASE_TAG}"
+            [ -z "${TAG}" ] && TAG=$(gh release list --repo "${GITHUB_REPOSITORY}" -L 1 --json tagName -q '.[0].tagName')
+            VERSION="${TAG#v}"
+            echo "Uploading .debs for ${TAG} (version ${VERSION})"
+            mkdir -p dist
+            gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --pattern 'pelagos_*.deb' --dir dist --clobber
+            ls -1 dist/*.deb
+            fail=0
+            for f in dist/pelagos_*.deb; do
+              code=$(curl -sS -o /tmp/up_resp -w '%{http_code}' -X POST "${BASE}" \
+                -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" -F "file=@${f}")
+              if [ "$code" = "201" ] || [ "$code" = "409" ]; then
+                echo "uploaded ${f}: HTTP ${code} ($([ "$code" = "409" ] && echo "already present" || echo "ok"))"
+              else
+                echo "FAILED ${f}: HTTP ${code} -- $(cat /tmp/up_resp)"
+                fail=1
+              fi
+            done
+            [ "$fail" -ne 0 ] && { echo "::error::Upload failed (token write scope, or registry still over quota)."; exit 1; }
+            echo "Upload complete."
+            exit 0
+          fi
+
+          # ── list (shared by dry-run / delete) ──────────────────────────────────
+          # The list endpoint wraps results in {"items":[...]} and returns them
+          # OLDEST-first, so we sort by version ourselves below.
           : > all.ndjson
           page=1
           while :; do
@@ -65,13 +92,13 @@ jobs:
           echo "Total package entries in registry: ${total}"
           if [ "${total}" -eq 0 ]; then echo "Nothing to prune."; exit 0; fi
 
-          # 2. Keep the newest $KEEP versions by SEMVER (sort -V), regardless of API
-          #    order, so we never accidentally prune recent releases.
+          # Keep the newest $KEEP versions by SEMVER (sort -V), regardless of API
+          # order, so we never accidentally prune recent releases.
           mapfile -t KEEPV < <(jq -r '.version' all.ndjson | sort -uV -r | head -n "${KEEP}")
           printf 'Keeping newest %s version(s): %s\n' "${KEEP}" "${KEEPV[*]}"
           KEEPSET=$(printf '%s\n' "${KEEPV[@]}" | jq -R . | jq -s .)
 
-          # 3. Package entries whose version is NOT in the keep set.
+          # Package entries whose version is NOT in the keep set.
           jq -c --argjson keep "${KEEPSET}" 'select(.version as $v | ($keep | index($v)) | not)' all.ndjson > prune.ndjson || true
           to_prune=$(wc -l < prune.ndjson | tr -d ' ')
           echo "Package entries to prune: ${to_prune}"
@@ -86,7 +113,7 @@ jobs:
             exit 0
           fi
 
-          # 4. Delete (best-effort per item; report each).
+          # delete (best-effort per item; report each)
           fail=0
           while read -r row; do
             id=$(echo "$row" | jq -r '.id')
@@ -101,7 +128,7 @@ jobs:
             fi
           done < prune.ndjson
           if [ "$fail" -ne 0 ]; then
-            echo "::error::Some deletions failed (likely the token lacks the delete_packages scope)."
+            echo "::error::Some deletions failed (token likely lacks delete_packages scope)."
             exit 1
           fi
           echo "Prune complete."
