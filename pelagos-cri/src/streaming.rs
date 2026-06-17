@@ -232,11 +232,14 @@ async fn handle_exec(
     let handler = Arc::clone(&config.handler);
     let conn = spdystream_rs::connection::Connection::serve(tcp, move |s| handler(s)).await?;
 
-    // Wait until we have all expected streams (or timeout).
-    tokio::time::timeout(Duration::from_secs(10), state.wait_ready()).await??;
-
-    // Spawn the subprocess and relay I/O.
-    let run_result = state.run(Arc::clone(&conn)).await;
+    // Wait until we have all expected streams (or timeout), then run. On
+    // timeout/error we must STILL close the connection below — the old `??` here
+    // returned early and left the SPDY connection open, hanging the client (#339).
+    let run_result = match tokio::time::timeout(Duration::from_secs(10), state.wait_ready()).await {
+        Ok(Ok(())) => state.run(Arc::clone(&conn)).await,
+        Ok(Err(e)) => Err(e),
+        Err(elapsed) => Err(Box::new(elapsed) as Box<dyn std::error::Error + Send + Sync>),
+    };
 
     // Always close the SPDY connection so the client's sockets are released even
     // when it doesn't close from its side (critest leaves exec/attach streams
@@ -305,13 +308,18 @@ impl ExecState {
             // and stderr (id=5), but they are dispatched to different worker tasks
             // so there is a real (if unlikely) race.
             let stdin_ok = !self.pending.stdin || self.stdin_stream.lock().await.is_some();
+            // With a TTY there is NO separate stderr stream (it is merged into
+            // stdout), so don't wait for one — otherwise tty execs block here until
+            // the 10s timeout and then hang the client (#339).
+            let stderr_ok = self.pending.tty || has_stderr;
             // error stream uses a different worker than stdout/stderr so it
             // may not have arrived yet; wait for it since we need it for exit code.
             let has_error = self.error_stream.lock().await.is_some();
             log::debug!(
-                "wait_ready: stdout={has_stdout} stderr={has_stderr} stdin_ok={stdin_ok} error={has_error}"
+                "wait_ready: stdout={has_stdout} stderr={has_stderr} stdin_ok={stdin_ok} error={has_error} tty={}",
+                self.pending.tty
             );
-            if has_stdout && has_stderr && stdin_ok && has_error {
+            if has_stdout && stderr_ok && stdin_ok && has_error {
                 return Ok(());
             }
             notified.await;
@@ -325,12 +333,18 @@ impl ExecState {
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
 
-        // Build: pelagos exec <name> [--] <cmd...>
-        let mut args = vec![
-            "exec".to_string(),
-            self.pending.container_name.clone(),
-            "--".to_string(),
-        ];
+        // Build: pelagos exec [-i] <name> -- <cmd...>
+        // For tty=true we pass `-i`, which makes `pelagos exec` allocate a real PTY
+        // for the container command (controlling TTY via setsid+TIOCSCTTY) and merge
+        // its stdout+stderr onto that PTY. We feed it pipes; its InteractiveSession
+        // skips raw-mode when its own stdin isn't a TTY, so the SPDY bytes pass
+        // through unchanged and the container still sees an actual terminal.
+        let mut args = vec!["exec".to_string()];
+        if self.pending.tty {
+            args.push("-i".to_string());
+        }
+        args.push(self.pending.container_name.clone());
+        args.push("--".to_string());
         args.extend_from_slice(&self.pending.cmd);
 
         let mut child = Command::new(&self.pelagos_bin)
@@ -341,12 +355,19 @@ impl ExecState {
                 std::process::Stdio::null()
             })
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            // With a TTY the inner PTY merges stderr into stdout; only `pelagos
+            // exec`'s own diagnostic stderr would arrive here, so drop it. Without
+            // a TTY, capture stderr for the separate SPDY stderr stream.
+            .stderr(if self.pending.tty {
+                std::process::Stdio::null()
+            } else {
+                std::process::Stdio::piped()
+            })
             .spawn()?;
 
         let mut child_stdin = child.stdin.take();
         let child_stdout = child.stdout.take().expect("stdout piped");
-        let child_stderr = child.stderr.take().expect("stderr piped");
+        let child_stderr = child.stderr.take(); // None when tty (stderr → null)
 
         // Keep Arcs for FIN sending after relay tasks complete.
         let stdout_stream = self.stdout_stream.lock().await.clone();
@@ -362,12 +383,14 @@ impl ExecState {
             None
         };
 
-        // Relay stderr: child → SPDY stream (data only; FIN sent explicitly below)
-        let stderr_task = if let Some(ref spdy_err) = stderr_stream {
-            let t = tokio::spawn(relay_read_to_spdy_data(child_stderr, Arc::clone(spdy_err)));
-            Some(t)
-        } else {
-            None
+        // Relay stderr: child → SPDY stream (non-tty only; tty merged it into
+        // stdout, so child_stderr is None there).
+        let stderr_task = match (child_stderr, stderr_stream.as_ref()) {
+            (Some(child_stderr), Some(spdy_err)) => Some(tokio::spawn(relay_read_to_spdy_data(
+                child_stderr,
+                Arc::clone(spdy_err),
+            ))),
+            _ => None,
         };
 
         // Relay stdin: SPDY stream → child
