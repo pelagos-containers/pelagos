@@ -40,18 +40,20 @@ jobs:
           REG=pelagos
           BASE="https://api.buildkite.com/v2/packages/organizations/${ORG}/registries/${REG}/packages"
 
-          # 1. Fetch every package entry (paginated, newest-first).
+          # 1. Fetch every package entry. The list endpoint wraps results in
+          #    {"items":[...]} and returns them OLDEST-first, so we sort by version
+          #    ourselves below rather than trusting the order.
           : > all.ndjson
           page=1
           while :; do
             resp=$(curl -sS -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" "${BASE}?per_page=100&page=${page}")
-            if ! echo "$resp" | jq -e 'type=="array"' >/dev/null 2>&1; then
-              echo "::error::List API did not return an array (page ${page}). Response:"
+            if ! echo "$resp" | jq -e '.items | type=="array"' >/dev/null 2>&1; then
+              echo "::error::List API response had no .items array (page ${page}). Response:"
               echo "$resp"
               exit 1
             fi
-            n=$(echo "$resp" | jq 'length')
-            echo "$resp" | jq -c '.[] | {id, name, version, created_at}' >> all.ndjson
+            n=$(echo "$resp" | jq '.items | length')
+            echo "$resp" | jq -c '.items[] | {id, name, version, created_at}' >> all.ndjson
             [ "$n" -lt 100 ] && break
             page=$((page + 1))
           done
@@ -60,8 +62,9 @@ jobs:
           echo "Total package entries in registry: ${total}"
           if [ "${total}" -eq 0 ]; then echo "Nothing to prune."; exit 0; fi
 
-          # 2. Newest-first unique versions; keep the first $KEEP, the rest are pruned.
-          mapfile -t KEEPV < <(jq -r '.version' all.ndjson | awk '!seen[$0]++' | head -n "${KEEP}")
+          # 2. Keep the newest $KEEP versions by SEMVER (sort -V), regardless of API
+          #    order, so we never accidentally prune recent releases.
+          mapfile -t KEEPV < <(jq -r '.version' all.ndjson | sort -uV -r | head -n "${KEEP}")
           printf 'Keeping newest %s version(s): %s\n' "${KEEP}" "${KEEPV[*]}"
           KEEPSET=$(printf '%s\n' "${KEEPV[@]}" | jq -R . | jq -s .)
 
