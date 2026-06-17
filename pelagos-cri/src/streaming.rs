@@ -494,73 +494,91 @@ async fn handle_port_forward(
 
     let pod_ip = Arc::new(pending.pod_ip.clone());
 
-    let config = ServerConfig::new(move |stream: Arc<Stream>| {
-        let pod_ip = Arc::clone(&pod_ip);
-        Box::pin(async move {
-            // kubelet sets header "port" with the target port number.
-            let port = stream
-                .headers
-                .get("port")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(0);
+    // Signalled when a data stream's relay finishes. We must NOT close the SPDY
+    // connection until then: closing immediately (the old bug) dropped the client
+    // before it even opened its data stream → critest "lost connection to pod".
+    let done = Arc::new(tokio::sync::Notify::new());
 
-            if port == 0 {
-                log::warn!("portforward: missing or invalid port header");
-                stream
-                    .reset(spdystream_rs::frame::RstStatus::ProtocolError)
-                    .await
-                    .ok();
-                return;
-            }
+    let config = ServerConfig::new({
+        let done = Arc::clone(&done);
+        move |stream: Arc<Stream>| {
+            let pod_ip = Arc::clone(&pod_ip);
+            let done = Arc::clone(&done);
+            Box::pin(async move {
+                // The portforward.k8s.io protocol opens TWO streams per port: an
+                // "error" side-channel and the actual "data" stream. Only the data
+                // stream carries bytes to/from the pod; relaying on the error stream
+                // (as the old code did, since it ignored streamType) double-connects
+                // to the pod and corrupts the forward.
+                let stream_type = stream
+                    .headers
+                    .get("streamType")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let port = stream
+                    .headers
+                    .get("port")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0);
 
-            stream.send_reply(http::HeaderMap::new(), false).await.ok();
+                stream.send_reply(http::HeaderMap::new(), false).await.ok();
 
-            let addr = format!("{pod_ip}:{port}");
-            log::debug!("portforward: connecting to {addr}");
-
-            match TcpStream::connect(&addr).await {
-                Ok(target) => {
-                    relay_spdy_tcp(stream, target).await;
+                // Error stream: accept it but leave it idle (no relay).
+                if stream_type == "error" {
+                    return;
                 }
-                Err(e) => {
-                    log::warn!("portforward: connect {addr} failed: {e}");
+
+                if port == 0 {
+                    log::warn!("portforward: missing or invalid port header");
                     stream
-                        .reset(spdystream_rs::frame::RstStatus::Cancel)
+                        .reset(spdystream_rs::frame::RstStatus::ProtocolError)
                         .await
                         .ok();
+                    done.notify_one();
+                    return;
                 }
-            }
-        })
+
+                let addr = format!("{pod_ip}:{port}");
+                log::debug!("portforward: connecting to {addr}");
+
+                match TcpStream::connect(&addr).await {
+                    Ok(target) => relay_spdy_tcp(stream, target).await,
+                    Err(e) => {
+                        log::warn!("portforward: connect {addr} failed: {e}");
+                        stream
+                            .reset(spdystream_rs::frame::RstStatus::Cancel)
+                            .await
+                            .ok();
+                    }
+                }
+                done.notify_one();
+            })
+        }
     });
 
     // HTTP upgrade already done; serve SPDY directly without re-parsing it.
     let handler = Arc::clone(&config.handler);
     let conn = spdystream_rs::connection::Connection::serve(tcp, move |s| handler(s)).await?;
+
+    // Keep the connection alive until a data relay completes (bounded so a client
+    // that never opens a data stream can't wedge us), then close to release the
+    // client's sockets.
+    let _ = tokio::time::timeout(Duration::from_secs(60), done.notified()).await;
     let _ = conn.close().await;
     Ok(())
 }
 
 /// Bidirectional relay between a SPDY stream and a TCP connection.
-async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, mut tcp: TcpStream) {
+async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, tcp: TcpStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut tcp_read, mut tcp_write) = tcp.split();
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
-    // SPDY → TCP
-    let stream_to_tcp = {
-        let stream = Arc::clone(&stream);
-        async move {
-            while let Ok(Some(data)) = stream.read_data().await {
-                if tcp_write.write_all(&data).await.is_err() {
-                    break;
-                }
-            }
-        }
-    };
-
-    // TCP → SPDY
-    let tcp_to_stream = {
+    // pod → client. AUTHORITATIVE: once the pod closes its side, the forward is
+    // finished; we propagate that as a SPDY half-close (FIN) to the client.
+    let pod_to_client = {
         let stream = Arc::clone(&stream);
         async move {
             let mut buf = vec![0u8; 32 * 1024];
@@ -579,5 +597,28 @@ async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, mut tcp: TcpStream) 
         }
     };
 
-    tokio::join!(stream_to_tcp, tcp_to_stream);
+    // client → pod. Best-effort; propagate the client's half-close to the pod by
+    // shutting down the pod-side write half when the client stops sending.
+    let client_to_pod = async move {
+        while let Ok(Some(data)) = stream.read_data().await {
+            if tcp_write.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        let _ = tcp_write.shutdown().await;
+    };
+
+    // THE #339 PORT-FORWARD HANG: the old code `tokio::join!`-ed both directions,
+    // so the forward only completed when BOTH closed. But port-forward clients
+    // (kubelet/critest) read the pod's reply and never half-close their otherwise
+    // idle write stream, so client→pod blocked forever and the forward hung
+    // ("lost connection to pod"). The pod→client direction is authoritative — the
+    // moment the pod closes we finish and FIN the client, regardless of whether
+    // the client ever closes its write half. If the client closes first, we keep
+    // draining the pod's response to completion.
+    tokio::pin!(pod_to_client);
+    tokio::select! {
+        _ = &mut pod_to_client => {}
+        _ = client_to_pod => { pod_to_client.await; }
+    }
 }
