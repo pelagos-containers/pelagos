@@ -1,0 +1,101 @@
+# Manually-triggered pruner for the Buildkite package registry.
+#
+# The registry hit its plan's resource limit ("Resource limit reached. Please
+# contact support@buildkite.com to upgrade." — HTTP 403 on upload), which is why
+# .deb publishing stopped around v0.65.36. The token is fine; the registry is just
+# full. This deletes old package versions to get back under the cap.
+#
+# SAFE BY DEFAULT: runs in `dry-run` mode (lists what *would* be deleted, deletes
+# nothing). Re-run with mode=delete to actually prune. Deletion requires the
+# PACKAGECLOUD_TOKEN to have the `delete_packages` scope; if it doesn't, the dry
+# run still works (read-only) and the delete calls will report 403 — add the scope
+# to the token then.
+name: Prune Buildkite Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_versions:
+        description: "Number of most-recent versions to keep (each version ≈ 2 .debs)"
+        default: "10"
+        required: true
+      mode:
+        description: "dry-run = list only; delete = actually remove old versions"
+        type: choice
+        options: [dry-run, delete]
+        default: dry-run
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old packages
+        env:
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+          KEEP: ${{ inputs.keep_versions }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          ORG=christopher-brown
+          REG=pelagos
+          BASE="https://api.buildkite.com/v2/packages/organizations/${ORG}/registries/${REG}/packages"
+
+          # 1. Fetch every package entry (paginated, newest-first).
+          : > all.ndjson
+          page=1
+          while :; do
+            resp=$(curl -sS -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" "${BASE}?per_page=100&page=${page}")
+            if ! echo "$resp" | jq -e 'type=="array"' >/dev/null 2>&1; then
+              echo "::error::List API did not return an array (page ${page}). Response:"
+              echo "$resp"
+              exit 1
+            fi
+            n=$(echo "$resp" | jq 'length')
+            echo "$resp" | jq -c '.[] | {id, name, version, created_at}' >> all.ndjson
+            [ "$n" -lt 100 ] && break
+            page=$((page + 1))
+          done
+
+          total=$(wc -l < all.ndjson | tr -d ' ')
+          echo "Total package entries in registry: ${total}"
+          if [ "${total}" -eq 0 ]; then echo "Nothing to prune."; exit 0; fi
+
+          # 2. Newest-first unique versions; keep the first $KEEP, the rest are pruned.
+          mapfile -t KEEPV < <(jq -r '.version' all.ndjson | awk '!seen[$0]++' | head -n "${KEEP}")
+          printf 'Keeping newest %s version(s): %s\n' "${KEEP}" "${KEEPV[*]}"
+          KEEPSET=$(printf '%s\n' "${KEEPV[@]}" | jq -R . | jq -s .)
+
+          # 3. Package entries whose version is NOT in the keep set.
+          jq -c --argjson keep "${KEEPSET}" 'select(.version as $v | ($keep | index($v)) | not)' all.ndjson > prune.ndjson || true
+          to_prune=$(wc -l < prune.ndjson | tr -d ' ')
+          echo "Package entries to prune: ${to_prune}"
+          if [ "${to_prune}" -eq 0 ]; then echo "Already within the keep window. Done."; exit 0; fi
+
+          echo "----- versions slated for pruning -----"
+          jq -r '"\(.version)\t\(.name)\t\(.created_at)\t\(.id)"' prune.ndjson | sort -u
+          echo "---------------------------------------"
+
+          if [ "${MODE}" != "delete" ]; then
+            echo "DRY-RUN: nothing deleted. Re-run with mode=delete to prune the ${to_prune} entries above."
+            exit 0
+          fi
+
+          # 4. Delete (best-effort per item; report each).
+          fail=0
+          while read -r row; do
+            id=$(echo "$row" | jq -r '.id')
+            ver=$(echo "$row" | jq -r '.version')
+            code=$(curl -sS -o /tmp/del_resp -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" "${BASE}/${id}")
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "deleted ${ver} (${id}): HTTP ${code}"
+            else
+              echo "FAILED ${ver} (${id}): HTTP ${code} -- $(cat /tmp/del_resp)"
+              fail=1
+            fi
+          done < prune.ndjson
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Some deletions failed (likely the token lacks the delete_packages scope)."
+            exit 1
+          fi
+          echo "Prune complete."
