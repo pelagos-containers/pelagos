@@ -211,6 +211,15 @@ jobs:
   # the failure is honestly reported on its own job rather than masked.
   publish-buildkite:
     needs: [package]
+    # TEMPORARILY DISABLED (2026-06): the Buildkite package registry is over its
+    # monthly storage+bandwidth quota (Personal plan = 1 GB/month hard limit), so
+    # uploads return 403 until the monthly reset. The job is already decoupled so it
+    # can't block AUR/tap/crate, but a failed job still marks the whole release run
+    # red. Disable it for now so releases go green. RE-ENABLE by removing this
+    # `if: false` once the quota resets (or the plan is upgraded); use the
+    # "Buildkite Registry Admin" workflow's `upload` mode to backfill any versions
+    # missed in the meantime. See project_packagecloud_403.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Download packages artifact
