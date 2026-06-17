@@ -404,6 +404,11 @@ jobs:
             su builder -c 'cd /src/pkg/aur/pelagos     && makepkg --printsrcinfo > .SRCINFO'
             su builder -c 'cd /src/pkg/aur/pelagos-bin && makepkg --printsrcinfo > .SRCINFO'
           "
+          # makepkg ran as the in-container `builder` user, leaving pkg/aur owned
+          # by builder's UID. Restore host-runner ownership so the later
+          # `git pull --rebase` (Commit updated PKGBUILDs to main repo) can unlink
+          # and rewrite these files instead of failing with "Permission denied".
+          sudo chown -R "$(id -u):$(id -g)" pkg/aur
       - name: Push pelagos to AUR
         run: |
           git clone ssh://aur@aur.archlinux.org/pelagos.git /tmp/aur-pelagos
