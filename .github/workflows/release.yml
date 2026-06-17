@@ -202,15 +202,23 @@ jobs:
         with:
           name: packages
           path: dist/packages/
+  # Secondary distribution channel — deliberately OFF the critical path. NOTHING
+  # `needs:` this job, so a broken/expired PACKAGECLOUD_TOKEN (HTTP 403) can neither
+  # fail the release nor skip package-test / update-aur / update-tap / publish-crate;
+  # it runs in parallel with them. The .deb reaches the Buildkite registry only when
+  # the token is valid — everything users actually consume (GitHub release, AUR,
+  # Homebrew tap, crates.io) is fully independent of it. Keeps `exit 1` on error so
+  # the failure is honestly reported on its own job rather than masked.
+  publish-buildkite:
+    needs: [package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist/packages
       - name: Publish to Buildkite package registry
-        # Best-effort: the Buildkite registry is a secondary distribution channel.
-        # A broken/expired PACKAGECLOUD_TOKEN (HTTP 403) must NOT fail this job and
-        # thereby skip the downstream package-test -> update-aur / update-tap /
-        # publish-crate jobs. The GitHub release (binaries + .deb/.rpm) and AUR/tap/
-        # crate publishes are what users actually consume; don't let them be held
-        # hostage to this one upload. (Unblocks the AUR/tap/crate backlog since
-        # v0.65.36; #400-adjacent release-infra fix.)
-        continue-on-error: true
         env:
           PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
         run: |
