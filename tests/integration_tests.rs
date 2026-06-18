@@ -3249,6 +3249,95 @@ mod stats {
             name
         );
     }
+
+    /// `pelagos run --detach --stdin` must wire the container's stdin to a
+    /// persistent FIFO at `/run/pelagos/containers/<name>/stdin` so that input
+    /// written to the FIFO after launch reaches the running process, and the
+    /// container does NOT EOF-exit while idle (the watcher holds the FIFO open).
+    /// This is the runtime foundation for CRI `attach` (#403): a failure here
+    /// means an interactive container either never receives attached input or
+    /// exits immediately at startup.
+    #[test]
+    fn test_run_stdin_fifo() {
+        if !is_root() {
+            eprintln!("Skipping test_run_stdin_fifo: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_run_stdin_fifo: alpine-rootfs not found");
+            return;
+        };
+
+        let name = format!("test-stdin-{}", std::process::id());
+
+        // A shell that echoes each stdin line with a marker prefix.
+        let start = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args([
+                "run",
+                "--detach",
+                "--stdin",
+                "--name",
+                &name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                "while read line; do echo \"got:$line\"; done",
+            ])
+            .output()
+            .expect("pelagos run --stdin");
+        assert!(
+            start.status.success(),
+            "pelagos run --stdin failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let fifo = format!("/run/pelagos/containers/{name}/stdin");
+        let stdout_log = format!("/run/pelagos/containers/{name}/stdout.log");
+
+        // The stdin FIFO must exist and be a named pipe.
+        let is_fifo = std::fs::metadata(&fifo)
+            .map(|m| {
+                use std::os::unix::fs::FileTypeExt;
+                m.file_type().is_fifo()
+            })
+            .unwrap_or(false);
+
+        // Write a line to the FIFO; the container should echo it.
+        if is_fifo {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&fifo) {
+                let _ = f.write_all(b"ping123\n");
+                let _ = f.flush();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        let log = std::fs::read_to_string(&stdout_log).unwrap_or_default();
+
+        // Container must still be running (it did not EOF-exit while idle).
+        let ps = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["ps"])
+            .output()
+            .expect("pelagos ps");
+        let running = String::from_utf8_lossy(&ps.stdout).contains(&name);
+
+        // Clean up regardless of assertions.
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["rm", "--force", &name])
+            .output();
+
+        assert!(is_fifo, "stdin FIFO not created at {fifo}");
+        assert!(
+            log.contains("got:ping123"),
+            "container did not echo FIFO stdin; stdout.log = {log:?}"
+        );
+        assert!(
+            running,
+            "container with --stdin EOF-exited while idle (should stay running)"
+        );
+    }
 }
 
 mod networking {

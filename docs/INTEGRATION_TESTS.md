@@ -5349,3 +5349,17 @@ the subsequent `systemctl stop` would block host **PID 1** uninterruptibly in `c
 `fork`/SSH-session hangs. A failure here means the namespace-collapse invariant the drain relies on
 is broken. (The systemd-ordering half — drain-before-`systemctl stop` — is covered end-to-end by
 the critest `NamespaceOption` conformance bucket, which hung indefinitely before this fix.)
+
+## `stats::test_run_stdin_fifo`
+**Requires root** and the Alpine rootfs; skipped if either is missing.
+Covers the new `pelagos run --detach --stdin` path that underpins CRI `attach` (#403). Starts a
+detached `/bin/sh` loop (`while read line; do echo "got:$line"; done`), then asserts three things:
+(1) a **named-pipe** `stdin` FIFO is created at `/run/pelagos/containers/<name>/stdin`; (2) a line
+written to that FIFO after launch is read by the running shell and echoed (`got:ping123` appears in
+the container's `stdout.log`) — proving input reaches the live process post-launch; and (3) the
+container is **still running** afterward, i.e. it did not see stdin EOF and exit at startup (the
+watcher holds an `O_RDWR` keeper fd on the FIFO). **Why it matters:** CRI attach delivers the
+client's stdin by writing to this FIFO; if the FIFO is absent, not wired to the container's stdin,
+or EOFs immediately, an attached interactive container would either never receive input or exit
+before it could be attached to. A failure here breaks `kubectl attach` / the critest attach
+conformance spec at the runtime layer.

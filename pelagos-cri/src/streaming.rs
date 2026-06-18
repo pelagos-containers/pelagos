@@ -170,8 +170,14 @@ async fn handle_connection(
     send_upgrade_response_with_protocol(&mut tcp, protocol.as_deref()).await?;
 
     match (kind, pending) {
-        ("exec" | "attach", Pending::Exec(p)) => {
+        ("exec", Pending::Exec(p)) => {
             handle_exec(tcp, p, pelagos_bin).await?;
+        }
+        // Attach is NOT exec-with-empty-command: it wires the client's streams to
+        // the ALREADY-RUNNING container's stdio (stdin FIFO + tailing the raw
+        // stdout/stderr logs), so it has its own handler (#403).
+        ("attach", Pending::Exec(p)) => {
+            handle_attach(tcp, p).await?;
         }
         ("portforward", Pending::PortForward(p)) => {
             handle_port_forward(tcp, p).await?;
@@ -268,6 +274,110 @@ async fn handle_exec(
 
     run_result?;
     Ok(())
+}
+
+// ── Attach handler ──────────────────────────────────────────────────────────────
+
+/// Handle a CRI `attach`: wire the client's SPDY streams to the ALREADY-RUNNING
+/// container's stdio. Unlike exec, attach spawns no process — it relays the
+/// client's stdin into the container's persistent stdin FIFO and tails the
+/// container's raw stdout/stderr logs back to the client. It runs until the
+/// client detaches (closes the connection) (#403).
+async fn handle_attach(
+    tcp: TcpStream,
+    pending: PendingExec,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use spdystream_rs::server::ServerConfig;
+    use spdystream_rs::Stream;
+
+    let container_dir = format!("/run/pelagos/containers/{}", pending.container_name);
+    log::info!(
+        "streaming attach: container={} dir={} stdin={} stdout={} stderr={} tty={}",
+        pending.container_name,
+        container_dir,
+        pending.stdin,
+        pending.stdout,
+        pending.stderr,
+        pending.tty
+    );
+
+    let state = Arc::new(ExecState::new(pending, String::new()));
+
+    let config = ServerConfig::new({
+        let state = Arc::clone(&state);
+        move |stream: Arc<Stream>| {
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                let stream_type = stream
+                    .headers
+                    .get("streamType")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                log::debug!(
+                    "attach stream: id={} type={stream_type:?}",
+                    stream.stream_id
+                );
+                stream.send_reply(http::HeaderMap::new(), false).await.ok();
+                state.register_stream(stream_type, stream).await;
+            })
+        }
+    });
+
+    let handler = Arc::clone(&config.handler);
+    let conn = spdystream_rs::connection::Connection::serve(tcp, move |s| handler(s)).await?;
+
+    let run_result = match tokio::time::timeout(Duration::from_secs(10), state.wait_ready()).await {
+        Ok(Ok(())) => {
+            state.run_attach(Arc::clone(&conn), container_dir).await;
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(elapsed) => Err(Box::new(elapsed) as Box<dyn std::error::Error + Send + Sync>),
+    };
+
+    // run_attach already blocked on the client closing; this is the backstop
+    // GoAway+close (mirrors handle_exec / #402).
+    let _ = conn.close().await;
+    run_result?;
+    Ok(())
+}
+
+/// Tail `path` from `start_off`, streaming newly-appended bytes to `stream` as
+/// SPDY DATA frames until `cancel` fires. Polls at 50 ms — fast enough for an
+/// interactive attach without busy-spinning.
+async fn tail_file_to_spdy(
+    path: String,
+    start_off: u64,
+    stream: Arc<spdystream_rs::Stream>,
+    cancel: Arc<tokio::sync::Notify>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut offset = start_off;
+    loop {
+        if let Ok(mut f) = tokio::fs::File::open(&path).await {
+            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match f.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            offset += n as u64;
+                            let data = Bytes::copy_from_slice(&buf[..n]);
+                            if stream.write_data(data, false).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.notified() => return,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
 }
 
 /// Holds per-exec mutable state collected as SPDY streams arrive.
@@ -492,6 +602,129 @@ impl ExecState {
         // crictl's error-stream goroutine: if crictl processes GoAway before
         // it reads the error DATA frame, it may report exit code 0.
         Ok(())
+    }
+
+    /// Relay an attach: client stdin → the container's stdin FIFO, and the
+    /// container's raw stdout/stderr logs → the client's stdout/stderr streams.
+    /// Runs until the client detaches (closes the connection). Unlike `run()`
+    /// there is no child process and no exit code — the error stream just FINs.
+    async fn run_attach(
+        &self,
+        conn: Arc<spdystream_rs::connection::Connection>,
+        container_dir: String,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        let stdin_stream = self.stdin_stream.lock().await.clone();
+        let stdout_stream = self.stdout_stream.lock().await.clone();
+        let stderr_stream = self.stderr_stream.lock().await.clone();
+        let error_stream = self.error_stream.lock().await.clone();
+
+        // Capture the current log sizes UP FRONT (before relaying any stdin) so
+        // the tailers stream only output produced from the attach point onward —
+        // matching `kubectl attach` semantics — and so the echo of any command
+        // the client sends can't be missed by a late offset read.
+        let stdout_path = format!("{container_dir}/stdout.log");
+        let stderr_path = format!("{container_dir}/stderr.log");
+        let stdout_off = tokio::fs::metadata(&stdout_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let stderr_off = tokio::fs::metadata(&stderr_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        // Fires when the client half-closes its stdin stream (it has sent all
+        // input). For an interactive `/bin/sh` this is the cue that the output
+        // for the just-sent input is about to be produced and the attach can be
+        // finalized — kubelet/critest attach with StdinOnce expect the stream to
+        // complete after the input is delivered, not stay open forever (#403).
+        let stdin_closed = Arc::new(tokio::sync::Notify::new());
+
+        // stdin: client stream → container stdin FIFO. Opening O_WRONLY succeeds
+        // because the container (and the watcher's keeper fd) hold the read side
+        // open; writes flow straight to the running process.
+        let stdin_task = match (self.pending.stdin, stdin_stream) {
+            (true, Some(spdy_in)) => {
+                let fifo = format!("{container_dir}/stdin");
+                let stdin_closed = Arc::clone(&stdin_closed);
+                Some(tokio::spawn(async move {
+                    let mut f = match tokio::fs::OpenOptions::new().write(true).open(&fifo).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log::warn!("attach: open stdin fifo {fifo}: {e}");
+                            return;
+                        }
+                    };
+                    while let Ok(Some(data)) = spdy_in.read_data().await {
+                        if f.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        let _ = f.flush().await;
+                    }
+                    // Client closed its stdin stream — signal finalization.
+                    stdin_closed.notify_waiters();
+                }))
+            }
+            _ => None,
+        };
+
+        // stdout/stderr: tail the raw container logs → client streams.
+        let stdout_task = stdout_stream.clone().map(|s| {
+            tokio::spawn(tail_file_to_spdy(
+                stdout_path,
+                stdout_off,
+                s,
+                Arc::clone(&cancel),
+            ))
+        });
+        let stderr_task = stderr_stream.clone().map(|s| {
+            tokio::spawn(tail_file_to_spdy(
+                stderr_path,
+                stderr_off,
+                s,
+                Arc::clone(&cancel),
+            ))
+        });
+
+        // Attach ends when the client detaches (closes the connection) OR, for a
+        // one-shot stdin attach, shortly after the client closes its stdin
+        // stream: the input has been delivered, so we give the container a brief
+        // moment to flush the resulting output, then finalize by FIN-ing the
+        // streams. Without this the streams would stay open forever (the FIFO
+        // keeper prevents the container from EOF-exiting), the client would
+        // never see stdout completion, and the attach would hang (#403).
+        tokio::select! {
+            _ = conn.wait_closed() => {}
+            _ = stdin_closed.notified(), if self.pending.stdin => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
+
+        // Stop the relays.
+        cancel.notify_waiters();
+        if let Some(t) = stdin_task {
+            t.abort();
+        }
+        if let Some(t) = stdout_task {
+            let _ = t.await;
+        }
+        if let Some(t) = stderr_task {
+            let _ = t.await;
+        }
+
+        // Best-effort FINs (the client is already detaching).
+        if let Some(ref s) = error_stream {
+            s.write_data(Bytes::new(), true).await.ok();
+        }
+        if let Some(ref s) = stdout_stream {
+            s.write_data(Bytes::new(), true).await.ok();
+        }
+        if let Some(ref s) = stderr_stream {
+            s.write_data(Bytes::new(), true).await.ok();
+        }
     }
 }
 

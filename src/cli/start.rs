@@ -110,6 +110,7 @@ fn spawn_config_to_run_args(
         rm: false,
         interactive: false,
         tty: false,
+        stdin: false,
         network: sc.network,
         publish: sc.publish,
         nat: sc.nat,

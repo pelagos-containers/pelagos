@@ -312,6 +312,13 @@ pub struct CriContainer {
     /// SELinux label "user:role:type:level" (empty = not set).
     #[serde(default)]
     pub selinux_label: String,
+    /// Container was created with `stdin: true` — keep its stdin open on a FIFO
+    /// (`pelagos run --stdin`) so a later `attach` can deliver input (#403).
+    #[serde(default)]
+    pub stdin: bool,
+    /// Container was created with `tty: true` (CRI ContainerConfig.tty).
+    #[serde(default)]
+    pub tty: bool,
 }
 
 fn default_oom_score_unset() -> i32 {
