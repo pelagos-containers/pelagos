@@ -1642,6 +1642,8 @@ impl RuntimeService for RuntimeSvc {
             stop_signal,
             hugepage_limits,
             selinux_label,
+            stdin: config.stdin,
+            tty: config.tty,
         };
 
         {
@@ -1677,6 +1679,15 @@ impl RuntimeService for RuntimeSvc {
             "--sandbox".into(),
             container.sandbox_id.clone(),
         ];
+
+        // Keep the container's stdin open on a FIFO when it was created with
+        // `stdin: true`, so a later CRI `attach` can deliver input to the running
+        // process (#403). Without this the detached container's stdin is
+        // /dev/null and an interactive process (e.g. a shell) would see EOF and
+        // exit immediately.
+        if container.stdin {
+            args.push("--stdin".into());
+        }
 
         for (k, v) in &container.envs {
             args.push("--env".into());

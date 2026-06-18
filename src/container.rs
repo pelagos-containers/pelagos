@@ -829,14 +829,27 @@ pub enum Stdio {
     /// Creates a pipe between parent and child. The parent can read/write
     /// through the pipe to communicate with the child.
     Piped,
+
+    /// Use an already-open file descriptor as the stream.
+    ///
+    /// Ownership of the fd is transferred to the spawned process (the
+    /// underlying `std::process::Command` dup2's it onto the target stdio slot
+    /// and closes the original after spawn). Used to wire a container's stdin to
+    /// a persistent FIFO so a CRI `attach` can deliver input to the running
+    /// process after launch.
+    Fd(std::os::unix::io::RawFd),
 }
 
 impl From<Stdio> for process::Stdio {
     fn from(stdio: Stdio) -> Self {
+        use std::os::unix::io::FromRawFd;
         match stdio {
             Stdio::Inherit => process::Stdio::inherit(),
             Stdio::Null => process::Stdio::null(),
             Stdio::Piped => process::Stdio::piped(),
+            // Safety: the caller guarantees `fd` is a valid, owned descriptor it
+            // no longer uses; `Stdio` takes ownership and closes it after spawn.
+            Stdio::Fd(fd) => unsafe { process::Stdio::from_raw_fd(fd) },
         }
     }
 }
@@ -5708,21 +5721,9 @@ impl Command {
             let extra_args: Vec<std::ffi::OsString> =
                 self.inner.get_args().map(|a| a.to_owned()).collect();
 
-            let stdin = match self.stdio_in {
-                Stdio::Inherit => std::process::Stdio::inherit(),
-                Stdio::Null => std::process::Stdio::null(),
-                Stdio::Piped => std::process::Stdio::piped(),
-            };
-            let stdout = match self.stdio_out {
-                Stdio::Inherit => std::process::Stdio::inherit(),
-                Stdio::Null => std::process::Stdio::null(),
-                Stdio::Piped => std::process::Stdio::piped(),
-            };
-            let stderr = match self.stdio_err {
-                Stdio::Inherit => std::process::Stdio::inherit(),
-                Stdio::Null => std::process::Stdio::null(),
-                Stdio::Piped => std::process::Stdio::piped(),
-            };
+            let stdin: std::process::Stdio = self.stdio_in.into();
+            let stdout: std::process::Stdio = self.stdio_out.into();
+            let stderr: std::process::Stdio = self.stdio_err.into();
 
             let inner =
                 crate::wasm::spawn_wasm(&prog_path, &extra_args, &wasi, stdin, stdout, stderr)

@@ -1,5 +1,6 @@
 //! `pelagos run` — create and start a container.
 
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// PID of the container process being watched.  Written once after spawn,
@@ -57,6 +58,13 @@ pub struct RunArgs {
     /// Pelagos has no "stdin without PTY" mode; `-t` is a no-op alias. (pelagos#149)
     #[clap(long = "tty", short = 't')]
     pub tty: bool,
+
+    /// Keep the container's stdin open on a persistent FIFO (`--detach` only) so a
+    /// later `attach` can deliver input to the running process. Without it a
+    /// detached container's stdin is /dev/null. Used by the CRI runtime for
+    /// containers created with `stdin: true`.
+    #[clap(long = "stdin")]
+    pub stdin: bool,
 
     /// Network mode (repeatable for multi-network): none, loopback, bridge, pasta, or named
     /// First value is primary; additional values attach secondary bridge interfaces.
@@ -448,6 +456,7 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             attach_stdout,
             attach_stderr,
             upper_dir: persistent_upper,
+            keep_stdin: args.stdin,
         })
     } else if args.interactive {
         run_interactive(
@@ -1471,6 +1480,9 @@ struct DetachedArgs {
     attach_stdout: bool,
     attach_stderr: bool,
     upper_dir: Option<PathBuf>,
+    /// Wire the container's stdin to a persistent FIFO (`<dir>/stdin`) instead of
+    /// /dev/null so a later `attach` can write to the running process.
+    keep_stdin: bool,
 }
 
 fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1485,6 +1497,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         attach_stdout,
         attach_stderr,
         upper_dir,
+        keep_stdin,
     } = a;
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
@@ -1493,6 +1506,19 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let stdout_log = dir.join("stdout.log");
     let stderr_log = dir.join("stderr.log");
+    let stdin_fifo = dir.join("stdin");
+
+    // For an attachable container (`--stdin`), create a FIFO that becomes the
+    // container's stdin. The watcher holds an O_RDWR "keeper" fd open for the
+    // container's lifetime so the FIFO never reaches EOF (the process keeps
+    // waiting for input) and so the container's O_RDONLY open below does not
+    // block. A later `attach` opens the FIFO O_WRONLY and writes the client's
+    // stdin into the running process.
+    if keep_stdin {
+        let c = std::ffi::CString::new(stdin_fifo.as_os_str().as_bytes())?;
+        // mkfifo; ignore EEXIST so a restart/reuse of the dir is harmless.
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    }
 
     let state = ContainerState {
         name: name.clone(),
@@ -1594,11 +1620,31 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = write_state(&early);
             }
 
-            // Set up piped stdio so we can relay to log files.
-            cmd = cmd
-                .stdin(Stdio::Null)
-                .stdout(Stdio::Piped)
-                .stderr(Stdio::Piped);
+            // Set up piped stdout/stderr so we can relay to log files.
+            cmd = cmd.stdout(Stdio::Piped).stderr(Stdio::Piped);
+
+            // stdin: /dev/null by default; for an attachable container open the
+            // FIFO. The watcher holds an O_RDWR "keeper" fd for the whole
+            // container lifetime so the FIFO never EOFs and the container's
+            // O_RDONLY open does not block; `_stdin_keeper` keeps it alive until
+            // the watcher exits (which closes it). The O_RDONLY read end becomes
+            // the container's stdin (fd 0) and must NOT be O_CLOEXEC so it
+            // survives the exec into the container.
+            let _stdin_keeper = if keep_stdin {
+                let c = std::ffi::CString::new(stdin_fifo.as_os_str().as_bytes())
+                    .expect("fifo path has no NUL");
+                let keeper = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+                let child_stdin = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+                if keeper < 0 || child_stdin < 0 {
+                    eprintln!("pelagos watcher: open stdin fifo failed");
+                    unsafe { libc::_exit(1) };
+                }
+                cmd = cmd.stdin(Stdio::Fd(child_stdin));
+                keeper
+            } else {
+                cmd = cmd.stdin(Stdio::Null);
+                -1
+            };
 
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
