@@ -39,12 +39,33 @@ for the duration of a critest sweep and always restarts + uncordons it afterward
 (restore runs even on failure/interrupt). Between sweeps ipc6 contributes its
 capacity to the cluster.
 
+## Builder image
+
+The Job runs in a **derived builder image** — `rust:1-bookworm` + a modern protoc
+baked in (`k8s/build/builder.Dockerfile`). protoc is a build dependency
+(pelagos-cri's tonic-build) that must be newer than Debian apt's (3.21, too old
+for the CRI api.proto's `debug_redact`); baking it into the image keeps it a
+versioned, pullable dependency instead of node-local host state.
+
+Built and hosted entirely with pelagos (dogfood), into the cluster Zot registry:
+```bash
+# on a cluster node (e.g. ipc4)
+sudo pelagos build -t 192.168.89.2:5004/pelagos-builder:rust-protoc-34.1 \
+  --file k8s/build/builder.Dockerfile k8s/build
+sudo pelagos image push --insecure 192.168.89.2:5004/pelagos-builder:rust-protoc-34.1
+```
+The Job's `image:` points at that ref. `192.168.*` is auto-treated as an insecure
+(HTTP) registry by pelagos's `oci_client_config`, so the pod pulls it with no
+extra config. Bump the protoc version → rebuild + re-push under a new tag and
+update `pelagos-build-job.yaml`.
+
 ## One-time setup
 
 ### Build node (ipc4)
 Node label `kubernetes.io/hostname=ipc4` already exists (k3s sets it); the Job's
 nodeAffinity uses it. hostPath dirs are auto-created (`DirectoryOrCreate`):
-`/srv/pelagos-build/{cache,staging}`. Nothing else to do — the Job runs as root.
+`/srv/pelagos-build/{cache,staging}` (cache = cargo/target/repo build data only —
+protoc now comes from the builder image). Nothing else to do — the Job runs as root.
 
 To target ipc5 instead, change the nodeAffinity value in `pelagos-build-job.yaml`.
 
@@ -82,7 +103,8 @@ node you're on), see `scripts/node-build-install.sh`.
 
 ## Status
 
-The manifests + units + driver are authored; the one-time setup above
-(systemd units on ipc6, ipc4->ipc6 SSH trust) still needs to be applied and the
-end-to-end Job run validated live. Until then, `scripts/node-build-install.sh`
-(build+install on a single node via SSH) is the working path.
+**Live and validated end-to-end.** One-time setup is applied (path-unit on ipc6,
+ipc4→{all nodes} SSH trust, builder image pushed to Zot 5004). `scripts/cluster-build.sh main`
+has been run start to finish: Job builds on ipc4 in the builder image (~15s
+incremental), delivers ipc4→ipc6 over LAN, the path-unit installs + restarts
+pelagos-cri. `scripts/node-build-install.sh` remains as a single-node fallback.

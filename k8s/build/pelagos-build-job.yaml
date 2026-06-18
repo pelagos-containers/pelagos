@@ -37,7 +37,12 @@ spec:
         runAsUser: 0  # write the host-mounted cache/staging dirs as root
       containers:
         - name: build
-          image: rust:1-bookworm  # ships cargo + a C toolchain (cc/ld)
+          # Derived builder image (rust + protoc baked in), built with
+          # `pelagos build` and hosted in the cluster Zot registry. Replaces the
+          # old host-cached-protoc hack — the image is the versioned dependency
+          # contract. 192.168.x is auto-treated as an insecure (HTTP) registry by
+          # pelagos's oci_client_config, so no extra pull config is needed.
+          image: 192.168.89.2:5004/pelagos-builder:rust-protoc-34.1
           env:
             - name: GIT_REF
               value: "__GIT_REF__"          # branch/tag/sha to build
@@ -49,18 +54,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              # pelagos-cri's tonic-build needs protoc, and recent enough to know
-              # `debug_redact` (used in the CRI api.proto) — Debian's apt protoc
-              # (3.21) is too old. Install a modern protoc once into the cache.
-              PROTOC_VER=34.1
-              export PROTOC=/cache/protoc/bin/protoc
-              if ! "$PROTOC" --version 2>/dev/null | grep -q "$PROTOC_VER"; then
-                mkdir -p /cache/protoc
-                curl -fsSL -o /tmp/protoc.zip \
-                  "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VER}/protoc-${PROTOC_VER}-linux-x86_64.zip"
-                (cd /cache/protoc && (command -v unzip >/dev/null || (apt-get update -qq && apt-get install -y -qq unzip)) && unzip -o -q /tmp/protoc.zip)
-              fi
-              "$PROTOC" --version
+              protoc --version   # baked into the builder image (on PATH)
               REPO=/cache/repo
               if [ -d "$REPO/.git" ]; then
                 git -C "$REPO" fetch --all -q
