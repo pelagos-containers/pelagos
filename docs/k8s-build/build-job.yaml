@@ -1,0 +1,70 @@
+# Example: build pelagos inside a Kubernetes/k3s cluster.
+#
+# This is a TEMPLATE — replace the <PLACEHOLDERS> for your environment. It builds
+# the `pelagos` and `pelagos-cri` binaries from a git ref and drops them on a
+# host path; how you then install them on your nodes is up to you (a systemd
+# path-unit, an init job, manual copy, etc.).
+#
+# Prereqs:
+#   * Build + push the builder image (builder.Dockerfile) to <REGISTRY>.
+#   * `kubectl apply -f build-job.yaml` (sed/envsubst the placeholders first).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pelagos-build
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      # Pin to a node with enough CPU/RAM to compile (and where you want the
+      # output to land). Replace with your node's hostname.
+      nodeSelector:
+        kubernetes.io/hostname: <BUILD_NODE>
+      securityContext:
+        runAsUser: 0   # to write the host-mounted cache/output dirs
+      containers:
+        - name: build
+          # The builder image you pushed (see builder.Dockerfile). protoc is
+          # baked in, so the build does no protoc download.
+          image: <REGISTRY>/pelagos-builder:rust-protoc-34.1
+          env:
+            - name: GIT_REF
+              value: "main"                 # branch / tag / sha to build
+            - name: CARGO_HOME
+              value: /cache/cargo           # persisted → cached crates
+            - name: CARGO_TARGET_DIR
+              value: /cache/target          # persisted → incremental rebuilds
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              protoc --version              # baked into the builder image
+              REPO=/cache/repo
+              if [ -d "$REPO/.git" ]; then
+                git -C "$REPO" fetch --all -q
+              else
+                git clone -q https://github.com/pelagos-containers/pelagos.git "$REPO"
+              fi
+              cd "$REPO"
+              git checkout -q "$GIT_REF"
+              if git rev-parse --verify -q "origin/$GIT_REF" >/dev/null 2>&1; then
+                git reset --hard -q "origin/$GIT_REF"
+              fi
+              echo "building $(git rev-parse --short HEAD)"
+              cargo build --release -p pelagos -p pelagos-cri
+              install -m0755 "$CARGO_TARGET_DIR/release/pelagos" \
+                             "$CARGO_TARGET_DIR/release/pelagos-cri" /out/
+              echo "built pelagos + pelagos-cri -> /out"
+          volumeMounts:
+            - { name: cache,  mountPath: /cache }
+            - { name: output, mountPath: /out }
+      volumes:
+        # Build cache (git checkout + cargo registry + target dir). A hostPath
+        # keeps it node-local and fast; swap for a PVC if you prefer.
+        - name: cache
+          hostPath: { path: /srv/pelagos-build/cache, type: DirectoryOrCreate }
+        # Where the finished binaries land on the build node.
+        - name: output
+          hostPath: { path: /srv/pelagos-build/out, type: DirectoryOrCreate }
