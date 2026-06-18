@@ -241,12 +241,29 @@ async fn handle_exec(
         Err(elapsed) => Err(Box::new(elapsed) as Box<dyn std::error::Error + Send + Sync>),
     };
 
-    // Always close the SPDY connection so the client's sockets are released even
-    // when it doesn't close from its side (critest leaves exec/attach streams
-    // open, leaking ~93 sockets and wedging the suite). close() enqueues GoAway
-    // on the same ordered write channel as the exit-code/FIN frames already sent
-    // by run(), so those are delivered first and exit-code reporting is preserved
-    // (#339).
+    // Let the client drive teardown before we GoAway.
+    //
+    // A TTY exec opens FOUR client streams — error, stdin, stdout, and a
+    // `resize` stream — but `wait_ready` only blocks on error/stdin/stdout (a
+    // TTY has no separate stderr). For a fast-exiting command (`echo`) `run()`
+    // finishes and returns almost instantly, often BEFORE the client's `resize`
+    // SYN_STREAM reaches us. If we GoAway right away, spdystream refuses that
+    // late stream (RST_STREAM REFUSED); the client treats its TTY exec setup as
+    // failed and hangs until its own 30s deadline ("failed to open streamer")
+    // (#402). The output stream FINs sent by `run()` are already flushed, so a
+    // well-behaved client (kubelet/critest) closes its end as soon as it has
+    // read them — `wait_closed()` returns the moment that GoAway/EOF arrives,
+    // which is sub-second in the normal case. Waiting for the client to close
+    // first means its `resize` stream is accepted (replied to) rather than
+    // refused, so the exec completes.
+    //
+    // Cap the wait: a client that never closes (attach, or the critest streams
+    // that #339 found leak ~93 sockets) must not wedge the connection forever.
+    // After the cap we force the GoAway+close exactly as before — the exit-code
+    // and FIN frames were already enqueued by `run()` on the same ordered write
+    // channel, so they are delivered before the GoAway and exit reporting is
+    // preserved (#339).
+    let _ = tokio::time::timeout(Duration::from_secs(30), conn.wait_closed()).await;
     let _ = conn.close().await;
 
     run_result?;
