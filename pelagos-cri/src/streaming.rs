@@ -232,11 +232,14 @@ async fn handle_exec(
     let handler = Arc::clone(&config.handler);
     let conn = spdystream_rs::connection::Connection::serve(tcp, move |s| handler(s)).await?;
 
-    // Wait until we have all expected streams (or timeout).
-    tokio::time::timeout(Duration::from_secs(10), state.wait_ready()).await??;
-
-    // Spawn the subprocess and relay I/O.
-    let run_result = state.run(Arc::clone(&conn)).await;
+    // Wait until we have all expected streams (or timeout), then run. On
+    // timeout/error we must STILL close the connection below — the old `??` here
+    // returned early and left the SPDY connection open, hanging the client (#339).
+    let run_result = match tokio::time::timeout(Duration::from_secs(10), state.wait_ready()).await {
+        Ok(Ok(())) => state.run(Arc::clone(&conn)).await,
+        Ok(Err(e)) => Err(e),
+        Err(elapsed) => Err(Box::new(elapsed) as Box<dyn std::error::Error + Send + Sync>),
+    };
 
     // Always close the SPDY connection so the client's sockets are released even
     // when it doesn't close from its side (critest leaves exec/attach streams
@@ -305,13 +308,18 @@ impl ExecState {
             // and stderr (id=5), but they are dispatched to different worker tasks
             // so there is a real (if unlikely) race.
             let stdin_ok = !self.pending.stdin || self.stdin_stream.lock().await.is_some();
+            // With a TTY there is NO separate stderr stream (it is merged into
+            // stdout), so don't wait for one — otherwise tty execs block here until
+            // the 10s timeout and then hang the client (#339).
+            let stderr_ok = self.pending.tty || has_stderr;
             // error stream uses a different worker than stdout/stderr so it
             // may not have arrived yet; wait for it since we need it for exit code.
             let has_error = self.error_stream.lock().await.is_some();
             log::debug!(
-                "wait_ready: stdout={has_stdout} stderr={has_stderr} stdin_ok={stdin_ok} error={has_error}"
+                "wait_ready: stdout={has_stdout} stderr={has_stderr} stdin_ok={stdin_ok} error={has_error} tty={}",
+                self.pending.tty
             );
-            if has_stdout && has_stderr && stdin_ok && has_error {
+            if has_stdout && stderr_ok && stdin_ok && has_error {
                 return Ok(());
             }
             notified.await;
@@ -325,12 +333,18 @@ impl ExecState {
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
 
-        // Build: pelagos exec <name> [--] <cmd...>
-        let mut args = vec![
-            "exec".to_string(),
-            self.pending.container_name.clone(),
-            "--".to_string(),
-        ];
+        // Build: pelagos exec [-i] <name> -- <cmd...>
+        // For tty=true we pass `-i`, which makes `pelagos exec` allocate a real PTY
+        // for the container command (controlling TTY via setsid+TIOCSCTTY) and merge
+        // its stdout+stderr onto that PTY. We feed it pipes; its InteractiveSession
+        // skips raw-mode when its own stdin isn't a TTY, so the SPDY bytes pass
+        // through unchanged and the container still sees an actual terminal.
+        let mut args = vec!["exec".to_string()];
+        if self.pending.tty {
+            args.push("-i".to_string());
+        }
+        args.push(self.pending.container_name.clone());
+        args.push("--".to_string());
         args.extend_from_slice(&self.pending.cmd);
 
         let mut child = Command::new(&self.pelagos_bin)
@@ -341,12 +355,19 @@ impl ExecState {
                 std::process::Stdio::null()
             })
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            // With a TTY the inner PTY merges stderr into stdout; only `pelagos
+            // exec`'s own diagnostic stderr would arrive here, so drop it. Without
+            // a TTY, capture stderr for the separate SPDY stderr stream.
+            .stderr(if self.pending.tty {
+                std::process::Stdio::null()
+            } else {
+                std::process::Stdio::piped()
+            })
             .spawn()?;
 
         let mut child_stdin = child.stdin.take();
         let child_stdout = child.stdout.take().expect("stdout piped");
-        let child_stderr = child.stderr.take().expect("stderr piped");
+        let child_stderr = child.stderr.take(); // None when tty (stderr → null)
 
         // Keep Arcs for FIN sending after relay tasks complete.
         let stdout_stream = self.stdout_stream.lock().await.clone();
@@ -362,12 +383,14 @@ impl ExecState {
             None
         };
 
-        // Relay stderr: child → SPDY stream (data only; FIN sent explicitly below)
-        let stderr_task = if let Some(ref spdy_err) = stderr_stream {
-            let t = tokio::spawn(relay_read_to_spdy_data(child_stderr, Arc::clone(spdy_err)));
-            Some(t)
-        } else {
-            None
+        // Relay stderr: child → SPDY stream (non-tty only; tty merged it into
+        // stdout, so child_stderr is None there).
+        let stderr_task = match (child_stderr, stderr_stream.as_ref()) {
+            (Some(child_stderr), Some(spdy_err)) => Some(tokio::spawn(relay_read_to_spdy_data(
+                child_stderr,
+                Arc::clone(spdy_err),
+            ))),
+            _ => None,
         };
 
         // Relay stdin: SPDY stream → child
@@ -494,73 +517,91 @@ async fn handle_port_forward(
 
     let pod_ip = Arc::new(pending.pod_ip.clone());
 
-    let config = ServerConfig::new(move |stream: Arc<Stream>| {
-        let pod_ip = Arc::clone(&pod_ip);
-        Box::pin(async move {
-            // kubelet sets header "port" with the target port number.
-            let port = stream
-                .headers
-                .get("port")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(0);
+    // Signalled when a data stream's relay finishes. We must NOT close the SPDY
+    // connection until then: closing immediately (the old bug) dropped the client
+    // before it even opened its data stream → critest "lost connection to pod".
+    let done = Arc::new(tokio::sync::Notify::new());
 
-            if port == 0 {
-                log::warn!("portforward: missing or invalid port header");
-                stream
-                    .reset(spdystream_rs::frame::RstStatus::ProtocolError)
-                    .await
-                    .ok();
-                return;
-            }
+    let config = ServerConfig::new({
+        let done = Arc::clone(&done);
+        move |stream: Arc<Stream>| {
+            let pod_ip = Arc::clone(&pod_ip);
+            let done = Arc::clone(&done);
+            Box::pin(async move {
+                // The portforward.k8s.io protocol opens TWO streams per port: an
+                // "error" side-channel and the actual "data" stream. Only the data
+                // stream carries bytes to/from the pod; relaying on the error stream
+                // (as the old code did, since it ignored streamType) double-connects
+                // to the pod and corrupts the forward.
+                let stream_type = stream
+                    .headers
+                    .get("streamType")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let port = stream
+                    .headers
+                    .get("port")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0);
 
-            stream.send_reply(http::HeaderMap::new(), false).await.ok();
+                stream.send_reply(http::HeaderMap::new(), false).await.ok();
 
-            let addr = format!("{pod_ip}:{port}");
-            log::debug!("portforward: connecting to {addr}");
-
-            match TcpStream::connect(&addr).await {
-                Ok(target) => {
-                    relay_spdy_tcp(stream, target).await;
+                // Error stream: accept it but leave it idle (no relay).
+                if stream_type == "error" {
+                    return;
                 }
-                Err(e) => {
-                    log::warn!("portforward: connect {addr} failed: {e}");
+
+                if port == 0 {
+                    log::warn!("portforward: missing or invalid port header");
                     stream
-                        .reset(spdystream_rs::frame::RstStatus::Cancel)
+                        .reset(spdystream_rs::frame::RstStatus::ProtocolError)
                         .await
                         .ok();
+                    done.notify_one();
+                    return;
                 }
-            }
-        })
+
+                let addr = format!("{pod_ip}:{port}");
+                log::debug!("portforward: connecting to {addr}");
+
+                match TcpStream::connect(&addr).await {
+                    Ok(target) => relay_spdy_tcp(stream, target).await,
+                    Err(e) => {
+                        log::warn!("portforward: connect {addr} failed: {e}");
+                        stream
+                            .reset(spdystream_rs::frame::RstStatus::Cancel)
+                            .await
+                            .ok();
+                    }
+                }
+                done.notify_one();
+            })
+        }
     });
 
     // HTTP upgrade already done; serve SPDY directly without re-parsing it.
     let handler = Arc::clone(&config.handler);
     let conn = spdystream_rs::connection::Connection::serve(tcp, move |s| handler(s)).await?;
+
+    // Keep the connection alive until a data relay completes (bounded so a client
+    // that never opens a data stream can't wedge us), then close to release the
+    // client's sockets.
+    let _ = tokio::time::timeout(Duration::from_secs(60), done.notified()).await;
     let _ = conn.close().await;
     Ok(())
 }
 
 /// Bidirectional relay between a SPDY stream and a TCP connection.
-async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, mut tcp: TcpStream) {
+async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, tcp: TcpStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut tcp_read, mut tcp_write) = tcp.split();
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
-    // SPDY → TCP
-    let stream_to_tcp = {
-        let stream = Arc::clone(&stream);
-        async move {
-            while let Ok(Some(data)) = stream.read_data().await {
-                if tcp_write.write_all(&data).await.is_err() {
-                    break;
-                }
-            }
-        }
-    };
-
-    // TCP → SPDY
-    let tcp_to_stream = {
+    // pod → client. AUTHORITATIVE: once the pod closes its side, the forward is
+    // finished; we propagate that as a SPDY half-close (FIN) to the client.
+    let pod_to_client = {
         let stream = Arc::clone(&stream);
         async move {
             let mut buf = vec![0u8; 32 * 1024];
@@ -579,5 +620,28 @@ async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, mut tcp: TcpStream) 
         }
     };
 
-    tokio::join!(stream_to_tcp, tcp_to_stream);
+    // client → pod. Best-effort; propagate the client's half-close to the pod by
+    // shutting down the pod-side write half when the client stops sending.
+    let client_to_pod = async move {
+        while let Ok(Some(data)) = stream.read_data().await {
+            if tcp_write.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        let _ = tcp_write.shutdown().await;
+    };
+
+    // THE #339 PORT-FORWARD HANG: the old code `tokio::join!`-ed both directions,
+    // so the forward only completed when BOTH closed. But port-forward clients
+    // (kubelet/critest) read the pod's reply and never half-close their otherwise
+    // idle write stream, so client→pod blocked forever and the forward hung
+    // ("lost connection to pod"). The pod→client direction is authoritative — the
+    // moment the pod closes we finish and FIN the client, regardless of whether
+    // the client ever closes its write half. If the client closes first, we keep
+    // draining the pod's response to completion.
+    tokio::pin!(pod_to_client);
+    tokio::select! {
+        _ = &mut pod_to_client => {}
+        _ = client_to_pod => { pod_to_client.await; }
+    }
 }

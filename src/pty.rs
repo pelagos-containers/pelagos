@@ -95,8 +95,15 @@ impl InteractiveSession {
 }
 
 /// Core relay loop: forwards bytes between stdin/stdout and the PTY master.
+///
+/// Exit condition is exactly one thing: the PTY **master** closing, which means
+/// the container process (the slave side) exited. stdin reaching EOF does NOT end
+/// the relay — the container may still be producing output — it only means "no
+/// more input", so we stop polling stdin (a closed/EOF fd is perpetually readable
+/// and would otherwise spin the loop at 100% CPU).
 fn relay_loop(master_fd: RawFd) -> io::Result<()> {
     let mut buf = [0u8; 4096];
+    let mut stdin_open = true;
 
     loop {
         // Handle any pending window resize before blocking on poll
@@ -109,10 +116,14 @@ fn relay_loop(master_fd: RawFd) -> io::Result<()> {
         let stdin_bfd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
         let master_bfd = unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) };
 
-        let mut fds = [
-            PollFd::new(stdin_bfd, PollFlags::POLLIN),
-            PollFd::new(master_bfd, PollFlags::POLLIN),
-        ];
+        // Only poll stdin while it is still open; once it EOFs we drop it from the
+        // set so the loop never busy-spins on a perpetually-readable closed fd.
+        let mut fds: Vec<PollFd> = Vec::with_capacity(2);
+        if stdin_open {
+            fds.push(PollFd::new(stdin_bfd, PollFlags::POLLIN));
+        }
+        fds.push(PollFd::new(master_bfd, PollFlags::POLLIN));
+        let master_idx = fds.len() - 1;
 
         // Short timeout so we can check WINCH_RECEIVED even if no I/O arrives
         // PollTimeout::from(100i16) = 100ms
@@ -126,21 +137,31 @@ fn relay_loop(master_fd: RawFd) -> io::Result<()> {
         }
 
         // stdin → master (user keystrokes go into the container)
-        if let Some(revents) = fds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let n = unsafe {
-                    libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len())
-                };
-                if n > 0 {
-                    unsafe {
-                        libc::write(master_fd, buf.as_ptr() as *const _, n as usize);
+        if stdin_open {
+            if let Some(revents) = fds[0].revents() {
+                if revents.contains(PollFlags::POLLIN) {
+                    let n = unsafe {
+                        libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
+                    if n > 0 {
+                        unsafe {
+                            libc::write(master_fd, buf.as_ptr() as *const _, n as usize);
+                        }
+                    } else {
+                        // EOF (n == 0) or error: no more input. Stop polling stdin
+                        // but KEEP relaying the container's output until it exits.
+                        stdin_open = false;
                     }
+                }
+                if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+                    stdin_open = false;
                 }
             }
         }
 
-        // master → stdout (container output comes to the user's screen)
-        if let Some(revents) = fds[1].revents() {
+        // master → stdout (container output comes to the user's screen). This is
+        // the sole exit condition: when the master closes, the container exited.
+        if let Some(revents) = fds[master_idx].revents() {
             if revents.contains(PollFlags::POLLIN) {
                 let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n > 0 {
@@ -148,12 +169,10 @@ fn relay_loop(master_fd: RawFd) -> io::Result<()> {
                         libc::write(libc::STDOUT_FILENO, buf.as_ptr() as *const _, n as usize);
                     }
                 } else {
-                    // n == 0 or n < 0: slave closed its end (container exited)
-                    // On Linux, reading from a PTY master after all slaves close returns EIO
+                    // n == 0 / EIO: all slaves closed — container exited.
                     break;
                 }
             }
-            // POLLHUP/POLLERR: slave side closed — container exited
             if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
                 break;
             }
