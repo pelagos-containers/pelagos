@@ -42,7 +42,7 @@ fi
 echo "HEAD=$(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 
 echo "== build (release) =="
-cargo build --release --bin pelagos -p pelagos-cri
+cargo build --release -p pelagos -p pelagos-cri
 
 echo "== install =="
 sudo install -m0755 target/release/pelagos     /usr/local/bin/pelagos

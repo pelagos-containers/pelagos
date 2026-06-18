@@ -49,6 +49,18 @@ spec:
           args:
             - |
               set -euo pipefail
+              # pelagos-cri's tonic-build needs protoc, and recent enough to know
+              # `debug_redact` (used in the CRI api.proto) — Debian's apt protoc
+              # (3.21) is too old. Install a modern protoc once into the cache.
+              PROTOC_VER=34.1
+              export PROTOC=/cache/protoc/bin/protoc
+              if ! "$PROTOC" --version 2>/dev/null | grep -q "$PROTOC_VER"; then
+                mkdir -p /cache/protoc
+                curl -fsSL -o /tmp/protoc.zip \
+                  "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VER}/protoc-${PROTOC_VER}-linux-x86_64.zip"
+                (cd /cache/protoc && (command -v unzip >/dev/null || (apt-get update -qq && apt-get install -y -qq unzip)) && unzip -o -q /tmp/protoc.zip)
+              fi
+              "$PROTOC" --version
               REPO=/cache/repo
               if [ -d "$REPO/.git" ]; then
                 git -C "$REPO" fetch --all -q
@@ -63,7 +75,7 @@ spec:
               fi
               SHA=$(git rev-parse --short HEAD)
               echo "building pelagos @ $SHA ($GIT_REF)"
-              cargo build --release --bin pelagos -p pelagos-cri
+              cargo build --release -p pelagos -p pelagos-cri
               install -m0755 "$CARGO_TARGET_DIR/release/pelagos" \
                              "$CARGO_TARGET_DIR/release/pelagos-cri" /staging/
               git rev-parse HEAD > /staging/.commit
