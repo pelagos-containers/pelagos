@@ -1274,10 +1274,15 @@ impl RuntimeService for RuntimeSvc {
             }),
             linux: Some(LinuxPodSandboxStatus {
                 namespaces: Some(Namespace {
+                    // Report the sandbox's ACTUAL namespace modes, not zeros. The
+                    // kubelet's `podSandboxChanged` compares these against the pod
+                    // spec; reporting POD (0) for a hostNetwork sandbox makes it
+                    // recreate the sandbox every sync — an endless crash-loop for
+                    // host-namespace pods (#410).
                     options: Some(NamespaceOption {
-                        network: 0,
-                        pid: 0,
-                        ipc: 0,
+                        network: sandbox.namespaces.network.to_cri(),
+                        pid: sandbox.namespaces.pid.to_cri(),
+                        ipc: sandbox.namespaces.ipc.to_cri(),
                         target_id: String::new(),
                         userns_options: None,
                     }),
@@ -3218,6 +3223,100 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// A minimal in-memory `CriSandbox` carrying the given namespace modes.
+    #[cfg(test)]
+    fn sbx_with_namespaces(id: &str, namespaces: state::NamespaceModes) -> state::CriSandbox {
+        state::CriSandbox {
+            id: id.into(),
+            name: format!("{}-pod", id),
+            namespace: "default".into(),
+            uid: format!("uid-{}", id),
+            attempt: 0,
+            labels: Default::default(),
+            annotations: Default::default(),
+            created_at_ns: 0,
+            state: state::SandboxState::Running,
+            netns: String::new(),
+            ip: "192.168.1.10".into(),
+            cni_conf: String::new(),
+            pause_pid: 1,
+            log_directory: String::new(),
+            cgroup_parent: String::new(),
+            supplemental_groups: vec![],
+            dns_servers: vec![],
+            dns_searches: vec![],
+            dns_options: vec![],
+            namespaces,
+            port_mappings: vec![],
+        }
+    }
+
+    /// Regression test for #410: `pod_sandbox_status` must report the sandbox's
+    /// ACTUAL namespace modes, not hardcoded `POD`(0). When it reported `POD` for a
+    /// `hostNetwork` sandbox, the kubelet's `podSandboxChanged` saw a mismatch
+    /// against the pod spec and recreated the sandbox on every sync — an endless
+    /// ~1/sec crash-loop for every host-network pod (kube-vip, MetalLB, …).
+    #[tokio::test]
+    async fn test_pod_sandbox_status_reports_namespace_modes() {
+        let svc = RuntimeSvc {
+            state: AppState::new("pelagos".into()),
+            streaming_base_url: String::new(),
+            registry: Default::default(),
+        };
+        {
+            let mut st = svc.state.inner.lock().await;
+            // hostNetwork pod: network == NODE(2); pid CONTAINER(1); ipc POD(0).
+            st.sandboxes.insert(
+                "hostnet-410".into(),
+                sbx_with_namespaces("hostnet-410", state::NamespaceModes::from_cri(2, 1, 0)),
+            );
+            // hostIPC pod: ipc == NODE(2); network/pid default.
+            st.sandboxes.insert(
+                "hostipc-410".into(),
+                sbx_with_namespaces("hostipc-410", state::NamespaceModes::from_cri(0, 1, 2)),
+            );
+            // Default pod: all default (network POD, ipc POD).
+            st.sandboxes.insert(
+                "podnet-410".into(),
+                sbx_with_namespaces("podnet-410", state::NamespaceModes::default()),
+            );
+        }
+
+        async fn ns_of(svc: &RuntimeSvc, id: &str) -> NamespaceOption {
+            let resp = svc
+                .pod_sandbox_status(Request::new(PodSandboxStatusRequest {
+                    pod_sandbox_id: id.into(),
+                    verbose: false,
+                }))
+                .await
+                .expect("status ok")
+                .into_inner();
+            resp.status
+                .unwrap()
+                .linux
+                .unwrap()
+                .namespaces
+                .unwrap()
+                .options
+                .unwrap()
+        }
+
+        // hostNetwork sandbox MUST report network == NODE(2), or the kubelet
+        // crash-loops it (#410).
+        let host = ns_of(&svc, "hostnet-410").await;
+        assert_eq!(host.network, 2, "hostNetwork sandbox must report NODE(2)");
+
+        // hostIPC sandbox reports ipc == NODE(2).
+        let hipc = ns_of(&svc, "hostipc-410").await;
+        assert_eq!(hipc.ipc, 2, "hostIPC sandbox must report NODE(2) for ipc");
+        assert_eq!(hipc.network, 0, "hostIPC pod still has POD network");
+
+        // Default sandbox reports POD(0) for network and ipc.
+        let pod = ns_of(&svc, "podnet-410").await;
+        assert_eq!(pod.network, 0, "default sandbox reports POD(0) network");
+        assert_eq!(pod.ipc, 0, "default sandbox reports POD(0) ipc");
+    }
 
     #[test]
     fn test_resolve_apparmor() {

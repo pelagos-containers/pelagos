@@ -40,6 +40,20 @@ impl NsMode {
         }
     }
 
+    /// Convert back to the CRI `NamespaceMode` i32 (`POD`=0, `CONTAINER`=1, `NODE`=2).
+    /// Inverse of [`NsMode::from_cri`]; used by `PodSandboxStatus` to report the
+    /// sandbox's namespace modes back to the kubelet. Reporting the wrong value
+    /// (e.g. `POD` for a `hostNetwork` sandbox) makes the kubelet's
+    /// `podSandboxChanged` check see a mismatch and recreate the sandbox on every
+    /// sync — an endless crash-loop for host-namespace pods (#410).
+    pub fn to_cri(self) -> i32 {
+        match self {
+            NsMode::Pod => 0,
+            NsMode::Container => 1,
+            NsMode::Node => 2,
+        }
+    }
+
     /// True if this is the host namespace (CRI `NODE`).
     pub fn is_host(self) -> bool {
         matches!(self, NsMode::Node)
