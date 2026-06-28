@@ -5363,3 +5363,16 @@ client's stdin by writing to this FIFO; if the FIFO is absent, not wired to the 
 or EOFs immediately, an attached interactive container would either never receive input or exit
 before it could be attached to. A failure here breaks `kubectl attach` / the critest attach
 conformance spec at the runtime layer.
+
+## `pelagos-cri runtime::tests::test_pod_sandbox_status_reports_namespace_modes`
+**No root required.** Lives in `pelagos-cri/src/runtime.rs` (run with `cargo test -p pelagos-cri`).
+Regression test for #410. Inserts three in-memory sandboxes into a `RuntimeSvc` — a `hostNetwork`
+sandbox (`NamespaceModes::from_cri(2,1,0)`), a `hostIPC` sandbox (`from_cri(0,1,2)`), and a default
+sandbox — then calls the real `PodSandboxStatus` gRPC method and asserts the returned
+`linux.namespaces.options` echoes the **stored** modes: the hostNetwork sandbox reports
+`network == NODE(2)`, the hostIPC sandbox reports `ipc == NODE(2)` (and `network == POD(0)`), and the
+default sandbox reports `network == ipc == POD(0)`. **Why it matters:** `pod_sandbox_status`
+previously hardcoded these to `0` (POD). The kubelet's `podSandboxChanged` compares the reported
+network-namespace mode against the pod spec; reporting POD for a hostNetwork pod made it kill and
+recreate the sandbox on **every sync (~1/sec)** — an endless crash-loop that broke *all* host-network
+workloads (kube-vip, MetalLB, Multus). A failure here means hostNetwork pods are unschedulable.
