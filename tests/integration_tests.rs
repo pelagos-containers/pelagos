@@ -28566,18 +28566,26 @@ mod issue_336_cri_restart_readopt {
         stop_unit(&parent_unit);
         stop_unit(&scope_unit);
 
-        // Carry the sentinels in the *binary name* (symlinks to sleep) rather than
-        // as args — `sleep 3600 <tag>` would be an invalid time interval. pgrep -f
-        // then matches each sleep's argv0 uniquely.
+        // Carry the sentinels in the *script path* (a tiny wrapper that runs sleep)
+        // rather than an argv0 symlink to sleep. An argv0 symlink breaks on
+        // multi-call coreutils — Ubuntu 26.04 ships uutils/coreutils, which
+        // dispatches on argv[0] and rejects an unknown applet name
+        // ("coreutils: unknown program '<tag>'"), so the child never starts. A
+        // wrapper runs the real sleep on any distro, and its path (bearing the
+        // sentinel) stays in the parent /bin/sh's cmdline for `pgrep -f`. It must
+        // NOT `exec` sleep — that would replace the shell and drop the sentinel
+        // from the process cmdline.
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
-        let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists())
-            .expect("a sleep binary");
+        let write_sleeper = |path: &std::path::Path| {
+            std::fs::write(path, "#!/bin/sh\nsleep \"$@\"\n").expect("write sleeper");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod sleeper");
+        };
         let sup_bin = dir.path().join(&sup_tag);
         let ctrl_bin = dir.path().join(&ctrl_tag);
-        std::os::unix::fs::symlink(sleep_bin, &sup_bin).expect("symlink sup sleep");
-        std::os::unix::fs::symlink(sleep_bin, &ctrl_bin).expect("symlink ctrl sleep");
+        write_sleeper(&sup_bin);
+        write_sleeper(&ctrl_bin);
 
         // The parent service's body, written to a temp script so the parent's own
         // command line does NOT contain the sentinels (keeping pgrep unambiguous).
@@ -28589,8 +28597,9 @@ mod issue_336_cri_restart_readopt {
                  {sup} 3600 &\n\
              # Control: stays in THIS service's cgroup, must die on stop.\n\
              {ctrl} 3600 &\n\
-             # Keep the service active until we stop it.\n\
-             exec {sleep_bin} 3600\n",
+             # Keep the service active until we stop it. (argv0 is 'sleep' here,
+             # so multi-call coreutils dispatches correctly; no sentinel needed.)\n\
+             exec sleep 3600\n",
             sup = sup_bin.to_str().unwrap(),
             ctrl = ctrl_bin.to_str().unwrap(),
         );
