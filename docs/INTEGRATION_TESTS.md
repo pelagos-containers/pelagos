@@ -1994,6 +1994,18 @@ instruction list has 10 entries of the correct variant types.
 
 Failure indicates a regression in any instruction parser.
 
+### `test_parse_env_multi_var`
+**Requires:** neither root nor rootfs (parser-only)
+
+Regression for #420. Parses an `ENV` line with several `KEY=VALUE` pairs across a
+line continuation (one value containing a colon, `0.0.0.0:8080`) plus a second
+`ENV` mixing a double-quoted value with spaces and a following bare pair. Asserts
+the result is one `Instruction::Env` per pair with exact keys/values.
+
+Failure indicates the ENV parser regressed to first-pair-only — the pre-fix bug
+that assigned the entire rest of the line to the first variable (e.g. an unusable
+`BIND_ADDR`) and left the other variables unset, causing app CrashLoopBackOff.
+
 ### `test_parse_arg_instruction`
 **Requires:** neither root nor rootfs (parser-only)
 

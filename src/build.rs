@@ -203,11 +203,15 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 instructions.push(Instruction::Cmd(cmd));
             }
             "ENV" => {
-                let (key, value) = parse_env_value(rest).ok_or_else(|| BuildError::Parse {
+                // One ENV line may declare multiple KEY=VALUE pairs (Docker
+                // semantics); each becomes its own Env instruction. See #420.
+                let pairs = parse_env_pairs(rest).ok_or_else(|| BuildError::Parse {
                     line: line_num,
                     message: "ENV requires KEY=VALUE or KEY VALUE".to_string(),
                 })?;
-                instructions.push(Instruction::Env { key, value });
+                for (key, value) in pairs {
+                    instructions.push(Instruction::Env { key, value });
+                }
             }
             "WORKDIR" => {
                 if rest.is_empty() {
@@ -469,28 +473,114 @@ fn parse_label_value(rest: &str) -> Option<(String, String)> {
     Some((k.to_string(), v.to_string()))
 }
 
-/// Parse ENV: supports `KEY=VALUE`, `KEY="VALUE"`, or `KEY VALUE`.
-/// Outer single or double quotes are stripped from the value (matching Docker).
-fn parse_env_value(rest: &str) -> Option<(String, String)> {
+/// Parse an ENV instruction body into one or more `(key, value)` pairs.
+///
+/// Two Docker forms are supported, disambiguated by whether the first
+/// whitespace-delimited token contains `=`:
+/// - `KEY VALUE` (first token has no `=`): a **single** variable whose value is
+///   the rest of the line (legacy form). Outer quotes are stripped.
+/// - `KEY=VALUE [KEY2=VALUE2 …]` (first token has `=`): **one or more**
+///   whitespace-separated pairs. Values may be single- or double-quoted to
+///   include spaces, and `\` escapes the next character. Quote delimiters are
+///   removed. This is the form that was previously mis-parsed (#420): only the
+///   first pair was kept and the rest of the line became its value.
+fn parse_env_pairs(rest: &str) -> Option<Vec<(String, String)>> {
     let trimmed = rest.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let (k, v) = if let Some(pair) = trimmed.split_once('=') {
-        pair
-    } else if let Some((k, v)) = trimmed.split_once(char::is_whitespace) {
-        (k, v.trim())
-    } else {
-        return None;
-    };
-    let v = v.trim();
-    let v =
-        if (v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')) {
+
+    // Legacy `KEY VALUE` form: the first token carries no `=`, so the whole
+    // remainder is a single value (which may itself contain spaces).
+    let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+    if !first_tok.contains('=') {
+        let (k, v) = trimmed.split_once(char::is_whitespace)?;
+        let v = v.trim();
+        let v = if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+            || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+        {
             &v[1..v.len() - 1]
         } else {
             v
         };
-    Some((k.to_string(), v.to_string()))
+        return Some(vec![(k.to_string(), v.to_string())]);
+    }
+
+    // Multi-pair form: tokenize honoring quotes/escapes, then split each token
+    // on its first `=`.
+    let tokens = tokenize_env(trimmed)?;
+    let mut pairs = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        let (k, v) = tok.split_once('=')?; // every token must be KEY=VALUE
+        if k.is_empty() {
+            return None;
+        }
+        pairs.push((k.to_string(), v.to_string()));
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs)
+    }
+}
+
+/// Split an ENV body into whitespace-separated tokens, honoring single/double
+/// quotes (which group spaces into one token) and backslash escapes. Quote
+/// delimiters are consumed; inside double quotes and unquoted text `\x` yields a
+/// literal `x`. Returns `None` on an unterminated quote.
+fn tokenize_env(s: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars();
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => {
+                if c.is_whitespace() {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    in_token = true;
+                } else if c == '\\' {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                    in_token = true;
+                } else {
+                    cur.push(c);
+                    in_token = true;
+                }
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return None; // unterminated quote
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2441,6 +2531,77 @@ CMD ["/bin/sh", "-c", "echo hello"]"#;
                 key: "MY_VAR".into(),
                 value: "hello world".into()
             }
+        );
+    }
+
+    #[test]
+    fn test_parse_env_multi_var_single_line() {
+        // #420: multiple KEY=VALUE pairs on one line must each be set.
+        let content = "FROM alpine\nENV A=1 B=two C=3";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            &instructions[1..],
+            &[
+                Instruction::Env {
+                    key: "A".into(),
+                    value: "1".into()
+                },
+                Instruction::Env {
+                    key: "B".into(),
+                    value: "two".into()
+                },
+                Instruction::Env {
+                    key: "C".into(),
+                    value: "3".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_multi_var_continuation() {
+        // The exact shape from #420: line-continuation with several pairs, one of
+        // which (BIND_ADDR) has a value containing a colon — must NOT swallow the
+        // following pairs.
+        let content = "FROM alpine\nENV BIND_ADDR=0.0.0.0:8080 \\\n    FRONTEND_DIR=/app/frontend \\\n    RUST_LOG=info";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            &instructions[1..],
+            &[
+                Instruction::Env {
+                    key: "BIND_ADDR".into(),
+                    value: "0.0.0.0:8080".into()
+                },
+                Instruction::Env {
+                    key: "FRONTEND_DIR".into(),
+                    value: "/app/frontend".into()
+                },
+                Instruction::Env {
+                    key: "RUST_LOG".into(),
+                    value: "info".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_quoted_value_with_spaces() {
+        // A quoted value may contain spaces and must stay attached to its key,
+        // while the following bare pair is still parsed separately.
+        let content = "FROM alpine\nENV GREETING=\"hello world\" LANG=C";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            &instructions[1..],
+            &[
+                Instruction::Env {
+                    key: "GREETING".into(),
+                    value: "hello world".into()
+                },
+                Instruction::Env {
+                    key: "LANG".into(),
+                    value: "C".into()
+                },
+            ]
         );
     }
 
