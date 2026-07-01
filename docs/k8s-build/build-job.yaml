@@ -54,6 +54,14 @@ spec:
               fi
               echo "building $(git rev-parse --short HEAD)"
               cargo build --release -p pelagos -p pelagos-cri
+              # Gate the build on the unit tests: they're hermetic (no root,
+              # namespaces, or cgroups) so they run cleanly in the build pod, and
+              # `set -e` aborts before /out is populated if any fail. The
+              # privileged integration suite (`cargo test --test integration_tests`)
+              # is NOT run here — it needs root + host netns/nftables/cgroups and
+              # belongs on a dedicated, drained node (see README "Running tests").
+              echo "unit tests"
+              cargo test --release --lib -p pelagos -p pelagos-cri
               install -m0755 "$CARGO_TARGET_DIR/release/pelagos" \
                              "$CARGO_TARGET_DIR/release/pelagos-cri" /out/
               echo "built pelagos + pelagos-cri -> /out"

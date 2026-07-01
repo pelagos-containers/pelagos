@@ -87,4 +87,22 @@ grep -o '/run/pelagos/overlay-[^ ]*' /proc/mounts 2>/dev/null | while read -r mn
     umount -l "$mnt" 2>/dev/null && echo "  unmounted $mnt" || true
 done || true
 
+# A chroot container SIGKILL'd mid-run leaves its auto-injected bind mounts
+# (etc/resolv.conf, etc/hosts, dev/*, proc, sys, ca-certificates, mnt, shm) stacked
+# on the SHARED test rootfs. Their backing source (e.g. /run/pelagos/dns-*/resolv.conf)
+# then gets cleaned up, leaving a ghost mountpoint — the next container's bind onto
+# it fails with ENOENT (which pelagos masks as a bare "os error 22"). reset never
+# swept these, so they accumulated across runs and eventually broke every spawn
+# test on the dev box. Sweep any mount whose target is inside a *-rootfs dir,
+# deepest-first (so stacked/nested mounts unwind), repeated to clear stacks.
+echo "=== Unmounting leaked bind-mounts on test rootfs dirs ==="
+for pass in 1 2 3; do
+    # column 5 of mountinfo is the mount target; match test rootfs dirs by name.
+    awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
+        | grep -E '/[^/]*-rootfs(/|$)' \
+        | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2- | while read -r mnt; do
+        umount -l "$mnt" 2>/dev/null && echo "  unmounted $mnt" || true
+    done
+done || true
+
 echo "=== Clean ==="

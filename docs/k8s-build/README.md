@@ -46,6 +46,39 @@ This directory is a **template**, not a turnkey deploy — replace the
    `pelagos-cri`, however you manage that (a script, a systemd `path` unit
    watching a drop directory, a second Job, etc.).
 
+## Running tests on the cluster
+
+pelagos has two test tiers with very different isolation needs:
+
+- **Unit tests** (`cargo test --lib`) are hermetic — no root, namespaces, or
+  cgroups. `build-job.yaml` runs them right after `cargo build` and **before**
+  populating `/out`, so a failing build never produces installable binaries. This
+  is the safe, default way to test in-cluster.
+
+- **Integration tests** (`cargo test --test integration_tests`) require **root**
+  and mutate **host** state: they create and tear down a bridge, veth pairs,
+  nftables tables, cgroups, and mount/network namespaces. Do **not** run them as
+  an ordinary pod on a working node — they will collide with that node's real
+  networking. Run them on a **dedicated node you've drained** (`kubectl cordon` +
+  stop the kubelet so its pod GC doesn't interfere), as a host `cargo test` over
+  SSH, and restore the node afterwards. Sketch:
+  ```bash
+  # compile while still in-cluster; then run the compiled binary as root
+  ssh "$NODE" 'cd pelagos && cargo test --test integration_tests --no-run'
+  kubectl cordon "$NODE"; ssh "$NODE" 'sudo systemctl stop kubelet'          # drain
+  EXE=$(ssh "$NODE" 'ls -t pelagos/target/debug/deps/integration_tests-* | grep -v "\.d$" | head -1')
+  ssh "$NODE" "sudo '$EXE'"                                                  # run as root
+  ssh "$NODE" 'sudo systemctl start kubelet'; kubectl uncordon "$NODE"       # always restore
+  ```
+  Run the compiled *binary* as root rather than `sudo cargo test` — many nodes'
+  sudo strips `-E`, and a root `cargo` can't find a toolchain installed under the
+  user's home. The node needs a Rust toolchain on the host (rustup) and
+  `build-essential`; protoc is not required (the integration tests don't compile
+  pelagos-cri). **If the node runs pelagos as its own CRI, stop that service too**
+  for the run (and restart it before the kubelet) — the suite and
+  `scripts/reset-test-env.sh` operate on `/run/pelagos`, the live runtime's dir,
+  and will otherwise wedge the node NotReady.
+
 ## Notes / adapt to taste
 
 - The build cache (`/cache`: git checkout + cargo registry + target dir) is a

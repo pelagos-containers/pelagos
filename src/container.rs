@@ -4382,10 +4382,10 @@ impl Command {
                             ptr::null(),
                         );
                         if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "dns bind mount: {}",
-                                io::Error::last_os_error()
-                            )));
+                            // Preserve the real errno (e.g. ENOENT when a leaked
+                            // bind mount left a ghost mountpoint on the shared
+                            // rootfs) instead of letting std mask it to EINVAL(22).
+                            return Err(pre_exec_err("dns bind mount", io::Error::last_os_error()));
                         }
                     }
 
@@ -6993,10 +6993,10 @@ impl Command {
                             ptr::null(),
                         );
                         if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "dns bind mount: {}",
-                                io::Error::last_os_error()
-                            )));
+                            // Preserve the real errno (e.g. ENOENT when a leaked
+                            // bind mount left a ghost mountpoint on the shared
+                            // rootfs) instead of letting std mask it to EINVAL(22).
+                            return Err(pre_exec_err("dns bind mount", io::Error::last_os_error()));
                         }
                     }
 
@@ -8677,6 +8677,30 @@ pub struct DeviceNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A pre_exec hook that fails with a real syscall errno (e.g. ENOENT when a
+    // leaked bind mount leaves a ghost mountpoint on the shared rootfs) must
+    // surface that errno to the parent, not let std mask it to EINVAL(22). This
+    // is the bug that made an ENOENT DNS bind read as "Invalid argument (os
+    // error 22)" and sent a debugging session chasing a phantom kernel problem.
+    #[test]
+    fn test_pre_exec_err_preserves_real_errno() {
+        let e = pre_exec_err("dns bind mount", io::Error::from_raw_os_error(libc::ENOENT));
+        assert_eq!(
+            e.raw_os_error(),
+            Some(libc::ENOENT),
+            "pre_exec_err must preserve ENOENT, not mask it to EINVAL"
+        );
+    }
+
+    // When the source error genuinely has no errno, pre_exec_err keeps the
+    // context message (the parent will still see EINVAL, but logs show why).
+    #[test]
+    fn test_pre_exec_err_keeps_context_when_no_errno() {
+        let e = pre_exec_err("some ctx", io::Error::other("boom"));
+        assert_eq!(e.raw_os_error(), None);
+        assert!(e.to_string().contains("some ctx: boom"));
+    }
 
     #[test]
     fn test_resolve_mount_target_follows_var_run_symlink() {
