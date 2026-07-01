@@ -25,9 +25,10 @@ extern "C" fn watcher_forward_signal(signum: libc::c_int) {
 }
 
 use super::{
-    check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
-    parse_memory, parse_ulimit, parse_user_in_layers, parse_user_in_rootfs, rootfs_path,
-    write_state, ContainerState, ContainerStatus, HealthConfig, HealthStatus, SpawnConfig,
+    check_liveness, container_dir, containers_dir, generate_name, home_dir_in_layers,
+    parse_capability, parse_cpus, parse_memory, parse_ulimit, parse_user_in_layers,
+    parse_user_in_rootfs, rootfs_path, write_state, ContainerState, ContainerStatus, HealthConfig,
+    HealthStatus, SpawnConfig,
 };
 use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
 use pelagos::network::NetworkMode;
@@ -690,6 +691,27 @@ fn build_image_run(
         }
     }
 
+    // Inject a default HOME when the image config omits it, matching
+    // containerd/CRI (which pelagos-cri relies on): resolve it from the
+    // effective user's /etc/passwd entry, else /root for root and / otherwise.
+    // A later `--env HOME=...` (pod env, applied in apply_cli_options) still
+    // wins. Without this, images that don't set HOME (e.g. distroless, the
+    // Tailscale operator) crash tools that need it (#421).
+    if !manifest
+        .config
+        .env
+        .iter()
+        .any(|e| e == "HOME" || e.starts_with("HOME="))
+    {
+        let effective_user = args.user.as_deref().or(if manifest.config.user.is_empty() {
+            None
+        } else {
+            Some(manifest.config.user.as_str())
+        });
+        let home = home_dir_in_layers(effective_user, &layer_dirs);
+        cmd = cmd.env("HOME", home);
+    }
+
     // Apply image config working directory.
     if !manifest.config.working_dir.is_empty() && args.workdir.is_none() {
         cmd = cmd.with_cwd(&manifest.config.working_dir);
@@ -760,6 +782,13 @@ fn build_command(
         );
 
     let rootfs_layers = vec![rootfs_dir.to_path_buf()];
+
+    // Default HOME (containerd/CRI parity, #421); a later `--env HOME=` overrides.
+    cmd = cmd.env(
+        "HOME",
+        home_dir_in_layers(args.user.as_deref(), &rootfs_layers),
+    );
+
     cmd = apply_cli_options(
         cmd,
         args,

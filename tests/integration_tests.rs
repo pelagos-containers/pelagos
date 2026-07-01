@@ -368,6 +368,69 @@ mod core {
             out, err
         );
     }
+
+    /// test_run_injects_default_home
+    ///
+    /// Requires: root + rootfs (spawns a real container via the pelagos binary).
+    ///
+    /// Regression for #421: pelagos must inject a default `HOME` (containerd/CRI
+    /// parity) when neither the image config nor `--env` sets one. Runs
+    /// `pelagos run` on the alpine rootfs executing `/usr/bin/env` and asserts the
+    /// container's environment contains `HOME=/root` (root's passwd home). Without
+    /// the fix the container has no HOME at all — which crashes tools that require
+    /// it (e.g. the Tailscale operator's tsnet: "neither $XDG_CONFIG_HOME nor
+    /// $HOME are defined").
+    #[test]
+    fn test_run_injects_default_home() {
+        if !is_root() {
+            eprintln!("Skipping test_run_injects_default_home: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_run_injects_default_home: alpine-rootfs not found");
+            return;
+        };
+
+        let name = format!("test-home-{}", std::process::id());
+        let run = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                &name,
+                "--network",
+                "loopback",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/usr/bin/env",
+            ])
+            .output()
+            .expect("pelagos run");
+        assert!(
+            run.status.success(),
+            "pelagos run failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let logs = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["logs", &name])
+            .output()
+            .expect("pelagos logs");
+
+        // Clean up regardless of assertions.
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["rm", "--force", &name])
+            .output();
+
+        let out = String::from_utf8_lossy(&logs.stdout);
+        assert!(
+            out.lines().any(|l| l.trim() == "HOME=/root"),
+            "expected HOME=/root in container env (default HOME injection, #421); got:\n{}",
+            out
+        );
+    }
 }
 
 mod capabilities {

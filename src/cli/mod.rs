@@ -516,6 +516,46 @@ fn lookup_user_in_layers(
     ))
 }
 
+/// Resolve the default `HOME` for a container user, matching containerd/CRI
+/// behaviour: look the effective user up in the container's own `/etc/passwd`
+/// and use its home field; fall back to `/root` for uid 0 and `/` otherwise.
+///
+/// `user` is the effective user spec (numeric uid, `uid:gid`, or a name), or
+/// `None` for root. Used to inject a default `HOME` when neither the image
+/// config nor an explicit `--env`/pod env provides one (#421): pelagos does not
+/// otherwise set `HOME` the way containerd does, and some workloads (e.g. tsnet
+/// / anything using Go's `os.UserHomeDir`) fatal without it.
+pub fn home_dir_in_layers(user: Option<&str>, layer_dirs: &[std::path::PathBuf]) -> String {
+    // Effective uid: 0 unless a user spec resolves to a different one. An
+    // unresolvable spec falls back to root here — env defaulting must not fail
+    // the run; the real user resolution (with its hard errors) happens later.
+    let uid = match user {
+        None => 0,
+        Some(spec) => {
+            let name_or_uid = spec.split(':').next().unwrap_or(spec).trim();
+            resolve_uid_in_layers(name_or_uid, layer_dirs).unwrap_or(0)
+        }
+    };
+    // passwd format: name:password:uid:gid:gecos:home:shell — field 5 is home.
+    for layer_dir in layer_dirs.iter().rev() {
+        let passwd_path = layer_dir.join("etc/passwd");
+        if let Ok(contents) = std::fs::read_to_string(&passwd_path) {
+            for line in contents.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 6 && fields[2].parse::<u32>() == Ok(uid) && !fields[5].is_empty()
+                {
+                    return fields[5].to_string();
+                }
+            }
+        }
+    }
+    if uid == 0 {
+        "/root".to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
 fn resolve_uid_in_layers(s: &str, layer_dirs: &[std::path::PathBuf]) -> Result<u32, String> {
     if let Ok(n) = s.parse::<u32>() {
         // u32::MAX == (uid_t)-1; setuid(-1) is EINVAL and in some implementations
@@ -775,6 +815,34 @@ pub fn verify_pid_not_recycled(pid: i32, state: &ContainerState) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #421: with no passwd to consult, HOME defaults to /root for uid 0 and / otherwise.
+    #[test]
+    fn test_home_dir_defaults_without_passwd() {
+        let empty: Vec<std::path::PathBuf> = vec![];
+        assert_eq!(home_dir_in_layers(None, &empty), "/root");
+        assert_eq!(home_dir_in_layers(Some("1000"), &empty), "/");
+    }
+
+    /// #421: HOME is read from the container's /etc/passwd home field, resolving
+    /// the user by name, numeric uid, or `uid:gid` (uid part).
+    #[test]
+    fn test_home_dir_from_passwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+        std::fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n",
+        )
+        .unwrap();
+        let layers = vec![dir.path().to_path_buf()];
+        assert_eq!(home_dir_in_layers(None, &layers), "/root");
+        assert_eq!(home_dir_in_layers(Some("app"), &layers), "/home/app");
+        assert_eq!(home_dir_in_layers(Some("1000"), &layers), "/home/app");
+        assert_eq!(home_dir_in_layers(Some("1000:1000"), &layers), "/home/app");
+        // An unknown user falls back safely rather than erroring.
+        assert_eq!(home_dir_in_layers(Some("nobodyx"), &layers), "/root");
+    }
 
     /// rootfs_path should accept an existing filesystem directory path and
     /// return its canonicalized form, without requiring it to be registered

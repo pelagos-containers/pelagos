@@ -1446,6 +1446,19 @@ Runs a shell loop that forks an external command (`sleep 0`) five times. All fiv
 succeed and the container must print `FORKS_OK`. Failure indicates the double-fork mechanism
 in `pre_exec` (which makes the container process PID 1 in the new namespace) is broken.
 
+### `test_run_injects_default_home`
+**Requires:** root, rootfs
+
+Regression for #421. Spawns `pelagos run` (the binary) on the alpine rootfs executing
+`/usr/bin/env`, captures the container's output via `pelagos logs`, and asserts it contains
+`HOME=/root`. Verifies that pelagos injects a default `HOME` — resolved from the effective
+user's `/etc/passwd` home, falling back to `/root` for uid 0 — when neither the image config
+nor `--env` provides one, matching containerd/CRI behaviour.
+
+Failure indicates the default-HOME injection regressed: containers get no `HOME`, which
+silently breaks any tool that requires it (e.g. Go's `os.UserHomeDir`, tsnet / the Tailscale
+Kubernetes operator, which fatals with "neither $XDG_CONFIG_HOME nor $HOME are defined").
+
 ---
 
 ## Container Linking Tests
