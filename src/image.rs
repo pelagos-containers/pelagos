@@ -533,15 +533,33 @@ pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
     let json =
         serde_json::to_string_pretty(manifest).map_err(|e| io::Error::other(e.to_string()))?;
     let manifest_path = dir.join("manifest.json");
-    // If an existing root-owned manifest.json can't be overwritten directly,
-    // remove it first (the dir has group-write so we can unlink even without
-    // owning the file) and then write the new one.
-    if let Err(e) = std::fs::write(&manifest_path, &json) {
-        if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+    // Atomic write: stage to a temp file in the same dir, then rename(2) over the
+    // target. rename is atomic, so a concurrent load_image() observes either the
+    // complete old or the complete new manifest — never the 0-byte window that
+    // `fs::write`'s truncate-then-write exposes. That window parsed as "EOF while
+    // parsing a value at line 1 column 0" and flaked tests whenever two of them
+    // pulled/saved the same image (e.g. alpine) at once.
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::Builder::new()
+        .prefix(".manifest.json.")
+        .tempfile_in(&dir)?;
+    tmp.as_file().write_all(json.as_bytes())?;
+    // Manifests are read by any user of the shared (group=pelagos) store; the
+    // temp file starts 0600, so widen it before it becomes manifest.json.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
+    if let Err(e) = tmp.persist(&manifest_path) {
+        // rename can fail if an existing root-owned manifest can't be replaced in
+        // place here; remove it (the dir has group-write) and rename the temp in.
+        if matches!(
+            e.error.raw_os_error(),
+            Some(libc::EPERM) | Some(libc::EACCES)
+        ) {
+            let tmp_path = e.file.path().to_path_buf();
             let _ = std::fs::remove_file(&manifest_path);
-            std::fs::write(&manifest_path, &json)?;
+            std::fs::rename(&tmp_path, &manifest_path)?;
         } else {
-            return Err(e);
+            return Err(io::Error::other(e.error.to_string()));
         }
     }
     Ok(())
@@ -616,6 +634,58 @@ pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // Concurrent save_image + load_image on the same reference must never yield a
+    // parse error. A non-atomic writer (plain fs::write, truncate-then-write)
+    // exposes a 0-byte manifest window that load_image reads as "EOF while parsing
+    // a value at line 1 column 0" — the race that flaked detached-run tests under
+    // parallel image pulls. With the temp-file + rename write, every load that
+    // finds the file sees a complete manifest.
+    #[test]
+    fn test_save_image_atomic_under_concurrent_load() {
+        let reference = format!("pelagos-atomic-test-{}", std::process::id());
+        let mk = |n: usize| ImageManifest {
+            reference: reference.clone(),
+            digest: format!("sha256:{:064x}", n),
+            layers: Vec::new(),
+            layer_types: Vec::new(),
+            config: ImageConfig::default(),
+        };
+        save_image(&mk(0)).expect("seed save");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (reference, stop) = (reference.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for n in 1..400 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = save_image(&ImageManifest {
+                        reference: reference.clone(),
+                        digest: format!("sha256:{:064x}", n),
+                        layers: Vec::new(),
+                        layer_types: Vec::new(),
+                        config: ImageConfig::default(),
+                    });
+                }
+            })
+        };
+
+        let mut result = Ok(());
+        for _ in 0..400 {
+            if let Err(e) = load_image(&reference) {
+                // We seeded the manifest, so ENOENT is impossible; any error here
+                // is a truncated/partial read — the bug this fix prevents.
+                result = Err(format!("load_image saw a non-atomic write: {e}"));
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().ok();
+        let _ = remove_image(&reference);
+        result.unwrap();
+    }
 
     #[test]
     #[serial]

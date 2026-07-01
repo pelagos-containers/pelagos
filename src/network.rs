@@ -2817,15 +2817,24 @@ pub fn teardown_pasta_network(setup: &mut PastaSetup) {
     }
 }
 
-/// Returns true if `pasta` is on PATH and responds to `--version`.
+/// Returns true if an executable `pasta` is present on `PATH`.
+///
+/// Resolved by scanning `PATH` rather than spawning `pasta --version`: under
+/// heavy parallel load (the full integration suite) a probe fork can transiently
+/// fail with EAGAIN, and `.unwrap_or(false)` would then misreport pasta as "not
+/// installed" — spuriously flaking every pasta-networking test. A path lookup
+/// needs no fork and can't fail that way.
 pub fn is_pasta_available() -> bool {
-    SysCmd::new("pasta")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        let candidate = dir.join("pasta");
+        std::fs::metadata(&candidate)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
