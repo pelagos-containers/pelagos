@@ -1303,11 +1303,10 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     if bind_rc != 0 {
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EINVAL) {
-            return Err(io::Error::other(format!(
-                "bind-mount {} to itself: {}",
-                new_root.display(),
-                e
-            )));
+            return Err(pre_exec_err(
+                &format!("bind-mount {} to itself", new_root.display()),
+                e,
+            ));
         }
     }
 
@@ -1324,12 +1323,10 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
 
     let rc = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
     if rc != 0 {
-        return Err(io::Error::other(format!(
-            "pivot_root({}, {}): {}",
-            new_root.display(),
-            put_old.display(),
-            io::Error::last_os_error()
-        )));
+        return Err(pre_exec_err(
+            &format!("pivot_root({}, {})", new_root.display(), put_old.display()),
+            io::Error::last_os_error(),
+        ));
     }
 
     // We are now inside new_root.  Chdir to the new "/".
