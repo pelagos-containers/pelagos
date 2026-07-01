@@ -5376,3 +5376,17 @@ previously hardcoded these to `0` (POD). The kubelet's `podSandboxChanged` compa
 network-namespace mode against the pod spec; reporting POD for a hostNetwork pod made it kill and
 recreate the sandbox on **every sync (~1/sec)** — an endless crash-loop that broke *all* host-network
 workloads (kube-vip, MetalLB, Multus). A failure here means hostNetwork pods are unschedulable.
+
+## `issue_412_cgroup_kill_orphans::test_kill_cgroup_reaps_setsid_process_in_cgroup`
+**Requires root** and **cgroup v2** (skips otherwise). Guards the fix for the orphaned
+hostNetwork-container-process bug (#412). Creates a test cgroup under `/sys/fs/cgroup`,
+launches a shell that moves itself into it and backgrounds a **`setsid sleep`** (a
+process in its own, *different* session), then calls `pelagos::cgroup::kill_cgroup(name)`
+and asserts the cgroup drains to **empty**. **Why it matters:** the container stop/rm
+paths (`cmd_stop`, `cmd_rm`) SIGKILL only the single recorded `state.pid`; that misses
+forked/`setsid`'d descendants and processes reparented to init, which then survive as
+orphans holding resources (the MetalLB speaker held port 7946 across a restart → the next
+instance CrashLooped on `bind: address already in use`). `kill_cgroup` sweeps the whole
+cgroup (atomic `cgroup.kill`, or a `cgroup.procs` walk) so nothing survives. The test
+specifically verifies a **setsid session leader** — which a single-PID/process-group kill
+would leave alive — is reaped. A failure here means container teardown can leak orphans.

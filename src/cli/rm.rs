@@ -31,6 +31,11 @@ pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>>
                     }
                 }
             }
+            // Sweep the whole container cgroup so forked/`setsid`'d descendants (which
+            // the single-PID kill above misses) can't survive as orphans (#412).
+            if let Some(ref cg) = state.cgroup_name {
+                pelagos::cgroup::kill_cgroup(cg);
+            }
             // Wait for the watcher to finish cleanup (nftables/veth/overlay teardown)
             // before removing state.  The watcher exits shortly after the container dies.
             if state.watcher_pid > 0 {

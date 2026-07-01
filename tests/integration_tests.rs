@@ -29076,3 +29076,96 @@ mod issue_347_no_host_destruction {
         );
     }
 }
+
+/// #412 — `pelagos::cgroup::kill_cgroup` must SIGKILL **every** process in a
+/// container's cgroup, including a `setsid`'d process in a *different session* that a
+/// single-PID (or process-group) kill would miss. This is the container-teardown
+/// hardening for the orphaned-hostNetwork-process bug: a process surviving a container
+/// restart kept holding its port (e.g. a MetalLB speaker on 7946), wedging every
+/// subsequent instance into CrashLoop.
+mod issue_412_cgroup_kill_orphans {
+    use std::time::Duration;
+
+    #[test]
+    fn test_kill_cgroup_reaps_setsid_process_in_cgroup() {
+        if !super::is_root() {
+            eprintln!("Skipping test_kill_cgroup_reaps_setsid_process_in_cgroup: requires root");
+            return;
+        }
+        if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            eprintln!("Skipping test_kill_cgroup_reaps_setsid_process_in_cgroup: needs cgroup v2");
+            return;
+        }
+
+        let name = format!("pelagos-killcg-test-{}", std::process::id());
+        let dir = format!("/sys/fs/cgroup/{}", name);
+        std::fs::create_dir_all(&dir).expect("create test cgroup");
+
+        // A shell moves itself into the test cgroup, backgrounds a `setsid sleep`
+        // (its own new session — precisely what a single-PID/pgroup kill misses), then
+        // `exec`s into a sleep. Both processes live in the test cgroup.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > {dir}/cgroup.procs; setsid sleep 300 >/dev/null 2>&1 & exec sleep 300"
+            ))
+            .spawn()
+            .expect("spawn test shell");
+
+        let read_pids = || -> Vec<i32> {
+            std::fs::read_to_string(format!("{dir}/cgroup.procs"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        };
+
+        // Wait until the cgroup holds both processes.
+        let mut pids = Vec::new();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            pids = read_pids();
+            if pids.len() >= 2 {
+                break;
+            }
+        }
+        assert!(
+            pids.len() >= 2,
+            "cgroup should hold >=2 procs, got {:?}",
+            pids
+        );
+        // Sanity: at least one is a session leader in its own session (the setsid'd one),
+        // which a single-PID kill of the shell would not reap.
+        let has_setsid = pids.iter().any(|&p| unsafe { libc::getsid(p) } == p);
+        assert!(
+            has_setsid,
+            "expected a setsid session leader in the cgroup: {:?}",
+            pids
+        );
+
+        // The fix under test: kill the whole cgroup.
+        pelagos::cgroup::kill_cgroup(&name);
+
+        // Every process must be gone from the cgroup — no orphan survivors.
+        let mut remaining = pids.clone();
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(50));
+            remaining = read_pids();
+            if remaining.is_empty() {
+                break;
+            }
+        }
+
+        // Clean up regardless of the assertion outcome.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir(&dir);
+
+        assert!(
+            remaining.is_empty(),
+            "kill_cgroup left processes alive (orphans): {:?} — a single-PID kill would \
+             leave the setsid'd process holding its resources (#412)",
+            remaining
+        );
+    }
+}

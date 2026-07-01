@@ -468,3 +468,59 @@ pub fn read_stats(cg: &Cgroup) -> io::Result<ResourceStats> {
 
     Ok(stats)
 }
+
+/// SIGKILL **every** process in a container's cgroup subtree (cgroup v2).
+///
+/// The per-container stop/rm paths signal only the single recorded `state.pid`,
+/// which misses forked or `setsid`'d descendants and processes reparented to init —
+/// leaving orphans that keep holding resources (e.g. a listening port), the root
+/// cause of the orphaned-hostNetwork-process bug (#412). Killing the whole cgroup
+/// catches them all regardless of reparenting, the way runc/containerd do.
+///
+/// `cgroup_name` is the path **relative to `/sys/fs/cgroup`** (as stored in the
+/// container state's `cgroup_name`). No-op if the cgroup is absent/unknown. Prefers
+/// the atomic `cgroup.kill` (kernel ≥ 5.14); otherwise walks `cgroup.procs` across
+/// the subtree until it drains.
+pub fn kill_cgroup(cgroup_name: &str) {
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(cgroup_name.trim_start_matches('/'));
+    if !dir.is_dir() {
+        return;
+    }
+    // Atomic subtree kill (cgroup v2, kernel >= 5.14).
+    let kill_file = dir.join("cgroup.kill");
+    if kill_file.exists() && std::fs::write(&kill_file, "1").is_ok() {
+        return;
+    }
+    // Fallback: SIGKILL every pid in cgroup.procs across the subtree, retrying a few
+    // times since a shell can spawn a straggler while it is being torn down.
+    for _ in 0..20 {
+        let mut killed_any = false;
+        kill_cgroup_subtree(&dir, &mut killed_any);
+        if !killed_any {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn kill_cgroup_subtree(dir: &std::path::Path, killed_any: &mut bool) {
+    if let Ok(contents) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+        for line in contents.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                // Never signal pid <= 1 (init / group-sentinel guard).
+                if pid > 1 {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    *killed_any = true;
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                kill_cgroup_subtree(&p, killed_any);
+            }
+        }
+    }
+}
