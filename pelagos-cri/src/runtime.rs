@@ -629,6 +629,30 @@ impl RuntimeSvc {
         self.state.inner.lock().await.pelagos_bin.clone()
     }
 
+    /// Version of the pelagos binary we delegate to, for the CRI `Version` RPC.
+    ///
+    /// pelagos-cri's own crate version is meaningless as a runtime version (it
+    /// is decoupled from the pelagos release, #424), so we ask the binary
+    /// itself: `pelagos --version` → `pelagos 0.65.42+abc1234`. This reflects
+    /// the actually-installed release and makes kubelet's node
+    /// containerRuntimeVersion (and kube_node_info) report the true version.
+    /// Falls back to this crate's version if the binary can't be queried.
+    async fn pelagos_binary_version(&self) -> String {
+        let bin = self.bin().await;
+        let fallback = || env!("CARGO_PKG_VERSION").to_string();
+        match tokio::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                parse_pelagos_version(&String::from_utf8_lossy(&out.stdout))
+                    .unwrap_or_else(fallback)
+            }
+            _ => fallback(),
+        }
+    }
+
     /// The config digest (image id) of a stored image dir: sha256 of its raw
     /// `oci-config.json` blob (matches containerd's image id and what PullImage/
     /// ImageStatus report). Falls back to the manifest digest when the config
@@ -717,6 +741,12 @@ impl RuntimeSvc {
 
 // ── Trait impl ───────────────────────────────────────────────────────────────
 
+/// Extract the version token from `pelagos --version` output.
+/// `"pelagos 0.65.42+abc1234\n"` → `Some("0.65.42+abc1234")`.
+fn parse_pelagos_version(output: &str) -> Option<String> {
+    output.split_whitespace().nth(1).map(|s| s.to_string())
+}
+
 #[tonic::async_trait]
 impl RuntimeService for RuntimeSvc {
     async fn version(
@@ -724,9 +754,12 @@ impl RuntimeService for RuntimeSvc {
         _request: Request<VersionRequest>,
     ) -> Result<Response<VersionResponse>, Status> {
         Ok(Response::new(VersionResponse {
+            // `version` is the constant CRI-API marker (mirrors containerd);
+            // kubelet builds the node's containerRuntimeVersion from
+            // runtime_name://runtime_version, so the real release goes there.
             version: "0.1.0".into(),
             runtime_name: "pelagos".into(),
-            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime_version: self.pelagos_binary_version().await,
             runtime_api_version: "v1".into(),
         }))
     }
@@ -3868,5 +3901,23 @@ mod tests {
     fn test_generate_id_is_unique() {
         let ids: std::collections::HashSet<String> = (0..20).map(|_| generate_id()).collect();
         assert_eq!(ids.len(), 20, "generate_id() produced duplicate IDs");
+    }
+
+    /// #424: the CRI Version RPC must report the pelagos binary's real version,
+    /// parsed from `pelagos --version` output, so kubelet/kube_node_info show the
+    /// actual release instead of the pelagos-cri crate's pinned 0.1.0.
+    #[test]
+    fn test_parse_pelagos_version() {
+        assert_eq!(
+            parse_pelagos_version("pelagos 0.65.42+abc1234\n").as_deref(),
+            Some("0.65.42+abc1234")
+        );
+        assert_eq!(
+            parse_pelagos_version("pelagos 0.65.42").as_deref(),
+            Some("0.65.42")
+        );
+        // Malformed / empty output → None so the caller falls back safely.
+        assert_eq!(parse_pelagos_version("pelagos"), None);
+        assert_eq!(parse_pelagos_version(""), None);
     }
 }
