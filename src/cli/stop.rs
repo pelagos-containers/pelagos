@@ -69,6 +69,13 @@ pub fn cmd_stop(name: &str, time: u64) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    // Belt-and-suspenders: the single-PID signals above miss forked/`setsid`'d
+    // descendants and processes reparented to init. SIGKILL the whole container
+    // cgroup so nothing survives as an orphan holding a port etc. (#412).
+    if let Some(ref cg) = state.cgroup_name {
+        pelagos::cgroup::kill_cgroup(cg);
+    }
+
     // Update state to exited.
     state.status = ContainerStatus::Exited;
     write_state(&state)?;
