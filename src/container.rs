@@ -1303,11 +1303,10 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     if bind_rc != 0 {
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EINVAL) {
-            return Err(io::Error::other(format!(
-                "bind-mount {} to itself: {}",
-                new_root.display(),
-                e
-            )));
+            return Err(pre_exec_err(
+                &format!("bind-mount {} to itself", new_root.display()),
+                e,
+            ));
         }
     }
 
@@ -1324,12 +1323,10 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
 
     let rc = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
     if rc != 0 {
-        return Err(io::Error::other(format!(
-            "pivot_root({}, {}): {}",
-            new_root.display(),
-            put_old.display(),
-            io::Error::last_os_error()
-        )));
+        return Err(pre_exec_err(
+            &format!("pivot_root({}, {})", new_root.display(), put_old.display()),
+            io::Error::last_os_error(),
+        ));
     }
 
     // We are now inside new_root.  Chdir to the new "/".
@@ -3828,9 +3825,8 @@ impl Command {
                                     .write(true)
                                     .open("/proc/self/setgroups")
                                     .map_err(|e| pre_exec_err("setgroups", e))?;
-                                sg.write_all(b"deny\n").map_err(|e| {
-                                    io::Error::other(format!("setgroups write: {}", e))
-                                })?;
+                                sg.write_all(b"deny\n")
+                                    .map_err(|e| pre_exec_err("setgroups write", e))?;
                             }
                             if !uid_maps.is_empty() {
                                 let mut content = String::new();
@@ -3844,9 +3840,8 @@ impl Command {
                                     .write(true)
                                     .open("/proc/self/uid_map")
                                     .map_err(|e| pre_exec_err("uid_map", e))?;
-                                f.write_all(content.as_bytes()).map_err(|e| {
-                                    io::Error::other(format!("uid_map write: {}", e))
-                                })?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| pre_exec_err("uid_map write", e))?;
                             }
                             if !gid_maps.is_empty() {
                                 let mut content = String::new();
@@ -3860,18 +3855,16 @@ impl Command {
                                     .write(true)
                                     .open("/proc/self/gid_map")
                                     .map_err(|e| pre_exec_err("gid_map", e))?;
-                                f.write_all(content.as_bytes()).map_err(|e| {
-                                    io::Error::other(format!("gid_map write: {}", e))
-                                })?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| pre_exec_err("gid_map write", e))?;
                             }
                         }
                         // 1c. Unshare remaining namespaces — now with proper uid/gid mapping
                         //     and full capabilities in the user namespace.
                         let remaining = namespaces & !Namespace::USER;
                         if !remaining.is_empty() {
-                            unshare(remaining.to_clone_flags()).map_err(|e| {
-                                io::Error::other(format!("unshare remaining: {}", e))
-                            })?;
+                            unshare(remaining.to_clone_flags())
+                                .map_err(|e| pre_exec_err("unshare remaining", e))?;
                         }
                     } else {
                         // Privileged (root) mode: unshare all namespaces at once.
@@ -3938,7 +3931,7 @@ impl Command {
                             // already provides isolation even without re-labelling propagation.
                             let has_user_ns = is_rootless || namespaces.contains(Namespace::USER);
                             if !has_user_ns || err.raw_os_error() != Some(libc::EINVAL) {
-                                return Err(io::Error::other(format!("MS_PRIVATE: {}", err)));
+                                return Err(pre_exec_err("MS_PRIVATE", err));
                             }
                         }
                     }
@@ -4131,20 +4124,18 @@ impl Command {
                 if let Some(ref ns_path) = bridge_ns_path {
                     let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                     if fd < 0 {
-                        return Err(io::Error::other(format!(
-                            "open netns '{}': {}",
-                            ns_path.to_string_lossy(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("open netns '{}'", ns_path.to_string_lossy()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                     let ret = libc::setns(fd, libc::CLONE_NEWNET);
                     libc::close(fd);
                     if ret != 0 {
-                        return Err(io::Error::other(format!(
-                            "setns netns '{}': {}",
-                            ns_path.to_string_lossy(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("setns netns '{}'", ns_path.to_string_lossy()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
 
@@ -4428,10 +4419,10 @@ impl Command {
                                 ptr::null(),
                             );
                             if r != 0 {
-                                return Err(io::Error::other(format!(
-                                    "ca cert bind mount: {}",
-                                    io::Error::last_os_error()
-                                )));
+                                return Err(pre_exec_err(
+                                    "ca cert bind mount",
+                                    io::Error::last_os_error(),
+                                ));
                             }
                         }
                     }
@@ -4464,10 +4455,10 @@ impl Command {
                             ptr::null(),
                         );
                         if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "hosts bind mount: {}",
-                                io::Error::last_os_error()
-                            )));
+                            return Err(pre_exec_err(
+                                "hosts bind mount",
+                                io::Error::last_os_error(),
+                            ));
                         }
                     }
 
@@ -4498,11 +4489,10 @@ impl Command {
                         use std::os::unix::ffi::OsStrExt as _;
                         let host_target = resolve_mount_target_in_root(effective_root, &km.target);
                         std::fs::create_dir_all(&host_target).map_err(|e| {
-                            io::Error::other(format!(
-                                "kernel mount mkdir {}: {}",
-                                host_target.display(),
-                                e
-                            ))
+                            pre_exec_err(
+                                &format!("kernel mount mkdir {}", host_target.display()),
+                                e,
+                            )
                         })?;
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
                         let src_c = CString::new(km.source.as_bytes()).unwrap();
@@ -4521,13 +4511,15 @@ impl Command {
                             dat_ptr,
                         );
                         if result != 0 {
-                            return Err(io::Error::other(format!(
-                                "mount {} ({}) at {}: {}",
-                                km.fs_type,
-                                km.source,
-                                host_target.display(),
-                                io::Error::last_os_error()
-                            )));
+                            return Err(pre_exec_err(
+                                &format!(
+                                    "mount {} ({}) at {}",
+                                    km.fs_type,
+                                    km.source,
+                                    host_target.display()
+                                ),
+                                io::Error::last_os_error(),
+                            ));
                         }
                     }
 
@@ -4553,7 +4545,7 @@ impl Command {
                         if r != 0 {
                             let e = io::Error::last_os_error();
                             if !is_rootless {
-                                return Err(io::Error::other(format!("mount tmpfs /dev: {}", e)));
+                                return Err(pre_exec_err("mount tmpfs /dev", e));
                             }
                         } else {
                             // Create subdirectories.
@@ -4717,19 +4709,16 @@ impl Command {
                         // Linux requires the mount target to exist and be the same type
                         // (file or directory) as the source.
                         if bm.source.is_dir() {
-                            std::fs::create_dir_all(&host_target).map_err(|e| {
-                                io::Error::other(format!("bind mount mkdir: {}", e))
-                            })?;
+                            std::fs::create_dir_all(&host_target)
+                                .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                         } else {
                             if let Some(parent) = host_target.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkdir: {}", e))
-                                })?;
+                                std::fs::create_dir_all(parent)
+                                    .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                             }
                             if !host_target.exists() {
-                                std::fs::File::create(&host_target).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkfile: {}", e))
-                                })?;
+                                std::fs::File::create(&host_target)
+                                    .map_err(|e| pre_exec_err("bind mount mkfile", e))?;
                             }
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
@@ -4763,12 +4752,14 @@ impl Command {
                             ptr::null(),
                         );
                         if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "bind mount {} -> {}: {}",
-                                bm.source.display(),
-                                host_target.display(),
-                                io::Error::last_os_error()
-                            )));
+                            return Err(pre_exec_err(
+                                &format!(
+                                    "bind mount {} -> {}",
+                                    bm.source.display(),
+                                    host_target.display()
+                                ),
+                                io::Error::last_os_error(),
+                            ));
                         }
                         // Step 2 (if readonly): make the mount read-only.
                         if bm.readonly {
@@ -4789,11 +4780,10 @@ impl Command {
                                     ptr::null(),
                                 );
                                 if r2 != 0 {
-                                    return Err(io::Error::other(format!(
-                                        "bind mount remount ro {}: {}",
-                                        host_target.display(),
-                                        io::Error::last_os_error()
-                                    )));
+                                    return Err(pre_exec_err(
+                                        &format!("bind mount remount ro {}", host_target.display()),
+                                        io::Error::last_os_error(),
+                                    ));
                                 }
                             }
                         }
@@ -4853,10 +4843,7 @@ impl Command {
                     // owned by our user namespace. With USER+PID (auto-added by spawn()),
                     // proc succeeds. Only skip errors in rootless mode.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::other(format!(
-                            "mount proc: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("mount proc", io::Error::last_os_error()));
                     }
                 }
 
@@ -4875,10 +4862,7 @@ impl Command {
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::other(format!(
-                            "mount sys: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("mount sys", io::Error::last_os_error()));
                     }
                 }
 
@@ -4902,11 +4886,10 @@ impl Command {
                         opts_ptr,                         // data: mount options
                     );
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "tmpfs mount {}: {}",
-                            tm.target.display(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("tmpfs mount {}", tm.target.display()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
 
@@ -4923,11 +4906,10 @@ impl Command {
                         ptr::null(),
                     );
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "propagation remount at {}: {}",
-                            target.display(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("propagation remount at {}", target.display()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
 
@@ -5317,10 +5299,7 @@ impl Command {
                 if !additional_gids.is_empty() {
                     let result = libc::setgroups(additional_gids.len(), additional_gids.as_ptr());
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgroups: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("setgroups", io::Error::last_os_error()));
                     }
                 }
 
@@ -5345,19 +5324,13 @@ impl Command {
                 if let Some(gid_val) = gid {
                     let result = libc::setgid(gid_val);
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgid: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("setgid", io::Error::last_os_error()));
                     }
                 }
                 if let Some(uid_val) = uid {
                     let result = libc::setuid(uid_val);
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setuid: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("setuid", io::Error::last_os_error()));
                     }
                 }
 
@@ -6560,9 +6533,8 @@ impl Command {
                                     .write(true)
                                     .open("/proc/self/setgroups")
                                     .map_err(|e| pre_exec_err("setgroups", e))?;
-                                sg.write_all(b"deny\n").map_err(|e| {
-                                    io::Error::other(format!("setgroups write: {}", e))
-                                })?;
+                                sg.write_all(b"deny\n")
+                                    .map_err(|e| pre_exec_err("setgroups write", e))?;
                             }
                             if !uid_maps.is_empty() {
                                 let mut content = String::new();
@@ -6576,9 +6548,8 @@ impl Command {
                                     .write(true)
                                     .open("/proc/self/uid_map")
                                     .map_err(|e| pre_exec_err("uid_map", e))?;
-                                f.write_all(content.as_bytes()).map_err(|e| {
-                                    io::Error::other(format!("uid_map write: {}", e))
-                                })?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| pre_exec_err("uid_map write", e))?;
                             }
                             if !gid_maps.is_empty() {
                                 let mut content = String::new();
@@ -6592,9 +6563,8 @@ impl Command {
                                     .write(true)
                                     .open("/proc/self/gid_map")
                                     .map_err(|e| pre_exec_err("gid_map", e))?;
-                                f.write_all(content.as_bytes()).map_err(|e| {
-                                    io::Error::other(format!("gid_map write: {}", e))
-                                })?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| pre_exec_err("gid_map write", e))?;
                             }
                         }
                         let remaining = namespaces & !Namespace::USER;
@@ -6777,20 +6747,18 @@ impl Command {
                 if let Some(ref ns_path) = bridge_ns_path {
                     let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                     if fd < 0 {
-                        return Err(io::Error::other(format!(
-                            "open netns '{}': {}",
-                            ns_path.to_string_lossy(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("open netns '{}'", ns_path.to_string_lossy()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                     let ret = libc::setns(fd, libc::CLONE_NEWNET);
                     libc::close(fd);
                     if ret != 0 {
-                        return Err(io::Error::other(format!(
-                            "setns netns '{}': {}",
-                            ns_path.to_string_lossy(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("setns netns '{}'", ns_path.to_string_lossy()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
 
@@ -7033,10 +7001,10 @@ impl Command {
                                 ptr::null(),
                             );
                             if r != 0 {
-                                return Err(io::Error::other(format!(
-                                    "ca cert bind mount: {}",
-                                    io::Error::last_os_error()
-                                )));
+                                return Err(pre_exec_err(
+                                    "ca cert bind mount",
+                                    io::Error::last_os_error(),
+                                ));
                             }
                         }
                     }
@@ -7068,10 +7036,10 @@ impl Command {
                             ptr::null(),
                         );
                         if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "hosts bind mount: {}",
-                                io::Error::last_os_error()
-                            )));
+                            return Err(pre_exec_err(
+                                "hosts bind mount",
+                                io::Error::last_os_error(),
+                            ));
                         }
                     }
 
@@ -7095,11 +7063,10 @@ impl Command {
                         use std::os::unix::ffi::OsStrExt as _;
                         let host_target = resolve_mount_target_in_root(effective_root, &km.target);
                         std::fs::create_dir_all(&host_target).map_err(|e| {
-                            io::Error::other(format!(
-                                "kernel mount mkdir {}: {}",
-                                host_target.display(),
-                                e
-                            ))
+                            pre_exec_err(
+                                &format!("kernel mount mkdir {}", host_target.display()),
+                                e,
+                            )
                         })?;
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
                         let src_c = CString::new(km.source.as_bytes()).unwrap();
@@ -7118,13 +7085,15 @@ impl Command {
                             dat_ptr,
                         );
                         if result != 0 {
-                            return Err(io::Error::other(format!(
-                                "mount {} ({}) at {}: {}",
-                                km.fs_type,
-                                km.source,
-                                host_target.display(),
-                                io::Error::last_os_error()
-                            )));
+                            return Err(pre_exec_err(
+                                &format!(
+                                    "mount {} ({}) at {}",
+                                    km.fs_type,
+                                    km.source,
+                                    host_target.display()
+                                ),
+                                io::Error::last_os_error(),
+                            ));
                         }
                     }
 
@@ -7150,7 +7119,7 @@ impl Command {
                         if r != 0 {
                             let e = io::Error::last_os_error();
                             if !is_rootless {
-                                return Err(io::Error::other(format!("mount tmpfs /dev: {}", e)));
+                                return Err(pre_exec_err("mount tmpfs /dev", e));
                             }
                         } else {
                             let _ = std::fs::create_dir_all(dev_host.join("pts"));
@@ -7297,19 +7266,16 @@ impl Command {
                         // /var/run -> /run) before binding. See issue #334.
                         let host_target = resolve_mount_target_in_root(effective_root, &bm.target);
                         if bm.source.is_dir() {
-                            std::fs::create_dir_all(&host_target).map_err(|e| {
-                                io::Error::other(format!("bind mount mkdir: {}", e))
-                            })?;
+                            std::fs::create_dir_all(&host_target)
+                                .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                         } else {
                             if let Some(parent) = host_target.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkdir: {}", e))
-                                })?;
+                                std::fs::create_dir_all(parent)
+                                    .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                             }
                             if !host_target.exists() {
-                                std::fs::File::create(&host_target).map_err(|e| {
-                                    io::Error::other(format!("bind mount mkfile: {}", e))
-                                })?;
+                                std::fs::File::create(&host_target)
+                                    .map_err(|e| pre_exec_err("bind mount mkfile", e))?;
                             }
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
@@ -7334,12 +7300,14 @@ impl Command {
                             ptr::null(),
                         );
                         if r != 0 {
-                            return Err(io::Error::other(format!(
-                                "bind mount {} -> {}: {}",
-                                bm.source.display(),
-                                host_target.display(),
-                                io::Error::last_os_error()
-                            )));
+                            return Err(pre_exec_err(
+                                &format!(
+                                    "bind mount {} -> {}",
+                                    bm.source.display(),
+                                    host_target.display()
+                                ),
+                                io::Error::last_os_error(),
+                            ));
                         }
                         if bm.readonly {
                             // Recursive RO (#356) via mount_setattr(AT_RECURSIVE);
@@ -7355,11 +7323,10 @@ impl Command {
                                     ptr::null(),
                                 );
                                 if r2 != 0 {
-                                    return Err(io::Error::other(format!(
-                                        "bind mount remount ro {}: {}",
-                                        host_target.display(),
-                                        io::Error::last_os_error()
-                                    )));
+                                    return Err(pre_exec_err(
+                                        &format!("bind mount remount ro {}", host_target.display()),
+                                        io::Error::last_os_error(),
+                                    ));
                                 }
                             }
                         }
@@ -7407,10 +7374,7 @@ impl Command {
                     // In rootless mode, proc mount fails without an owned PID namespace.
                     // With USER+PID (auto-added by spawn()), proc succeeds. Only skip in rootless.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::other(format!(
-                            "mount proc: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("mount proc", io::Error::last_os_error()));
                     }
                 }
 
@@ -7428,10 +7392,7 @@ impl Command {
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
                     if result != 0 && !is_rootless {
-                        return Err(io::Error::other(format!(
-                            "mount sys: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("mount sys", io::Error::last_os_error()));
                     }
                 }
 
@@ -7455,11 +7416,10 @@ impl Command {
                         opts_ptr,
                     );
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "tmpfs mount {}: {}",
-                            tm.target.display(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("tmpfs mount {}", tm.target.display()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
 
@@ -7474,11 +7434,10 @@ impl Command {
                         ptr::null(),
                     );
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "propagation remount at {}: {}",
-                            target.display(),
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err(
+                            &format!("propagation remount at {}", target.display()),
+                            io::Error::last_os_error(),
+                        ));
                     }
                 }
 
@@ -7777,10 +7736,7 @@ impl Command {
                 if !additional_gids.is_empty() {
                     let result = libc::setgroups(additional_gids.len(), additional_gids.as_ptr());
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgroups: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("setgroups", io::Error::last_os_error()));
                     }
                 }
 
@@ -7799,19 +7755,13 @@ impl Command {
                 if let Some(gid_val) = gid {
                     let result = libc::setgid(gid_val);
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgid: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("setgid", io::Error::last_os_error()));
                     }
                 }
                 if let Some(uid_val) = uid {
                     let result = libc::setuid(uid_val);
                     if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setuid: {}",
-                            io::Error::last_os_error()
-                        )));
+                        return Err(pre_exec_err("setuid", io::Error::last_os_error()));
                     }
                 }
 
