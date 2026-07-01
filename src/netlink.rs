@@ -703,7 +703,18 @@ mod tests {
             return;
         }
         let name = format!("pelagos-test-ns-{}", unsafe { libc::getpid() });
-        netns_create(&name).expect("netns_create");
+        // Running as root is necessary but not sufficient: a restricted container
+        // (e.g. an unprivileged CI/build pod) runs as uid 0 yet lacks the
+        // CAP_SYS_ADMIN that `unshare(CLONE_NEWNET)` / the netns bind-mount need.
+        // Skip on a permission error rather than fail the build; a real regression
+        // still surfaces on a capable host (dev box, cluster test node).
+        if let Err(e) = netns_create(&name) {
+            if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+                eprintln!("SKIP test_netns_create_del_roundtrip: netns not permitted here: {e}");
+                return;
+            }
+            panic!("netns_create: {e}");
+        }
         assert!(
             std::path::Path::new(&format!("/run/netns/{name}")).exists(),
             "netns path must exist after create"
