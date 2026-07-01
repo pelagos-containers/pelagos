@@ -10692,6 +10692,51 @@ EXPOSE 8080
         assert!(matches!(instructions[9], build::Instruction::Expose(_)));
     }
 
+    /// test_parse_env_multi_var
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Regression for #420: a single `ENV` line declaring several `KEY=VALUE`
+    /// pairs (including a line continuation and a value containing a colon) must
+    /// expand to one `Instruction::Env` per pair with the correct value — not a
+    /// single Env whose value swallows the rest of the line. Also checks that a
+    /// quoted value keeps its spaces while a following bare pair parses separately.
+    ///
+    /// Failure indicates the ENV parser regressed to first-pair-only, which in
+    /// practice fed a bogus multi-token value to the app (e.g. an unusable
+    /// `BIND_ADDR`) and caused CrashLoopBackOff.
+    #[test]
+    fn test_parse_env_multi_var() {
+        let content =
+            "FROM alpine\nENV BIND_ADDR=0.0.0.0:8080 \\\n    FRONTEND_DIR=/app/frontend \\\n    RUST_LOG=info\nENV GREETING=\"hello world\" LANG=C";
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(
+            &instructions[1..],
+            &[
+                build::Instruction::Env {
+                    key: "BIND_ADDR".into(),
+                    value: "0.0.0.0:8080".into()
+                },
+                build::Instruction::Env {
+                    key: "FRONTEND_DIR".into(),
+                    value: "/app/frontend".into()
+                },
+                build::Instruction::Env {
+                    key: "RUST_LOG".into(),
+                    value: "info".into()
+                },
+                build::Instruction::Env {
+                    key: "GREETING".into(),
+                    value: "hello world".into()
+                },
+                build::Instruction::Env {
+                    key: "LANG".into(),
+                    value: "C".into()
+                },
+            ]
+        );
+    }
+
     /// test_parse_arg_instruction
     ///
     /// Requires: neither root nor rootfs (parser-only).
