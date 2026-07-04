@@ -13,7 +13,8 @@ pub struct BuildArgs {
     #[clap(long, short = 'f')]
     pub file: Option<String>,
 
-    /// Network mode for RUN steps: bridge (root) or pasta (rootless)
+    /// Network mode for RUN steps: auto | bridge (root) | pasta (rootless) |
+    /// host (share parent/pod network, for in-pod builds) | none (isolated)
     #[clap(long, default_value = "auto")]
     pub network: String,
 
@@ -93,6 +94,13 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         "bridge" => NetworkMode::Bridge,
         "pasta" => NetworkMode::Pasta,
         "none" => NetworkMode::Loopback,
+        // Share the parent's network namespace (no isolation) — like
+        // `docker build --network host`. This is what makes `pelagos build`
+        // work INSIDE a pod (in-cluster CI): RUN steps inherit the pod's
+        // network (which already has internet), so no pasta/bridge is needed —
+        // pasta's netns bind is EPERM'd nested-in-pod and bridge needs host
+        // CAP_NET_ADMIN. See #430.
+        "host" => NetworkMode::None,
         "auto" => {
             if pelagos::paths::is_rootless() {
                 NetworkMode::Pasta
@@ -107,7 +115,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
                 NetworkMode::BridgeNamed(name.to_string())
             } else {
                 return Err(format!(
-                    "unknown network '{}' — use a mode (none, bridge, pasta, auto) \
+                    "unknown network '{}' — use a mode (none, host, bridge, pasta, auto) \
                      or create it first: pelagos network create {} --subnet CIDR",
                     name, name
                 )

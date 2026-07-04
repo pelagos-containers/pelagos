@@ -1010,6 +1010,19 @@ direct-`unshare` path and gets EPERM, so `.spawn()` panics. Or the `/proc` stash
 that unblocks a fresh procfs mount in a nested user namespace regressed, so `/proc`
 is missing/inherited. Either breaks in-cluster (in-pod) `pelagos build`.
 
+### `test_build_network_host_shares_parent_netns`
+**Requires:** root, rootfs, host with ≥2 network interfaces
+
+Verifies #430: `pelagos build --network host` maps to `NetworkMode::None`, which
+shares the parent's network namespace (no new netns) — the mode that lets an
+in-pod build reach the internet via the pod's network. Spawns a container with
+`NetworkMode::None` and asserts its `/proc/net/dev` interface set equals the
+host's; then spawns one with `NetworkMode::Loopback` and asserts it sees only
+`lo`. `/proc/net/dev` is per-netns, so this directly proves shared-vs-isolated.
+
+A failure means `host` no longer inherits the parent network (or `Loopback`
+stopped isolating) — either breaks in-pod `pelagos build` internet access.
+
 ### `test_overlay_lower_unchanged`
 **Requires:** root, rootfs
 

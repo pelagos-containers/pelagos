@@ -8809,6 +8809,94 @@ mod images {
             .expect("nested-spawn test thread panicked (see assertion above)");
     }
 
+    /// Interface names from `/proc/net/dev` (skips the two header lines; the
+    /// field before ':' is the interface name). `/proc/net/dev` is per-network-
+    /// namespace, so it is a reliable probe of which netns a process is in.
+    fn proc_net_dev_ifaces(s: &str) -> std::collections::BTreeSet<String> {
+        s.lines()
+            .skip(2)
+            .filter_map(|l| l.split(':').next())
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
+    /// #430: `pelagos build --network host` maps to `NetworkMode::None`, which
+    /// shares the parent's network namespace (no new netns) — the mode that makes
+    /// in-pod builds reach the internet (the pod's network) after #426.
+    ///
+    /// This asserts the semantics at the library level: a container spawned with
+    /// `NetworkMode::None` sees the **same** interface set as the host (shared
+    /// netns), whereas `NetworkMode::Loopback` sees only `lo` (isolated netns).
+    /// A failure means `host` no longer inherits the parent network, which would
+    /// break in-pod `pelagos build` internet access.
+    ///
+    /// Requires: root + alpine-rootfs (and a host with >1 interface, so the
+    /// shared-vs-isolated distinction is observable).
+    #[test]
+    fn test_build_network_host_shares_parent_netns() {
+        use pelagos::network::NetworkMode;
+        if !is_root() {
+            eprintln!("Skipping test_build_network_host_shares_parent_netns: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_build_network_host_shares_parent_netns: alpine-rootfs not found"
+            );
+            return;
+        };
+        let host_ifaces = proc_net_dev_ifaces(
+            &std::fs::read_to_string("/proc/net/dev").expect("read host /proc/net/dev"),
+        );
+        if host_ifaces.len() < 2 {
+            eprintln!(
+                "Skipping test_build_network_host_shares_parent_netns: host has <2 interfaces ({host_ifaces:?})"
+            );
+            return;
+        }
+
+        let run = |mode: NetworkMode| -> std::collections::BTreeSet<String> {
+            let layer = tempfile::tempdir().expect("layer dir");
+            copy_rootfs(&rootfs, layer.path());
+            let (status, out, err) = Command::new("/bin/sh")
+                .args(["-c", "cat /proc/net/dev"])
+                .with_image_layers(vec![layer.path().to_path_buf()])
+                .with_namespaces(Namespace::UTS | Namespace::PID)
+                .with_proc_mount()
+                .with_network(mode)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn")
+                .wait_with_output()
+                .expect("wait");
+            assert!(
+                status.success(),
+                "container should exit 0; stderr={:?}",
+                String::from_utf8_lossy(&err)
+            );
+            proc_net_dev_ifaces(&String::from_utf8_lossy(&out))
+        };
+
+        // Host mode (NetworkMode::None): shares the host netns → same interfaces.
+        let host_mode = run(NetworkMode::None);
+        assert_eq!(
+            host_mode, host_ifaces,
+            "NetworkMode::None (build --network host) must share the parent netns"
+        );
+
+        // Loopback: isolated netns → only lo. Confirms the distinction is real.
+        let loopback = run(NetworkMode::Loopback);
+        assert_eq!(
+            loopback,
+            std::iter::once("lo".to_string()).collect(),
+            "NetworkMode::Loopback must be an isolated netns (lo only), got {loopback:?}"
+        );
+    }
+
     /// test_pull_and_run_real_image
     ///
     /// Requires: root, network access.
