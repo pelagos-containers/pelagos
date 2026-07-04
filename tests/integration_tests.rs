@@ -29782,4 +29782,93 @@ mod issue_412_cgroup_kill_orphans {
             remaining
         );
     }
+
+    /// #412 (reopened) — the container **teardown** path must reap orphans, not
+    /// just the CLI stop/rm paths. A container that **self-exits** under
+    /// crash-restart churn never calls `pelagos stop`; the watcher runs
+    /// `teardown_cgroup`, which previously only did `cg.delete()` (a bare rmdir).
+    /// rmdir fails on a non-empty cgroup, so a `setsid`'d/reparented descendant
+    /// that outlived the main PID survived — holding its port/lock and wedging
+    /// every restart. This drives `teardown_cgroup` directly against exactly that
+    /// state and asserts it (a) kills the orphan and (b) removes the cgroup.
+    #[test]
+    fn test_teardown_cgroup_reaps_orphan_on_self_exit() {
+        if !super::is_root() {
+            eprintln!("Skipping test_teardown_cgroup_reaps_orphan_on_self_exit: requires root");
+            return;
+        }
+        if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            eprintln!("Skipping test_teardown_cgroup_reaps_orphan_on_self_exit: needs cgroup v2");
+            return;
+        }
+
+        let name = format!("pelagos-teardown412-{}", std::process::id());
+        let dir = format!("/sys/fs/cgroup/{}", name);
+        std::fs::create_dir_all(&dir).expect("create test cgroup");
+
+        // A shell joins the cgroup, backgrounds a `setsid sleep` (its own session —
+        // reparented to init when the shell dies), then **exits**. This mimics a
+        // container that self-exits (crash) leaving a descendant in its cgroup.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > {dir}/cgroup.procs; setsid sleep 300 >/dev/null 2>&1 & exit 0"
+            ))
+            .status()
+            .expect("run test shell");
+        assert!(status.success(), "setup shell should exit 0");
+
+        let read_pids = || -> Vec<i32> {
+            std::fs::read_to_string(format!("{dir}/cgroup.procs"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        };
+
+        // The orphan should remain in the cgroup after the shell self-exited.
+        let mut pids = Vec::new();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            pids = read_pids();
+            if !pids.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !pids.is_empty(),
+            "expected a surviving orphan in the cgroup after self-exit"
+        );
+        let orphan = pids[0];
+
+        // The fix under test: teardown must reap the cgroup, then remove it.
+        let cg = pelagos::cgroup::open_cgroup(&name).expect("open test cgroup");
+        pelagos::cgroup::teardown_cgroup(cg);
+
+        // The orphan must be dead...
+        let mut alive = true;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(50));
+            if unsafe { libc::kill(orphan, 0) } != 0 {
+                alive = false;
+                break;
+            }
+        }
+        // ...and the cgroup removed (rmdir only succeeds once it is empty).
+        let dir_gone = !std::path::Path::new(&dir).exists();
+
+        // Clean up regardless of assertion outcome.
+        unsafe { libc::kill(orphan, libc::SIGKILL) };
+        let _ = std::fs::remove_dir(&dir);
+
+        assert!(
+            !alive,
+            "teardown_cgroup left the self-exit orphan (pid {orphan}) alive (#412)"
+        );
+        assert!(
+            dir_gone,
+            "teardown_cgroup did not remove the cgroup — rmdir failed on a non-empty \
+             cgroup because the orphan was not reaped (#412)"
+        );
+    }
 }
