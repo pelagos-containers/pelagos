@@ -120,6 +120,12 @@ pub struct RunArgs {
     #[clap(long = "read-only")]
     pub read_only: bool,
 
+    /// Put the container's overlay scratch (writable layer) on the RAM-backed
+    /// tmpfs instead of the disk default. Fast + auto-freed, but RAM-capped —
+    /// use only for small, short-lived, write-light containers.
+    #[clap(long = "overlay-tmpfs")]
+    pub overlay_tmpfs: bool,
+
     /// Environment variable KEY=VALUE (repeatable)
     #[clap(long = "env", short = 'e')]
     pub env: Vec<String>,
@@ -669,6 +675,7 @@ fn build_image_run(
         // we OR into the flags already set by with_image_layers (MOUNT) rather
         // than replacing them.
         .add_namespaces(Namespace::UTS | pid_ns | ipc_ns | Namespace::CGROUP);
+    cmd = cmd.with_overlay_tmpfs(args.overlay_tmpfs);
 
     // Apply image config environment.  This includes any PATH set by Dockerfile
     // ENV instructions.  apply_cli_options no longer injects a fallback PATH
@@ -780,6 +787,7 @@ fn build_command(
             "PATH",
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         );
+    cmd = cmd.with_overlay_tmpfs(args.overlay_tmpfs);
 
     let rootfs_layers = vec![rootfs_dir.to_path_buf()];
 

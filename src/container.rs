@@ -1208,6 +1208,10 @@ pub struct Command {
     dns_options: Vec<String>,
     // Overlay filesystem (upper + work dirs; lower = chroot_dir).
     overlay: Option<OverlayConfig>,
+    // Put the overlay scratch (upper/work/merged) on the RAM-backed runtime
+    // tmpfs instead of the disk default. Fast + auto-freed but RAM-capped —
+    // opt-in for small, short-lived containers. See paths::overlay_scratch_base.
+    overlay_tmpfs: bool,
     // OCI sync: (ready_write_fd, listen_fd). Used by cmd_create to block the container
     // in pre_exec until "pelagos start" connects to exec.sock.
     oci_sync: Option<(i32, i32)>,
@@ -1377,6 +1381,7 @@ impl Command {
             dns_searches: Vec::new(),
             dns_options: Vec::new(),
             overlay: None,
+            overlay_tmpfs: false,
             oci_sync: None,
             pty_slave: None,
             container_cwd: None,
@@ -2454,6 +2459,18 @@ impl Command {
         self
     }
 
+    /// Place the overlay scratch (upper/work/merged) on the RAM-backed runtime
+    /// tmpfs instead of the disk default.
+    ///
+    /// Disk is the default — the writable layer is bounded by disk (not RAM) and
+    /// can't OOM the node, matching docker/containerd/podman. Opt into tmpfs for
+    /// small, short-lived, write-light containers that want RAM speed + auto-clean.
+    /// Equivalent to `PELAGOS_OVERLAY_TMPFS=1` / the `--overlay-tmpfs` CLI flag.
+    pub fn with_overlay_tmpfs(mut self, enabled: bool) -> Self {
+        self.overlay_tmpfs = enabled;
+        self
+    }
+
     /// Add a Landlock read-only rule: allow the container to read and execute
     /// files beneath `path` but not modify them.
     ///
@@ -3222,7 +3239,7 @@ impl Command {
         let overlay_merged_dir: Option<PathBuf> = if let Some(ref mut ov) = self.overlay {
             let pid = unsafe { libc::getpid() };
             let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = crate::paths::overlay_base(pid, n);
+            let base = crate::paths::overlay_scratch_base(pid, n, self.overlay_tmpfs);
             let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
             // Auto-create ephemeral upper/work for image-layer mode.
@@ -6024,7 +6041,7 @@ impl Command {
         let overlay_merged_dir: Option<PathBuf> = if let Some(ref mut ov) = self.overlay {
             let pid = unsafe { libc::getpid() };
             let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = crate::paths::overlay_base(pid, n);
+            let base = crate::paths::overlay_scratch_base(pid, n, self.overlay_tmpfs);
             let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
             if ov.upper_dir.as_os_str().is_empty() {

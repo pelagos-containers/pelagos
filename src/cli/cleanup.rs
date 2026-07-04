@@ -12,8 +12,19 @@ pub fn cmd_cleanup() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Stale named network namespaces: /run/netns/rem-{pid}-{n}
     cleaned += cleanup_netns()?;
 
-    // 2. Stale overlay dirs: /run/pelagos/overlay-{pid}-{n}/
+    // 2. Stale overlay dirs on the runtime tmpfs (used only in --overlay-tmpfs
+    //    mode): /run/pelagos/overlay-{pid}-{n}/. Cleared on reboot anyway.
     cleaned += cleanup_dir_pattern("/run/pelagos", "overlay-")?;
+
+    // 2b. Stale overlay dirs on the DISK scratch (the default location):
+    //     <scratch_root>/overlay-{pid}-{n}/. Disk overlays SURVIVE reboot (the
+    //     /run tmpfs did not), so this sweep is what reclaims a leaked/crashed
+    //     container's writable layer. (A PID recycled after reboot can keep one
+    //     stale dir alive — bounded; the common exited-container case is handled.)
+    let scratch = pelagos::paths::scratch_root();
+    if let Some(scratch) = scratch.to_str() {
+        cleaned += cleanup_dir_pattern(scratch, "overlay-")?;
+    }
 
     // 3. Stale DNS temp dirs: /run/pelagos/dns-{pid}-{n}/
     cleaned += cleanup_dir_pattern("/run/pelagos", "dns-")?;

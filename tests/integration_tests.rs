@@ -8562,6 +8562,119 @@ mod images {
         );
     }
 
+    /// Spawns an image-layer container with the DEFAULT overlay mode and verifies
+    /// the overlay scratch (upper/work/merged) lands on the **disk** scratch root
+    /// (`paths::scratch_root()`), not the RAM-backed `/run` tmpfs.
+    ///
+    /// This is the #427 fix: a container's writable layer is bounded by disk, not
+    /// RAM, so it can't OOM the node and large writes (e.g. builds) aren't
+    /// RAM-capped. Failure means the default overlay location regressed onto the
+    /// tmpfs — reintroducing the RAM cap.
+    #[test]
+    #[serial]
+    fn test_overlay_default_on_disk() {
+        if !is_root() {
+            eprintln!("Skipping test_overlay_default_on_disk: requires root");
+            return;
+        }
+        // A stray override would move the overlay and invalidate the assertion.
+        if std::env::var("PELAGOS_OVERLAY_DIR").is_ok()
+            || std::env::var("PELAGOS_OVERLAY_TMPFS").is_ok()
+        {
+            eprintln!("Skipping test_overlay_default_on_disk: PELAGOS_OVERLAY_* set");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_overlay_default_on_disk: alpine-rootfs not found");
+            return;
+        };
+        let layer = tempfile::tempdir().expect("layer dir");
+        copy_rootfs(&rootfs, layer.path());
+        let layers = vec![layer.path().to_path_buf()];
+
+        let mut child = Command::new("/bin/true")
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let merged = child
+            .overlay_merged_dir()
+            .expect("merged dir")
+            .to_path_buf();
+        let overlay_base = merged.parent().expect("merged parent").to_path_buf();
+
+        assert!(
+            overlay_base.starts_with(pelagos::paths::scratch_root()),
+            "default overlay should be on the disk scratch root {:?}, got {:?}",
+            pelagos::paths::scratch_root(),
+            overlay_base
+        );
+        assert!(
+            !overlay_base.starts_with(pelagos::paths::runtime_dir()),
+            "default overlay must NOT be on the /run tmpfs: {:?}",
+            overlay_base
+        );
+
+        let status = child.wait().expect("wait");
+        assert!(status.success(), "container should exit 0");
+    }
+
+    /// Same as above but with the tmpfs opt-in (`with_overlay_tmpfs(true)`, i.e.
+    /// the `--overlay-tmpfs` flag): the overlay scratch must land back on the
+    /// RAM-backed `/run` tmpfs (`paths::runtime_dir()`). Verifies the opt-in path
+    /// still works after the disk default.
+    #[test]
+    #[serial]
+    fn test_overlay_tmpfs_optin() {
+        if !is_root() {
+            eprintln!("Skipping test_overlay_tmpfs_optin: requires root");
+            return;
+        }
+        if std::env::var("PELAGOS_OVERLAY_DIR").is_ok() {
+            eprintln!("Skipping test_overlay_tmpfs_optin: PELAGOS_OVERLAY_DIR set");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_overlay_tmpfs_optin: alpine-rootfs not found");
+            return;
+        };
+        let layer = tempfile::tempdir().expect("layer dir");
+        copy_rootfs(&rootfs, layer.path());
+        let layers = vec![layer.path().to_path_buf()];
+
+        let mut child = Command::new("/bin/true")
+            .with_image_layers(layers)
+            .with_overlay_tmpfs(true)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let merged = child
+            .overlay_merged_dir()
+            .expect("merged dir")
+            .to_path_buf();
+        let overlay_base = merged.parent().expect("merged parent").to_path_buf();
+
+        assert!(
+            overlay_base.starts_with(pelagos::paths::runtime_dir()),
+            "--overlay-tmpfs should put the overlay on the /run tmpfs {:?}, got {:?}",
+            pelagos::paths::runtime_dir(),
+            overlay_base
+        );
+
+        let status = child.wait().expect("wait");
+        assert!(status.success(), "container should exit 0");
+    }
+
     /// test_pull_and_run_real_image
     ///
     /// Requires: root, network access.
