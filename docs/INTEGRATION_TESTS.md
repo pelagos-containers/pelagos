@@ -1032,6 +1032,21 @@ nested uid-0 case (CAP_SETUID/CAP_SETGID are still held). Most meaningful on a
 native-overlay backend (ext4/xfs); fuse-overlayfs fallbacks copy up differently
 but the create must still succeed.
 
+### `test_nested_build_setgroups_allowed`
+**Requires:** root, rootfs
+
+Reproduces #434 (nested build's user namespace set `setgroups=deny`, breaking
+`apt` and any privilege-dropping tool). On a **dedicated thread** it drops
+`CAP_SYS_ADMIN` (nested/in-pod path), spawns an overlay container, and reads
+`/proc/self/setgroups` — asserting it is **`allow`**.
+
+What a failure indicates: the parent id-map writer denied setgroups again. Because
+the root parent holds `CAP_SETGID` it can write the gid_map while setgroups stays
+`allow` (as Docker/Podman/runc do for range-mapped build user namespaces); denying
+it makes `setgroups(2)` inside the container return EPERM, so e.g. `apt-get install`
+dies with "Method http has died". Backend-independent (about the id-map, not the
+overlay), so it holds on both native-overlay and fuse-overlayfs hosts.
+
 ### `test_build_network_host_shares_parent_netns`
 **Requires:** root, rootfs, host with ≥2 network interfaces
 

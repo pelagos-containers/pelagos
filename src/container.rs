@@ -5668,9 +5668,18 @@ impl Command {
                         }
                     }
                     if !gid_maps_h.is_empty() {
-                        // Must deny setgroups before writing gid_map (kernel requirement).
-                        let sg_path = format!("/proc/{}/setgroups", child_pid);
-                        let _ = std::fs::write(&sg_path, b"deny\n");
+                        // A root parent holding CAP_SETGID may write the gid_map while
+                        // /proc/pid/setgroups stays "allow". Leaving it "allow" lets the
+                        // container call setgroups(2) — required by apt (drops privileges
+                        // to _apt), su, and other tools. Only the unprivileged path must
+                        // write "deny" before an own-id gid_map. Denying here broke
+                        // `apt-get` in nested/in-pod builds once #432 removed the
+                        // privileged workaround (setgroups EPERM → "Method http died").
+                        const CAP_SETGID: u32 = 6;
+                        if !has_effective_cap(CAP_SETGID) {
+                            let sg_path = format!("/proc/{}/setgroups", child_pid);
+                            let _ = std::fs::write(&sg_path, b"deny\n");
+                        }
                         let path = format!("/proc/{}/gid_map", child_pid);
                         let content: String = gid_maps_h
                             .iter()
@@ -8218,8 +8227,14 @@ impl Command {
                         }
                     }
                     if !gid_maps_h.is_empty() {
-                        let sg_path = format!("/proc/{}/setgroups", child_pid);
-                        let _ = std::fs::write(&sg_path, b"deny\n");
+                        // See spawn(): keep setgroups "allow" when we hold CAP_SETGID so
+                        // the container can call setgroups(2) (apt/_apt, su). Only the
+                        // unprivileged path must deny before an own-id gid_map.
+                        const CAP_SETGID: u32 = 6;
+                        if !has_effective_cap(CAP_SETGID) {
+                            let sg_path = format!("/proc/{}/setgroups", child_pid);
+                            let _ = std::fs::write(&sg_path, b"deny\n");
+                        }
                         let path = format!("/proc/{}/gid_map", child_pid);
                         let content: String = gid_maps_h
                             .iter()

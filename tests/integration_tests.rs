@@ -8904,6 +8904,73 @@ mod images {
             .expect("nested copy-up test thread panicked (see assertion above)");
     }
 
+    /// #434: a nested build (uid 0 without `CAP_SYS_ADMIN`) must leave
+    /// `/proc/self/setgroups` = **`allow`** so the container can call
+    /// `setgroups(2)` — `apt` (drops privileges to `_apt`), `su`, and other
+    /// privilege-dropping tools require it. The root parent that writes the
+    /// child's gid_map holds `CAP_SETGID`, so it does NOT need to deny setgroups
+    /// (that is only required for the unprivileged own-id mapping). This matches
+    /// Docker/Podman/runc for range-mapped build user namespaces.
+    ///
+    /// **What failure means:** the nested userns is back to `setgroups=deny`, so
+    /// any RUN step that drops groups fails with `setgroups (Operation not
+    /// permitted)` — e.g. `apt-get install` dies with "Method http has died".
+    /// Backend-independent (this is about the id-map, not the overlay), so it is
+    /// meaningful on both native-overlay and fuse-overlayfs hosts.
+    ///
+    /// Requires: root + `alpine-rootfs`.
+    #[test]
+    fn test_nested_build_setgroups_allowed() {
+        if !is_root() {
+            eprintln!("Skipping test_nested_build_setgroups_allowed: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_nested_build_setgroups_allowed: alpine-rootfs not found");
+            return;
+        };
+
+        let handle = std::thread::spawn(move || {
+            assert!(
+                drop_cap_sys_admin(),
+                "failed to drop CAP_SYS_ADMIN (capget/capset)"
+            );
+            let layer = tempfile::tempdir().expect("layer dir");
+            copy_rootfs(&rootfs, layer.path());
+            let layers = vec![layer.path().to_path_buf()];
+
+            let (status, stdout_bytes, stderr_bytes) = Command::new("/bin/sh")
+                .args(["-c", "cat /proc/self/setgroups"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::UTS | Namespace::IPC | Namespace::PID)
+                .with_proc_mount()
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("nested spawn should succeed")
+                .wait_with_output()
+                .expect("wait_with_output");
+
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            assert!(
+                status.success(),
+                "container should exit 0; stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(
+                stdout.trim(),
+                "allow",
+                "nested-build user namespace must leave setgroups=allow so \
+                 setgroups(2) works (regression #434); got {stdout:?}"
+            );
+        });
+        handle
+            .join()
+            .expect("nested setgroups test thread panicked (see assertion above)");
+    }
+
     /// Interface names from `/proc/net/dev` (skips the two header lines; the
     /// field before ':' is the interface name). `/proc/net/dev` is per-network-
     /// namespace, so it is a reliable probe of which netns a process is in.
