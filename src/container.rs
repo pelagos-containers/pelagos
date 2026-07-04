@@ -123,6 +123,13 @@ static DNS_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Counter for unique per-container hosts temp-dir names.
 static HOSTS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Fixed directory name (inside the container's new root) used to stash a
+/// recursive bind of the parent's `/proc` across `pivot_root`, so it can be
+/// used as a fallback if mounting a fresh procfs is rejected by the kernel
+/// (nested/in-pod builds — see the proc-mount fallback and #426).  Always
+/// detached and removed before `exec`.
+const PROC_STASH_NAME: &str = ".pelagos_proc_stash";
+
 // Re-export SeccompProfile for public API
 pub use crate::seccomp::SeccompProfile;
 
@@ -150,6 +157,43 @@ fn pre_exec_err<E: Into<io::Error>>(ctx: &str, e: E) -> io::Error {
     } else {
         io::Error::other(format!("{}: {}", ctx, e))
     }
+}
+
+/// Returns `true` if the calling thread holds `CAP_SYS_ADMIN` in its effective
+/// capability set.
+///
+/// This is the predicate that decides whether pelagos must create a **user
+/// namespace** before unsharing the other namespaces.  Creating NS/PID/NET/UTS/
+/// IPC namespaces via `unshare(2)` requires `CAP_SYS_ADMIN` in the current user
+/// namespace.  A plain root process on the host has it, so the direct-unshare
+/// path works.  But when pelagos itself runs as uid 0 **inside** a
+/// capability-restricted container — a k8s pod (even a "privileged" one whose
+/// bounding set is trimmed) or a nested `pelagos` container — that capability is
+/// absent, and the direct `unshare` fails with `EPERM`/`EINVAL`.  In that case
+/// we must unshare `CLONE_NEWUSER` first to obtain a full capability set within
+/// the new user namespace (the rootless path), which is exactly what makes
+/// `pelagos build`'s `RUN` steps work in-pod (see #426).
+///
+/// Reads `CapEff` from `/proc/thread-self/status`.  Capabilities are per-thread
+/// and `unshare(2)`/`fork(2)` inherit the *calling thread's* set, so we inspect
+/// the calling thread (not `/proc/self`, which is the thread-group leader).
+/// Fails **open** (returns `true`, i.e. "assume we have it, use the legacy
+/// direct-unshare path") if the field cannot be read or parsed, so this never
+/// perturbs the normal host path.
+fn has_effective_cap_sys_admin() -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    let status = match std::fs::read_to_string("/proc/thread-self/status") {
+        Ok(s) => s,
+        Err(_) => return true,
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            if let Ok(caps) = u64::from_str_radix(hex.trim(), 16) {
+                return caps & (1u64 << CAP_SYS_ADMIN) != 0;
+            }
+        }
+    }
+    true
 }
 
 /// Read the host (outermost) PID of the calling process from `/proc/thread-self/status`.
@@ -2982,6 +3026,22 @@ impl Command {
 
         // Detect rootless mode (running as non-root) and auto-configure.
         let is_rootless = unsafe { libc::getuid() } != 0;
+        // uid 0 is not sufficient on its own: when pelagos runs inside a
+        // capability-restricted container (a k8s pod, a nested pelagos
+        // container), it is uid 0 but lacks CAP_SYS_ADMIN, so unsharing
+        // NS/PID/NET/… directly fails with EPERM/EINVAL.  Treat "uid 0 without
+        // CAP_SYS_ADMIN" like rootless and create a user namespace to obtain the
+        // capabilities within it.  This is what makes `pelagos build` RUN steps
+        // work in-pod (#426).  A normal host root process HAS CAP_SYS_ADMIN, so
+        // this leaves the host path (host CRI, integration tests) unchanged.
+        let lacks_sys_admin = !has_effective_cap_sys_admin();
+        let needs_user_ns = is_rootless || lacks_sys_admin;
+        if needs_user_ns && !is_rootless {
+            log::info!(
+                "uid 0 without CAP_SYS_ADMIN (nested/in-pod) — creating a user \
+                 namespace so RUN/container namespaces can be unshared"
+            );
+        }
         // Don't unshare a new USER namespace if we're joining an existing one
         // (e.g. `pelagos exec` on a rootless container): setns to a sibling
         // user namespace after unshare(CLONE_NEWUSER) returns EINVAL.
@@ -2991,12 +3051,17 @@ impl Command {
             .join_namespaces
             .iter()
             .any(|(_, ns)| *ns == Namespace::USER);
-        if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
+        if needs_user_ns && !joining_user_ns && !self.skip_rootless_user_ns {
             // Pre-flight: catch host configurations that will fail with a
             // confusing EACCES on /proc/self/setgroups and emit a targeted
             // hint instead. Pure UX; bypassed by PELAGOS_SKIP_ROOTLESS_CHECK=1.
-            crate::rootless_check::check()
-                .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+            // Only for true rootless (uid ≠ 0), which relies on subordinate-id
+            // mappings; the uid-0-without-CAP_SYS_ADMIN case maps 0→0 and needs
+            // no /etc/subuid entries.
+            if is_rootless {
+                crate::rootless_check::check()
+                    .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+            }
             // Unprivileged containers require a user namespace.
             self.namespaces |= Namespace::USER;
             let host_uid = unsafe { libc::getuid() };
@@ -4346,6 +4411,12 @@ impl Command {
                         None
                     };
 
+                // #426: set when we stash a recursive bind of the parent's /proc
+                // inside the new root before pivot_root, for use as a fallback if
+                // a fresh procfs mount is refused after the pivot (see the
+                // proc-mount fallback below).
+                let mut proc_stashed = false;
+
                 // Step 4: Change root if specified
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
@@ -4822,6 +4893,48 @@ impl Command {
                         );
                     }
 
+                    // #426: recursively bind the parent's /proc to a fixed path
+                    // inside the new root BEFORE pivot_root detaches the old root.
+                    // This serves TWO purposes — do not remove it thinking it is
+                    // only a fallback:
+                    //   1. Its mere presence makes the fresh `mount -t proc` below
+                    //      SUCCEED in a nested user namespace.  The kernel's
+                    //      mount_too_revealing check only permits a fresh procfs
+                    //      from a non-initial userns when a fully-visible procfs is
+                    //      already mounted in the mount namespace; the stash is
+                    //      exactly that.  Without it the fresh mount is rejected
+                    //      with EPERM in a pod / nested container.  With it, the
+                    //      container gets a proper private /proc (its own PID
+                    //      namespace).
+                    //   2. If the fresh mount still fails, we bind this stash onto
+                    //      /proc as a fallback so there is at least a working (if
+                    //      less isolated) /proc.
+                    // The stash is always detached and removed before exec, so a
+                    // normal (non-nested) container is unaffected apart from one
+                    // extra bind + unmount.
+                    if mount_proc {
+                        let stash = effective_root.join(PROC_STASH_NAME);
+                        let _ = std::fs::create_dir_all(&stash);
+                        let src_c = CString::new("/proc").unwrap();
+                        let tgt_c = CString::new(stash.as_os_str().as_bytes()).unwrap();
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND | libc::MS_REC,
+                            ptr::null(),
+                        );
+                        if r == 0 {
+                            proc_stashed = true;
+                        } else {
+                            log::debug!(
+                                "/proc stash bind failed (a fresh mount will still \
+                                 be attempted after pivot): {}",
+                                io::Error::last_os_error()
+                            );
+                        }
+                    }
+
                     // Normal path: pivot_root atomically makes new_root the
                     // mount namespace root and detaches the old root.
                     // Fuse overlay (rootless) uses the same path — effective_root
@@ -4847,20 +4960,66 @@ impl Command {
                     let _ = std::fs::create_dir_all("/proc");
                     let proc_src = CString::new("proc").unwrap();
                     let proc_tgt = CString::new("/proc").unwrap();
+                    // Prefer a fresh, private procfs (nosuid,nodev,noexec — matches
+                    // runc/Docker and carries the flags the kernel requires of a
+                    // procfs mounted from a nested user namespace). It reflects the
+                    // container's own PID namespace.
                     let result = libc::mount(
-                        proc_src.as_ptr(), // source
-                        proc_tgt.as_ptr(), // target
-                        proc_src.as_ptr(), // fstype (proc)
-                        0,                 // flags
-                        ptr::null(),       // data
+                        proc_src.as_ptr(),
+                        proc_tgt.as_ptr(),
+                        proc_src.as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                        ptr::null(),
                     );
-                    // In rootless mode OR with a USER namespace, proc mount fails (EPERM or
-                    // EINVAL) because the PID namespace is not owned by our user namespace.
-                    // In rootless mode, proc mount fails because the PID namespace is not
-                    // owned by our user namespace. With USER+PID (auto-added by spawn()),
-                    // proc succeeds. Only skip errors in rootless mode.
-                    if result != 0 && !is_rootless {
-                        return Err(pre_exec_err("mount proc", io::Error::last_os_error()));
+                    let mut fatal: Option<io::Error> = None;
+                    if result != 0 {
+                        // #426: the kernel refused a fresh procfs (mount_too_revealing
+                        // / EPERM) — pelagos is nested in a restricted user namespace
+                        // whose parent /proc is more locked-down (e.g. an in-pod
+                        // build). Fall back to the parent's /proc stashed before the
+                        // pivot; if there is no stash, tolerate in rootless mode
+                        // (the inherited /proc is still usable) and fail otherwise.
+                        let fresh_err = io::Error::last_os_error();
+                        let bound = proc_stashed && {
+                            let stash_c = CString::new(format!("/{PROC_STASH_NAME}")).unwrap();
+                            libc::mount(
+                                stash_c.as_ptr(),
+                                proc_tgt.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND | libc::MS_REC,
+                                ptr::null(),
+                            ) == 0
+                        };
+                        if bound {
+                            log::warn!(
+                                "mounting a fresh /proc was rejected ({}); bound the \
+                                 parent's /proc instead. pelagos is running nested in a \
+                                 restricted user namespace (e.g. an in-pod build), so \
+                                 /proc reflects the parent PID namespace, not the \
+                                 container's. See #426.",
+                                fresh_err
+                            );
+                        } else if !is_rootless {
+                            fatal = Some(fresh_err);
+                        } else {
+                            log::warn!(
+                                "proc mount unavailable ({}) with no usable fallback; \
+                                 continuing without a private /proc",
+                                fresh_err
+                            );
+                        }
+                    }
+                    // Remove the stash mountpoint if we made one. After a successful
+                    // fresh mount it is redundant; after a fallback bind the /proc
+                    // mount is an independent clone, so detaching the stash here does
+                    // not affect it.
+                    if proc_stashed {
+                        let stash_c = CString::new(format!("/{PROC_STASH_NAME}")).unwrap();
+                        libc::umount2(stash_c.as_ptr(), libc::MNT_DETACH);
+                        libc::rmdir(stash_c.as_ptr());
+                    }
+                    if let Some(e) = fatal {
+                        return Err(pre_exec_err("mount proc", e));
                     }
                 }
 
@@ -5815,17 +5974,30 @@ impl Command {
             .collect();
 
         // Detect rootless mode and auto-configure (same logic as spawn()).
+        // "uid 0 without CAP_SYS_ADMIN" (nested/in-pod) also needs a user
+        // namespace — see has_effective_cap_sys_admin() and #426.
         let is_rootless = unsafe { libc::getuid() } != 0;
+        let lacks_sys_admin = !has_effective_cap_sys_admin();
+        let needs_user_ns = is_rootless || lacks_sys_admin;
+        if needs_user_ns && !is_rootless {
+            log::info!(
+                "uid 0 without CAP_SYS_ADMIN (nested/in-pod) — creating a user \
+                 namespace so container namespaces can be unshared"
+            );
+        }
         let joining_user_ns = self
             .join_namespaces
             .iter()
             .any(|(_, ns)| *ns == Namespace::USER);
-        if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
+        if needs_user_ns && !joining_user_ns && !self.skip_rootless_user_ns {
             // Pre-flight: catch host configurations that will fail with a
             // confusing EACCES on /proc/self/setgroups and emit a targeted
             // hint instead. Pure UX; bypassed by PELAGOS_SKIP_ROOTLESS_CHECK=1.
-            crate::rootless_check::check()
-                .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+            // Only for true rootless (uid ≠ 0); uid-0 nested maps 0→0.
+            if is_rootless {
+                crate::rootless_check::check()
+                    .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+            }
             self.namespaces |= Namespace::USER;
             let host_uid = unsafe { libc::getuid() };
             let host_gid = unsafe { libc::getgid() };
@@ -6939,6 +7111,10 @@ impl Command {
                         None
                     };
 
+                // #426: set when we stash a recursive bind of the parent's /proc
+                // inside the new root before pivot_root (see the other spawn path).
+                let mut proc_stashed = false;
+
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
@@ -7362,6 +7538,48 @@ impl Command {
                         );
                     }
 
+                    // #426: recursively bind the parent's /proc to a fixed path
+                    // inside the new root BEFORE pivot_root detaches the old root.
+                    // This serves TWO purposes — do not remove it thinking it is
+                    // only a fallback:
+                    //   1. Its mere presence makes the fresh `mount -t proc` below
+                    //      SUCCEED in a nested user namespace.  The kernel's
+                    //      mount_too_revealing check only permits a fresh procfs
+                    //      from a non-initial userns when a fully-visible procfs is
+                    //      already mounted in the mount namespace; the stash is
+                    //      exactly that.  Without it the fresh mount is rejected
+                    //      with EPERM in a pod / nested container.  With it, the
+                    //      container gets a proper private /proc (its own PID
+                    //      namespace).
+                    //   2. If the fresh mount still fails, we bind this stash onto
+                    //      /proc as a fallback so there is at least a working (if
+                    //      less isolated) /proc.
+                    // The stash is always detached and removed before exec, so a
+                    // normal (non-nested) container is unaffected apart from one
+                    // extra bind + unmount.
+                    if mount_proc {
+                        let stash = effective_root.join(PROC_STASH_NAME);
+                        let _ = std::fs::create_dir_all(&stash);
+                        let src_c = CString::new("/proc").unwrap();
+                        let tgt_c = CString::new(stash.as_os_str().as_bytes()).unwrap();
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND | libc::MS_REC,
+                            ptr::null(),
+                        );
+                        if r == 0 {
+                            proc_stashed = true;
+                        } else {
+                            log::debug!(
+                                "/proc stash bind failed (a fresh mount will still \
+                                 be attempted after pivot): {}",
+                                io::Error::last_os_error()
+                            );
+                        }
+                    }
+
                     // Normal path: pivot_root atomically makes new_root the
                     // mount namespace root and detaches the old root.
                     // Fuse overlay (rootless) uses the same path — effective_root
@@ -7381,17 +7599,59 @@ impl Command {
                     let _ = std::fs::create_dir_all("/proc");
                     let proc_src = CString::new("proc").unwrap();
                     let proc_tgt = CString::new("/proc").unwrap();
+                    // Prefer a fresh, private procfs (nosuid,nodev,noexec — matches
+                    // runc/Docker and carries the flags the kernel requires of a
+                    // procfs mounted from a nested user namespace). See the other
+                    // proc mount site for the full rationale and the #426 fallback.
                     let result = libc::mount(
                         proc_src.as_ptr(),
                         proc_tgt.as_ptr(),
                         proc_src.as_ptr(),
-                        0,
+                        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                         ptr::null(),
                     );
-                    // In rootless mode, proc mount fails without an owned PID namespace.
-                    // With USER+PID (auto-added by spawn()), proc succeeds. Only skip in rootless.
-                    if result != 0 && !is_rootless {
-                        return Err(pre_exec_err("mount proc", io::Error::last_os_error()));
+                    let mut fatal: Option<io::Error> = None;
+                    if result != 0 {
+                        // #426: fresh procfs refused (nested/in-pod). Fall back to the
+                        // parent's /proc stashed before the pivot; tolerate in
+                        // rootless mode, fail otherwise.
+                        let fresh_err = io::Error::last_os_error();
+                        let bound = proc_stashed && {
+                            let stash_c = CString::new(format!("/{PROC_STASH_NAME}")).unwrap();
+                            libc::mount(
+                                stash_c.as_ptr(),
+                                proc_tgt.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND | libc::MS_REC,
+                                ptr::null(),
+                            ) == 0
+                        };
+                        if bound {
+                            log::warn!(
+                                "mounting a fresh /proc was rejected ({}); bound the \
+                                 parent's /proc instead. pelagos is running nested in a \
+                                 restricted user namespace (e.g. an in-pod build), so \
+                                 /proc reflects the parent PID namespace, not the \
+                                 container's. See #426.",
+                                fresh_err
+                            );
+                        } else if !is_rootless {
+                            fatal = Some(fresh_err);
+                        } else {
+                            log::warn!(
+                                "proc mount unavailable ({}) with no usable fallback; \
+                                 continuing without a private /proc",
+                                fresh_err
+                            );
+                        }
+                    }
+                    if proc_stashed {
+                        let stash_c = CString::new(format!("/{PROC_STASH_NAME}")).unwrap();
+                        libc::umount2(stash_c.as_ptr(), libc::MNT_DETACH);
+                        libc::rmdir(stash_c.as_ptr());
+                    }
+                    if let Some(e) = fatal {
+                        return Err(pre_exec_err("mount proc", e));
                     }
                 }
 

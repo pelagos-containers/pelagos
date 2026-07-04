@@ -8675,6 +8675,140 @@ mod images {
         assert!(status.success(), "container should exit 0");
     }
 
+    /// Drop `CAP_SYS_ADMIN` from the calling thread's effective + permitted sets.
+    /// Capabilities are per-thread, so this must be invoked on a dedicated thread
+    /// (see `test_nested_build_spawn_without_cap_sys_admin`) to avoid disturbing
+    /// the rest of the suite. Returns false if the capset syscalls fail.
+    fn drop_cap_sys_admin() -> bool {
+        const CAP_SYS_ADMIN: u32 = 21; // < 32 → lives in capability word 0
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: libc::c_int,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut hdr = CapHeader {
+            version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        unsafe {
+            if libc::syscall(
+                libc::SYS_capget,
+                &mut hdr as *mut CapHeader,
+                data.as_mut_ptr(),
+            ) != 0
+            {
+                return false;
+            }
+            let bit = 1u32 << CAP_SYS_ADMIN;
+            data[0].effective &= !bit;
+            data[0].permitted &= !bit;
+            libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) == 0
+        }
+    }
+
+    /// #426: `pelagos build`'s RUN steps failed to spawn (EINVAL/EPERM on
+    /// `unshare`) when pelagos itself ran nested inside a container — a k8s pod —
+    /// as **uid 0 without `CAP_SYS_ADMIN`** (the pod's trimmed capability set).
+    ///
+    /// This reproduces that condition faithfully: on a dedicated thread it drops
+    /// `CAP_SYS_ADMIN` (capabilities are per-thread, so the drop is isolated from
+    /// the rest of the suite), then spawns an overlay + `/proc` container exactly
+    /// like a build RUN step.
+    ///
+    /// **What failure means:** before the fix, `spawn()` keyed its user-namespace
+    /// decision on `getuid() != 0`, so a capless uid-0 process took the
+    /// direct-unshare path and got EPERM — this test would panic in `.spawn()`.
+    /// The fix makes pelagos (a) create a user namespace when `CAP_SYS_ADMIN` is
+    /// absent regardless of uid, and (b) stash the parent's `/proc` before pivot
+    /// so a fresh private procfs can be mounted. A pass proves both: the nested
+    /// spawn succeeds, the container exits 0, and it gets its OWN `/proc`
+    /// (readable `/proc/self/status`, and a private PID namespace so only a
+    /// handful of PIDs are visible — not the host's hundreds).
+    ///
+    /// Requires: root + `alpine-rootfs`.
+    #[test]
+    fn test_nested_build_spawn_without_cap_sys_admin() {
+        if !is_root() {
+            eprintln!("Skipping test_nested_build_spawn_without_cap_sys_admin: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_nested_build_spawn_without_cap_sys_admin: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Run on a dedicated thread: the CAP_SYS_ADMIN drop is per-thread and
+        // must not leak into any other test.
+        let handle = std::thread::spawn(move || {
+            assert!(
+                drop_cap_sys_admin(),
+                "failed to drop CAP_SYS_ADMIN (capget/capset)"
+            );
+
+            let layer = tempfile::tempdir().expect("layer dir");
+            copy_rootfs(&rootfs, layer.path());
+            let layers = vec![layer.path().to_path_buf()];
+
+            // Mimic a build RUN step: image layers (overlay) + UTS/IPC/PID + /proc.
+            let (status, stdout_bytes, stderr_bytes) = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "echo PIDCOUNT=$(ls -d /proc/[0-9]* | wc -l); head -1 /proc/self/status",
+                ])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::UTS | Namespace::IPC | Namespace::PID)
+                .with_proc_mount()
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("nested-style spawn without CAP_SYS_ADMIN should succeed")
+                .wait_with_output()
+                .expect("wait_with_output");
+
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            assert!(
+                status.success(),
+                "container should exit 0; stdout={stdout:?} stderr={stderr:?}"
+            );
+            // /proc is functional (a fresh private procfs was mounted).
+            assert!(
+                stdout.contains("Name:"),
+                "expected readable /proc/self/status; got: {stdout:?}"
+            );
+            // Private PID namespace: only the container's own handful of PIDs are
+            // visible — proves it is NOT the host's /proc (which shows hundreds).
+            let count: usize = stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("PIDCOUNT="))
+                .and_then(|n| n.trim().parse().ok())
+                .expect("PIDCOUNT line");
+            assert!(
+                (1..50).contains(&count),
+                "expected a private /proc with few PIDs, got PIDCOUNT={count}"
+            );
+        });
+        handle
+            .join()
+            .expect("nested-spawn test thread panicked (see assertion above)");
+    }
+
     /// test_pull_and_run_real_image
     ///
     /// Requires: root, network access.
