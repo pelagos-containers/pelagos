@@ -993,6 +993,23 @@ Same as above but with `with_overlay_tmpfs(true)` (the `--overlay-tmpfs` flag /
 `paths::runtime_dir()` (the `/run` tmpfs). Failure means the tmpfs opt-in is broken — users
 can no longer choose the fast, RAM-backed, auto-cleaned overlay for small ephemeral containers.
 
+### `test_nested_build_spawn_without_cap_sys_admin`
+**Requires:** root, rootfs
+
+Reproduces #426 (`pelagos build` RUN steps failing when pelagos runs nested inside
+a container/pod). On a **dedicated thread** — because capabilities are per-thread —
+it drops `CAP_SYS_ADMIN` from the calling thread, then spawns an overlay + `/proc`
+container exactly like a build RUN step (`with_image_layers` + `UTS|IPC|PID` +
+`with_proc_mount`). Asserts the spawn **succeeds**, the container exits 0, its
+`/proc/self/status` is readable, and only a handful of PIDs are visible (a private
+PID namespace, not the host's `/proc`).
+
+What a failure indicates: pelagos is back to deciding "do I need a user namespace?"
+from `getuid() != 0` alone — a capless uid-0 process (a k8s pod) then takes the
+direct-`unshare` path and gets EPERM, so `.spawn()` panics. Or the `/proc` stash
+that unblocks a fresh procfs mount in a nested user namespace regressed, so `/proc`
+is missing/inherited. Either breaks in-cluster (in-pod) `pelagos build`.
+
 ### `test_overlay_lower_unchanged`
 **Requires:** root, rootfs
 

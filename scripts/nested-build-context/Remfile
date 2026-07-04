@@ -1,0 +1,2 @@
+FROM alpine:latest
+RUN echo NESTED_RUN_STEP_OK > /marker && cat /marker
