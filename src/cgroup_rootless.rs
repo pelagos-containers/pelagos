@@ -207,6 +207,11 @@ pub fn read_rootless_stats(cg: &RootlessCgroup) -> io::Result<ResourceStats> {
 /// Remove the sub-cgroup directory. Only succeeds when all tasks have exited.
 /// Logs a warning on failure (non-fatal).
 pub fn teardown_rootless_cgroup(cg: &RootlessCgroup) {
+    // Reap survivors before removing the cgroup — same defense-in-depth as the
+    // root path (#412). A forked/reparented descendant that outlived the main PID
+    // otherwise keeps the delegated cgroup non-empty, so the `remove_dir` below
+    // fails and the orphan lingers holding its resource. No-op when empty.
+    crate::cgroup::kill_cgroup_at(&cg.path);
     if let Err(e) = fs::remove_dir(&cg.path) {
         log::warn!(
             "rootless cgroup remove {} failed (non-fatal): {}",

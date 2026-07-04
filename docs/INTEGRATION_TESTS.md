@@ -5502,3 +5502,17 @@ instance CrashLooped on `bind: address already in use`). `kill_cgroup` sweeps th
 cgroup (atomic `cgroup.kill`, or a `cgroup.procs` walk) so nothing survives. The test
 specifically verifies a **setsid session leader** — which a single-PID/process-group kill
 would leave alive — is reaped. A failure here means container teardown can leak orphans.
+
+## `issue_412_cgroup_kill_orphans::test_teardown_cgroup_reaps_orphan_on_self_exit`
+**Requires root** and **cgroup v2** (skips otherwise). Guards the *reopened* half of
+#412: the **teardown** path, not just the CLI stop/rm paths. Creates a test cgroup, runs
+a shell that joins it, backgrounds a **`setsid sleep`**, then **exits** — mimicking a
+container that **self-exits under crash-restart churn** (which never calls `pelagos
+stop`). It then drives `pelagos::cgroup::teardown_cgroup` directly against that state and
+asserts the orphan is **killed** and the cgroup **removed**. **Why it matters:** the
+watcher runs `teardown_cgroup` on every container exit; it previously only did
+`cg.delete()` (a bare rmdir), which fails on a non-empty cgroup — so a `setsid`'d/
+reparented descendant survived, held its port/lock, and wedged every restart into
+CrashLoop (MetalLB speaker on :7946, Vault on its raft.db lock, both seen 2026-07-04). A
+failure here means teardown regressed to rmdir-without-reap and orphans can leak again.
+The companion rootless path (`teardown_rootless_cgroup`) is hardened the same way.

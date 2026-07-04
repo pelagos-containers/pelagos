@@ -400,6 +400,16 @@ pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
 /// are non-fatal since the kernel will reclaim resources automatically once
 /// all tasks have exited.
 pub fn teardown_cgroup(cg: Cgroup) {
+    // Defense-in-depth (#412): reap any processes still in the cgroup before
+    // removing it. This runs in the watcher on *every* container exit — including
+    // a self-exit under crash-restart churn, which never goes through `pelagos
+    // stop`. A forked/`setsid`'d/reparented descendant that outlived the main PID
+    // otherwise survives here, keeps holding its resource (a hostNetwork port, a
+    // raft.db lock), and the bare `delete()` (rmdir) below fails on the non-empty
+    // cgroup — leaving the orphan to wedge every subsequent restart. Killing the
+    // cgroup first catches them all; it is a no-op on the clean-exit case (the
+    // cgroup is already empty).
+    kill_cgroup(cg.path());
     if let Err(e) = cg.delete() {
         log::warn!("cgroup delete failed (non-fatal): {}", e);
     }
@@ -483,21 +493,50 @@ pub fn read_stats(cg: &Cgroup) -> io::Result<ResourceStats> {
 /// the subtree until it drains.
 pub fn kill_cgroup(cgroup_name: &str) {
     let dir = std::path::Path::new("/sys/fs/cgroup").join(cgroup_name.trim_start_matches('/'));
+    kill_cgroup_at(&dir);
+}
+
+/// SIGKILL every process in the cgroup subtree rooted at `dir` (an absolute
+/// `/sys/fs/cgroup/...` path). Shared by [`kill_cgroup`] (name-based, root
+/// containers) and the rootless teardown (which knows its cgroup by absolute
+/// path). No-op if `dir` is not a directory.
+pub(crate) fn kill_cgroup_at(dir: &std::path::Path) {
     if !dir.is_dir() {
         return;
     }
     // Atomic subtree kill (cgroup v2, kernel >= 5.14).
     let kill_file = dir.join("cgroup.kill");
     if kill_file.exists() && std::fs::write(&kill_file, "1").is_ok() {
+        // cgroup.kill is asynchronous: SIGKILL is delivered but the tasks take a
+        // moment to exit and leave cgroup.procs. Wait for the cgroup to drain so a
+        // caller can immediately rmdir it (teardown_cgroup does exactly that).
+        wait_cgroup_drained(dir);
         return;
     }
     // Fallback: SIGKILL every pid in cgroup.procs across the subtree, retrying a few
     // times since a shell can spawn a straggler while it is being torn down.
     for _ in 0..20 {
         let mut killed_any = false;
-        kill_cgroup_subtree(&dir, &mut killed_any);
+        kill_cgroup_subtree(dir, &mut killed_any);
         if !killed_any {
             break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    wait_cgroup_drained(dir);
+}
+
+/// Poll until `dir`'s `cgroup.procs` is empty (up to ~2s). SIGKILL delivery and
+/// the subsequent task teardown are asynchronous, so a freshly-killed cgroup can
+/// briefly still list its (now-dying) tasks; waiting lets the caller rmdir it.
+fn wait_cgroup_drained(dir: &std::path::Path) {
+    let procs = dir.join("cgroup.procs");
+    for _ in 0..40 {
+        let empty = std::fs::read_to_string(&procs)
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        if empty {
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
