@@ -8809,6 +8809,101 @@ mod images {
             .expect("nested-spawn test thread panicked (see assertion above)");
     }
 
+    /// #432: a nested `pelagos build` RUN step (uid 0 without `CAP_SYS_ADMIN`)
+    /// could not create files inside image directories owned by a **non-root
+    /// uid/gid**. Container image layers own files as arbitrary ids (rust's
+    /// `/usr/local/cargo` is gid 983); overlayfs copy-up must preserve that
+    /// ownership onto the new upper file, but the nested user namespace mapped
+    /// only `0→0`, so an unmapped id could not be represented and the create
+    /// failed with `EOVERFLOW` — surfacing as cargo's misleading "failed to
+    /// acquire package cache lock: Value too large for defined data type".
+    ///
+    /// This reproduces it faithfully: on a dedicated thread it drops
+    /// `CAP_SYS_ADMIN` (entering the nested/in-pod path), builds an overlay whose
+    /// lower layer has a directory owned by a non-root gid, then runs a container
+    /// that creates a file inside it — forcing overlayfs to copy the directory up.
+    ///
+    /// **What failure means:** before the fix, the nested user namespace mapped a
+    /// single id (`0→0`), so the copy-up of the non-root-gid directory returned
+    /// EOVERFLOW and the `touch` failed (container exits non-zero). The fix
+    /// identity-maps the whole id space in the nested uid-0 case (we still hold
+    /// CAP_SETUID/CAP_SETGID there), so every image-layer ownership is
+    /// representable and the create succeeds. A pass proves a file can be created
+    /// beneath a non-root-owned image directory in the nested build path.
+    ///
+    /// Most meaningful on a native-overlay backend (ext4/xfs); on backends that
+    /// fall back to fuse-overlayfs the copy-up path differs but the test still
+    /// asserts the create succeeds.
+    ///
+    /// Requires: root + `alpine-rootfs`.
+    #[test]
+    fn test_nested_build_overlay_copyup_unmapped_gid() {
+        if !is_root() {
+            eprintln!("Skipping test_nested_build_overlay_copyup_unmapped_gid: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_nested_build_overlay_copyup_unmapped_gid: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let handle = std::thread::spawn(move || {
+            // Arbitrary non-root gid, mirroring a real image (rust's
+            // /usr/local/cargo is gid 983). Any id unmapped by a `0→0`-only user
+            // namespace triggers the bug.
+            const IMAGE_GID: u32 = 983;
+
+            let layer = tempfile::tempdir().expect("layer dir");
+            copy_rootfs(&rootfs, layer.path());
+
+            // A lower-layer directory (and file) owned by IMAGE_GID. Creating a
+            // file inside it forces overlayfs to copy the directory up, preserving
+            // this ownership onto the upper — the operation that failed with #432.
+            let img_dir = layer.path().join("cargotest");
+            std::fs::create_dir_all(&img_dir).expect("create image dir");
+            std::fs::write(img_dir.join("config"), b"seed").expect("seed file");
+            // CAP_CHOWN is retained (only CAP_SYS_ADMIN is dropped below).
+            std::os::unix::fs::chown(&img_dir, Some(0), Some(IMAGE_GID)).expect("chown dir");
+            std::os::unix::fs::chown(img_dir.join("config"), Some(0), Some(IMAGE_GID))
+                .expect("chown file");
+
+            // Enter the nested/in-pod condition: uid 0 without CAP_SYS_ADMIN.
+            assert!(
+                drop_cap_sys_admin(),
+                "failed to drop CAP_SYS_ADMIN (capget/capset)"
+            );
+
+            let layers = vec![layer.path().to_path_buf()];
+            let (status, stdout_bytes, stderr_bytes) = Command::new("/bin/sh")
+                .args(["-c", "touch /cargotest/.package-cache && echo CREATED"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::UTS | Namespace::IPC | Namespace::PID)
+                .with_proc_mount()
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("nested spawn should succeed")
+                .wait_with_output()
+                .expect("wait_with_output");
+
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            assert!(
+                status.success() && stdout.contains("CREATED"),
+                "creating a file beneath a non-root-gid image directory must \
+                 succeed under the nested user namespace (regression #432); \
+                 status={status:?} stdout={stdout:?} stderr={stderr:?}"
+            );
+        });
+        handle
+            .join()
+            .expect("nested copy-up test thread panicked (see assertion above)");
+    }
+
     /// Interface names from `/proc/net/dev` (skips the two header lines; the
     /// field before ':' is the interface name). `/proc/net/dev` is per-network-
     /// namespace, so it is a reliable probe of which netns a process is in.

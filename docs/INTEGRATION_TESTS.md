@@ -1010,6 +1010,28 @@ direct-`unshare` path and gets EPERM, so `.spawn()` panics. Or the `/proc` stash
 that unblocks a fresh procfs mount in a nested user namespace regressed, so `/proc`
 is missing/inherited. Either breaks in-cluster (in-pod) `pelagos build`.
 
+### `test_nested_build_overlay_copyup_unmapped_gid`
+**Requires:** root, rootfs
+
+Reproduces #432 (nested `pelagos build` RUN steps could not create files inside
+image directories owned by a **non-root uid/gid**). On a **dedicated thread** it
+drops `CAP_SYS_ADMIN` (entering the nested/in-pod path), builds an overlay whose
+lower layer contains a directory owned by gid 983 (mirroring rust's
+`/usr/local/cargo`), then runs a container that creates a file inside it —
+forcing overlayfs to copy the directory up. Asserts the container exits 0 and
+prints `CREATED`.
+
+What a failure indicates: the nested user namespace has regressed to mapping a
+single id (`0→0`). overlayfs copy-up must preserve the lower directory's
+ownership onto the new upper file, but an id unmapped in the namespace cannot be
+represented, so the create fails with `EOVERFLOW` — the exact failure that made
+`cargo build` (and any tool writing under a non-root-owned image dir) fail
+in-pod with the misleading "failed to acquire package cache lock: Value too
+large for defined data type". The fix identity-maps the whole id space in the
+nested uid-0 case (CAP_SETUID/CAP_SETGID are still held). Most meaningful on a
+native-overlay backend (ext4/xfs); fuse-overlayfs fallbacks copy up differently
+but the create must still succeed.
+
 ### `test_build_network_host_shares_parent_netns`
 **Requires:** root, rootfs, host with ≥2 network interfaces
 

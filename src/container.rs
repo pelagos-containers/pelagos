@@ -182,6 +182,15 @@ fn pre_exec_err<E: Into<io::Error>>(ctx: &str, e: E) -> io::Error {
 /// perturbs the normal host path.
 fn has_effective_cap_sys_admin() -> bool {
     const CAP_SYS_ADMIN: u32 = 21;
+    has_effective_cap(CAP_SYS_ADMIN)
+}
+
+/// Returns `true` if the calling thread holds capability `cap` (a `CAP_*`
+/// number) in its effective set.  Reads `CapEff` from `/proc/thread-self/status`
+/// — capabilities are per-thread, and `unshare(2)`/`fork(2)` inherit the calling
+/// thread's set.  Fails **open** (returns `true`) if the field cannot be read or
+/// parsed, so a probe failure never blocks a path that would otherwise work.
+fn has_effective_cap(cap: u32) -> bool {
     let status = match std::fs::read_to_string("/proc/thread-self/status") {
         Ok(s) => s,
         Err(_) => return true,
@@ -189,7 +198,7 @@ fn has_effective_cap_sys_admin() -> bool {
     for line in status.lines() {
         if let Some(hex) = line.strip_prefix("CapEff:") {
             if let Ok(caps) = u64::from_str_radix(hex.trim(), 16) {
-                return caps & (1u64 << CAP_SYS_ADMIN) != 0;
+                return caps & (1u64 << cap) != 0;
             }
         }
     }
@@ -3119,20 +3128,54 @@ impl Command {
                         }
                     }
                 }
-                // Fallback: single-UID map (current behavior).
+                // Fallback map.  Two cases reach here:
+                //
+                // 1. Nested uid-0 (in-pod, no CAP_SYS_ADMIN — the #426 path).
+                //    A single `0→0` map is NOT enough: container image layers own
+                //    files as arbitrary uids/gids (rust's `/usr/local/cargo` is
+                //    gid 983).  overlayfs copy-up must preserve that ownership onto
+                //    the new upper file, and an id that is *unmapped* in the user
+                //    namespace cannot be represented — so creating any file beneath
+                //    such a directory fails with `EOVERFLOW` (#432; surfaces as
+                //    cargo's misleading "failed to acquire package cache lock").
+                //    We hold CAP_SETUID/CAP_SETGID here (only CAP_SYS_ADMIN was
+                //    dropped), so identity-map the whole id space; the parent
+                //    writes the multi-count map (`needs_parent_idmap`).
+                //
+                // 2. True rootless with no subuid delegation: keep the single-UID
+                //    map — an unprivileged process may only map its own id.
+                const FULL_ID_RANGE: u32 = u32::MAX; // maps [0, 0xFFFFFFFE]; excludes (id_t)-1
+                const CAP_SETGID: u32 = 6;
+                const CAP_SETUID: u32 = 7;
                 if self.uid_maps.is_empty() {
-                    self.uid_maps.push(UidMap {
-                        inside: 0,
-                        outside: host_uid,
-                        count: 1,
-                    });
+                    if !is_rootless && has_effective_cap(CAP_SETUID) {
+                        self.uid_maps.push(UidMap {
+                            inside: 0,
+                            outside: 0,
+                            count: FULL_ID_RANGE,
+                        });
+                    } else {
+                        self.uid_maps.push(UidMap {
+                            inside: 0,
+                            outside: host_uid,
+                            count: 1,
+                        });
+                    }
                 }
                 if self.gid_maps.is_empty() {
-                    self.gid_maps.push(GidMap {
-                        inside: 0,
-                        outside: host_gid,
-                        count: 1,
-                    });
+                    if !is_rootless && has_effective_cap(CAP_SETGID) {
+                        self.gid_maps.push(GidMap {
+                            inside: 0,
+                            outside: 0,
+                            count: FULL_ID_RANGE,
+                        });
+                    } else {
+                        self.gid_maps.push(GidMap {
+                            inside: 0,
+                            outside: host_gid,
+                            count: 1,
+                        });
+                    }
                 }
             }
             // Bridge networking requires root-level capabilities on the host network.
@@ -6053,20 +6096,54 @@ impl Command {
                         }
                     }
                 }
-                // Fallback: single-UID map (current behavior).
+                // Fallback map.  Two cases reach here:
+                //
+                // 1. Nested uid-0 (in-pod, no CAP_SYS_ADMIN — the #426 path).
+                //    A single `0→0` map is NOT enough: container image layers own
+                //    files as arbitrary uids/gids (rust's `/usr/local/cargo` is
+                //    gid 983).  overlayfs copy-up must preserve that ownership onto
+                //    the new upper file, and an id that is *unmapped* in the user
+                //    namespace cannot be represented — so creating any file beneath
+                //    such a directory fails with `EOVERFLOW` (#432; surfaces as
+                //    cargo's misleading "failed to acquire package cache lock").
+                //    We hold CAP_SETUID/CAP_SETGID here (only CAP_SYS_ADMIN was
+                //    dropped), so identity-map the whole id space; the parent
+                //    writes the multi-count map (`needs_parent_idmap`).
+                //
+                // 2. True rootless with no subuid delegation: keep the single-UID
+                //    map — an unprivileged process may only map its own id.
+                const FULL_ID_RANGE: u32 = u32::MAX; // maps [0, 0xFFFFFFFE]; excludes (id_t)-1
+                const CAP_SETGID: u32 = 6;
+                const CAP_SETUID: u32 = 7;
                 if self.uid_maps.is_empty() {
-                    self.uid_maps.push(UidMap {
-                        inside: 0,
-                        outside: host_uid,
-                        count: 1,
-                    });
+                    if !is_rootless && has_effective_cap(CAP_SETUID) {
+                        self.uid_maps.push(UidMap {
+                            inside: 0,
+                            outside: 0,
+                            count: FULL_ID_RANGE,
+                        });
+                    } else {
+                        self.uid_maps.push(UidMap {
+                            inside: 0,
+                            outside: host_uid,
+                            count: 1,
+                        });
+                    }
                 }
                 if self.gid_maps.is_empty() {
-                    self.gid_maps.push(GidMap {
-                        inside: 0,
-                        outside: host_gid,
-                        count: 1,
-                    });
+                    if !is_rootless && has_effective_cap(CAP_SETGID) {
+                        self.gid_maps.push(GidMap {
+                            inside: 0,
+                            outside: 0,
+                            count: FULL_ID_RANGE,
+                        });
+                    } else {
+                        self.gid_maps.push(GidMap {
+                            inside: 0,
+                            outside: host_gid,
+                            count: 1,
+                        });
+                    }
                 }
             }
             // Bridge networking requires root-level capabilities on the host network.
