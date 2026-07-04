@@ -115,6 +115,7 @@ fn spawn_config_to_run_args(
         publish: sc.publish,
         nat: sc.nat,
         no_nat: sc.no_nat,
+        overlay_tmpfs: false,
         dns: sc.dns,
         dns_search: sc.dns_search,
         dns_option: sc.dns_options,

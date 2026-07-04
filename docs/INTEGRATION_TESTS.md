@@ -973,6 +973,26 @@ rootfs), and the volume write does **not** appear in the overlay upper dir. Fail
 would indicate that volume bind mounts are not correctly layered on top of the overlay
 merged view, or that volume writes are leaking into the overlay upper directory.
 
+### `test_overlay_default_on_disk`
+**Requires:** root, rootfs
+
+Spawns an image-layer container (`with_image_layers`) with the **default** overlay mode,
+then checks the overlay merged dir's parent (the `overlay-<pid>-<n>` scratch base).
+Asserts it lives under `paths::scratch_root()` (the disk-backed `/var/lib/pelagos/scratch`)
+and **not** under `paths::runtime_dir()` (the `/run` tmpfs). Skips if `PELAGOS_OVERLAY_*`
+is set (an override would move the location). Guards the #427 fix: the container's writable
+layer is now bounded by disk, not RAM, so it can't OOM the node and large writes (builds)
+aren't capped at the tmpfs size. Failure means the overlay default regressed back onto the
+RAM tmpfs, reintroducing the cap.
+
+### `test_overlay_tmpfs_optin`
+**Requires:** root, rootfs
+
+Same as above but with `with_overlay_tmpfs(true)` (the `--overlay-tmpfs` flag /
+`PELAGOS_OVERLAY_TMPFS=1` opt-in). Asserts the overlay scratch lands back under
+`paths::runtime_dir()` (the `/run` tmpfs). Failure means the tmpfs opt-in is broken — users
+can no longer choose the fast, RAM-backed, auto-cleaned overlay for small ephemeral containers.
+
 ### `test_overlay_lower_unchanged`
 **Requires:** root, rootfs
 

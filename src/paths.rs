@@ -169,9 +169,72 @@ pub fn oci_state_dir(id: &str) -> PathBuf {
     runtime_dir().join(id)
 }
 
-/// Overlay scratch directory: `<runtime>/overlay-<pid>-<n>/`.
+/// Per-UID **disk-backed** scratch root for container overlays.
+///
+/// Unlike `data_dir()` (which is shared once `/var/lib/pelagos` exists, so a
+/// non-root user can read the same image store as root), the overlay *scratch*
+/// is a per-UID execution boundary — like `runtime_dir()`, but on **disk**
+/// instead of the RAM-backed `/run` tmpfs. The container's writable layer is
+/// therefore bounded by disk (not RAM) and can't OOM the node. This matches
+/// docker/containerd/podman, which all keep the writable layer on disk.
+///
+/// - Root: `/var/lib/pelagos/scratch/`
+/// - Rootless: `$XDG_DATA_HOME/pelagos/scratch/` (default `~/.local/share/pelagos/scratch/`)
+///
+/// The scratch root is created mode 0700 (the per-UID boundary); individual
+/// `overlay-<pid>-<n>` dirs inside stay 0755 (the kernel checks overlay
+/// upper/work perms against the post-`setuid` fsuid), gated by the 0700 parent.
+pub fn scratch_root() -> PathBuf {
+    if !is_rootless() {
+        return PathBuf::from("/var/lib/pelagos/scratch");
+    }
+    // Rootless: always the per-user disk dir (NOT the shared /var/lib/pelagos),
+    // because scratch must be writable by — and isolated to — the running user.
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("pelagos/scratch");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/share/pelagos/scratch");
+    }
+    PathBuf::from(format!("/tmp/pelagos-scratch-{}", unsafe {
+        libc::getuid()
+    }))
+}
+
+/// Whether the overlay scratch should use the RAM-backed tmpfs (`runtime_dir()`)
+/// instead of the disk default. Global opt-in via `PELAGOS_OVERLAY_TMPFS=1`;
+/// the per-command `--overlay-tmpfs` flag is threaded in as the `tmpfs` arg.
+fn overlay_tmpfs_env() -> bool {
+    matches!(
+        std::env::var("PELAGOS_OVERLAY_TMPFS").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Overlay scratch directory for a container (holds `upper/`, `work/`, `merged/`).
+///
+/// **Defaults to disk** (`scratch_root()/overlay-<pid>-<n>`). Opt into the
+/// RAM-backed tmpfs with `tmpfs = true` or `PELAGOS_OVERLAY_TMPFS=1`; or point it
+/// anywhere with `PELAGOS_OVERLAY_DIR` (highest precedence).
+pub fn overlay_scratch_base(pid: i32, n: u32, tmpfs: bool) -> PathBuf {
+    let name = format!("overlay-{}-{}", pid, n);
+    if let Ok(dir) = std::env::var("PELAGOS_OVERLAY_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join(name);
+        }
+    }
+    if tmpfs || overlay_tmpfs_env() {
+        return runtime_dir().join(name);
+    }
+    scratch_root().join(name)
+}
+
+/// Back-compat wrapper — overlay scratch on the **disk** default.
+/// Prefer `overlay_scratch_base(pid, n, tmpfs)` at call sites that know the mode.
 pub fn overlay_base(pid: i32, n: u32) -> PathBuf {
-    runtime_dir().join(format!("overlay-{}-{}", pid, n))
+    overlay_scratch_base(pid, n, false)
 }
 
 /// DNS temp directory: `<runtime>/dns-<pid>-<n>/`.
@@ -655,13 +718,34 @@ mod tests {
         let rt = runtime_dir();
         assert!(containers_dir().starts_with(&rt));
         assert!(oci_state_dir("test").starts_with(&rt));
-        assert!(overlay_base(1, 0).starts_with(&rt));
+        // Overlay in tmpfs mode still lives under the runtime tmpfs dir.
+        assert!(overlay_scratch_base(1, 0, true).starts_with(&rt));
         assert!(dns_dir(1, 0).starts_with(&rt));
         assert!(hosts_dir(1, 0).starts_with(&rt));
         assert!(ipam_file().starts_with(&rt));
         assert!(nat_refcount_file().starts_with(&rt));
         assert!(port_forwards_file().starts_with(&rt));
         assert!(counter_file().starts_with(&rt));
+    }
+
+    #[test]
+    fn test_overlay_scratch_disk_default_tmpfs_optin() {
+        // Guard against a stray override leaking in from the environment.
+        if std::env::var("PELAGOS_OVERLAY_DIR").is_ok()
+            || std::env::var("PELAGOS_OVERLAY_TMPFS").is_ok()
+        {
+            return;
+        }
+        // Default (tmpfs=false) → disk scratch root, NOT the /run tmpfs.
+        let disk = overlay_scratch_base(7, 3, false);
+        assert!(disk.starts_with(scratch_root()));
+        assert!(!disk.starts_with(runtime_dir()));
+        // The back-compat wrapper defaults to disk too.
+        assert!(overlay_base(7, 3).starts_with(scratch_root()));
+        // Opt-in (tmpfs=true) → the runtime tmpfs.
+        assert!(overlay_scratch_base(7, 3, true).starts_with(runtime_dir()));
+        // Disk scratch must be a distinct location from the tmpfs runtime dir.
+        assert_ne!(scratch_root(), runtime_dir());
     }
 
     #[test]
