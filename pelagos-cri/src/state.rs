@@ -190,7 +190,33 @@ pub struct CriPortMapping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SandboxState {
     Running,
+    /// The sandbox has been explicitly stopped via `StopPodSandbox`.
+    ///
+    /// **Invariant**: this variant is set in exactly ONE place —
+    /// `stop_pod_sandbox` in `runtime.rs`.  Nothing else must write it.
+    /// Phantom-detection (`stale_sandbox_ids`) relies on this: a sandbox
+    /// in this state has a dead pause *by design*, so the missing pause is
+    /// not evidence of an unexpected crash.  If you add another code path
+    /// that sets `NotReady`, update `CriSandbox::is_explicitly_stopped` and
+    /// `stale_sandbox_ids` to match.
     NotReady,
+}
+
+impl CriSandbox {
+    /// Returns `true` iff `stop_pod_sandbox` has been called for this sandbox.
+    ///
+    /// The phantom-reaping logic uses this to distinguish between two cases
+    /// that look identical at the pause-liveness level:
+    ///
+    /// * `false` (state == Running, pause dead) → unexpected crash → phantom → reap
+    /// * `true`  (state == NotReady, pause dead) → explicit stop → waiting for
+    ///   `remove_pod_sandbox` → do NOT reap (#438)
+    ///
+    /// The single source of truth for the mapping is `SandboxState::NotReady`;
+    /// see the invariant doc on that variant before adding new callers.
+    pub fn is_explicitly_stopped(&self) -> bool {
+        self.state == SandboxState::NotReady
+    }
 }
 
 // ── CRI container metadata ───────────────────────────────────────────────────
@@ -487,12 +513,13 @@ pub(crate) fn stale_sandbox_ids<F: Fn(i32) -> bool>(
 ) -> Vec<String> {
     sandboxes
         .values()
-        // Only reap Running sandboxes whose pause has died unexpectedly.
-        // A NotReady sandbox was explicitly stopped via StopPodSandbox and is
-        // waiting for RemovePodSandbox to clean it up. Reaping it early removes
-        // its containers from state, causing ContainerStatus to return not_found
-        // and breaking `kubectl logs` for terminated pods (#438).
-        .filter(|s| s.state == SandboxState::Running && s.pause_pid > 0 && !is_alive(s.pause_pid))
+        // Only reap sandboxes that were NOT explicitly stopped.  A sandbox
+        // where `is_explicitly_stopped()` returns true had its pause killed
+        // intentionally by `stop_pod_sandbox`; it must survive in state until
+        // `remove_pod_sandbox` is called, so that `ContainerStatus` can still
+        // return container records and `kubectl logs` works on terminated pods
+        // (#438).  See `CriSandbox::is_explicitly_stopped` for the invariant.
+        .filter(|s| !s.is_explicitly_stopped() && s.pause_pid > 0 && !is_alive(s.pause_pid))
         .map(|s| s.id.clone())
         .collect()
 }
