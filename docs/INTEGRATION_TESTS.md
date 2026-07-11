@@ -5548,3 +5548,19 @@ Create→Start→Exit→Restart cycle cleanly. A regression here would cause the
 sidecar restart loop to fail or leave state corrupted, breaking any pod that relies on a
 persistent sidecar co-process (e.g. SPIRE attestation verifiers, log forwarders, secret
 agents).
+
+## `state::tests::stopped_sandbox_with_dead_pause_is_not_reaped` (pelagos-cri unit test)
+**No root required.** Guards the fix for `kubectl logs` failing on terminated containers
+(#438). Verifies that `stale_sandbox_ids` does NOT classify a `NotReady` sandbox
+(explicitly stopped via `StopPodSandbox`) as a phantom even when its pause process is
+dead. **Why it matters:** before this fix, `list_pod_sandbox` reaped the sandbox (and its
+containers) as soon as the pause died, even if `StopPodSandbox` had killed it on purpose.
+`ContainerStatus` then returned `not_found`, breaking `kubectl logs` for any completed pod.
+
+## `state::tests::only_running_sandboxes_with_dead_pause_are_reaped` (pelagos-cri unit test)
+**No root required.** Companion to the #438 fix. Verifies the new `stale_sandbox_ids`
+rule in full: given a mix of Running-live, Running-dead, and NotReady-dead sandboxes, only
+the Running sandbox with a dead pause is classified as stale. **Why it matters:** confirms
+the fix is targeted — legitimate phantoms (pause died unexpectedly while the sandbox was
+still in Running state) are still reaped, while intentionally stopped sandboxes are not,
+preserving the #347 phantom-GC invariant.

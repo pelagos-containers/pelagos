@@ -190,7 +190,33 @@ pub struct CriPortMapping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SandboxState {
     Running,
+    /// The sandbox has been explicitly stopped via `StopPodSandbox`.
+    ///
+    /// **Invariant**: this variant is set in exactly ONE place —
+    /// `stop_pod_sandbox` in `runtime.rs`.  Nothing else must write it.
+    /// Phantom-detection (`stale_sandbox_ids`) relies on this: a sandbox
+    /// in this state has a dead pause *by design*, so the missing pause is
+    /// not evidence of an unexpected crash.  If you add another code path
+    /// that sets `NotReady`, update `CriSandbox::is_explicitly_stopped` and
+    /// `stale_sandbox_ids` to match.
     NotReady,
+}
+
+impl CriSandbox {
+    /// Returns `true` iff `stop_pod_sandbox` has been called for this sandbox.
+    ///
+    /// The phantom-reaping logic uses this to distinguish between two cases
+    /// that look identical at the pause-liveness level:
+    ///
+    /// * `false` (state == Running, pause dead) → unexpected crash → phantom → reap
+    /// * `true`  (state == NotReady, pause dead) → explicit stop → waiting for
+    ///   `remove_pod_sandbox` → do NOT reap (#438)
+    ///
+    /// The single source of truth for the mapping is `SandboxState::NotReady`;
+    /// see the invariant doc on that variant before adding new callers.
+    pub fn is_explicitly_stopped(&self) -> bool {
+        self.state == SandboxState::NotReady
+    }
 }
 
 // ── CRI container metadata ───────────────────────────────────────────────────
@@ -382,8 +408,10 @@ impl StateInner {
     /// dead "phantom" sandbox is removed within one interval instead of lingering
     /// in the live listing until the next restart. A lingering phantom is exactly
     /// what the kubelet discovers as an orphan and garbage-collects — the path
-    /// that deleted the host `/bin` (#347). Keys on pause-liveness, not the
-    /// recorded `state`, so it reaps both Ready-but-dead and NotReady-but-dead.
+    /// that deleted the host `/bin` (#347). Keys on pause-liveness AND sandbox
+    /// state: only Running sandboxes with a dead pause are phantoms; a NotReady
+    /// sandbox whose pause is dead was explicitly stopped via StopPodSandbox and
+    /// must survive until RemovePodSandbox is called (#438).
     pub(crate) fn reap_stale_sandboxes<F: Fn(i32) -> bool>(&mut self, is_alive: F) -> Vec<String> {
         let stale = stale_sandbox_ids(&self.sandboxes, is_alive);
         for sid in &stale {
@@ -485,7 +513,13 @@ pub(crate) fn stale_sandbox_ids<F: Fn(i32) -> bool>(
 ) -> Vec<String> {
     sandboxes
         .values()
-        .filter(|s| s.pause_pid > 0 && !is_alive(s.pause_pid))
+        // Only reap sandboxes that were NOT explicitly stopped.  A sandbox
+        // where `is_explicitly_stopped()` returns true had its pause killed
+        // intentionally by `stop_pod_sandbox`; it must survive in state until
+        // `remove_pod_sandbox` is called, so that `ContainerStatus` can still
+        // return container records and `kubectl logs` works on terminated pods
+        // (#438).  See `CriSandbox::is_explicitly_stopped` for the invariant.
+        .filter(|s| !s.is_explicitly_stopped() && s.pause_pid > 0 && !is_alive(s.pause_pid))
         .map(|s| s.id.clone())
         .collect()
 }
@@ -673,6 +707,55 @@ mod tests {
                  "state":"Running","exit_code":0}}"#
         );
         serde_json::from_str(&json).expect("valid container json")
+    }
+
+    /// Build a CriSandbox that has been explicitly stopped via StopPodSandbox
+    /// (state=NotReady, pause already dead) — as opposed to a phantom whose pause
+    /// died unexpectedly.
+    fn stopped_sandbox(id: &str, pause_pid: i32) -> CriSandbox {
+        let json = format!(
+            r#"{{"id":"{id}","name":"n","namespace":"ns","uid":"u","attempt":0,
+                 "labels":{{}},"annotations":{{}},"created_at_ns":0,"state":"NotReady",
+                 "pause_pid":{pause_pid}}}"#
+        );
+        serde_json::from_str(&json).expect("valid stopped sandbox json")
+    }
+
+    /// #438 regression: a NotReady sandbox whose pause is dead (because
+    /// StopPodSandbox was already called) must NOT be reaped as a phantom.
+    ///
+    /// The normal kubelet sequence is: StopPodSandbox → [kubectl logs works here]
+    /// → RemovePodSandbox.  If stale_sandbox_ids includes the NotReady sandbox,
+    /// list_pod_sandbox reaps it and its containers — ContainerStatus then returns
+    /// not_found and `kubectl logs` on a terminated pod fails.
+    #[test]
+    fn stopped_sandbox_with_dead_pause_is_not_reaped() {
+        // Sandbox explicitly stopped (state=NotReady); pause is gone.
+        let sandboxes = map(vec![stopped_sandbox("stopped", 1234)]);
+        let stale = stale_sandbox_ids(&sandboxes, |_pid| false); // all pids "dead"
+        assert!(
+            stale.is_empty(),
+            "a NotReady sandbox must not be reaped as a phantom (#438): {stale:?}"
+        );
+    }
+
+    /// #438: only Running sandboxes with a dead pause are phantoms.  A mix of
+    /// Running/NotReady sandboxes must reap exactly the Running-and-dead ones.
+    #[test]
+    fn only_running_sandboxes_with_dead_pause_are_reaped() {
+        let sandboxes = map(vec![
+            sandbox("running-live", 1001),         // Running, pause alive → keep
+            sandbox("running-dead", 1002),         // Running, pause dead → reap
+            stopped_sandbox("stopped-dead", 1003), // NotReady, pause dead → keep
+        ]);
+        // pid 1001 alive; 1002 and 1003 dead.
+        let mut stale = stale_sandbox_ids(&sandboxes, |pid| pid == 1001);
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec!["running-dead".to_string()],
+            "only the Running sandbox with a dead pause must be reaped"
+        );
     }
 
     /// #347 follow-up: reaping a dead-pause "phantom" sandbox must drop it from the
