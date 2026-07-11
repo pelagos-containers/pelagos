@@ -5516,3 +5516,35 @@ reparented descendant survived, held its port/lock, and wedged every restart int
 CrashLoop (MetalLB speaker on :7946, Vault on its raft.db lock, both seen 2026-07-04). A
 failure here means teardown regressed to rmdir-without-reap and orphans can leak again.
 The companion rootless path (`teardown_rootless_cgroup`) is hardened the same way.
+
+## `runtime::tests::test_is_sidecar_detected_from_label` (pelagos-cri unit test)
+**No root required.** Guards KEP-753 native sidecar detection (#437). Verifies that
+`CriContainer.is_sidecar` is set to `true` when `CreateContainer` receives a container
+with the kubelet-assigned label `io.kubernetes.cri.container-type=sidecar_container`, and
+`false` for `container` type or no label at all. **Why it matters:** `is_sidecar` is the
+runtime's signal that a container is a persistent sidecar (init container with
+`restartPolicy: Always`). Misdetection would cause the runtime to treat sidecars as
+one-shot init containers and could lead to log relay or lifecycle divergence in future
+sidecar-aware paths.
+
+## `runtime::tests::test_stop_container_captures_real_exit_code` (pelagos-cri unit test)
+**No root required.** Guards the exit-code fix in `stop_container` (#437). Verifies that
+a `state.json` written by the watcher (e.g. `exit_code: 137`) is correctly parsed and
+would be applied to the in-memory container record when `stop_container` is called on an
+already-exited container. **Why it matters:** before this fix, `stop_container` left
+`exit_code=0` (the creation default) for any container that had already exited before the
+kubelet called `StopContainer`. For native sidecars, the kubelet uses the exit code for
+restart backoff — reporting 0 instead of 137 (SIGKILL) masked crashes as clean exits and
+broke restart diagnostics.
+
+## `runtime::tests::test_sidecar_restart_cycle_state_machine` (pelagos-cri unit test)
+**No root required.** Guards the full native sidecar restart cycle through the pelagos-cri
+state machine (#437). Simulates the kubelet's restart loop for an exited sidecar:
+`(Running) → (Exited, code=137) → StopContainer → RemoveContainer →
+CreateContainer(attempt=1) → StartContainer → (Running)`. Asserts that after the cycle:
+the new container is `Running`, `attempt=1`, `is_sidecar=true`, and `exit_code=0` (fresh
+for the new attempt). **Why it matters:** native sidecars (KEP-753) must survive the
+Create→Start→Exit→Restart cycle cleanly. A regression here would cause the kubelet's
+sidecar restart loop to fail or leave state corrupted, breaking any pod that relies on a
+persistent sidecar co-process (e.g. SPIRE attestation verifiers, log forwarders, secret
+agents).

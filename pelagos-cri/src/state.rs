@@ -333,6 +333,12 @@ pub struct CriContainer {
     /// Container was created with `tty: true` (CRI ContainerConfig.tty).
     #[serde(default)]
     pub tty: bool,
+    /// True when the kubelet sets `io.kubernetes.cri.container-type=sidecar_container`
+    /// (KEP-753 native sidecars: init containers with restartPolicy: Always). Stored so
+    /// log relay and lifecycle handlers can distinguish sidecars from regular init
+    /// containers without re-parsing the labels map on every call (#437).
+    #[serde(default)]
+    pub is_sidecar: bool,
 }
 
 fn default_oom_score_unset() -> i32 {
