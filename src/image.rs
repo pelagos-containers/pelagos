@@ -310,14 +310,26 @@ pub fn load_oci_config(reference: &str) -> io::Result<String> {
     std::fs::read_to_string(oci_config_path(reference))
 }
 
-/// Extract a gzipped tar layer into the content-addressable layer store.
+/// Extract a tar layer into the content-addressable layer store, branching on `media_type`.
+///
+/// Supported media types:
+/// - `application/vnd.oci.image.layer.v1.tar+gzip` — gzip-compressed tar (OCI)
+/// - `application/vnd.docker.image.rootfs.diff.tar.gzip` — gzip-compressed tar (Docker)
+/// - `""` (empty string) — treated as gzip for backward compatibility with pre-mediaType callers
+/// - `application/vnd.oci.image.layer.v1.tar` — uncompressed tar (OCI, no `+gzip` suffix);
+///   used by images that ship large uncompressed layers (e.g. `quay.io/kubevirt/virt-operator`)
+///
+/// Any other media type returns an `io::Error` with kind `Unsupported`.
+///
+/// Future extension point: `application/vnd.oci.image.layer.v1.tar+zstd` (zstd-compressed)
+/// is not yet implemented; add a `zstd` dependency and a branch here when needed.
 ///
 /// Handles OCI whiteout files:
 /// - `.wh.<name>` → creates an overlayfs character device (0,0) named `<name>`.
 /// - `.wh..wh..opq` → sets the `trusted.overlay.opaque` xattr on the parent dir.
 ///
 /// Returns the path to the extracted layer directory.
-pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
+pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Result<PathBuf> {
     ensure_image_dirs()?;
     let rootless = crate::paths::is_rootless();
     let dest = layer_dir(digest);
@@ -344,9 +356,29 @@ pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
     }
     std::fs::create_dir_all(&partial)?;
 
-    let file = std::fs::File::open(tar_gz_path)?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
+    let file = std::fs::File::open(tar_path)?;
+
+    // Branch on mediaType: gzip-compressed vs uncompressed tar.
+    // An empty string is treated as gzip for backward compat with callers that lack
+    // mediaType information (e.g. load_image from OCI tar archives without annotations).
+    let is_gzip = matches!(
+        media_type,
+        "" | "application/vnd.oci.image.layer.v1.tar+gzip"
+            | "application/vnd.docker.image.rootfs.diff.tar.gzip"
+    );
+    let is_plain_tar = media_type == "application/vnd.oci.image.layer.v1.tar";
+
+    let mut archive: tar::Archive<Box<dyn std::io::Read>> = if is_gzip {
+        let decoder = flate2::read::GzDecoder::new(file);
+        tar::Archive::new(Box::new(decoder))
+    } else if is_plain_tar {
+        tar::Archive::new(Box::new(file))
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unsupported layer media type: {}", media_type),
+        ));
+    };
     archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
 
