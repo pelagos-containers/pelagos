@@ -1031,8 +1031,13 @@ fn apply_cli_options(
     // already applied before apply_cli_options is called (issue #114).
 
     // User: resolve against the container's own /etc/passwd, not the host's.
+    // Stash the resolved UID so the capability block below can decide whether
+    // to wire ambient caps (only meaningful for non-root UIDs — root already
+    // has full caps and setuid is a no-op in that case).
+    let mut resolved_uid: Option<u32> = None;
     if let Some(ref u) = args.user {
         let (uid, gid) = parse_user_in_layers(u, layer_dirs)?;
+        resolved_uid = Some(uid);
         cmd = cmd.with_uid(uid);
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);
@@ -1143,6 +1148,23 @@ fn apply_cli_options(
             }
         }
         cmd = cmd.with_capabilities(effective);
+
+        // Wire the same caps into the ambient set when the container runs as a
+        // non-root UID.  setuid(non-root) clears the ambient set; the pre-exec
+        // hook re-raises it at step 8.6 (after setuid, before NNP at step 8.7)
+        // so that PR_CAP_AMBIENT_RAISE succeeds.  Without this, child processes
+        // that rely on Go's SysProcAttr.AmbientCaps (e.g. KubeVirt
+        // virt-launcher-monitor → virt-launcher) get EPERM on the raise
+        // because the permitted set is empty and there is nothing to re-raise.
+        // This mirrors what src/oci.rs does for OCI-bundle paths.
+        let is_nonroot_uid = resolved_uid.map_or(false, |u| u != 0);
+        if is_nonroot_uid && !effective.is_empty() {
+            for cap_num in 0u8..64u8 {
+                if effective.bits() & (1u64 << cap_num) != 0 {
+                    cmd = cmd.with_ambient_capability(cap_num);
+                }
+            }
+        }
     }
 
     // Security options
