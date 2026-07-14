@@ -30,7 +30,7 @@ use super::{
     parse_user_in_rootfs, rootfs_path, write_state, ContainerState, ContainerStatus, HealthConfig,
     HealthStatus, SpawnConfig,
 };
-use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
+use pelagos::container::{self, Capability, Command, Namespace, Stdio, Volume};
 use pelagos::network::NetworkMode;
 use pelagos::wasm::WasmRuntime;
 use std::io::{self, Read, Write};
@@ -111,6 +111,14 @@ pub struct RunArgs {
     /// Read-only bind mount /host:/container (repeatable)
     #[clap(long = "bind-ro")]
     pub bind_ro: Vec<String>,
+
+    /// Expose a host device inside the container.
+    /// Format: /host/path[:/container/path]
+    /// The host file is stat'd to obtain device type, major/minor, and mode.
+    /// Defaults container_path to host_path when omitted.
+    /// (repeatable)
+    #[clap(long = "device")]
+    pub device: Vec<String>,
 
     /// tmpfs mount `/path[:options]` (repeatable)
     #[clap(long = "tmpfs")]
@@ -534,6 +542,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         no_nat: args.no_nat,
         labels: args.label.clone(),
         tmpfs: args.tmpfs.clone(),
+        device: args.device.clone(),
         no_pid_ns: args.no_pid_ns,
         no_ipc_ns: args.no_ipc_ns,
         privileged: args.privileged,
@@ -998,6 +1007,9 @@ fn apply_cli_options(
         let (src, tgt) = split_mount_spec(b, "--bind-ro")?;
         cmd = cmd.with_bind_mount_ro(src, tgt);
     }
+    for d in &args.device {
+        cmd = add_device(cmd, d)?;
+    }
     for t in &args.tmpfs {
         let (path, opts) = t.split_once(':').unwrap_or((t.as_str(), ""));
         cmd = cmd.with_tmpfs(path, opts);
@@ -1268,6 +1280,43 @@ fn split_mount_spec<'a>(
 ) -> Result<(&'a str, &'a str), Box<dyn std::error::Error>> {
     s.split_once(':')
         .ok_or_else(|| format!("invalid {} '{}': expected /host:/container", flag, s).into())
+}
+
+/// Parse `--device /host/path[:/container/path]`, stat the host file, and call
+/// `cmd.with_device()` with the discovered properties.
+///
+/// Works for character devices (e.g. `/dev/kvm`, `/dev/net/tun`, `/dev/vhost-net`).
+/// The container_path defaults to host_path when omitted.
+fn add_device(
+    cmd: Command,
+    spec: &str,
+) -> Result<Command, Box<dyn std::error::Error>> {
+    let (host_path, container_path) = if let Some((h, c)) = spec.split_once(':') {
+        (h, c)
+    } else {
+        (spec, spec)
+    };
+    let st = nix::sys::stat::stat(host_path)
+        .map_err(|e| format!("--device {}: {}", host_path, e))?;
+    let kind = if nix::sys::stat::SFlag::from_bits_truncate(st.st_mode as _)
+        .contains(nix::sys::stat::SFlag::S_IFBLK)
+    {
+        'b'
+    } else {
+        'c' // default to character device
+    };
+    let major = nix::sys::stat::major(st.st_rdev);
+    let minor = nix::sys::stat::minor(st.st_rdev);
+    let mode = st.st_mode & 0o777;
+    Ok(cmd.with_device(container::DeviceNode {
+        path: std::path::PathBuf::from(container_path),
+        kind,
+        major: major as u64,
+        minor: minor as u64,
+        mode,
+        uid: st.st_uid,
+        gid: st.st_gid,
+    }))
 }
 
 // ---------------------------------------------------------------------------

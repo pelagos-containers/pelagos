@@ -1689,6 +1689,21 @@ impl RuntimeService for RuntimeSvc {
                 .get("io.kubernetes.cri.container-type")
                 .map(|v| v == "sidecar_container")
                 .unwrap_or(false),
+            // Device plugin allocations from ContainerConfig.devices (#449).
+            // The kubelet populates this from device plugin AllocateResponse.DeviceSpecs.
+            devices: config
+                .devices
+                .iter()
+                .map(|d| state::CriDevice {
+                    host_path: d.host_path.clone(),
+                    container_path: if d.container_path.is_empty() {
+                        d.host_path.clone()
+                    } else {
+                        d.container_path.clone()
+                    },
+                    permissions: d.permissions.clone(),
+                })
+                .collect(),
         };
 
         {
@@ -2038,6 +2053,23 @@ impl RuntimeService for RuntimeSvc {
         if !container.selinux_label.is_empty() {
             args.push("--selinux-label".into());
             args.push(container.selinux_label.clone());
+        }
+
+        // Device plugin device allocations (ContainerConfig.devices).
+        // The kubelet populates this from device plugin AllocateResponse.DeviceSpecs;
+        // each entry has a host_path, container_path, and permissions string.
+        // Pass them as --device host:container so pelagos mknod's the node inside
+        // the container's /dev and records it in the cgroup device allowlist (#449).
+        for dev in &container.devices {
+            if !dev.host_path.is_empty() {
+                let container_path = if dev.container_path.is_empty() {
+                    &dev.host_path
+                } else {
+                    &dev.container_path
+                };
+                args.push("--device".into());
+                args.push(format!("{}:{}", dev.host_path, container_path));
+            }
         }
 
         // `--` stops clap flag parsing so that container args beginning with `-`

@@ -219,6 +219,10 @@ pub struct SpawnConfig {
     /// tmpfs mounts as "path" or "path:options" strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tmpfs: Vec<String>,
+    /// Host device files to expose inside the container, as "host_path[:/container_path]" strings.
+    /// Device type, major/minor, and mode are stat'd from the host at spawn time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device: Vec<String>,
     /// When true, the container runs in the host PID namespace (no CLONE_NEWPID).
     /// Saved from `--no-pid-ns`; restored by `pelagos start`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
