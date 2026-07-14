@@ -5444,15 +5444,17 @@ impl Command {
                     callback()?;
                 }
 
-                // Step 6.5: Set no-new-privileges flag if requested
-                // This prevents privilege escalation via setuid/setgid binaries
-                if no_new_privileges {
-                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
-                    let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
+                // Step 6.5: (previously set PR_SET_NO_NEW_PRIVS here — deferred to 8.7)
+                //
+                // NNP used to be set at this point so that the seccomp install at
+                // step 7 could proceed without CAP_SYS_ADMIN.  However, NNP before
+                // setuid blocks PR_CAP_AMBIENT_RAISE at step 8.6 unconditionally —
+                // even when the cap is already in the ambient set — breaking any
+                // container process that uses Go's SysProcAttr.AmbientCaps (#447).
+                //
+                // Fix: seccomp (step 7) now uses apply_filter_no_nnp() (CAP_SYS_ADMIN
+                // path, still available here before setuid).  NNP is deferred to
+                // step 8.7, after setuid + capset + ambient re-raise.
 
                 // Step 6.6: PTY slave setup for OCI terminal mode.
                 // When the caller allocated a PTY (process.terminal = true), wire the
@@ -5490,19 +5492,19 @@ impl Command {
                 }
 
                 // Step 7: Apply seccomp filter (no_new_privileges=true path only).
-                // When no_new_privileges=true, NNP was already set at step 6.5, which
-                // grants permission to apply seccomp without CAP_SYS_ADMIN.
+                // NNP is now deferred to step 8.7, so we use apply_filter_no_nnp()
+                // here (CAP_SYS_ADMIN, still held before setuid at step 8.5).
                 // When no_new_privileges=false, seccomp was applied at step 4.849 using
                 // CAP_SYS_ADMIN (before capability drops), so no action needed here.
                 if no_new_privileges {
                     if let Some(ref filter) = seccomp_filter {
-                        crate::seccomp::apply_filter(filter)?;
+                        crate::seccomp::apply_filter_no_nnp(filter)?;
                     }
                 }
 
                 // Step 7.1: Install user_notif filter (NNP=true path).
                 //
-                // NNP was set at step 6.5, so CAP_SYS_ADMIN is no longer required.
+                // Uses CAP_SYS_ADMIN (still held here; NNP is deferred to step 8.7).
                 // Installed after regular seccomp (LIFO → evaluated first by kernel).
                 if no_new_privileges && !user_notif_bpf.is_empty() {
                     let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf)?;
@@ -5638,6 +5640,22 @@ impl Command {
                         0,
                         0,
                     );
+                }
+
+                // Step 8.7: Set no-new-privileges after all capability setup.
+                //
+                // Deferred from step 6.5 so that PR_CAP_AMBIENT_RAISE above
+                // succeeds: the kernel unconditionally blocks ambient cap raising
+                // when no_new_privs=1, regardless of whether the cap is already
+                // in the ambient set (see #447).  NNP is always cleared on execve,
+                // so deferring it here does not change the container's observable
+                // security posture — the cap set was established above.
+                if no_new_privileges {
+                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                    let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
 
                 Ok(())
@@ -8072,13 +8090,7 @@ impl Command {
                     }
                 }
 
-                if no_new_privileges {
-                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
-                    let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
+                // (NNP deferred to step 8.7 — see spawn() step 6.5 comment, #447)
 
                 // PTY slave setup for OCI terminal mode (same logic as spawn()).
                 if let Some(slave_fd) = pty_slave {
@@ -8108,13 +8120,15 @@ impl Command {
                 }
 
                 // Apply seccomp (no_new_privileges=true path only, mirrors spawn() step 7).
+                // Uses apply_filter_no_nnp() — NNP is deferred to step 8.7 (#447).
                 if no_new_privileges {
                     if let Some(ref filter) = seccomp_filter {
-                        crate::seccomp::apply_filter(filter)?;
+                        crate::seccomp::apply_filter_no_nnp(filter)?;
                     }
                 }
 
                 // Install user_notif filter (NNP=true path, mirrors spawn() step 7.1).
+                // Uses CAP_SYS_ADMIN (still held here; NNP deferred to step 8.7).
                 if no_new_privileges && !user_notif_bpf_i.is_empty() {
                     let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf_i)?;
                     crate::notif::send_notif_fd(notif_child_sock_i, notif_fd)?;
@@ -8220,6 +8234,15 @@ impl Command {
                         0,
                         0,
                     );
+                }
+
+                // Step 8.7: Set NNP after all capability setup (mirrors spawn() step 8.7).
+                if no_new_privileges {
+                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                    let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
 
                 Ok(())
