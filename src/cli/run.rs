@@ -1287,17 +1287,14 @@ fn split_mount_spec<'a>(
 ///
 /// Works for character devices (e.g. `/dev/kvm`, `/dev/net/tun`, `/dev/vhost-net`).
 /// The container_path defaults to host_path when omitted.
-fn add_device(
-    cmd: Command,
-    spec: &str,
-) -> Result<Command, Box<dyn std::error::Error>> {
+fn add_device(cmd: Command, spec: &str) -> Result<Command, Box<dyn std::error::Error>> {
     let (host_path, container_path) = if let Some((h, c)) = spec.split_once(':') {
         (h, c)
     } else {
         (spec, spec)
     };
-    let st = nix::sys::stat::stat(host_path)
-        .map_err(|e| format!("--device {}: {}", host_path, e))?;
+    let st =
+        nix::sys::stat::stat(host_path).map_err(|e| format!("--device {}: {}", host_path, e))?;
     let kind = if nix::sys::stat::SFlag::from_bits_truncate(st.st_mode as _)
         .contains(nix::sys::stat::SFlag::S_IFBLK)
     {
