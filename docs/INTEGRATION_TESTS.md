@@ -1624,6 +1624,31 @@ then simulates a prior rootless-degraded layer (strips the suid bit + writes the
 rootless pull would permanently degrade setuid binaries for every root container reusing the
 layer.
 
+### `test_extract_layer_uncompressed`
+**Requires:** root
+
+Verifies the #441 fix: creates a synthetic **uncompressed** tar layer (no gzip wrapper),
+extracts it via `image::extract_layer()` with `application/vnd.oci.image.layer.v1.tar`,
+and asserts the file is present with correct content. Failure indicates the uncompressed-tar
+branch is missing or broken — images like `quay.io/kubevirt/virt-operator` that ship large
+uncompressed layers would fail to pull.
+
+### `test_extract_layer_unsupported_media_type`
+**Requires:** root
+
+Calls `image::extract_layer()` with an unrecognised mediaType
+(`application/vnd.oci.image.layer.v1.tar+zstd`) and asserts it returns an `io::Error`
+with kind `Unsupported` whose message names the bad type. Failure means unknown compression
+formats silently misparse blobs as gzip instead of surfacing a clear error.
+
+### `test_extract_layer_gzip_regression`
+**Requires:** root
+
+Extracts a gzip layer with the legacy Docker mediaType
+(`application/vnd.docker.image.rootfs.diff.tar.gzip`) to confirm the Docker variant is
+accepted alongside the OCI `+gzip` type. Failure indicates a regression in the
+compressed-layer branch after the #441 fix.
+
 ### `test_multi_layer_overlay_merge`
 **Requires:** root, rootfs
 

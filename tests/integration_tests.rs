@@ -8249,7 +8249,12 @@ mod images {
         let _ = std::fs::remove_file(&marker);
 
         // Root extract: suid preserved, no rootless marker.
-        let layer = pelagos::image::extract_layer(digest, &tar_gz).expect("extract");
+        let layer = pelagos::image::extract_layer(
+            digest,
+            &tar_gz,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("extract");
         let suidtool = layer.join("usr/bin/suidtool");
         let mode1 = std::fs::metadata(&suidtool).unwrap().permissions().mode();
         assert_eq!(mode1 & 0o4000, 0o4000, "root extract must preserve suid");
@@ -8264,7 +8269,12 @@ mod images {
 
         // Root re-extract: the marker must trigger a full re-extraction that
         // restores the suid bit and clears the marker.
-        let layer2 = pelagos::image::extract_layer(digest, &tar_gz).expect("re-extract");
+        let layer2 = pelagos::image::extract_layer(
+            digest,
+            &tar_gz,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("re-extract");
         let mode2 = std::fs::metadata(layer2.join("usr/bin/suidtool"))
             .unwrap()
             .permissions()
@@ -8355,7 +8365,11 @@ mod images {
         // Clean up any previous run.
         let _ = std::fs::remove_dir_all(&layer_path);
 
-        let result = image::extract_layer(digest, &tar_gz_path);
+        let result = image::extract_layer(
+            digest,
+            &tar_gz_path,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        );
         assert!(
             result.is_ok(),
             "extract_layer should succeed: {:?}",
@@ -8380,6 +8394,181 @@ mod images {
         );
 
         // Clean up.
+        let _ = std::fs::remove_dir_all(&layer_path);
+    }
+
+    /// test_extract_layer_uncompressed
+    ///
+    /// Requires: root (for mknod whiteout devices in extract_layer).
+    ///
+    /// Creates a synthetic uncompressed tar layer (no gzip), extracts it via
+    /// `image::extract_layer()` with `application/vnd.oci.image.layer.v1.tar`,
+    /// and verifies the file is extracted correctly. Failure indicates the
+    /// uncompressed-layer branch introduced to fix issue #441 is broken.
+    #[test]
+    #[serial]
+    fn test_extract_layer_uncompressed() {
+        if !is_root() {
+            eprintln!("Skipping test_extract_layer_uncompressed: requires root");
+            return;
+        }
+
+        use pelagos::image;
+
+        // Build an uncompressed tar (no gzip wrapper).
+        let tmp_dir = tempfile::tempdir().expect("create tempdir");
+        let tar_path = tmp_dir.path().join("layer.tar");
+        {
+            let file = std::fs::File::create(&tar_path).expect("create tar");
+            let mut builder = tar::Builder::new(file);
+
+            let data = b"uncompressed content";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "plain.txt", &data[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let digest = "sha256:test_extract_layer_uncompressed_deadbeef";
+        let layer_path = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&layer_path);
+
+        let result =
+            image::extract_layer(digest, &tar_path, "application/vnd.oci.image.layer.v1.tar");
+        assert!(
+            result.is_ok(),
+            "extract_layer with uncompressed tar should succeed: {:?}",
+            result.err()
+        );
+        let extracted = result.unwrap();
+        assert!(
+            extracted.join("plain.txt").exists(),
+            "plain.txt should exist in extracted uncompressed layer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("plain.txt")).unwrap(),
+            "uncompressed content"
+        );
+
+        let _ = std::fs::remove_dir_all(&layer_path);
+    }
+
+    /// test_extract_layer_unsupported_media_type
+    ///
+    /// Requires: root (ensure_image_dirs runs before mediaType check).
+    ///
+    /// Calls `image::extract_layer()` with an unrecognised mediaType and asserts
+    /// that it returns an `Unsupported` error rather than silently misinterpreting
+    /// the blob. Failure indicates the mediaType guard is missing or bypassed.
+    #[test]
+    #[serial]
+    fn test_extract_layer_unsupported_media_type() {
+        if !is_root() {
+            eprintln!("Skipping test_extract_layer_unsupported_media_type: requires root");
+            return;
+        }
+
+        use pelagos::image;
+
+        // Any file will do; the error must fire before we read content.
+        let tmp_dir = tempfile::tempdir().expect("create tempdir");
+        let dummy = tmp_dir.path().join("dummy");
+        std::fs::write(&dummy, b"not a tar").unwrap();
+
+        let digest = "sha256:test_extract_layer_unsupported_media_type_deadbeef";
+        let layer_path = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&layer_path);
+
+        let result = image::extract_layer(
+            digest,
+            &dummy,
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+        );
+        assert!(
+            result.is_err(),
+            "extract_layer with unsupported media type must return an error"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Unsupported,
+            "error kind must be Unsupported, got: {:?}",
+            err.kind()
+        );
+        assert!(
+            err.to_string()
+                .contains("application/vnd.oci.image.layer.v1.tar+zstd"),
+            "error message must name the bad media type: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&layer_path);
+    }
+
+    /// test_extract_layer_gzip_regression
+    ///
+    /// Requires: root (for mknod whiteout devices in extract_layer).
+    ///
+    /// Exercises the gzip path with the legacy Docker mediaType
+    /// (`application/vnd.docker.image.rootfs.diff.tar.gzip`) to confirm
+    /// both OCI and Docker gzip variants are accepted. Failure indicates
+    /// a regression in the compressed-layer branch after the #441 fix.
+    #[test]
+    #[serial]
+    fn test_extract_layer_gzip_regression() {
+        if !is_root() {
+            eprintln!("Skipping test_extract_layer_gzip_regression: requires root");
+            return;
+        }
+
+        use pelagos::image;
+
+        let tmp_dir = tempfile::tempdir().expect("create tempdir");
+        let tar_gz_path = tmp_dir.path().join("layer.tar.gz");
+        {
+            let file = std::fs::File::create(&tar_gz_path).expect("create tar.gz");
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(gz);
+
+            let data = b"docker compat";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "docker-compat.txt", &data[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let digest = "sha256:test_extract_layer_gzip_regression_deadbeef";
+        let layer_path = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&layer_path);
+
+        let result = image::extract_layer(
+            digest,
+            &tar_gz_path,
+            "application/vnd.docker.image.rootfs.diff.tar.gzip",
+        );
+        assert!(
+            result.is_ok(),
+            "extract_layer with Docker gzip media type should succeed: {:?}",
+            result.err()
+        );
+        let extracted = result.unwrap();
+        assert!(
+            extracted.join("docker-compat.txt").exists(),
+            "docker-compat.txt should exist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("docker-compat.txt")).unwrap(),
+            "docker compat"
+        );
+
         let _ = std::fs::remove_dir_all(&layer_path);
     }
 
@@ -9248,7 +9437,12 @@ mod images {
         let _ = std::fs::remove_dir_all(&layer_path);
         let _ = std::fs::remove_file(&blob_path);
 
-        image::extract_layer(digest, tmp.path()).expect("extract_layer");
+        image::extract_layer(
+            digest,
+            tmp.path(),
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("extract_layer");
 
         assert!(
             layer_path.exists(),

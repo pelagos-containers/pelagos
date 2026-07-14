@@ -477,7 +477,7 @@ async fn pull_image(
             if is_wasm {
                 image::extract_wasm_layer(layer_digest, tmp.path())?;
             } else {
-                extract_layer(layer_digest, tmp.path())?;
+                extract_layer(layer_digest, tmp.path(), media_type)?;
             }
         }
         layer_digests.push(layer_digest.clone());
@@ -1165,6 +1165,13 @@ pub fn cmd_image_load(
                 .get("digest")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("layer {}: missing 'digest'", i))?;
+            // Extract mediaType from the layer descriptor if present. Fall back to ""
+            // (empty string), which extract_layer() treats as gzip for backward compat
+            // with OCI tar archives that predate the mediaType annotation.
+            let media_type = layer_desc
+                .get("mediaType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let layer_hex = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
             let layer_key = format!("blobs/sha256/{}", layer_hex);
             let layer_data = entries
@@ -1175,7 +1182,7 @@ pub fn cmd_image_load(
                 let mut tmp = tempfile::NamedTempFile::new()?;
                 tmp.write_all(layer_data)?;
                 tmp.flush()?;
-                extract_layer(layer_digest, tmp.path())?;
+                extract_layer(layer_digest, tmp.path(), media_type)?;
             }
             layer_digests.push(layer_digest.to_string());
         }
