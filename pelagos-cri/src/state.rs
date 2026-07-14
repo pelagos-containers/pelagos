@@ -365,6 +365,19 @@ pub struct CriContainer {
     /// containers without re-parsing the labels map on every call (#437).
     #[serde(default)]
     pub is_sidecar: bool,
+    /// Device plugin device allocations from ContainerConfig.devices.
+    /// Each entry is "host_path:container_path" (container_path may equal host_path).
+    #[serde(default)]
+    pub devices: Vec<CriDevice>,
+}
+
+/// A host device to expose inside the container, derived from the CRI Device proto.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CriDevice {
+    pub host_path: String,
+    pub container_path: String,
+    /// Cgroup permissions string ("mrw", "r", etc.).
+    pub permissions: String,
 }
 
 fn default_oom_score_unset() -> i32 {

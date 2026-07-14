@@ -127,6 +127,7 @@ fn spawn_config_to_run_args(
         bind: sc.bind,
         bind_ro: sc.bind_ro,
         tmpfs: sc.tmpfs,
+        device: sc.device,
         read_only: sc.read_only,
         env: sc.env,
         env_file: None,
