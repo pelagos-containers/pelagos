@@ -3271,7 +3271,23 @@ impl Command {
             .selinux_label
             .clone()
             .filter(|_| crate::mac::is_selinux_enabled());
-        let bind_mounts = self.bind_mounts.clone();
+        let mut bind_mounts = self.bind_mounts.clone();
+        // #444: privileged containers need /sys/fs/cgroup for cgroup detection
+        // (e.g. runc's IsCgroup2UnifiedMode). Inject a recursive bind mount of
+        // the host's cgroup hierarchy before pivot_root so it survives into the
+        // container — the same thing containerd/CRI-O do automatically.
+        if self.privileged && std::path::Path::new("/sys/fs/cgroup").exists() {
+            let cgroup_target = std::path::PathBuf::from("/sys/fs/cgroup");
+            if !bind_mounts.iter().any(|bm| bm.target == cgroup_target) {
+                bind_mounts.push(BindMount {
+                    source: std::path::PathBuf::from("/sys/fs/cgroup"),
+                    target: cgroup_target,
+                    readonly: false,
+                    recursive_readonly: false,
+                    propagation: MountPropagation::Private,
+                });
+            }
+        }
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
         let propagation_mounts = self.propagation_mounts.clone();
@@ -4839,6 +4855,14 @@ impl Command {
                         let host_target = resolve_mount_target_in_root(effective_root, &bm.target);
                         // Linux requires the mount target to exist and be the same type
                         // (file or directory) as the source.
+                        // #445: if the source doesn't exist, create it as a directory.
+                        // containerd does the same for HostPath volumes with type="" so
+                        // workloads that rely on the runtime creating missing host dirs
+                        // (e.g. KubeVirt's virt-handler) work without manual pre-creation.
+                        if !bm.source.exists() {
+                            std::fs::create_dir_all(&bm.source)
+                                .map_err(|e| pre_exec_err("bind mount mkdir source", e))?;
+                        }
                         if bm.source.is_dir() {
                             std::fs::create_dir_all(&host_target)
                                 .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
@@ -6230,7 +6254,20 @@ impl Command {
             .selinux_label
             .clone()
             .filter(|_| crate::mac::is_selinux_enabled());
-        let bind_mounts = self.bind_mounts.clone();
+        let mut bind_mounts = self.bind_mounts.clone();
+        // #444: same cgroup inject as in spawn() — see comment there.
+        if self.privileged && std::path::Path::new("/sys/fs/cgroup").exists() {
+            let cgroup_target = std::path::PathBuf::from("/sys/fs/cgroup");
+            if !bind_mounts.iter().any(|bm| bm.target == cgroup_target) {
+                bind_mounts.push(BindMount {
+                    source: std::path::PathBuf::from("/sys/fs/cgroup"),
+                    target: cgroup_target,
+                    readonly: false,
+                    recursive_readonly: false,
+                    propagation: MountPropagation::Private,
+                });
+            }
+        }
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
         let propagation_mounts = self.propagation_mounts.clone();
@@ -7544,6 +7581,11 @@ impl Command {
                         // Resolve symlinked parents in the image rootfs (e.g.
                         // /var/run -> /run) before binding. See issue #334.
                         let host_target = resolve_mount_target_in_root(effective_root, &bm.target);
+                        // #445: create missing source as a directory (containerd compat).
+                        if !bm.source.exists() {
+                            std::fs::create_dir_all(&bm.source)
+                                .map_err(|e| pre_exec_err("bind mount mkdir source", e))?;
+                        }
                         if bm.source.is_dir() {
                             std::fs::create_dir_all(&host_target)
                                 .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
