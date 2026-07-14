@@ -1157,7 +1157,7 @@ fn apply_cli_options(
         // virt-launcher-monitor → virt-launcher) get EPERM on the raise
         // because the permitted set is empty and there is nothing to re-raise.
         // This mirrors what src/oci.rs does for OCI-bundle paths.
-        let is_nonroot_uid = resolved_uid.map_or(false, |u| u != 0);
+        let is_nonroot_uid = resolved_uid.is_some_and(|u| u != 0);
         if is_nonroot_uid && !effective.is_empty() {
             for cap_num in 0u8..64u8 {
                 if effective.bits() & (1u64 << cap_num) != 0 {
