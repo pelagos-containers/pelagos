@@ -417,6 +417,25 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
 
         // Normal file — unpack.
         entry.unpack_in(&partial)?;
+
+        // Ensure regular files are world-readable after extraction (#452).
+        // Image layer directories are owned root:pelagos (setgid), so extracted
+        // files inherit the pelagos group. Containers running as other UIDs need
+        // to read their own files — security comes from namespace isolation, not
+        // from restricting read access on image content.
+        if entry.header().entry_type().is_file() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let extracted = partial.join(&raw_path);
+            if let Ok(meta) = std::fs::metadata(&extracted) {
+                let mode = meta.permissions().mode();
+                if mode & 0o004 == 0 {
+                    let _ = std::fs::set_permissions(
+                        &extracted,
+                        std::fs::Permissions::from_mode(mode | 0o004),
+                    );
+                }
+            }
+        }
     }
 
     // Ensure parent dir exists and rename partial → final.

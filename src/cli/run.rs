@@ -1304,15 +1304,19 @@ fn add_device(cmd: Command, spec: &str) -> Result<Command, Box<dyn std::error::E
     };
     let major = nix::sys::stat::major(st.st_rdev);
     let minor = nix::sys::stat::minor(st.st_rdev);
-    let mode = st.st_mode & 0o777;
+    // Use 0666 instead of the host device's mode so that non-root container
+    // processes can access CRI-injected devices like /dev/kvm and /dev/vhost-net
+    // (which are mode 0660 / GID kvm on the host but need to be world-accessible
+    // inside the container, matching containerd/runc behavior).
+    let mode = 0o666u32;
     Ok(cmd.with_device(container::DeviceNode {
         path: std::path::PathBuf::from(container_path),
         kind,
         major: major as u64,
         minor: minor as u64,
         mode,
-        uid: st.st_uid,
-        gid: st.st_gid,
+        uid: 0,
+        gid: 0,
     }))
 }
 
