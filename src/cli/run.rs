@@ -789,6 +789,7 @@ fn build_command(
         .with_chroot(rootfs_dir)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT | pid_ns | ipc_ns | Namespace::CGROUP)
         .with_proc_mount()
+        .with_sys_mount()
         .with_dev_mount()
         // Rootfs-based runs have no image config; inject the OCI default PATH
         // so executables in standard locations are always findable.
