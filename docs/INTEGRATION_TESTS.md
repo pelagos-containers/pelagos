@@ -5589,3 +5589,29 @@ the Running sandbox with a dead pause is classified as stale. **Why it matters:*
 the fix is targeted — legitimate phantoms (pause died unexpectedly while the sandbox was
 still in Running state) are still reaped, while intentionally stopped sandboxes are not,
 preserving the #347 phantom-GC invariant.
+
+## `issue_451_host_visible_overlay::test_host_visible_overlay_in_mountinfo`
+**Requires root.** Spawns a container with a native overlayfs (`with_overlay()`) and reads
+`/proc/self/mountinfo` from the HOST process (not inside the container) while the container
+is running. Asserts that the overlay merged path appears with filesystem type "overlay" in
+the host mount namespace. Then calls `wait()` and asserts the entry is gone. **Why it
+matters:** before #451 the overlay was mounted only inside the container's private namespace
+(in `pre_exec` after `unshare(CLONE_NEWNS)`), making it invisible to host tools. KubeVirt's
+`virt-handler` inspects `/proc/1/mountinfo` to locate a container's rootfs; a missing entry
+caused "no mount containing / found" and prevented VMI scheduling.
+
+## `issue_451_host_visible_overlay::test_nonprivileged_container_has_readonly_sysfs_cgroup`
+**Requires root.** Spawns a non-privileged container with chroot, reads `/proc/mounts`
+inside it, and asserts that `/sys/fs/cgroup` is present with the `ro` option. **Why it
+matters:** #451/#452 extended the `/sys/fs/cgroup` bind-mount (previously injected only for
+privileged containers via #444) to all chroot containers. Non-privileged containers need the
+mount to exist so tools like libvirt's `GetPodCPUSet` can read CPU affinity, but the mount
+must be read-only so `virtqemud` receives EROFS when it tries to write `cgroup.procs` and
+gracefully skips host-level cgroup placement instead of aborting.
+
+## `issue_451_host_visible_overlay::test_privileged_container_has_readwrite_sysfs_cgroup`
+**Requires root.** Spawns a privileged container with chroot, reads `/proc/mounts` inside
+it, and asserts that `/sys/fs/cgroup` is present without the `ro` option. **Why it
+matters:** companion to the above — confirms that the RO-for-non-privileged change did not
+regress privileged containers, which still need read-write cgroup access (e.g. runc's
+`IsCgroup2UnifiedMode`, Kubernetes device plugin accounting).

@@ -3260,6 +3260,7 @@ impl Command {
         // opening /dev/null and dup2-ing it to fd 0 at the start of pre_exec
         // (from the HOST filesystem, before pivot_root) closes this window.
         let null_stdin = matches!(self.stdio_in, Stdio::Null);
+        let privileged = self.privileged;
         // MAC: only activate AppArmor / SELinux if the respective LSM is running.
         // Checked in the parent so we can use is_apparmor_enabled() / is_selinux_enabled()
         // (which allocate) rather than deferring the check to the async-signal-safe pre_exec.
@@ -3272,17 +3273,23 @@ impl Command {
             .clone()
             .filter(|_| crate::mac::is_selinux_enabled());
         let mut bind_mounts = self.bind_mounts.clone();
-        // #444: privileged containers need /sys/fs/cgroup for cgroup detection
-        // (e.g. runc's IsCgroup2UnifiedMode). Inject a recursive bind mount of
-        // the host's cgroup hierarchy before pivot_root so it survives into the
-        // container — the same thing containerd/CRI-O do automatically.
-        if self.privileged && std::path::Path::new("/sys/fs/cgroup").exists() {
+        // #444 / #452: inject /sys/fs/cgroup so statfs("/sys/fs/cgroup") works inside
+        // the container (needed by runc's IsCgroup2UnifiedMode and virt-launcher's
+        // GetPodCPUSet). Privileged containers get RW; non-privileged get READ-ONLY
+        // so libvirt/virtqemud sees EROFS when attempting to write cgroup.procs and
+        // skips host-level cgroup placement gracefully (#453).
+        // Skipped when CAP_SYS_ADMIN is absent (nested/in-pod builds): inside a
+        // user namespace you cannot bind-mount the host cgroup hierarchy — EPERM.
+        if self.chroot_dir.is_some()
+            && !lacks_sys_admin
+            && std::path::Path::new("/sys/fs/cgroup").exists()
+        {
             let cgroup_target = std::path::PathBuf::from("/sys/fs/cgroup");
             if !bind_mounts.iter().any(|bm| bm.target == cgroup_target) {
                 bind_mounts.push(BindMount {
                     source: std::path::PathBuf::from("/sys/fs/cgroup"),
                     target: cgroup_target,
-                    readonly: false,
+                    readonly: !self.privileged,
                     recursive_readonly: false,
                     propagation: MountPropagation::Private,
                 });
@@ -3537,6 +3544,63 @@ impl Command {
                 use_fuse_overlay = false;
             }
         }
+
+        // Mount native overlayfs in the HOST mount namespace (#451).
+        //
+        // Previously the overlay mount was created inside pre_exec — after
+        // unshare(CLONE_NEWNS) — making it invisible to the host.  Tools like
+        // KubeVirt's virt-handler inspect /proc/1/mountinfo to locate container
+        // rootfs paths; without a host-namespace mount they fail with "no mount
+        // containing / found in the mount namespace of pid 1".
+        //
+        // Fix: mount here (parent, host namespace) so the overlay is visible in
+        // /proc/1/mountinfo.  After fork + unshare(CLONE_NEWNS), the child
+        // inherits a copy; pre_exec skips the redundant mount and proceeds
+        // directly to pivot_root.  Cleanup calls umount2(MNT_DETACH).
+        //
+        // Excluded: fuse-overlayfs (mounted by parent fuse child or inline in
+        // container namespace), rootless native overlay, and any spawn where the
+        // caller lacks CAP_SYS_ADMIN (e.g. uid-0 nested/in-pod builds, #426).
+        // In that last case pelagos automatically creates a user namespace so the
+        // overlay is mounted inside pre_exec after unshare(CLONE_NEWUSER) where
+        // the new userns provides the required CAP_SYS_ADMIN — attempting the
+        // mount here in the parent would fail EPERM.
+        let native_overlay_host_mounted =
+            if !use_fuse_overlay && !is_rootless && !lacks_sys_admin && self.overlay.is_some() {
+                match &overlay_cstrings {
+                    Some((lower, upper, work, merged)) => {
+                        let opts = format!(
+                            "lowerdir={},upperdir={},workdir={},metacopy=off",
+                            lower.to_string_lossy(),
+                            upper.to_string_lossy(),
+                            work.to_string_lossy(),
+                        );
+                        let opts_c = std::ffi::CString::new(opts.as_bytes()).map_err(|e| {
+                            Error::Io(io::Error::other(format!("overlay opts nul: {}", e)))
+                        })?;
+                        let ov_type = c"overlay";
+                        let ret = unsafe {
+                            libc::mount(
+                                ov_type.as_ptr(),
+                                merged.as_ptr(),
+                                ov_type.as_ptr(),
+                                0,
+                                opts_c.as_ptr() as *const libc::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            return Err(Error::Io(io::Error::other(format!(
+                                "mount overlay in host namespace: {}",
+                                io::Error::last_os_error()
+                            ))));
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
 
         // Collect OCI sync fds (captured by value — i32 is Copy).
         let oci_sync = self.oci_sync;
@@ -4442,6 +4506,11 @@ impl Command {
                                 // visible in this mount namespace (inherited before CLONE_NEWNS).
                                 Some(merged)
                             }
+                        } else if native_overlay_host_mounted {
+                            // Native overlay was already mounted in the host namespace
+                            // before fork (#451).  This child inherited it after
+                            // unshare(CLONE_NEWNS); skip the redundant mount here.
+                            Some(merged)
                         } else {
                             let mut opts_str = format!(
                                 "lowerdir={},upperdir={},workdir={},metacopy=off",
@@ -4785,6 +4854,81 @@ impl Command {
                                 dev_host.join("stderr"),
                             );
                             let _ = std::os::unix::fs::symlink("pts/ptmx", dev_host.join("ptmx"));
+
+                            // Privileged containers get the full host device tree (#452).
+                            // Walk host /dev and bind-mount every character/block device so
+                            // tools running inside the container (e.g. virt-chroot from the
+                            // virt-handler DaemonSet) can access host devices like
+                            // /dev/net/tun, /dev/kvm, /dev/vhost-net, etc.
+                            if privileged {
+                                fn bind_host_devs(
+                                    host_dir: &std::path::Path,
+                                    container_dir: &std::path::Path,
+                                ) {
+                                    let rd = match std::fs::read_dir(host_dir) {
+                                        Ok(d) => d,
+                                        Err(_) => return,
+                                    };
+                                    for entry in rd.flatten() {
+                                        use std::os::unix::fs::MetadataExt as _;
+                                        let epath = entry.path();
+                                        let meta = match entry.metadata() {
+                                            Ok(m) => m,
+                                            Err(_) => continue,
+                                        };
+                                        let ftype = meta.file_type();
+                                        let name = entry.file_name();
+                                        let target = container_dir.join(&name);
+                                        if ftype.is_dir() {
+                                            let _ = std::fs::create_dir_all(&target);
+                                            bind_host_devs(&epath, &target);
+                                        } else if ftype.is_symlink() {
+                                            if let Ok(link_target) = std::fs::read_link(&epath) {
+                                                let _ = std::os::unix::fs::symlink(
+                                                    &link_target,
+                                                    &target,
+                                                );
+                                            }
+                                        } else {
+                                            let mode = meta.mode() & 0o170000;
+                                            if mode == 0o020000 || mode == 0o060000 {
+                                                // Character or block device — bind-mount.
+                                                if let (Ok(src_c), Ok(tgt_c)) = (
+                                                    std::ffi::CString::new(
+                                                        epath.as_os_str().as_encoded_bytes(),
+                                                    ),
+                                                    std::ffi::CString::new(
+                                                        target.as_os_str().as_encoded_bytes(),
+                                                    ),
+                                                ) {
+                                                    let tfd = unsafe {
+                                                        libc::open(
+                                                            tgt_c.as_ptr(),
+                                                            libc::O_CREAT
+                                                                | libc::O_WRONLY
+                                                                | libc::O_CLOEXEC,
+                                                            0o666u32,
+                                                        )
+                                                    };
+                                                    if tfd >= 0 {
+                                                        unsafe { libc::close(tfd) };
+                                                    }
+                                                    unsafe {
+                                                        libc::mount(
+                                                            src_c.as_ptr(),
+                                                            tgt_c.as_ptr(),
+                                                            ptr::null(),
+                                                            libc::MS_BIND,
+                                                            ptr::null(),
+                                                        )
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                bind_host_devs(std::path::Path::new("/dev"), &dev_host);
+                            }
                         }
                     }
 
@@ -5185,6 +5329,14 @@ impl Command {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
+                        // Create parent directory if needed (e.g. /dev/net/ for /dev/net/tun).
+                        if let Some(parent) = dev.path.parent() {
+                            if parent != std::path::Path::new("")
+                                && parent != std::path::Path::new("/")
+                            {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                        }
                         let type_bits: libc::mode_t = match dev.kind {
                             'b' => libc::S_IFBLK,
                             'p' => libc::S_IFIFO,
@@ -5862,6 +6014,7 @@ impl Command {
             secondary_networks,
             pasta,
             overlay_merged_dir,
+            native_overlay_host_mounted,
             dns_temp_dir,
             hosts_temp_dir,
             fuse_overlay_child,
@@ -5948,6 +6101,7 @@ impl Command {
                 secondary_networks: Vec::new(),
                 pasta: None,
                 overlay_merged_dir: None,
+                native_overlay_host_mounted: false,
                 dns_temp_dir: None,
                 hosts_temp_dir: None,
                 fuse_overlay_child: None,
@@ -5979,6 +6133,7 @@ impl Command {
                 secondary_networks: Vec::new(),
                 pasta: None,
                 overlay_merged_dir: None,
+                native_overlay_host_mounted: false,
                 dns_temp_dir: None,
                 hosts_temp_dir: None,
                 fuse_overlay_child: None,
@@ -6264,6 +6419,7 @@ impl Command {
         let additional_gids = self.additional_gids.clone();
         let umask_val = self.umask;
         let landlock_rules = self.landlock_rules.clone();
+        let privileged = self.privileged;
         let apparmor_profile: Option<String> = self
             .apparmor_profile
             .clone()
@@ -6273,14 +6429,19 @@ impl Command {
             .clone()
             .filter(|_| crate::mac::is_selinux_enabled());
         let mut bind_mounts = self.bind_mounts.clone();
-        // #444: same cgroup inject as in spawn() — see comment there.
-        if self.privileged && std::path::Path::new("/sys/fs/cgroup").exists() {
+        // #444 / #452 / #453: same cgroup inject as in spawn() — see comment there.
+        // Privileged = RW, non-privileged = RO to prevent libvirt cgroup write attempts.
+        // Skipped when CAP_SYS_ADMIN is absent (nested/in-pod builds): EPERM inside user ns.
+        if self.chroot_dir.is_some()
+            && !lacks_sys_admin
+            && std::path::Path::new("/sys/fs/cgroup").exists()
+        {
             let cgroup_target = std::path::PathBuf::from("/sys/fs/cgroup");
             if !bind_mounts.iter().any(|bm| bm.target == cgroup_target) {
                 bind_mounts.push(BindMount {
                     source: std::path::PathBuf::from("/sys/fs/cgroup"),
                     target: cgroup_target,
-                    readonly: false,
+                    readonly: !self.privileged,
                     recursive_readonly: false,
                     propagation: MountPropagation::Private,
                 });
@@ -6498,6 +6659,44 @@ impl Command {
                 use_fuse_overlay = false;
             }
         }
+
+        // Mount native overlayfs in the HOST mount namespace (#451 — mirrors spawn()).
+        let native_overlay_host_mounted =
+            if !use_fuse_overlay && !is_rootless && !lacks_sys_admin && self.overlay.is_some() {
+                match &overlay_cstrings {
+                    Some((lower, upper, work, merged)) => {
+                        let opts = format!(
+                            "lowerdir={},upperdir={},workdir={},metacopy=off",
+                            lower.to_string_lossy(),
+                            upper.to_string_lossy(),
+                            work.to_string_lossy(),
+                        );
+                        let opts_c = std::ffi::CString::new(opts.as_bytes()).map_err(|e| {
+                            Error::Io(io::Error::other(format!("overlay opts nul: {}", e)))
+                        })?;
+                        let ov_type = c"overlay";
+                        let ret = unsafe {
+                            libc::mount(
+                                ov_type.as_ptr(),
+                                merged.as_ptr(),
+                                ov_type.as_ptr(),
+                                0,
+                                opts_c.as_ptr() as *const libc::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            return Err(Error::Io(io::Error::other(format!(
+                                "mount overlay in host namespace: {}",
+                                io::Error::last_os_error()
+                            ))));
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
 
         // Collect OCI sync fds.
         let oci_sync = self.oci_sync;
@@ -7224,6 +7423,10 @@ impl Command {
                                 // visible in this mount namespace (inherited before CLONE_NEWNS).
                                 Some(merged)
                             }
+                        } else if native_overlay_host_mounted {
+                            // Native overlay was already mounted in the host namespace
+                            // before fork (#451).  This child inherited it; skip remount.
+                            Some(merged)
                         } else {
                             let mut opts_str = format!(
                                 "lowerdir={},upperdir={},workdir={},metacopy=off",
@@ -7539,6 +7742,77 @@ impl Command {
                                 dev_host.join("stderr"),
                             );
                             let _ = std::os::unix::fs::symlink("pts/ptmx", dev_host.join("ptmx"));
+
+                            // Privileged containers get the full host device tree — mirrors
+                            // spawn() step 4.75 (#452).
+                            if privileged {
+                                fn bind_host_devs_i(
+                                    host_dir: &std::path::Path,
+                                    container_dir: &std::path::Path,
+                                ) {
+                                    let rd = match std::fs::read_dir(host_dir) {
+                                        Ok(d) => d,
+                                        Err(_) => return,
+                                    };
+                                    for entry in rd.flatten() {
+                                        use std::os::unix::fs::MetadataExt as _;
+                                        let epath = entry.path();
+                                        let meta = match entry.metadata() {
+                                            Ok(m) => m,
+                                            Err(_) => continue,
+                                        };
+                                        let ftype = meta.file_type();
+                                        let name = entry.file_name();
+                                        let target = container_dir.join(&name);
+                                        if ftype.is_dir() {
+                                            let _ = std::fs::create_dir_all(&target);
+                                            bind_host_devs_i(&epath, &target);
+                                        } else if ftype.is_symlink() {
+                                            if let Ok(link_target) = std::fs::read_link(&epath) {
+                                                let _ = std::os::unix::fs::symlink(
+                                                    &link_target,
+                                                    &target,
+                                                );
+                                            }
+                                        } else {
+                                            let mode = meta.mode() & 0o170000;
+                                            if mode == 0o020000 || mode == 0o060000 {
+                                                if let (Ok(src_c), Ok(tgt_c)) = (
+                                                    std::ffi::CString::new(
+                                                        epath.as_os_str().as_encoded_bytes(),
+                                                    ),
+                                                    std::ffi::CString::new(
+                                                        target.as_os_str().as_encoded_bytes(),
+                                                    ),
+                                                ) {
+                                                    let tfd = unsafe {
+                                                        libc::open(
+                                                            tgt_c.as_ptr(),
+                                                            libc::O_CREAT
+                                                                | libc::O_WRONLY
+                                                                | libc::O_CLOEXEC,
+                                                            0o666u32,
+                                                        )
+                                                    };
+                                                    if tfd >= 0 {
+                                                        unsafe { libc::close(tfd) };
+                                                    }
+                                                    unsafe {
+                                                        libc::mount(
+                                                            src_c.as_ptr(),
+                                                            tgt_c.as_ptr(),
+                                                            ptr::null(),
+                                                            libc::MS_BIND,
+                                                            ptr::null(),
+                                                        )
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                bind_host_devs_i(std::path::Path::new("/dev"), &dev_host);
+                            }
                         }
                     }
 
@@ -7886,6 +8160,14 @@ impl Command {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
+                        // Create parent directory if needed (e.g. /dev/net/ for /dev/net/tun).
+                        if let Some(parent) = dev.path.parent() {
+                            if parent != std::path::Path::new("")
+                                && parent != std::path::Path::new("/")
+                            {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                        }
                         let type_bits: libc::mode_t = match dev.kind {
                             'b' => libc::S_IFBLK,
                             'p' => libc::S_IFIFO,
@@ -8425,6 +8707,7 @@ impl Command {
                 secondary_networks,
                 pasta,
                 overlay_merged_dir,
+                native_overlay_host_mounted,
                 dns_temp_dir,
                 hosts_temp_dir,
                 fuse_overlay_child,
@@ -8492,6 +8775,9 @@ pub struct Child {
     pasta: Option<crate::network::PastaSetup>,
     /// Overlay merged-dir created before fork; removed after the child exits.
     overlay_merged_dir: Option<PathBuf>,
+    /// True when the native overlayfs was mounted in the host namespace before fork (#451).
+    /// Cleanup must call umount2(merged, MNT_DETACH) before removing the overlay base dir.
+    native_overlay_host_mounted: bool,
     /// Per-container DNS temp dir (`/run/pelagos/dns-{pid}-{n}/`); removed after child exits.
     dns_temp_dir: Option<PathBuf>,
     /// Per-container hosts temp dir; removed after child exits.
@@ -8818,6 +9104,16 @@ impl Child {
                 }
             }
             let _ = fuse_child.wait();
+        }
+        // Unmount native overlay from host namespace before removing the base dir (#451).
+        // When native_overlay_host_mounted=true the overlay was created in the parent
+        // process; it must be explicitly detached before the merged dir is removed.
+        if self.native_overlay_host_mounted {
+            if let Some(ref merged) = self.overlay_merged_dir {
+                if let Ok(c) = std::ffi::CString::new(merged.as_os_str().as_encoded_bytes()) {
+                    unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+                }
+            }
         }
         if !preserve_overlay {
             if let Some(ref merged) = self.overlay_merged_dir.take() {

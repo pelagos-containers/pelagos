@@ -30066,3 +30066,199 @@ mod issue_412_cgroup_kill_orphans {
         );
     }
 }
+
+// ── #451: host-visible overlay + #452-related: cgroup RO for non-privileged ──
+
+mod issue_451_host_visible_overlay {
+    use super::*;
+
+    /// After spawning a container that uses native overlayfs, the merged path must
+    /// appear in the HOST's /proc/self/mountinfo with filesystem type "overlay".
+    /// Before #451 the mount only existed inside the container's private namespace,
+    /// making it invisible to host tools (e.g. KubeVirt virt-handler) that inspect
+    /// /proc/1/mountinfo to locate a container's rootfs.
+    #[test]
+    fn test_host_visible_overlay_in_mountinfo() {
+        if !is_root() {
+            eprintln!("Skipping test_host_visible_overlay_in_mountinfo: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_host_visible_overlay_in_mountinfo: alpine-rootfs not found");
+            return;
+        };
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut child = Command::new("/bin/true")
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_overlay(&upper, &work)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn overlay container");
+
+        let merged = child
+            .overlay_merged_dir()
+            .expect("overlay_merged_dir should be set for with_overlay()")
+            .to_path_buf();
+
+        // The overlay mount in the host namespace persists until wait() even if
+        // the container process has already exited — so we can safely check here.
+        let mountinfo =
+            std::fs::read_to_string("/proc/self/mountinfo").expect("read /proc/self/mountinfo");
+        let merged_str = merged.to_string_lossy();
+        let visible = mountinfo
+            .lines()
+            .any(|l| l.contains(merged_str.as_ref()) && l.contains("overlay"));
+        assert!(
+            visible,
+            "overlay merged dir {:?} not found in host /proc/self/mountinfo (#451);\
+             \noverlay lines:\n{}",
+            merged,
+            mountinfo
+                .lines()
+                .filter(|l| l.contains("overlay"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        child.wait().expect("wait");
+
+        // After wait() the host-namespace overlay must have been detached.
+        let mountinfo_after =
+            std::fs::read_to_string("/proc/self/mountinfo").expect("read /proc/self/mountinfo");
+        let still_visible = mountinfo_after
+            .lines()
+            .any(|l| l.contains(merged_str.as_ref()));
+        assert!(
+            !still_visible,
+            "overlay merged dir {:?} still in host /proc/self/mountinfo after wait() — \
+             umount2(MNT_DETACH) did not run (#451)",
+            merged
+        );
+    }
+
+    /// Non-privileged containers get /sys/fs/cgroup bind-mounted read-only (#451/#452).
+    /// libvirt/virtqemud receives EROFS when it tries to write cgroup.procs, which it
+    /// handles gracefully — but it needs the mount to exist in the first place.
+    #[test]
+    fn test_nonprivileged_container_has_readonly_sysfs_cgroup() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_nonprivileged_container_has_readonly_sysfs_cgroup: requires root"
+            );
+            return;
+        }
+        if !std::path::Path::new("/sys/fs/cgroup").exists() {
+            eprintln!(
+                "Skipping test_nonprivileged_container_has_readonly_sysfs_cgroup: no /sys/fs/cgroup"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_nonprivileged_container_has_readonly_sysfs_cgroup: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Print /proc/mounts so we can parse the cgroup entry.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat /proc/mounts"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let mounts = String::from_utf8_lossy(&stdout);
+
+        let cgroup_line = mounts.lines().find(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            fields.len() >= 4 && fields[1] == "/sys/fs/cgroup"
+        });
+        assert!(
+            cgroup_line.is_some(),
+            "/sys/fs/cgroup not mounted in non-privileged container (#451/#452);\
+             \nmounts:\n{}",
+            mounts
+        );
+        let line = cgroup_line.unwrap();
+        let opts = line.split_whitespace().nth(3).unwrap_or("");
+        assert!(
+            opts.split(',').any(|o| o == "ro"),
+            "/sys/fs/cgroup should be read-only in a non-privileged container, \
+             got mount options: {opts} (#451/#452)"
+        );
+    }
+
+    /// Privileged containers get /sys/fs/cgroup bind-mounted read-write (#444).
+    #[test]
+    fn test_privileged_container_has_readwrite_sysfs_cgroup() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_privileged_container_has_readwrite_sysfs_cgroup: requires root"
+            );
+            return;
+        }
+        if !std::path::Path::new("/sys/fs/cgroup").exists() {
+            eprintln!(
+                "Skipping test_privileged_container_has_readwrite_sysfs_cgroup: no /sys/fs/cgroup"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_privileged_container_has_readwrite_sysfs_cgroup: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat /proc/mounts"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .with_privileged()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn privileged");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let mounts = String::from_utf8_lossy(&stdout);
+
+        let cgroup_line = mounts.lines().find(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            fields.len() >= 4 && fields[1] == "/sys/fs/cgroup"
+        });
+        assert!(
+            cgroup_line.is_some(),
+            "/sys/fs/cgroup not mounted in privileged container (#444);\
+             \nmounts:\n{}",
+            mounts
+        );
+        let line = cgroup_line.unwrap();
+        let opts = line.split_whitespace().nth(3).unwrap_or("");
+        assert!(
+            !opts.split(',').any(|o| o == "ro"),
+            "/sys/fs/cgroup should be read-write in a privileged container, \
+             got mount options: {opts} (#444)"
+        );
+    }
+}
