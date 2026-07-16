@@ -5175,14 +5175,12 @@ impl Command {
                     // (O_PATH fd approach fails: after MNT_DETACH the host cgroupfs
                     // is no longer in the namespace mount table so bind-from-fd
                     // returns EINVAL.)
-                    if inject_cgroup_after_sysfs
-                        && std::path::Path::new("/sys/fs/cgroup").exists()
+                    if inject_cgroup_after_sysfs && std::path::Path::new("/sys/fs/cgroup").exists()
                     {
                         let tmp = effective_root.join(".cg_tmp");
                         let _ = std::fs::create_dir_all(&tmp);
                         let src_c = CString::new("/sys/fs/cgroup").unwrap();
-                        let tgt_c =
-                            CString::new(tmp.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = CString::new(tmp.as_os_str().as_bytes()).unwrap();
                         let r = libc::mount(
                             src_c.as_ptr(),
                             tgt_c.as_ptr(),
@@ -5334,10 +5332,7 @@ impl Command {
                         }
                         libc::rmdir(cg_src.as_ptr());
                         if r != 0 && !is_rootless && !lacks_sys_admin {
-                            return Err(pre_exec_err(
-                                "move cgroupfs",
-                                io::Error::last_os_error(),
-                            ));
+                            return Err(pre_exec_err("move cgroupfs", io::Error::last_os_error()));
                         }
                     }
                 }
@@ -8105,14 +8100,12 @@ impl Command {
 
                     // #455: stage cgroupfs at <effective_root>/.cg_tmp before
                     // pivot_root — mirrors the spawn() path (see comment there).
-                    if inject_cgroup_after_sysfs
-                        && std::path::Path::new("/sys/fs/cgroup").exists()
+                    if inject_cgroup_after_sysfs && std::path::Path::new("/sys/fs/cgroup").exists()
                     {
                         let tmp = effective_root.join(".cg_tmp");
                         let _ = std::fs::create_dir_all(&tmp);
                         let src_c = CString::new("/sys/fs/cgroup").unwrap();
-                        let tgt_c =
-                            CString::new(tmp.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = CString::new(tmp.as_os_str().as_bytes()).unwrap();
                         let r = libc::mount(
                             src_c.as_ptr(),
                             tgt_c.as_ptr(),
@@ -8246,10 +8239,7 @@ impl Command {
                         }
                         libc::rmdir(cg_src.as_ptr());
                         if r != 0 && !is_rootless && !lacks_sys_admin {
-                            return Err(pre_exec_err(
-                                "move cgroupfs",
-                                io::Error::last_os_error(),
-                            ));
+                            return Err(pre_exec_err("move cgroupfs", io::Error::last_os_error()));
                         }
                     }
                 }

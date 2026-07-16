@@ -30486,9 +30486,7 @@ mod issue_455_cgroupfs_sysfs_order {
     #[test]
     fn test_cgroupfs_readonly_in_nonprivileged_container() {
         if !is_root() {
-            eprintln!(
-                "Skipping test_cgroupfs_readonly_in_nonprivileged_container: requires root"
-            );
+            eprintln!("Skipping test_cgroupfs_readonly_in_nonprivileged_container: requires root");
             return;
         }
         let Some(rootfs) = ensure_alpine() else {
@@ -30535,9 +30533,7 @@ mod issue_455_cgroupfs_sysfs_order {
     #[test]
     fn test_cgroupfs_readwrite_in_privileged_container() {
         if !is_root() {
-            eprintln!(
-                "Skipping test_cgroupfs_readwrite_in_privileged_container: requires root"
-            );
+            eprintln!("Skipping test_cgroupfs_readwrite_in_privileged_container: requires root");
             return;
         }
         let Some(rootfs) = ensure_alpine() else {
