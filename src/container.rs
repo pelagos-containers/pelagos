@@ -5256,7 +5256,7 @@ impl Command {
                         flags,
                         ptr::null(),
                     );
-                    if result != 0 && !is_rootless {
+                    if result != 0 && !is_rootless && !lacks_sys_admin {
                         return Err(pre_exec_err("mount sysfs", io::Error::last_os_error()));
                     }
                 }
@@ -8101,7 +8101,7 @@ impl Command {
                         flags,
                         ptr::null(),
                     );
-                    if result != 0 && !is_rootless {
+                    if result != 0 && !is_rootless && !lacks_sys_admin {
                         return Err(pre_exec_err("mount sysfs", io::Error::last_os_error()));
                     }
                 }
