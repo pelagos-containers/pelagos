@@ -30262,3 +30262,178 @@ mod issue_451_host_visible_overlay {
         );
     }
 }
+
+// ── #452: sysfs mounted in containers ─────────────────────────────────────────
+
+mod issue_452_sysfs_mount {
+    use super::*;
+
+    /// Non-privileged image-based containers must have a read-only sysfs at /sys
+    /// (#452). Before this fix the CRI path (with_image_layers) did not set
+    /// mount_sys, so /sys was absent and libvirt's virHostCPUGetOnlineBitmap()
+    /// failed with ENOENT on /sys/devices/system/cpu/online, aborting QEMU launch.
+    #[test]
+    fn test_image_container_has_readonly_sysfs() {
+        if !is_root() {
+            eprintln!("Skipping test_image_container_has_readonly_sysfs: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_image_container_has_readonly_sysfs: alpine-rootfs not found");
+            return;
+        };
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        // with_image_layers mirrors the CRI path. The sysfs path queried by
+        // libvirt to enumerate CPUs for vCPU affinity.
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "cat /proc/mounts && echo --- && ls /sys/devices/system/cpu/ 2>&1",
+            ])
+            .with_image_layers(vec![rootfs.clone()])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn image container");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+
+        // /sys must be a sysfs mount (not just the /sys/fs/cgroup entry).
+        let has_sysfs = out.lines().any(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            fields.len() >= 4 && fields[1] == "/sys" && fields[2] == "sysfs"
+        });
+        assert!(
+            has_sysfs,
+            "non-privileged image container missing sysfs at /sys (#452);\
+             \n/proc/mounts:\n{}",
+            out.lines()
+                .take_while(|l| *l != "---")
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // /sys must be read-only for non-privileged containers.
+        let sysfs_line = out.lines().find(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            fields.len() >= 4 && fields[1] == "/sys" && fields[2] == "sysfs"
+        });
+        let opts = sysfs_line
+            .and_then(|l| l.split_whitespace().nth(3))
+            .unwrap_or("");
+        assert!(
+            opts.split(',').any(|o| o == "ro"),
+            "non-privileged sysfs should be read-only; got mount options: {opts} (#452)"
+        );
+
+        // The key path libvirt uses for CPU enumeration must exist.
+        let after_sep = out.lines().skip_while(|l| *l != "---").skip(1);
+        let cpu_entries: Vec<&str> = after_sep.collect();
+        assert!(
+            cpu_entries.iter().any(|e| e.starts_with("cpu")),
+            "/sys/devices/system/cpu/ should list cpu entries; got: {:?}",
+            cpu_entries
+        );
+    }
+
+    /// Privileged containers must have a read-write sysfs at /sys (#452).
+    #[test]
+    fn test_privileged_image_container_has_readwrite_sysfs() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_privileged_image_container_has_readwrite_sysfs: requires root"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_privileged_image_container_has_readwrite_sysfs: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat /proc/mounts"])
+            .with_image_layers(vec![rootfs.clone()])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_proc_mount()
+            .with_privileged()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn privileged image container");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let mounts = String::from_utf8_lossy(&stdout);
+
+        let sysfs_line = mounts.lines().find(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            fields.len() >= 4 && fields[1] == "/sys" && fields[2] == "sysfs"
+        });
+        assert!(
+            sysfs_line.is_some(),
+            "privileged image container missing sysfs at /sys (#452);\nmounts:\n{}",
+            mounts
+        );
+        let opts = sysfs_line
+            .and_then(|l| l.split_whitespace().nth(3))
+            .unwrap_or("");
+        assert!(
+            !opts.split(',').any(|o| o == "ro"),
+            "privileged sysfs should be read-write; got mount options: {opts} (#452)"
+        );
+    }
+
+    /// /sys/devices/system/cpu/online must exist and be readable — the specific
+    /// file libvirt calls access() on during QEMU domain startup (#452).
+    #[test]
+    fn test_sysfs_cpu_online_readable_in_container() {
+        if !is_root() {
+            eprintln!("Skipping test_sysfs_cpu_online_readable_in_container: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_sysfs_cpu_online_readable_in_container: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat /sys/devices/system/cpu/online"])
+            .with_image_layers(vec![rootfs.clone()])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let (status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+
+        assert!(
+            status.success(),
+            "cat /sys/devices/system/cpu/online failed (#452) — ENOENT blocks libvirt QEMU launch"
+        );
+        assert!(
+            !out.trim().is_empty(),
+            "/sys/devices/system/cpu/online should contain a CPU range (e.g. '0-3'); got empty"
+        );
+    }
+}

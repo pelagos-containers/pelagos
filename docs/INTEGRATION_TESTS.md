@@ -5615,3 +5615,29 @@ it, and asserts that `/sys/fs/cgroup` is present without the `ro` option. **Why 
 matters:** companion to the above — confirms that the RO-for-non-privileged change did not
 regress privileged containers, which still need read-write cgroup access (e.g. runc's
 `IsCgroup2UnifiedMode`, Kubernetes device plugin accounting).
+
+## `issue_452_sysfs_mount::test_image_container_has_readonly_sysfs`
+**Requires root.** Launches an image-based container (the `with_image_layers` / CRI path)
+and asserts that `/proc/mounts` contains a `sysfs /sys sysfs ro,...` entry and that
+`/sys/devices/system/cpu/` lists CPU entries. **Why it matters:** before #452, the CRI
+path never called `with_sys_mount()`, so non-privileged containers had no sysfs at `/sys`.
+libvirt 11.9.0 calls `access("/sys/devices/system/cpu/online", F_OK)` during QEMU domain
+startup; ENOENT caused it to abort, preventing any KubeVirt VM from ever launching.
+Failure here means non-privileged CRI containers break KubeVirt and any other workload
+that reads sysfs.
+
+## `issue_452_sysfs_mount::test_privileged_image_container_has_readwrite_sysfs`
+**Requires root.** Verifies that a privileged image container (`with_privileged()`) has
+sysfs mounted at `/sys` with read-write options (no `ro` flag). **Why it matters:**
+privileged containers like KubeVirt's `virt-handler` must write sysfs knobs (e.g. HugePage
+configuration) during node setup; a read-only sysfs would silently fail those writes.
+Failure here indicates the `privileged` flag is not correctly threaded into the sysfs
+mount flags.
+
+## `issue_452_sysfs_mount::test_sysfs_cpu_online_readable_in_container`
+**Requires root.** Cats `/sys/devices/system/cpu/online` inside a non-privileged image
+container and asserts the command exits zero with non-empty output (e.g. `0-3`). **Why it
+matters:** this is the specific file path that libvirt's `virHostCPUGetOnlineBitmap()` reads
+via `open()` to enumerate online CPUs for vCPU affinity mapping before QEMU exec. Even
+if sysfs is mounted, a kernel that exposes fewer sub-paths than expected would cause the
+same ENOENT failure. This test pins the exact failure path from the KubeVirt strace.

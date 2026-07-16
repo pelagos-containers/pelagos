@@ -2342,6 +2342,7 @@ impl Command {
         });
         self.namespaces |= Namespace::MOUNT;
         self.mount_proc = true;
+        self.mount_sys = true;
         self.mount_dev = true;
         self
     }
@@ -5235,21 +5236,28 @@ impl Command {
                 }
 
                 if mount_sys {
-                    // Ensure /sys exists — some minimal images omit it.
+                    // Mount a fresh sysfs at /sys (#452).  A fresh virtual sysfs
+                    // (not a host bind) matches the OCI runtime spec default and
+                    // lets tools like libvirt read /sys/devices/system/cpu/online.
+                    // Non-privileged containers get it read-only; privileged get rw.
                     let _ = std::fs::create_dir_all("/sys");
-                    // Bind mount /sys (from host) to /sys (in container)
-                    let sys = CString::new("/sys").unwrap();
-                    let sysfs = CString::new("sysfs").unwrap();
+                    let sysfs_src = CString::new("sysfs").unwrap();
+                    let sys_tgt = CString::new("/sys").unwrap();
+                    let ro_flags = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV;
+                    let flags = if privileged {
+                        ro_flags
+                    } else {
+                        ro_flags | libc::MS_RDONLY
+                    };
                     let result = libc::mount(
-                        sys.as_ptr(),   // source
-                        sys.as_ptr(),   // target
-                        sysfs.as_ptr(), // fstype
-                        libc::MS_BIND,  // flags
-                        ptr::null(),    // data
+                        sysfs_src.as_ptr(),
+                        sys_tgt.as_ptr(),
+                        sysfs_src.as_ptr(),
+                        flags,
+                        ptr::null(),
                     );
-                    // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
-                    if result != 0 && !is_rootless {
-                        return Err(pre_exec_err("mount sys", io::Error::last_os_error()));
+                    if result != 0 && !is_rootless && !lacks_sys_admin {
+                        return Err(pre_exec_err("mount sysfs", io::Error::last_os_error()));
                     }
                 }
 
@@ -8076,20 +8084,25 @@ impl Command {
                 }
 
                 if mount_sys {
-                    // Ensure /sys exists — some minimal images omit it.
+                    // Fresh sysfs (#452) — mirrors spawn() path.
                     let _ = std::fs::create_dir_all("/sys");
-                    let sys = CString::new("/sys").unwrap();
-                    let sysfs = CString::new("sysfs").unwrap();
+                    let sysfs_src = CString::new("sysfs").unwrap();
+                    let sys_tgt = CString::new("/sys").unwrap();
+                    let ro_flags = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV;
+                    let flags = if privileged {
+                        ro_flags
+                    } else {
+                        ro_flags | libc::MS_RDONLY
+                    };
                     let result = libc::mount(
-                        sys.as_ptr(),
-                        sys.as_ptr(),
-                        sysfs.as_ptr(),
-                        libc::MS_BIND,
+                        sysfs_src.as_ptr(),
+                        sys_tgt.as_ptr(),
+                        sysfs_src.as_ptr(),
+                        flags,
                         ptr::null(),
                     );
-                    // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
-                    if result != 0 && !is_rootless {
-                        return Err(pre_exec_err("mount sys", io::Error::last_os_error()));
+                    if result != 0 && !is_rootless && !lacks_sys_admin {
+                        return Err(pre_exec_err("mount sysfs", io::Error::last_os_error()));
                     }
                 }
 
