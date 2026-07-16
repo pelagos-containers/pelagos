@@ -3274,15 +3274,27 @@ impl Command {
             .clone()
             .filter(|_| crate::mac::is_selinux_enabled());
         let mut bind_mounts = self.bind_mounts.clone();
-        // #444 / #452: inject /sys/fs/cgroup so statfs("/sys/fs/cgroup") works inside
+        // #444 / #452 / #455: inject /sys/fs/cgroup so statfs("/sys/fs/cgroup") works inside
         // the container (needed by runc's IsCgroup2UnifiedMode and virt-launcher's
         // GetPodCPUSet). Privileged containers get RW; non-privileged get READ-ONLY
         // so libvirt/virtqemud sees EROFS when attempting to write cgroup.procs and
         // skips host-level cgroup placement gracefully (#453).
         // Skipped when CAP_SYS_ADMIN is absent (nested/in-pod builds): inside a
         // user namespace you cannot bind-mount the host cgroup hierarchy — EPERM.
+        //
+        // When mount_sys is true we mount a fresh sysfs at /sys AFTER pivot_root.
+        // A pre-pivot cgroupfs bind at /sys/fs/cgroup ends up shadowed by sysfs
+        // (path traversal through /sys enters sysfs and finds sysfs's own fs/cgroup/
+        // virtual node instead of the cgroupfs mount).  In that case we defer the
+        // bind to post-sysfs, using an O_PATH fd opened just before pivot_root to
+        // survive the root switch (#455).
+        let inject_cgroup_after_sysfs = self.chroot_dir.is_some()
+            && !lacks_sys_admin
+            && self.mount_sys
+            && std::path::Path::new("/sys/fs/cgroup").exists();
         if self.chroot_dir.is_some()
             && !lacks_sys_admin
+            && !self.mount_sys
             && std::path::Path::new("/sys/fs/cgroup").exists()
         {
             let cgroup_target = std::path::PathBuf::from("/sys/fs/cgroup");
@@ -4545,6 +4557,11 @@ impl Command {
                 // a fresh procfs mount is refused after the pivot (see the
                 // proc-mount fallback below).
                 let mut proc_stashed = false;
+                // #455: true when we successfully bind-mounted the host cgroupfs to
+                // <effective_root>/.cg_tmp before pivot_root.  After pivot_root the
+                // bind survives as /.cg_tmp; after sysfs it is MS_MOVE'd onto
+                // /sys/fs/cgroup so path traversal through sysfs finds it correctly.
+                let mut cgroup_staged = false;
 
                 // Step 4: Change root if specified
                 if let Some(ref dir) = chroot_dir {
@@ -5151,6 +5168,37 @@ impl Command {
                     // mount namespace root and detaches the old root.
                     // Fuse overlay (rootless) uses the same path — effective_root
                     // is the merged dir, which is in our private mount namespace.
+
+                    // #455: stage cgroupfs at <effective_root>/.cg_tmp before
+                    // pivot_root.  After pivot_root this appears as /.cg_tmp and
+                    // can be MS_MOVE'd to /sys/fs/cgroup after sysfs is mounted.
+                    // (O_PATH fd approach fails: after MNT_DETACH the host cgroupfs
+                    // is no longer in the namespace mount table so bind-from-fd
+                    // returns EINVAL.)
+                    if inject_cgroup_after_sysfs
+                        && std::path::Path::new("/sys/fs/cgroup").exists()
+                    {
+                        let tmp = effective_root.join(".cg_tmp");
+                        let _ = std::fs::create_dir_all(&tmp);
+                        let src_c = CString::new("/sys/fs/cgroup").unwrap();
+                        let tgt_c =
+                            CString::new(tmp.as_os_str().as_bytes()).unwrap();
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        cgroup_staged = r == 0;
+                        if !cgroup_staged {
+                            log::debug!(
+                                "cgroupfs staging bind failed: {}",
+                                io::Error::last_os_error()
+                            );
+                        }
+                    }
+
                     let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
                     do_pivot_root(effective_root, put_old_name)?;
 
@@ -5258,6 +5306,39 @@ impl Command {
                     );
                     if result != 0 && !is_rootless && !lacks_sys_admin {
                         return Err(pre_exec_err("mount sysfs", io::Error::last_os_error()));
+                    }
+
+                    // #455: MS_MOVE the staged cgroupfs from /.cg_tmp onto
+                    // /sys/fs/cgroup inside the freshly-mounted sysfs so path
+                    // traversal through sysfs reaches the real cgroupfs, not sysfs's
+                    // own virtual fs/cgroup/ directory.
+                    if cgroup_staged {
+                        let _ = std::fs::create_dir_all("/sys/fs/cgroup");
+                        let cg_src = CString::new("/.cg_tmp").unwrap();
+                        let cg_tgt = CString::new("/sys/fs/cgroup").unwrap();
+                        let r = libc::mount(
+                            cg_src.as_ptr(),
+                            cg_tgt.as_ptr(),
+                            ptr::null(),
+                            libc::MS_MOVE,
+                            ptr::null(),
+                        );
+                        if r == 0 && !privileged {
+                            libc::mount(
+                                ptr::null(),
+                                cg_tgt.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                        }
+                        libc::rmdir(cg_src.as_ptr());
+                        if r != 0 && !is_rootless && !lacks_sys_admin {
+                            return Err(pre_exec_err(
+                                "move cgroupfs",
+                                io::Error::last_os_error(),
+                            ));
+                        }
                     }
                 }
 
@@ -6437,11 +6518,17 @@ impl Command {
             .clone()
             .filter(|_| crate::mac::is_selinux_enabled());
         let mut bind_mounts = self.bind_mounts.clone();
-        // #444 / #452 / #453: same cgroup inject as in spawn() — see comment there.
+        // #444 / #452 / #453 / #455: same cgroup inject as in spawn() — see comment there.
         // Privileged = RW, non-privileged = RO to prevent libvirt cgroup write attempts.
         // Skipped when CAP_SYS_ADMIN is absent (nested/in-pod builds): EPERM inside user ns.
+        // When mount_sys is true, cgroupfs is deferred to post-sysfs via O_PATH fd (#455).
+        let inject_cgroup_after_sysfs = self.chroot_dir.is_some()
+            && !lacks_sys_admin
+            && self.mount_sys
+            && std::path::Path::new("/sys/fs/cgroup").exists();
         if self.chroot_dir.is_some()
             && !lacks_sys_admin
+            && !self.mount_sys
             && std::path::Path::new("/sys/fs/cgroup").exists()
         {
             let cgroup_target = std::path::PathBuf::from("/sys/fs/cgroup");
@@ -7466,6 +7553,9 @@ impl Command {
                 // #426: set when we stash a recursive bind of the parent's /proc
                 // inside the new root before pivot_root (see the other spawn path).
                 let mut proc_stashed = false;
+                // #455: true when cgroupfs was staged at <effective_root>/.cg_tmp
+                // before pivot_root (see the other spawn path for full explanation).
+                let mut cgroup_staged = false;
 
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
@@ -8012,6 +8102,33 @@ impl Command {
                     // mount namespace root and detaches the old root.
                     // Fuse overlay (rootless) uses the same path — effective_root
                     // is the merged dir, which is in our private mount namespace.
+
+                    // #455: stage cgroupfs at <effective_root>/.cg_tmp before
+                    // pivot_root — mirrors the spawn() path (see comment there).
+                    if inject_cgroup_after_sysfs
+                        && std::path::Path::new("/sys/fs/cgroup").exists()
+                    {
+                        let tmp = effective_root.join(".cg_tmp");
+                        let _ = std::fs::create_dir_all(&tmp);
+                        let src_c = CString::new("/sys/fs/cgroup").unwrap();
+                        let tgt_c =
+                            CString::new(tmp.as_os_str().as_bytes()).unwrap();
+                        let r = libc::mount(
+                            src_c.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND,
+                            ptr::null(),
+                        );
+                        cgroup_staged = r == 0;
+                        if !cgroup_staged {
+                            log::debug!(
+                                "cgroupfs staging bind failed: {}",
+                                io::Error::last_os_error()
+                            );
+                        }
+                    }
+
                     let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
                     do_pivot_root(effective_root, put_old_name)?;
                     let cwd = container_cwd
@@ -8103,6 +8220,37 @@ impl Command {
                     );
                     if result != 0 && !is_rootless && !lacks_sys_admin {
                         return Err(pre_exec_err("mount sysfs", io::Error::last_os_error()));
+                    }
+
+                    // #455: MS_MOVE staged cgroupfs from /.cg_tmp onto
+                    // /sys/fs/cgroup inside sysfs — mirrors the spawn() path.
+                    if cgroup_staged {
+                        let _ = std::fs::create_dir_all("/sys/fs/cgroup");
+                        let cg_src = CString::new("/.cg_tmp").unwrap();
+                        let cg_tgt = CString::new("/sys/fs/cgroup").unwrap();
+                        let r = libc::mount(
+                            cg_src.as_ptr(),
+                            cg_tgt.as_ptr(),
+                            ptr::null(),
+                            libc::MS_MOVE,
+                            ptr::null(),
+                        );
+                        if r == 0 && !privileged {
+                            libc::mount(
+                                ptr::null(),
+                                cg_tgt.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                                ptr::null(),
+                            );
+                        }
+                        libc::rmdir(cg_src.as_ptr());
+                        if r != 0 && !is_rootless && !lacks_sys_admin {
+                            return Err(pre_exec_err(
+                                "move cgroupfs",
+                                io::Error::last_os_error(),
+                            ));
+                        }
                     }
                 }
 
