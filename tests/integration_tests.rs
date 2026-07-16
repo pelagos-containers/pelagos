@@ -30437,3 +30437,142 @@ mod issue_452_sysfs_mount {
         );
     }
 }
+
+mod issue_455_cgroupfs_sysfs_order {
+    use super::*;
+
+    fn ensure_alpine() -> Option<PathBuf> {
+        get_test_rootfs()
+    }
+
+    /// /sys/fs/cgroup must be reachable inside image-layer containers (#455).
+    /// When mount_sys=true, a fresh sysfs is mounted at /sys after pivot_root,
+    /// which used to shadow the pre-pivot cgroupfs bind.  The O_PATH fd fix
+    /// re-attaches cgroupfs *inside* sysfs so path traversal finds it correctly.
+    #[test]
+    fn test_cgroupfs_visible_with_mount_sys() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroupfs_visible_with_mount_sys: requires root");
+            return;
+        }
+        let Some(rootfs) = ensure_alpine() else {
+            eprintln!("Skipping test_cgroupfs_visible_with_mount_sys: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "stat /sys/fs/cgroup 2>&1 && echo OK"])
+            .with_image_layers(vec![rootfs.clone()])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn image container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success() && out.contains("OK"),
+            "/sys/fs/cgroup not reachable in image-layer container (#455)\nstdout: {out}\nstderr: {err}"
+        );
+    }
+
+    /// Non-privileged image containers must see /sys/fs/cgroup as read-only (#455).
+    #[test]
+    fn test_cgroupfs_readonly_in_nonprivileged_container() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroupfs_readonly_in_nonprivileged_container: requires root");
+            return;
+        }
+        let Some(rootfs) = ensure_alpine() else {
+            eprintln!(
+                "Skipping test_cgroupfs_readonly_in_nonprivileged_container: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Check /proc/mounts for the cgroupfs entry — it should be mounted 'ro'.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "grep cgroup /proc/mounts"])
+            .with_image_layers(vec![rootfs.clone()])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let mounts = String::from_utf8_lossy(&stdout);
+
+        let cg_line = mounts.lines().find(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() >= 4 && f[1] == "/sys/fs/cgroup"
+        });
+        assert!(
+            cg_line.is_some(),
+            "/sys/fs/cgroup missing from /proc/mounts in image-layer container (#455);\nmounts:\n{mounts}"
+        );
+        let opts = cg_line
+            .and_then(|l| l.split_whitespace().nth(3))
+            .unwrap_or("");
+        assert!(
+            opts.split(',').any(|o| o == "ro"),
+            "non-privileged /sys/fs/cgroup should be read-only; mount options: {opts} (#455)"
+        );
+    }
+
+    /// Privileged image containers must see /sys/fs/cgroup as read-write (#455).
+    #[test]
+    fn test_cgroupfs_readwrite_in_privileged_container() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroupfs_readwrite_in_privileged_container: requires root");
+            return;
+        }
+        let Some(rootfs) = ensure_alpine() else {
+            eprintln!(
+                "Skipping test_cgroupfs_readwrite_in_privileged_container: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "grep cgroup /proc/mounts"])
+            .with_image_layers(vec![rootfs.clone()])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_proc_mount()
+            .with_privileged()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn privileged");
+
+        let (_status, stdout, _stderr) = child.wait_with_output().expect("wait");
+        let mounts = String::from_utf8_lossy(&stdout);
+
+        let cg_line = mounts.lines().find(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() >= 4 && f[1] == "/sys/fs/cgroup"
+        });
+        assert!(
+            cg_line.is_some(),
+            "/sys/fs/cgroup missing from /proc/mounts in privileged image-layer container (#455);\nmounts:\n{mounts}"
+        );
+        let opts = cg_line
+            .and_then(|l| l.split_whitespace().nth(3))
+            .unwrap_or("");
+        assert!(
+            !opts.split(',').any(|o| o == "ro"),
+            "privileged /sys/fs/cgroup should be read-write; mount options: {opts} (#455)"
+        );
+    }
+}

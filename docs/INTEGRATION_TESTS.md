@@ -5641,3 +5641,30 @@ matters:** this is the specific file path that libvirt's `virHostCPUGetOnlineBit
 via `open()` to enumerate online CPUs for vCPU affinity mapping before QEMU exec. Even
 if sysfs is mounted, a kernel that exposes fewer sub-paths than expected would cause the
 same ENOENT failure. This test pins the exact failure path from the KubeVirt strace.
+
+## `issue_455_cgroupfs_sysfs_order::test_cgroupfs_visible_with_mount_sys`
+**Requires root.** Launches an image-layer container (`with_image_layers`), runs `stat
+/sys/fs/cgroup` inside it, and asserts the command succeeds. **Why it matters:** when
+`mount_sys=true`, a fresh sysfs is mounted at `/sys` after `pivot_root`. Before #455 the
+cgroupfs was bind-mounted into `bind_mounts` before `pivot_root`, so after sysfs mounted at
+`/sys` the bind was shadowed — path traversal entered sysfs and found its own virtual
+`fs/cgroup/` directory instead of the real cgroupfs. The fix uses a temporary staging bind
+at `/.cg_tmp` inside the container root (before `pivot_root`) and then `MS_MOVE`s it onto
+`/sys/fs/cgroup` after sysfs is mounted. Failure means tools using cgroupfs inside
+image-layer containers (runc's `IsCgroup2UnifiedMode`, Kubernetes cgroup-aware workloads)
+break silently.
+
+## `issue_455_cgroupfs_sysfs_order::test_cgroupfs_readonly_in_nonprivileged_container`
+**Requires root.** Spawns a non-privileged image-layer container and checks `/proc/mounts`
+to confirm `/sys/fs/cgroup` is present with the `ro` mount option. **Why it matters:**
+the staging + MS_MOVE approach must preserve the RO/RW distinction — after the move the
+RO remount must still be applied correctly. Failure here means either cgroupfs is
+completely absent (wrong staging) or the RO remount was skipped (security regression: a
+non-privileged container can write cgroup.procs on the host).
+
+## `issue_455_cgroupfs_sysfs_order::test_cgroupfs_readwrite_in_privileged_container`
+**Requires root.** Spawns a privileged image-layer container and checks `/proc/mounts` to
+confirm `/sys/fs/cgroup` is present WITHOUT the `ro` option. **Why it matters:** companion
+to the above — confirms that privileged containers still receive a read-write cgroupfs
+(needed by KubeVirt `virt-handler` and device plugin accounting). Failure here means the
+MS_MOVE path is applying the RO remount unconditionally.
