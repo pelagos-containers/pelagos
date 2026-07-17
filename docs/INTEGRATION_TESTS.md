@@ -5669,25 +5669,28 @@ to the above — confirms that privileged containers still receive a read-write 
 (needed by KubeVirt `virt-handler` and device plugin accounting). Failure here means the
 MS_MOVE path is applying the RO remount unconditionally.
 
-## `issue_457_stop_path_kill_verification::test_stop_path_kills_surviving_container_process`
-**Requires root.** Simulates the aberrant condition that causes `EADDRINUSE` on hostNetwork
-pods after a CRI restart: spawns a `sleep 300` process whose PID is written into a
-pelagos-style `state.json`, then calls `ensure_container_dead()` — the belt-and-suspenders
-step added to `stop_pod_sandbox` and `stop_container` in `pelagos-cri/src/runtime.rs`
-(#457). Asserts that `ensure_container_dead` returns `true` (unexpected survival detected)
-and that the process has exited via `try_wait()` after the call. **Why it matters:** the
-fix belongs in the Stop path, not at startup — if `pelagos stop` returns without killing
-the container process (a bug, always logged at WARN), `ensure_container_dead` must catch
-and kill it. A failure here means a surviving container process can hold a hostNetwork port
-through a kubelet-initiated pod restart, causing every subsequent `RunPodSandbox` to fail.
+## `issue_459_cmd_stop_cgroup_first::test_cmd_stop_kills_sigterm_ignoring_process`
+**Requires root.** Spawns `sh -c "trap '' TERM; sleep 300"` (SIGTERM handler cleared),
+writes `state.json`, and calls `pelagos stop`. The process must be dead after `stop`
+returns. **Why it matters:** `cmd_stop` now kills via cgroup (Phase 2) as the primary
+mechanism — not via SIGTERM alone — so a SIGTERM-ignoring container (MetalLB speaker,
+any Go binary with custom signal handling) is reliably terminated. A failure here means
+containers that trap SIGTERM would survive `pelagos stop` and hold hostNetwork ports
+through pod restarts, reproducing the 977-restart EADDRINUSE failure (#457/#459).
 
-## `issue_457_hostnetwork_startup_kill::test_hostnetwork_startup_kills_container_process`
-**Requires root.** Mirrors the startup reconciliation logic added to `AppState::new()` in
-`pelagos-cri/src/state.rs` (#457): spawns a `sleep 300` process, writes its PID into a
-pelagos-style `state.json`, and calls the startup kill helper. Asserts via `try_wait()` that
-the process has been killed. **Why it matters:** when pelagos-cri restarts, re-adopted
-hostNetwork container processes hold ports in the HOST network namespace. Any
-`RunPodSandbox` attempting the same port immediately fails with `EADDRINUSE` (the root
-cause of #457 recurring after v0.65.55). The startup reconcile kills exactly these processes
-and marks their CRI state as Exited so kubelet recreates the pods cleanly. Non-hostNetwork
-containers are left untouched (their ports are in an isolated netns and pose no risk).
+## `issue_459_cmd_stop_cgroup_first::test_cmd_stop_time_zero_immediate_kill`
+**Requires root.** Spawns a SIGTERM-ignoring process, calls `pelagos stop --time 0`, and
+asserts the call completes in under 4 s. **Why it matters:** `--time 0` must skip the
+SIGTERM grace period entirely and go straight to cgroup kill. This is the path used by
+the CRI startup reconcile (`pelagos stop --time 0`) for hostNetwork containers (#457).
+A failure here means the startup reconcile would either hang or fail to kill the container.
+
+## `issue_459_cmd_stop_cgroup_first::test_cmd_stop_zombie_proof_liveness_check`
+**Requires root.** Kills a child process with SIGKILL without calling `wait()` (making it a
+zombie), then calls `pelagos stop` against the zombie's PID and asserts it completes in
+under 4 s. **Why it matters:** `cmd_stop` uses `is_live_process(pid)` (reads
+`/proc/{pid}/status State:`) instead of `kill(pid, 0)` to check process liveness.
+`kill(pid, 0)` returns 0 for zombies, causing the old code to spin for 5 s on a process
+that had already released its ports. A regression here means `pelagos stop` would hang for
+5 s on a zombie during the pod restart cycle, delaying the replacement pod unnecessarily
+(#459).

@@ -86,57 +86,6 @@ struct PelagosContainerState {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// SIGKILL every process in a named cgroup (relative path under /sys/fs/cgroup).
-/// Uses cgroup.kill (kernel ≥ 5.14) when available, falls back to reading
-/// cgroup.procs. No-op if the cgroup directory does not exist.
-fn kill_cgroup_by_name(cgroup_name: &str) {
-    let dir = std::path::Path::new("/sys/fs/cgroup").join(cgroup_name.trim_start_matches('/'));
-    if !dir.is_dir() {
-        return;
-    }
-    let kill_file = dir.join("cgroup.kill");
-    if kill_file.exists() {
-        let _ = std::fs::write(&kill_file, "1");
-        return;
-    }
-    // Fallback: iterate cgroup.procs and SIGKILL each entry.
-    if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-        for line in procs.lines() {
-            if let Ok(pid) = line.trim().parse::<libc::pid_t>() {
-                if pid > 1 {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
-            }
-        }
-    }
-}
-
-/// Belt-and-suspenders kill for a container process after `pelagos stop` returns.
-///
-/// `pelagos stop` should always kill the process — if it didn't, that is an
-/// unexpected, aberrant condition worth logging at WARN. We kill directly via
-/// the PID and cgroup recorded in the pelagos state file so hostNetwork port
-/// bindings and cgroup resources are unconditionally released before the caller
-/// proceeds to network teardown or RunPodSandbox for the replacement pod (#457).
-fn ensure_container_dead(pelagos_name: &str) {
-    let state = read_pelagos_container_state(pelagos_name);
-    let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
-    if pid > 1 && unsafe { libc::kill(pid, 0) } == 0 {
-        // The process is still alive after pelagos stop returned — this should
-        // not happen. Log at WARN so the aberrant condition is visible.
-        log::warn!(
-            "stop: container {pelagos_name} pid={pid} survived pelagos stop \
-             (bug #457) — sending SIGKILL directly"
-        );
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
-    // Also kill via cgroup to catch any forked/setsid'd descendants that
-    // outlived the main pid (hostNetwork port holders, raft lock holders, etc.).
-    if let Some(cg) = state.and_then(|s| s.cgroup_name) {
-        kill_cgroup_by_name(&cg);
-    }
-}
-
 /// Generate a 64-character lowercase hex container/sandbox ID.
 ///
 /// 32 bytes from the OS CSPRNG encoded as hex — identical to the format used
@@ -1175,14 +1124,9 @@ impl RuntimeService for RuntimeSvc {
                     sandbox_id,
                     pelagos_name
                 );
+                // `pelagos stop` is the single kill path (#459): cgroup kill is
+                // primary, SIGKILL fallback, zombie-proof liveness wait.
                 let _ = run_pelagos(&bin, &["stop", pelagos_name]).await;
-                // Belt-and-suspenders: verify the process is actually dead.
-                // If pelagos stop failed silently (race, re-adopted container
-                // state mismatch) the log line from ensure_container_dead makes
-                // the aberrant condition visible and the SIGKILL ensures we
-                // don't proceed to network teardown / RunPodSandbox with a live
-                // process still holding a hostNetwork port (#457).
-                ensure_container_dead(pelagos_name);
                 log::debug!(
                     "StopPodSandbox {} step=stop-container {} DONE",
                     sandbox_id,
@@ -2243,11 +2187,9 @@ impl RuntimeService for RuntimeSvc {
             return Ok(Response::new(StopContainerResponse {}));
         };
 
+        // `pelagos stop` is the single kill path (#459): cgroup kill is primary,
+        // SIGKILL fallback, zombie-proof liveness wait.
         let _ = run_pelagos(&bin, &["stop", &pelagos_name]).await;
-        // Belt-and-suspenders: verify the process is dead after pelagos stop.
-        // Logs at WARN if the process survived (aberrant condition, bug #457)
-        // and SIGKILLs directly so the scope stop below finds nothing alive.
-        ensure_container_dead(&pelagos_name);
         // The watcher has exited, so the transient scope is now empty; --collect
         // reaps it, but stop it explicitly for determinism (#336).
         if scope::systemd_available() {

@@ -30577,197 +30577,207 @@ mod issue_455_cgroupfs_sysfs_order {
     }
 }
 
-mod issue_457_stop_path_kill_verification {
+/// Tests for the cgroup-first `pelagos stop` fix (#459).
+///
+/// These tests exercise the three properties that make `cmd_stop` the single
+/// authoritative kill path:
+///
+/// 1. **Cgroup kill reaches SIGTERM-ignoring processes** — a process that has
+///    `trap '' TERM` survives SIGTERM but is killed by the cgroup sweep.
+/// 2. **`--time 0` skips the grace period** — immediate cgroup kill, no wait.
+/// 3. **Zombie-proof liveness check** — `is_live_process` returns false for a
+///    zombie so `pelagos stop` does not spin for 5 s against a dead process.
+mod issue_459_cmd_stop_cgroup_first {
     use std::process::{Command as Proc, Stdio};
+    use std::time::{Duration, Instant};
 
-    /// Mirrors `ensure_container_dead` in pelagos-cri/src/runtime.rs: reads the
-    /// pelagos state.json for `pelagos_name`, and if the recorded pid is still
-    /// alive, SIGKILLs it.  This is the belt-and-suspenders step the CRI runs
-    /// after `pelagos stop` returns (#457).
-    fn ensure_container_dead(pelagos_name: &str) -> bool {
-        let state_path = format!("/run/pelagos/containers/{}/state.json", pelagos_name);
-        let data = match std::fs::read_to_string(&state_path) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        let cs: serde_json::Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let pid = match cs.get("pid").and_then(|v| v.as_i64()) {
-            Some(p) if p > 1 => p as libc::pid_t,
-            _ => return false,
-        };
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            // Process survived — this is the aberrant condition #457 targets.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            return true; // killed unexpectedly-surviving process
-        }
-        false
+    fn pelagos_bin() -> String {
+        std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "target/debug/pelagos".to_string())
     }
 
-    /// Requires root.  Simulates the scenario where `pelagos stop` returns but
-    /// the container process is still alive (the aberrant condition that causes
-    /// EADDRINUSE on hostNetwork pods after a CRI restart).  Verifies that
-    /// `ensure_container_dead` — the belt-and-suspenders step added to
-    /// `stop_pod_sandbox` and `stop_container` in pelagos-cri/src/runtime.rs —
-    /// kills the process and returns `true` to signal the unexpected condition.
+    fn write_state(state_dir: &str, name: &str, pid: u32) {
+        let _ = std::fs::create_dir_all(state_dir);
+        let json = serde_json::json!({
+            "name": name,
+            "rootfs": "",
+            "status": "running",
+            "pid": pid,
+            "watcher_pid": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+            "command": [],
+        });
+        std::fs::write(format!("{}/state.json", state_dir), json.to_string())
+            .expect("write state.json");
+    }
+
+    /// `pelagos stop` kills a process that ignores SIGTERM.
     ///
-    /// A regression here means a surviving container process would hold its
-    /// hostNetwork port through a kubelet-initiated pod restart, causing every
-    /// subsequent `RunPodSandbox` to fail with `EADDRINUSE` (#457).
+    /// Requires root. Spawns `sh -c "trap '' TERM; sleep 300"` (SIGTERM handler
+    /// cleared), writes a state.json pointing at it, and calls `pelagos stop`.
+    /// The process must be dead within 5 s of `stop` returning.  If this fails,
+    /// the cgroup kill in Phase 2 of `cmd_stop` is broken — a SIGTERM-ignoring
+    /// container (MetalLB speaker, any Go binary with custom signal handling)
+    /// would survive `pelagos stop` and hold its hostNetwork port (#457/#459).
     #[test]
-    fn test_stop_path_kills_surviving_container_process() {
+    fn test_cmd_stop_kills_sigterm_ignoring_process() {
         if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping test_stop_path_kills_surviving_container_process: requires root");
+            eprintln!("SKIP test_cmd_stop_kills_sigterm_ignoring_process: requires root");
             return;
         }
 
-        let name = format!("pcri-stop-verify-{}", std::process::id());
+        let name = format!("test-stop-sigterm-{}", std::process::id());
         let state_dir = format!("/run/pelagos/containers/{}", name);
-        let state_file = format!("{}/state.json", state_dir);
-        let _ = std::fs::create_dir_all(&state_dir);
+        let bin = pelagos_bin();
 
-        // Spawn a process that stands in for a container whose `pelagos stop`
-        // returned without actually killing it (the bug scenario).
-        let mut survivor = Proc::new("sleep")
-            .arg("300")
+        let mut child = Proc::new("sh")
+            .args(["-c", "trap '' TERM; sleep 300"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn survivor sleep");
-        let pid = survivor.id() as libc::pid_t;
+            .expect("spawn SIGTERM-ignoring sh");
+        let pid = child.id();
 
-        // Write the pelagos-style state.json (as `pelagos run --detach` would).
-        let state_json = serde_json::json!({
-            "name": name,
-            "status": "running",
-            "pid": pid,
-            "started_at": "2026-01-01T00:00:00Z",
-        });
-        std::fs::write(&state_file, state_json.to_string()).expect("write state.json");
+        write_state(&state_dir, &name, pid);
 
+        let out = Proc::new(&bin)
+            .args(["stop", "--time", "2", &name])
+            .output()
+            .expect("pelagos stop");
         assert!(
-            unsafe { libc::kill(pid, 0) } == 0,
-            "survivor should be alive before ensure_container_dead"
+            out.status.success(),
+            "pelagos stop failed: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
 
-        // This is the CRI's post-stop verification step.  It should detect the
-        // surviving process, SIGKILL it, and return true (unexpected condition).
-        let killed_unexpectedly = ensure_container_dead(&name);
-        assert!(
-            killed_unexpectedly,
-            "ensure_container_dead should have found and killed the surviving process"
-        );
-
-        // Give SIGKILL a moment to take effect, then check via try_wait.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let exited = survivor.try_wait().expect("try_wait").is_some();
+        std::thread::sleep(Duration::from_millis(200));
+        let exited = child.try_wait().expect("try_wait").is_some();
         if !exited {
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = survivor.wait();
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let _ = child.wait();
         }
         assert!(
             exited,
-            "survivor pid={pid} should be dead after ensure_container_dead (#457)"
+            "SIGTERM-ignoring process pid={pid} should be dead after pelagos stop (#459)"
         );
-        let _ = survivor.wait();
-
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&state_dir);
     }
-}
 
-mod issue_457_hostnetwork_startup_kill {
-    use std::process::{Command as Proc, Stdio};
-
-    /// Simulates the startup reconciliation for hostNetwork containers added in
-    /// #457: mirrors the logic in `AppState::new()` in
-    /// `pelagos-cri/src/state.rs` that kills container processes for re-adopted
-    /// hostNetwork pods and marks them Exited so kubelet restarts them clean.
+    /// `pelagos stop --time 0` kills immediately without a grace period.
     ///
-    /// The test writes a pelagos-style state.json (as `pelagos run` would),
-    /// runs the startup kill logic, and asserts the process is dead via
-    /// `try_wait()`.
-    ///
-    /// **Why it matters:** after a CRI restart, a re-adopted hostNetwork
-    /// container process holds its port in the HOST network namespace.  Any
-    /// subsequent `RunPodSandbox` for the same port fails with `EADDRINUSE`.
-    /// The startup kill releases the port and marks the container Exited so
-    /// kubelet recreates it cleanly (#457).
-    fn run_hostnetwork_startup_kill(pelagos_name: &str) -> bool {
-        let state_path = format!("/run/pelagos/containers/{}/state.json", pelagos_name);
-        let data = match std::fs::read_to_string(&state_path) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        let cs: serde_json::Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let pid = match cs.get("pid").and_then(|v| v.as_i64()) {
-            Some(p) if p > 1 => p as libc::pid_t,
-            _ => return false,
-        };
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            return true;
-        }
-        false
-    }
-
+    /// Requires root. Verifies that `--time 0` goes straight to cgroup kill
+    /// (no SIGTERM, no 10-second wait), and that the process is dead in well
+    /// under 2 s.  This is the path the CRI startup reconcile uses for
+    /// hostNetwork containers (#457/#459).
     #[test]
-    fn test_hostnetwork_startup_kills_container_process() {
+    fn test_cmd_stop_time_zero_immediate_kill() {
         if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping test_hostnetwork_startup_kills_container_process: requires root");
+            eprintln!("SKIP test_cmd_stop_time_zero_immediate_kill: requires root");
             return;
         }
 
-        let name = format!("pcri-hostnet-startup-{}", std::process::id());
+        let name = format!("test-stop-t0-{}", std::process::id());
         let state_dir = format!("/run/pelagos/containers/{}", name);
-        let state_file = format!("{}/state.json", state_dir);
-        let _ = std::fs::create_dir_all(&state_dir);
+        let bin = pelagos_bin();
 
-        // Spawn a process standing in for a re-adopted hostNetwork container.
-        let mut proc = Proc::new("sleep")
+        let mut child = Proc::new("sh")
+            .args(["-c", "trap '' TERM; sleep 300"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+
+        write_state(&state_dir, &name, pid);
+
+        let t0 = Instant::now();
+        let out = Proc::new(&bin)
+            .args(["stop", "--time", "0", &name])
+            .output()
+            .expect("pelagos stop --time 0");
+        let elapsed = t0.elapsed();
+
+        assert!(
+            out.status.success(),
+            "pelagos stop --time 0 failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "pelagos stop --time 0 took {elapsed:?}, expected < 4 s (no grace period)"
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+        let exited = child.try_wait().expect("try_wait").is_some();
+        if !exited {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        assert!(
+            exited,
+            "pid={pid} should be dead after pelagos stop --time 0 (#459)"
+        );
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// `pelagos stop` does not hang on a zombie process.
+    ///
+    /// Requires root. Kills a child with SIGKILL without calling wait() so it
+    /// becomes a zombie, writes state.json with the zombie's PID, then calls
+    /// `pelagos stop`.  The call must return in well under 5 s — a zombie has
+    /// already released its ports and resources; hanging on it for the full
+    /// kill-deadline wastes time and delays the replacement pod.
+    ///
+    /// This tests `is_live_process` in `cmd_stop`: it must return false for a
+    /// zombie so the kill-deadline wait loop exits immediately (#459).
+    #[test]
+    fn test_cmd_stop_zombie_proof_liveness_check() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP test_cmd_stop_zombie_proof_liveness_check: requires root");
+            return;
+        }
+
+        let name = format!("test-stop-zombie-{}", std::process::id());
+        let state_dir = format!("/run/pelagos/containers/{}", name);
+        let bin = pelagos_bin();
+
+        let mut child = Proc::new("sleep")
             .arg("300")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
-        let pid = proc.id() as libc::pid_t;
+        let pid = child.id();
 
-        let state_json = serde_json::json!({
-            "name": name,
-            "status": "running",
-            "pid": pid,
-            "started_at": "2026-01-01T00:00:00Z",
-        });
-        std::fs::write(&state_file, state_json.to_string()).expect("write state.json");
+        // Kill the child but do NOT call wait() — it becomes a zombie.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        std::thread::sleep(Duration::from_millis(100));
+
+        write_state(&state_dir, &name, pid);
+
+        let t0 = Instant::now();
+        let out = Proc::new(&bin)
+            .args(["stop", "--time", "1", &name])
+            .output()
+            .expect("pelagos stop on zombie");
+        let elapsed = t0.elapsed();
 
         assert!(
-            unsafe { libc::kill(pid, 0) } == 0,
-            "process should be alive before startup kill"
+            out.status.success(),
+            "pelagos stop on zombie failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "pelagos stop hung for {elapsed:?} on a zombie (is_live_process broken, #459)"
         );
 
-        let killed = run_hostnetwork_startup_kill(&name);
-        assert!(
-            killed,
-            "startup kill should have found and killed the hostNetwork process"
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let exited = proc.try_wait().expect("try_wait").is_some();
-        if !exited {
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = proc.wait();
-        }
-        assert!(
-            exited,
-            "hostNetwork container pid={pid} should be dead after startup kill (#457)"
-        );
-        let _ = proc.wait();
+        // Reap the zombie.
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 }
