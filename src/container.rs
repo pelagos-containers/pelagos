@@ -5189,7 +5189,22 @@ impl Command {
                             ptr::null(),
                         );
                         cgroup_staged = r == 0;
-                        if !cgroup_staged {
+                        if cgroup_staged {
+                            // Make the staged bind private so MS_MOVE succeeds after
+                            // pivot_root (#461).  MS_PRIVATE|MS_REC on "/" silently skips
+                            // MNT_LOCKED mounts (kernel returns 0 but leaves them shared),
+                            // so the new bind can inherit shared propagation from a host
+                            // mount that survived the MS_PRIVATE sweep.  Explicitly
+                            // privatising our own new bind is always allowed because we
+                            // just created it in this namespace — it cannot be MNT_LOCKED.
+                            libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_PRIVATE,
+                                ptr::null(),
+                            );
+                        } else {
                             log::debug!(
                                 "cgroupfs staging bind failed: {}",
                                 io::Error::last_os_error()
@@ -8136,7 +8151,22 @@ impl Command {
                             ptr::null(),
                         );
                         cgroup_staged = r == 0;
-                        if !cgroup_staged {
+                        if cgroup_staged {
+                            // Make the staged bind private so MS_MOVE succeeds after
+                            // pivot_root (#461).  MS_PRIVATE|MS_REC on "/" silently skips
+                            // MNT_LOCKED mounts (kernel returns 0 but leaves them shared),
+                            // so the new bind can inherit shared propagation from a host
+                            // mount that survived the MS_PRIVATE sweep.  Explicitly
+                            // privatising our own new bind is always allowed because we
+                            // just created it in this namespace — it cannot be MNT_LOCKED.
+                            libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_PRIVATE,
+                                ptr::null(),
+                            );
+                        } else {
                             log::debug!(
                                 "cgroupfs staging bind failed: {}",
                                 io::Error::last_os_error()
