@@ -130,14 +130,19 @@ This is a hard requirement, not optional cleanup.
 5. Confirm both repos are clean and up to date with remote
 6. Report: current SHA, what was completed, open issues that remain
 
-**"Once more into the breach!"** — Create issue, branch, plan, implement, test, report:
+**"Once more into the breach!"** — Create issue, branch, plan, implement, test, PR, merge, release:
 1. Create a GitHub issue describing the work (plan lives in the issue body)
 2. Create a feature branch named after the issue (e.g. `feat/description-NNN`)
 3. Move to that branch
 4. Present the plan to the user (from the issue body)
 5. Quietly implement — no step-by-step narration
-6. Create integration tests and run them to success
-7. Report back with what was done and test results
+6. Create integration tests and run them to success locally
+7. Commit, push, open a PR
+8. **Poll CI with `ScheduleWakeup` (90 s interval) until all checks pass.**
+   If invoked with `/loop`, use `ScheduleWakeup` to keep the session alive overnight.
+   On each wake: check `gh pr checks <N>`; if green → merge + bump Cargo.toml version
+   + commit + tag + push tag → "Engage!" release flow; if failed → diagnose, fix, push.
+9. Report: merged SHA, release version, CI URL
 
 **"Engage!"** — Tag, release, and monitor:
 1. **Bump `version` in `Cargo.toml` to match the release version** — commit this first.
