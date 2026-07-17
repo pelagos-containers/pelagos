@@ -141,4 +141,24 @@ mod tests {
     fn test_normalise_registry_key_index_docker_io() {
         assert_eq!(normalise_registry_key("index.docker.io"), "docker.io");
     }
+
+    #[test]
+    fn test_rewrite_reference_multiarch_child_digest() {
+        // When pull_image resolves a multi-arch image index it uses
+        // `oci_ref.clone_with_digest(child_digest)` to build the child reference.
+        // That produces `repo@sha256:hex`, NOT the bare `sha256:hex`.  Verify
+        // that rewrite_reference handles the `repo@digest` form correctly so the
+        // mirror receives `/v2/library/alpine/manifests/sha256:...` and not the
+        // mangled `/v2/library/sha256/manifests/...` (#407).
+        let digest = "sha256:3805b9089afd837fcf858f26cbb4422ef713b95e31645402464024ccad3a926f";
+        // The reference built by clone_with_digest on `docker.io/library/alpine:latest`
+        // comes out as `docker.io/library/alpine@sha256:...`.
+        let child_ref = format!("docker.io/library/alpine@{}", digest);
+        let out = rewrite_reference(&child_ref, "http://nazgul:5000");
+        assert_eq!(
+            out,
+            format!("nazgul:5000/library/alpine@{}", digest),
+            "child manifest reference must preserve the image repo, not mangle digest to repo name"
+        );
+    }
 }
