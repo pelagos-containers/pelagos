@@ -8204,6 +8204,230 @@ mod linking {
 mod images {
     use super::*;
 
+    // ── Mock OCI registry ─────────────────────────────────────────────────────
+    // A minimal hermetic HTTP server that speaks the OCI distribution protocol.
+    // Used by pull tests so they never touch Docker Hub, ECR, or Zot.
+
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct MockOciRegistry {
+        port: u16,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl MockOciRegistry {
+        /// Spawn a registry serving `image_name` (e.g. `"library/mock-img"`).
+        /// `multi_arch = true` → top-level manifest is an OCI image index with
+        /// one linux/amd64 entry; `false` → single-arch manifest served directly.
+        fn spawn(image_name: &str, multi_arch: bool) -> Self {
+            let routes = build_routes(image_name, multi_arch);
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock registry");
+            let port = listener.local_addr().unwrap().port();
+            // Non-blocking so the serve loop can check the shutdown flag.
+            listener.set_nonblocking(true).unwrap();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown2 = Arc::clone(&shutdown);
+
+            std::thread::spawn(move || {
+                while !shutdown2.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_request(stream, &routes),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            MockOciRegistry { port, shutdown }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+    }
+
+    impl Drop for MockOciRegistry {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // Routes: path → (content_type, docker-content-digest, body)
+    type Routes = HashMap<String, (String, String, Vec<u8>)>;
+
+    fn sha256_of(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(data))
+    }
+
+    fn build_routes(image_name: &str, multi_arch: bool) -> Routes {
+        use flate2::{write::GzEncoder, Compression};
+        use tar::Builder;
+
+        // Empty tar layer (two 512-byte EOF blocks).
+        let mut tar_raw: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut tar_raw);
+            b.finish().unwrap();
+        }
+        let diff_id = sha256_of(&tar_raw);
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_raw).unwrap();
+        let layer_bytes = gz.finish().unwrap();
+        let layer_digest = sha256_of(&layer_bytes);
+
+        // Minimal OCI image config.
+        let config_json = format!(
+            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["{}"]}},"config":{{}}}}"#,
+            diff_id
+        );
+        let config_bytes = config_json.into_bytes();
+        let config_digest = sha256_of(&config_bytes);
+
+        // OCI image manifest.
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","size":{},"digest":"{}"}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","size":{},"digest":"{}"}}]}}"#,
+            config_bytes.len(),
+            config_digest,
+            layer_bytes.len(),
+            layer_digest
+        );
+        let manifest_bytes = manifest_json.into_bytes();
+        let manifest_digest = sha256_of(&manifest_bytes);
+
+        // Optionally wrap in an OCI image index (multi-arch).
+        let (top_bytes, top_type) = if multi_arch {
+            let idx = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":{},"digest":"{}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+                manifest_bytes.len(),
+                manifest_digest
+            )
+            .into_bytes();
+            let t = "application/vnd.oci.image.index.v1+json".to_string();
+            (idx, t)
+        } else {
+            (
+                manifest_bytes.clone(),
+                "application/vnd.oci.image.manifest.v1+json".to_string(),
+            )
+        };
+        let top_digest = sha256_of(&top_bytes);
+
+        let mut r: Routes = HashMap::new();
+
+        // OCI ping endpoint.
+        r.insert(
+            "/v2/".to_string(),
+            (
+                "application/json".to_string(),
+                String::new(),
+                b"{}".to_vec(),
+            ),
+        );
+
+        // Top-level manifest (tag or index).
+        r.insert(
+            format!("/v2/{}/manifests/latest", image_name),
+            (top_type, top_digest, top_bytes),
+        );
+
+        // Platform manifest (referenced by the index, or duplicate for single-arch).
+        r.insert(
+            format!("/v2/{}/manifests/{}", image_name, manifest_digest),
+            (
+                "application/vnd.oci.image.manifest.v1+json".to_string(),
+                manifest_digest,
+                manifest_bytes,
+            ),
+        );
+
+        // Config blob.
+        r.insert(
+            format!("/v2/{}/blobs/{}", image_name, config_digest),
+            (
+                "application/vnd.oci.image.config.v1+json".to_string(),
+                config_digest,
+                config_bytes,
+            ),
+        );
+
+        // Layer blob.
+        r.insert(
+            format!("/v2/{}/blobs/{}", image_name, layer_digest),
+            (
+                "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                layer_digest,
+                layer_bytes,
+            ),
+        );
+
+        r
+    }
+
+    fn serve_request(stream: std::net::TcpStream, routes: &Routes) {
+        let mut out = stream.try_clone().expect("clone stream");
+        let reader = BufReader::new(stream);
+        let mut lines = reader.lines();
+
+        let request_line = match lines.next() {
+            Some(Ok(l)) => l,
+            _ => return,
+        };
+        // Drain the rest of the HTTP headers.
+        for line in lines.by_ref() {
+            match line {
+                Ok(l) if l.is_empty() => break,
+                Err(_) => return,
+                _ => {}
+            }
+        }
+
+        let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
+        if parts.len() < 2 {
+            return;
+        }
+        let method = parts[0];
+        let path = parts[1];
+
+        if let Some((ct, digest, body)) = routes.get(path) {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nDocker-Content-Digest: {}\r\n\r\n",
+                ct,
+                body.len(),
+                digest
+            );
+            let _ = out.write_all(header.as_bytes());
+            if method != "HEAD" {
+                let _ = out.write_all(body);
+            }
+        } else {
+            let _ = out.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        }
+    }
+
+    /// Run `pelagos image pull <reference>` with `PELAGOS_REGISTRIES` set.
+    /// Returns Ok(()) on success, Err(stderr) on failure.
+    fn pull_via_binary(reference: &str, registries_toml: &std::path::Path) -> Result<(), String> {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["image", "pull", "--insecure", reference])
+            .env("PELAGOS_REGISTRIES", registries_toml)
+            .output()
+            .expect("spawn pelagos");
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).to_string())
+        }
+    }
+
     #[test]
     fn test_extract_layer_reextracts_rootless_degraded_layer() {
         // #384: a rootless (non-CAP_FSETID) unpack strips setuid bits, and the
@@ -9456,6 +9680,114 @@ mod images {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&layer_path);
+    }
+
+    /// test_image_pull_mock_registry_single_arch
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Pulls a single-arch image from a hermetic local mock OCI registry.
+    /// Verifies `pelagos image pull` stores the image manifest and the layer.
+    /// No network access to Docker Hub, ECR, or Zot is needed.
+    ///
+    /// Failure indicates a regression in the basic pull-manifest → pull-config →
+    /// pull-layer → extract-layer → save-manifest pipeline.
+    #[test]
+    fn test_image_pull_mock_registry_single_arch() {
+        if !is_root() {
+            eprintln!("Skipping test_image_pull_mock_registry_single_arch: requires root");
+            return;
+        }
+
+        let image_name = "library/pelagos-mock-single";
+        let registry = MockOciRegistry::spawn(image_name, false);
+
+        // Point PELAGOS_REGISTRIES at the mock so `pelagos image pull
+        // docker.io/library/pelagos-mock-single:latest` hits it instead.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            format!("[mirrors]\n\"docker.io\" = [\"{}\"]\n", registry.endpoint()),
+        )
+        .expect("write registries.toml");
+
+        let reference = "docker.io/library/pelagos-mock-single:latest";
+        // Pre-clean so the pull is not a cache hit.
+        let _ = pelagos::image::remove_image(reference);
+
+        let result = pull_via_binary(reference, tmp.path());
+        assert!(result.is_ok(), "pull failed: {:?}", result.err());
+
+        let manifest =
+            pelagos::image::load_image(reference).expect("image manifest not stored after pull");
+        assert_eq!(
+            manifest.layers.len(),
+            1,
+            "expected 1 layer, got {}",
+            manifest.layers.len()
+        );
+        assert!(
+            pelagos::image::layer_exists(&manifest.layers[0]),
+            "layer dir missing after pull"
+        );
+
+        // Cleanup.
+        let _ = pelagos::image::remove_image(reference);
+    }
+
+    /// test_image_pull_mock_registry_multiarch
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Pulls a multi-arch image (OCI image index with a single linux/amd64 entry)
+    /// from a hermetic local mock OCI registry.  Verifies that the runtime
+    /// correctly resolves the index → platform manifest and stores the image.
+    ///
+    /// This is a regression test for #407: the mirror-rewritten reference must
+    /// preserve the image repository (`library/pelagos-mock-multi`) when fetching
+    /// the child manifest digest, not mangle it into `library/sha256`.  Failure
+    /// means multi-arch images cannot be pulled through a registry mirror.
+    #[test]
+    fn test_image_pull_mock_registry_multiarch() {
+        if !is_root() {
+            eprintln!("Skipping test_image_pull_mock_registry_multiarch: requires root");
+            return;
+        }
+
+        let image_name = "library/pelagos-mock-multi";
+        let registry = MockOciRegistry::spawn(image_name, true);
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            format!("[mirrors]\n\"docker.io\" = [\"{}\"]\n", registry.endpoint()),
+        )
+        .expect("write registries.toml");
+
+        let reference = "docker.io/library/pelagos-mock-multi:latest";
+        let _ = pelagos::image::remove_image(reference);
+
+        let result = pull_via_binary(reference, tmp.path());
+        assert!(
+            result.is_ok(),
+            "multi-arch pull failed (#407 regression?): {:?}",
+            result.err()
+        );
+
+        let manifest = pelagos::image::load_image(reference)
+            .expect("image manifest not stored after multi-arch pull");
+        assert_eq!(
+            manifest.layers.len(),
+            1,
+            "expected 1 layer after index resolution"
+        );
+        assert!(
+            pelagos::image::layer_exists(&manifest.layers[0]),
+            "layer dir missing after multi-arch pull"
+        );
+
+        // Cleanup.
+        let _ = pelagos::image::remove_image(reference);
     }
 }
 
@@ -27970,7 +28302,6 @@ mod cri_uid_hardening {
 
 #[cfg(test)]
 mod registry_mirror {
-    use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

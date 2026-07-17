@@ -5718,3 +5718,20 @@ alive so containers can join its namespaces.
 matters:** belt-and-suspenders coverage — once a zombie has been reaped, `/proc/<pid>/status`
 no longer exists and the function must handle the `Err(_)` branch, returning false without
 panicking.
+
+## `images::test_image_pull_mock_registry_single_arch`
+**Requires root** (writes to `/var/lib/pelagos/`). Spins up a hermetic local mock OCI
+registry (no network access to Docker Hub, ECR, or Zot), configures it as a docker.io
+mirror via a temp `registries.toml`, then pulls a synthetic single-arch image through the
+`pelagos image pull` binary. Asserts the manifest is stored and the layer directory exists.
+**Why it matters:** baseline regression test for the entire pull-manifest → pull-config →
+pull-layer → extract-layer → save-manifest pipeline without any external dependency.
+
+## `images::test_image_pull_mock_registry_multiarch`
+**Requires root** (writes to `/var/lib/pelagos/`). Same hermetic mock registry as above,
+but the top-level manifest is an OCI image index with a single linux/amd64 entry.
+Verifies that `pelagos image pull` resolves the index → platform manifest and stores the
+image correctly. **Why it matters:** regression test for #407 — the mirror-rewritten
+reference must preserve the image repository (`library/pelagos-mock-multi`) when fetching
+the child manifest's digest, not mangle it into `library/sha256` (which would cause a 404
+on every multi-arch mirror pull).
