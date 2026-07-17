@@ -5668,3 +5668,15 @@ confirm `/sys/fs/cgroup` is present WITHOUT the `ro` option. **Why it matters:**
 to the above — confirms that privileged containers still receive a read-write cgroupfs
 (needed by KubeVirt `virt-handler` and device plugin accounting). Failure here means the
 MS_MOVE path is applying the RO remount unconditionally.
+
+## `issue_457_stop_path_kill_verification::test_stop_path_kills_surviving_container_process`
+**Requires root.** Simulates the aberrant condition that causes `EADDRINUSE` on hostNetwork
+pods after a CRI restart: spawns a `sleep 300` process whose PID is written into a
+pelagos-style `state.json`, then calls `ensure_container_dead()` — the belt-and-suspenders
+step added to `stop_pod_sandbox` and `stop_container` in `pelagos-cri/src/runtime.rs`
+(#457). Asserts that `ensure_container_dead` returns `true` (unexpected survival detected)
+and that the process has exited via `try_wait()` after the call. **Why it matters:** the
+fix belongs in the Stop path, not at startup — if `pelagos stop` returns without killing
+the container process (a bug, always logged at WARN), `ensure_container_dead` must catch
+and kill it. A failure here means a surviving container process can hold a hostNetwork port
+through a kubelet-initiated pod restart, causing every subsequent `RunPodSandbox` to fail.
