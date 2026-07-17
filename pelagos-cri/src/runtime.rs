@@ -1762,6 +1762,22 @@ impl RuntimeService for RuntimeSvc {
         }
 
         for m in &container.mounts {
+            // Auto-create missing HostPath source directories (#445).
+            // containerd/CRI-O silently create the source when hostPath.type=""
+            // (unset) — a chicken-and-egg that some workloads (e.g. KubeVirt
+            // virt-handler) depend on: the daemon creates the dir; the container
+            // then populates it on first run. ENOENT from the bind mount otherwise
+            // keeps the container stuck in RunContainerError indefinitely.
+            if !m.host_path.is_empty() && !std::path::Path::new(&m.host_path).exists() {
+                if let Err(e) = std::fs::create_dir_all(&m.host_path) {
+                    log::warn!(
+                        "start_container {}: could not create missing HostPath source '{}': {}",
+                        container_id,
+                        m.host_path,
+                        e
+                    );
+                }
+            }
             args.push("-v".into());
             let mut spec = format!("{}:{}", m.host_path, m.container_path);
             // recursive_read_only (#356) → :rro (mount_setattr AT_RECURSIVE);

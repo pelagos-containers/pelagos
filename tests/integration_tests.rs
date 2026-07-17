@@ -30781,3 +30781,125 @@ mod issue_459_cmd_stop_cgroup_first {
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 }
+
+/// Issue #461 — SandboxState::is_alive() must return false for zombie processes.
+///
+/// The old implementation used `kill(pid, 0)` which returns 0 for zombies (they
+/// remain in the process table until reaped), causing a false-positive: pelagos
+/// would believe the pause is alive, attempt to join its /proc/<pid>/ns/{ipc,uts}
+/// namespaces via setns(), fail with EINVAL (the zombie's namespace may no longer
+/// be valid), and report a misleading "Failed to spawn process: Invalid argument".
+///
+/// The fix reads /proc/<pid>/status and checks the State: field, returning false
+/// for 'Z' (zombie).
+mod issue_461_sandbox_zombie_liveness {
+    use pelagos::sandbox::SandboxState;
+
+    fn make_zombie() -> (u32, std::process::Child) {
+        // Spawn a child and immediately SIGKILL it without calling wait() — it
+        // becomes a zombie and stays in the process table until we reap it.
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // Wait briefly so the kernel transitions it to zombie state.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        (pid, child)
+    }
+
+    fn fake_sandbox(pid: u32) -> SandboxState {
+        SandboxState {
+            id: "test-sandbox".to_string(),
+            name: None,
+            pause_pid: pid as i32,
+            ns_name: String::new(),
+            veth_host: String::new(),
+            container_ip: String::new(),
+            namespaces: Default::default(),
+        }
+    }
+
+    /// SandboxState::is_alive() returns false for a zombie process.
+    ///
+    /// Requires root (spawning and signaling processes). Verifies that the
+    /// zombie-proof liveness check in sandbox.rs does not return true for a
+    /// process that has exited but not yet been reaped — such a "pause" would
+    /// cause setns() to fail with EINVAL when the container tries to join its
+    /// namespace (#461).
+    #[test]
+    fn test_sandbox_is_alive_false_for_zombie() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP test_sandbox_is_alive_false_for_zombie: requires root");
+            return;
+        }
+
+        let (pid, mut child) = make_zombie();
+        let sandbox = fake_sandbox(pid);
+
+        assert!(
+            !sandbox.is_alive(),
+            "is_alive() must return false for zombie pid={pid} (#461)"
+        );
+
+        // Reap the zombie so it doesn't linger.
+        let _ = child.wait();
+    }
+
+    /// SandboxState::is_alive() returns true for a genuinely running process.
+    ///
+    /// Sanity check: the zombie-proof fix must not regress the normal case where
+    /// the pause process is alive and well.
+    #[test]
+    fn test_sandbox_is_alive_true_for_running() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP test_sandbox_is_alive_true_for_running: requires root");
+            return;
+        }
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let sandbox = fake_sandbox(pid);
+
+        assert!(
+            sandbox.is_alive(),
+            "is_alive() must return true for running pid={pid}"
+        );
+
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = child.wait();
+    }
+
+    /// SandboxState::is_alive() returns false for a pid that no longer exists.
+    ///
+    /// Belt-and-suspenders: the process has been reaped and /proc/<pid>/status
+    /// is gone.  is_alive() must return false.
+    #[test]
+    fn test_sandbox_is_alive_false_for_reaped() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP test_sandbox_is_alive_false_for_reaped: requires root");
+            return;
+        }
+
+        let (pid, mut child) = make_zombie();
+        // Reap the zombie — /proc/<pid>/ disappears.
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let sandbox = fake_sandbox(pid);
+        assert!(
+            !sandbox.is_alive(),
+            "is_alive() must return false for fully reaped pid={pid}"
+        );
+    }
+}
