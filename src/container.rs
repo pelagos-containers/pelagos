@@ -1702,9 +1702,8 @@ impl Command {
         // NET: for a hostNetwork pod there is no named netns and the pause stays
         // in the host network namespace. The container already inherits the host
         // netns (it does not unshare NET and `--sandbox` skips standard net
-        // setup), so we must NOT join anything — joining the empty
-        // `/run/netns/` path would fail. For a normal pod, join the sandbox's
-        // named netns so the container gets the pod IP (#394).
+        // setup), so we must NOT join anything. For a normal pod, join the
+        // sandbox's netns via /proc/<pause_pid>/ns/net (#394, #461).
         if !state.namespaces.host_network() {
             cmd = cmd.with_namespace_join(state.net_ns_path(), Namespace::NET);
         }

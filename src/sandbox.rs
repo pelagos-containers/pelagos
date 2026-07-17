@@ -189,9 +189,13 @@ impl SandboxState {
         std::fs::write(dir.join("state.json"), json)
     }
 
-    /// Returns `/proc/<pause_pid>/ns/net` path.
+    /// Returns the network namespace path for joining.
+    ///
+    /// Uses `/proc/<pause_pid>/ns/net` (always valid while the sandbox is
+    /// alive) rather than `/run/netns/<ns_name>` (bind-mount that can
+    /// disappear after a CRI restart, causing `setns` EINVAL — #461).
     pub fn net_ns_path(&self) -> PathBuf {
-        PathBuf::from(format!("/run/netns/{}", self.ns_name))
+        PathBuf::from(format!("/proc/{}/ns/net", self.pause_pid))
     }
 
     /// Returns `/proc/<pause_pid>/ns/ipc` path.
