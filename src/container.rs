@@ -1702,9 +1702,8 @@ impl Command {
         // NET: for a hostNetwork pod there is no named netns and the pause stays
         // in the host network namespace. The container already inherits the host
         // netns (it does not unshare NET and `--sandbox` skips standard net
-        // setup), so we must NOT join anything — joining the empty
-        // `/run/netns/` path would fail. For a normal pod, join the sandbox's
-        // named netns so the container gets the pod IP (#394).
+        // setup), so we must NOT join anything. For a normal pod, join the
+        // sandbox's netns via /proc/<pause_pid>/ns/net (#394, #461).
         if !state.namespaces.host_network() {
             cmd = cmd.with_namespace_join(state.net_ns_path(), Namespace::NET);
         }
@@ -5189,7 +5188,22 @@ impl Command {
                             ptr::null(),
                         );
                         cgroup_staged = r == 0;
-                        if !cgroup_staged {
+                        if cgroup_staged {
+                            // Make the staged bind private so MS_MOVE succeeds after
+                            // pivot_root (#461).  MS_PRIVATE|MS_REC on "/" silently skips
+                            // MNT_LOCKED mounts (kernel returns 0 but leaves them shared),
+                            // so the new bind can inherit shared propagation from a host
+                            // mount that survived the MS_PRIVATE sweep.  Explicitly
+                            // privatising our own new bind is always allowed because we
+                            // just created it in this namespace — it cannot be MNT_LOCKED.
+                            libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_PRIVATE,
+                                ptr::null(),
+                            );
+                        } else {
                             log::debug!(
                                 "cgroupfs staging bind failed: {}",
                                 io::Error::last_os_error()
@@ -8136,7 +8150,22 @@ impl Command {
                             ptr::null(),
                         );
                         cgroup_staged = r == 0;
-                        if !cgroup_staged {
+                        if cgroup_staged {
+                            // Make the staged bind private so MS_MOVE succeeds after
+                            // pivot_root (#461).  MS_PRIVATE|MS_REC on "/" silently skips
+                            // MNT_LOCKED mounts (kernel returns 0 but leaves them shared),
+                            // so the new bind can inherit shared propagation from a host
+                            // mount that survived the MS_PRIVATE sweep.  Explicitly
+                            // privatising our own new bind is always allowed because we
+                            // just created it in this namespace — it cannot be MNT_LOCKED.
+                            libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_PRIVATE,
+                                ptr::null(),
+                            );
+                        } else {
                             log::debug!(
                                 "cgroupfs staging bind failed: {}",
                                 io::Error::last_os_error()
