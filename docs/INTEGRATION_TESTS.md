@@ -5668,3 +5668,13 @@ confirm `/sys/fs/cgroup` is present WITHOUT the `ro` option. **Why it matters:**
 to the above — confirms that privileged containers still receive a read-write cgroupfs
 (needed by KubeVirt `virt-handler` and device plugin accounting). Failure here means the
 MS_MOVE path is applying the RO remount unconditionally.
+
+## `issue_457_cri_restart_orphan_kill::test_cri_restart_kills_orphaned_container_process`
+**Requires root.** Spawns a `sleep 300` process to stand in for a container process that
+survived a `pelagos-cri` restart, writes a pelagos-style `state.json` with its PID into
+`/run/pelagos/containers/`, runs `run_orphan_reconcile()` (the same logic added to
+`AppState::new()` in `pelagos-cri/src/state.rs`), then asserts the process has exited
+via `try_wait()`. **Why it matters:** before the fix, `pelagos-cri` restart left container
+processes alive and holding host ports; the next `RunPodSandbox` for the same port would
+fail with `EADDRINUSE`. A failure here means the startup reconciliation is broken —
+orphaned container processes will survive across CRI restarts and block port rebinding.

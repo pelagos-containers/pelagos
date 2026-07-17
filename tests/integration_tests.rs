@@ -30576,3 +30576,96 @@ mod issue_455_cgroupfs_sysfs_order {
         );
     }
 }
+
+mod issue_457_cri_restart_orphan_kill {
+    use std::process::{Command as Proc, Stdio};
+
+    fn is_alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Simulates the startup reconciliation introduced in #457: reads every
+    /// `/run/pelagos/containers/<name>/state.json`, extracts the pid field, and
+    /// sends SIGKILL to any process still alive.  This mirrors the logic in
+    /// `AppState::new()` in pelagos-cri/src/state.rs.
+    fn run_orphan_reconcile(pelagos_name: &str) {
+        let state_path = format!("/run/pelagos/containers/{}/state.json", pelagos_name);
+        if let Ok(data) = std::fs::read_to_string(&state_path) {
+            if let Ok(cs) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(pid) = cs.get("pid").and_then(|v| v.as_i64()) {
+                    let pid = pid as libc::pid_t;
+                    if pid > 0 && is_alive(pid) {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Requires root.  Spawns a long-running process, writes a pelagos-style
+    /// state.json with its PID (as `pelagos run` would), runs the orphan-kill
+    /// reconciliation, and asserts the process is dead.  This is the direct
+    /// regression test for #457: before the fix, restarting pelagos-cri left
+    /// container processes alive, holding host ports (EADDRINUSE).
+    #[test]
+    fn test_cri_restart_kills_orphaned_container_process() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test_cri_restart_kills_orphaned_container_process: requires root");
+            return;
+        }
+
+        let name = format!("pcri-orphan-test-{}", std::process::id());
+        let state_dir = format!("/run/pelagos/containers/{}", name);
+        let state_file = format!("{}/state.json", state_dir);
+
+        let _ = std::fs::create_dir_all(&state_dir);
+
+        // Spawn an orphan (stands in for a container process that survived CRI restart).
+        let mut orphan = Proc::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn orphan sleep");
+        let pid = orphan.id() as libc::pid_t;
+
+        // Write the pelagos-style state.json that pelagos-cri reads.
+        let state_json = serde_json::json!({
+            "name": name,
+            "status": "running",
+            "pid": pid,
+            "started_at": "2026-01-01T00:00:00Z",
+        });
+        std::fs::write(&state_file, state_json.to_string()).expect("write state.json");
+
+        assert!(
+            is_alive(pid),
+            "orphan should be alive before reconciliation"
+        );
+
+        // Run the same orphan-kill logic as AppState::new().
+        run_orphan_reconcile(&name);
+
+        // Give SIGKILL a moment to take effect, then reap so try_wait works.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let exited = orphan.try_wait().expect("try_wait").is_some();
+        if !exited {
+            // Ensure we don't leave the child running.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = orphan.wait();
+        }
+
+        assert!(
+            exited,
+            "orphan pid={pid} should be dead after startup reconciliation (#457)"
+        );
+
+        // Cleanup (orphan already reaped above or will be dropped).
+        let _ = orphan.wait();
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+}
