@@ -365,8 +365,8 @@ async fn pull_image(
     password: Option<&str>,
     insecure: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use oci_client::manifest::OciManifest;
     use oci_client::client::current_platform_resolver;
+    use oci_client::manifest::OciManifest;
     use oci_client::{Client, Reference as OciRef};
 
     // For pinned (immutable) tags, skip the network entirely if the image and
@@ -439,9 +439,8 @@ async fn pull_image(
     let (manifest, resolved_ref, digest) = match top_manifest {
         OciManifest::Image(m) => (m, oci_ref.clone(), top_digest),
         OciManifest::ImageIndex(idx) => {
-            let platform_digest = current_platform_resolver(&idx.manifests).ok_or(
-                "image index contains no manifest for the current platform",
-            )?;
+            let platform_digest = current_platform_resolver(&idx.manifests)
+                .ok_or("image index contains no manifest for the current platform")?;
             let child_ref = oci_ref.clone_with_digest(platform_digest.clone());
             log::debug!(
                 "pull: multi-arch index resolved to platform digest {}",
@@ -453,9 +452,7 @@ async fn pull_image(
                 .map_err(|e| format!("failed to pull platform manifest: {}", e))?;
             match child_manifest {
                 OciManifest::Image(m) => (m, child_ref, child_digest),
-                OciManifest::ImageIndex(_) => {
-                    return Err("nested image index not supported".into())
-                }
+                OciManifest::ImageIndex(_) => return Err("nested image index not supported".into()),
             }
         }
     };
