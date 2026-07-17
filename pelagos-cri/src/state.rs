@@ -491,40 +491,6 @@ impl AppState {
             log::info!("startup: removing stale sandbox {sid} (pause process gone)");
         }
 
-        // #457: Kill orphaned container processes left over from the previous
-        // pelagos-cri instance.  On CRI restart the process is still alive in
-        // its namespace; for hostNetwork pods the port binding stays on the
-        // host, causing EADDRINUSE on every kubelet restart attempt.
-        //
-        // For each CRI container whose pelagos state file still reports a
-        // living PID, send SIGKILL immediately so the new instance starts clean.
-        // We do this AFTER reap_stale_sandboxes so we only touch containers
-        // whose sandbox pause is still running (i.e. truly adopted containers,
-        // not sandboxes we are about to tear down).
-        let mut orphans_killed: u32 = 0;
-        for container in inner.containers.values() {
-            let pelagos_name = &container.pelagos_name;
-            let state_path = format!("/run/pelagos/containers/{}/state.json", pelagos_name);
-            if let Ok(data) = std::fs::read_to_string(&state_path) {
-                if let Ok(cs) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if let Some(pid) = cs.get("pid").and_then(|v| v.as_i64()) {
-                        let pid = pid as libc::pid_t;
-                        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
-                            unsafe { libc::kill(pid, libc::SIGKILL) };
-                            log::info!(
-                                "startup: killed orphaned container process pid={pid} \
-                                 ({pelagos_name}) left over from previous pelagos-cri instance (#457)"
-                            );
-                            orphans_killed += 1;
-                        }
-                    }
-                }
-            }
-        }
-        if orphans_killed > 0 {
-            log::info!("startup: killed {orphans_killed} orphaned container process(es)");
-        }
-
         AppState {
             inner: Arc::new(Mutex::new(inner)),
             log_done: Arc::new(Mutex::new(HashMap::new())),

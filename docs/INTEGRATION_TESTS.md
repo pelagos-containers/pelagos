@@ -5669,12 +5669,14 @@ to the above — confirms that privileged containers still receive a read-write 
 (needed by KubeVirt `virt-handler` and device plugin accounting). Failure here means the
 MS_MOVE path is applying the RO remount unconditionally.
 
-## `issue_457_cri_restart_orphan_kill::test_cri_restart_kills_orphaned_container_process`
-**Requires root.** Spawns a `sleep 300` process to stand in for a container process that
-survived a `pelagos-cri` restart, writes a pelagos-style `state.json` with its PID into
-`/run/pelagos/containers/`, runs `run_orphan_reconcile()` (the same logic added to
-`AppState::new()` in `pelagos-cri/src/state.rs`), then asserts the process has exited
-via `try_wait()`. **Why it matters:** before the fix, `pelagos-cri` restart left container
-processes alive and holding host ports; the next `RunPodSandbox` for the same port would
-fail with `EADDRINUSE`. A failure here means the startup reconciliation is broken —
-orphaned container processes will survive across CRI restarts and block port rebinding.
+## `issue_457_stop_path_kill_verification::test_stop_path_kills_surviving_container_process`
+**Requires root.** Simulates the aberrant condition that causes `EADDRINUSE` on hostNetwork
+pods after a CRI restart: spawns a `sleep 300` process whose PID is written into a
+pelagos-style `state.json`, then calls `ensure_container_dead()` — the belt-and-suspenders
+step added to `stop_pod_sandbox` and `stop_container` in `pelagos-cri/src/runtime.rs`
+(#457). Asserts that `ensure_container_dead` returns `true` (unexpected survival detected)
+and that the process has exited via `try_wait()` after the call. **Why it matters:** the
+fix belongs in the Stop path, not at startup — if `pelagos stop` returns without killing
+the container process (a bug, always logged at WARN), `ensure_container_dead` must catch
+and kill it. A failure here means a surviving container process can hold a hostNetwork port
+through a kubelet-initiated pod restart, causing every subsequent `RunPodSandbox` to fail.
