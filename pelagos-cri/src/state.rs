@@ -7,30 +7,6 @@ use tokio::sync::Mutex;
 
 const SANDBOXES_DIR: &str = "/run/pelagos-cri/sandboxes";
 const CONTAINERS_DIR: &str = "/run/pelagos-cri/containers";
-const PELAGOS_CONTAINERS_DIR: &str = "/run/pelagos/containers";
-
-/// SIGKILL every process in a named cgroup at startup (before tokio runtime
-/// is spun up, so we use the sync std API).  No-op if the cgroup is absent.
-fn kill_cgroup_on_startup(cgroup_name: &str) {
-    let dir = std::path::Path::new("/sys/fs/cgroup").join(cgroup_name.trim_start_matches('/'));
-    if !dir.is_dir() {
-        return;
-    }
-    let kill_file = dir.join("cgroup.kill");
-    if kill_file.exists() {
-        let _ = std::fs::write(&kill_file, "1");
-        return;
-    }
-    if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-        for line in procs.lines() {
-            if let Ok(pid) = line.trim().parse::<libc::pid_t>() {
-                if pid > 1 {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
-            }
-        }
-    }
-}
 
 // ── Namespace modes ──────────────────────────────────────────────────────────
 //
@@ -522,22 +498,23 @@ impl AppState {
         // StopPodSandbox + RunPodSandbox for a replacement pod, the new
         // container tries to bind the same port and fails with EADDRINUSE.
         //
-        // Fix: on startup, SIGKILL the container process for every re-adopted
-        // hostNetwork container and mark it Exited.  Kubelet sees the container
-        // as dead and immediately calls StartContainer (or a full recreate cycle)
-        // — the replacement starts clean with no port conflict.
+        // Fix: on startup, stop every re-adopted hostNetwork container via
+        // `pelagos stop --time 0` and mark it Exited.  Kubelet sees the
+        // container as dead and immediately schedules a replacement that starts
+        // clean with no port conflict (#457, #459).
         //
-        // Non-hostNetwork containers are NOT touched: their processes are in the
-        // pod's private network namespace and hold no host ports, so they survive
-        // the CRI restart harmlessly under #336 (zero churn).
+        // `--time 0` skips SIGTERM (no grace period) and goes straight to
+        // cgroup kill + SIGKILL — the same single kill path used by the
+        // normal stop path, so there is no separate inline kill logic here.
         //
-        // This is surgical: only the class of container that can cause EADDRINUSE
-        // gets restarted; the vast majority of workloads are unaffected.
+        // Non-hostNetwork containers are NOT touched: their processes are in
+        // the pod's private network namespace and hold no host ports, so they
+        // survive the CRI restart harmlessly under #336 (zero churn).
         let finished_at_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let host_network_ctrs: Vec<String> = inner
+        let host_network_ctrs: Vec<(String, String)> = inner
             .containers
             .values()
             .filter(|c| c.state == ContainerState::Running)
@@ -548,44 +525,41 @@ impl AppState {
                     .map(|s| s.namespaces.host_network())
                     .unwrap_or(false)
             })
-            .map(|c| c.id.clone())
+            .map(|c| (c.id.clone(), c.pelagos_name.clone()))
             .collect();
 
-        let mut host_net_killed: u32 = 0;
-        for cid in &host_network_ctrs {
-            let Some(c) = inner.containers.get_mut(cid) else {
-                continue;
-            };
-            let pelagos_name = c.pelagos_name.clone();
-
-            // Read the live PID from the pelagos state file and SIGKILL it.
-            let state_path = format!("{}/{}/state.json", PELAGOS_CONTAINERS_DIR, pelagos_name);
-            if let Ok(data) = std::fs::read_to_string(&state_path) {
-                if let Ok(cs) = serde_json::from_str::<serde_json::Value>(&data) {
-                    let pid = cs.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as libc::pid_t;
-                    if pid > 1 && unsafe { libc::kill(pid, 0) } == 0 {
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                        log::info!(
-                            "startup: killed hostNetwork container process \
-                             pid={pid} ({pelagos_name}) — port binding released (#457)"
-                        );
-                        host_net_killed += 1;
-                    }
-                    // Also kill via cgroup to catch forked/setsid'd descendants.
-                    if let Some(cg) = cs.get("cgroup_name").and_then(|v| v.as_str()) {
-                        kill_cgroup_on_startup(cg);
-                    }
-                }
+        let mut host_net_stopped: u32 = 0;
+        for (cid, pelagos_name) in &host_network_ctrs {
+            // Use the same kill path as the normal stop path: `pelagos stop --time 0`
+            // (cgroup kill primary, SIGKILL fallback, zombie-proof wait).
+            let ok = std::process::Command::new(&inner.pelagos_bin)
+                .args(["stop", "--time", "0", pelagos_name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                log::info!(
+                    "startup: stopped hostNetwork container {pelagos_name} — \
+                     port binding released (#457)"
+                );
+                host_net_stopped += 1;
+            } else {
+                log::warn!(
+                    "startup: pelagos stop returned non-zero for hostNetwork \
+                     container {pelagos_name} — container may have already exited"
+                );
             }
 
-            // Mark Exited so kubelet immediately schedules a container restart.
-            c.state = ContainerState::Exited;
-            c.finished_at_ns = finished_at_ns;
-            let _ = save_container(c);
+            // Mark Exited in CRI state so kubelet schedules a replacement.
+            if let Some(c) = inner.containers.get_mut(cid) {
+                c.state = ContainerState::Exited;
+                c.finished_at_ns = finished_at_ns;
+                let _ = save_container(c);
+            }
         }
-        if host_net_killed > 0 {
+        if host_net_stopped > 0 {
             log::info!(
-                "startup: released {host_net_killed} hostNetwork port binding(s); \
+                "startup: released {host_net_stopped} hostNetwork port binding(s); \
                  kubelet will restart those container(s)"
             );
         }
