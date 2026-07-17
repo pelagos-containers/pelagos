@@ -5728,12 +5728,34 @@ impl Command {
                 }
 
                 // Step 7: Apply seccomp filter (no_new_privileges=true path only).
-                // NNP is now deferred to step 8.7, so we use apply_filter_no_nnp()
-                // here (CAP_SYS_ADMIN, still held before setuid at step 8.5).
                 // When no_new_privileges=false, seccomp was applied at step 4.849 using
                 // CAP_SYS_ADMIN (before capability drops), so no action needed here.
+                //
+                // Two sub-paths based on whether ambient caps need re-raising after setuid:
+                //
+                // A) No ambient caps (common case): set NNP now, then apply the filter.
+                //    This is the standard approach (runc, containerd) — NNP satisfies the
+                //    kernel's privilege check without needing CAP_SYS_ADMIN (#461).
+                //    Step 8.7 repeats the NNP prctl (idempotent, harmless).
+                //
+                // B) Ambient caps present: NNP must stay deferred until step 8.7 so that
+                //    PR_CAP_AMBIENT_RAISE at step 8.5 (post-setuid) still works (#447).
+                //    Use CAP_SYS_ADMIN (still held here) via apply_filter_no_nnp().
                 if no_new_privileges {
                     if let Some(ref filter) = seccomp_filter {
+                        if ambient_cap_numbers.is_empty() {
+                            // Path A: set NNP first — always reliable (#461).
+                            const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                            let r = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                            if r != 0 {
+                                return Err(pre_exec_err(
+                                    "PR_SET_NO_NEW_PRIVS",
+                                    io::Error::last_os_error(),
+                                ));
+                            }
+                        }
+                        // NNP now set (path A) or CAP_SYS_ADMIN still held (path B):
+                        // either satisfies the kernel's seccomp privilege check.
                         crate::seccomp::apply_filter_no_nnp(filter)?;
                     }
                 }
@@ -8553,9 +8575,19 @@ impl Command {
                 }
 
                 // Apply seccomp (no_new_privileges=true path only, mirrors spawn() step 7).
-                // Uses apply_filter_no_nnp() — NNP is deferred to step 8.7 (#447).
+                // See step 7 comment in spawn() for the two-path logic (#447 #461).
                 if no_new_privileges {
                     if let Some(ref filter) = seccomp_filter {
+                        if ambient_cap_numbers.is_empty() {
+                            const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                            let r = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                            if r != 0 {
+                                return Err(pre_exec_err(
+                                    "PR_SET_NO_NEW_PRIVS",
+                                    io::Error::last_os_error(),
+                                ));
+                            }
+                        }
                         crate::seccomp::apply_filter_no_nnp(filter)?;
                     }
                 }

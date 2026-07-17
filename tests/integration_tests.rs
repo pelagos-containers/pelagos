@@ -964,6 +964,46 @@ mod security {
         );
     }
 
+    /// Regression test for #461: containers with seccompProfile=RuntimeDefault +
+    /// allowPrivilegeEscalation=false (no_new_privileges=true, no ambient caps) must
+    /// start successfully.  Previously `apply_filter_no_nnp()` intermittently returned
+    /// EINVAL because it relied on CAP_SYS_ADMIN; the fix sets NNP first so the kernel
+    /// allows the filter installation via task_no_new_privs() instead.
+    #[test]
+    fn test_seccomp_with_nnp_no_ambient_caps() {
+        if !is_root() {
+            eprintln!("Skipping test_seccomp_with_nnp_no_ambient_caps: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_seccomp_with_nnp_no_ambient_caps: alpine-rootfs not found");
+            return;
+        };
+
+        // This combination is exactly what virt-controller / virt-operator use:
+        //   seccompProfile: RuntimeDefault  →  with_seccomp_default()
+        //   allowPrivilegeEscalation: false →  with_no_new_privileges(true)
+        //   capabilities.drop: ALL          →  drop_all_capabilities() (no ambient caps)
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "grep 'NoNewPrivs:.*1' /proc/self/status"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_seccomp_default()
+            .with_no_new_privileges(true)
+            .drop_all_capabilities()
+            .spawn()
+            .expect("spawn must succeed — EINVAL here means #461 regression");
+
+        let status = child.wait().expect("wait failed");
+        assert!(status.success(), "NNP must be visible inside the container");
+    }
+
     #[test]
     fn test_no_new_privileges() {
         if !is_root() {

@@ -192,6 +192,16 @@ available.
 
 ## Phase 1 Security Tests
 
+### `test_seccomp_with_nnp_no_ambient_caps`
+**Requires:** root, rootfs
+
+Regression test for #461. Combines `with_seccomp_default()` + `with_no_new_privileges(true)` +
+`drop_all_capabilities()` (no ambient caps) — the exact profile used by virt-controller and
+virt-operator pods (`seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false`,
+`capabilities.drop: [ALL]`). The fix sets NNP before calling `prctl(PR_SET_SECCOMP)` when
+there are no ambient caps to re-raise post-setuid, eliminating the intermittent CAP_SYS_ADMIN
+dependency that caused EINVAL. Failure here means the #461 regression is back.
+
 ### `test_no_new_privileges`
 **Requires:** root, rootfs
 
