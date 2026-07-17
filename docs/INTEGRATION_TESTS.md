@@ -5680,3 +5680,14 @@ fix belongs in the Stop path, not at startup — if `pelagos stop` returns witho
 the container process (a bug, always logged at WARN), `ensure_container_dead` must catch
 and kill it. A failure here means a surviving container process can hold a hostNetwork port
 through a kubelet-initiated pod restart, causing every subsequent `RunPodSandbox` to fail.
+
+## `issue_457_hostnetwork_startup_kill::test_hostnetwork_startup_kills_container_process`
+**Requires root.** Mirrors the startup reconciliation logic added to `AppState::new()` in
+`pelagos-cri/src/state.rs` (#457): spawns a `sleep 300` process, writes its PID into a
+pelagos-style `state.json`, and calls the startup kill helper. Asserts via `try_wait()` that
+the process has been killed. **Why it matters:** when pelagos-cri restarts, re-adopted
+hostNetwork container processes hold ports in the HOST network namespace. Any
+`RunPodSandbox` attempting the same port immediately fails with `EADDRINUSE` (the root
+cause of #457 recurring after v0.65.55). The startup reconcile kills exactly these processes
+and marks their CRI state as Exited so kubelet recreates the pods cleanly. Non-hostNetwork
+containers are left untouched (their ports are in an isolated netns and pose no risk).

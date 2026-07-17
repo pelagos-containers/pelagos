@@ -27972,7 +27972,7 @@ mod cri_uid_hardening {
 mod registry_mirror {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
 
     /// Serve a minimal HTTP response and return.  Used to simulate a mirror
     /// that is reachable but returns a 404, so we can verify fallback to origin.
@@ -30674,6 +30674,100 @@ mod issue_457_stop_path_kill_verification {
         );
         let _ = survivor.wait();
 
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+}
+
+mod issue_457_hostnetwork_startup_kill {
+    use std::process::{Command as Proc, Stdio};
+
+    /// Simulates the startup reconciliation for hostNetwork containers added in
+    /// #457: mirrors the logic in `AppState::new()` in
+    /// `pelagos-cri/src/state.rs` that kills container processes for re-adopted
+    /// hostNetwork pods and marks them Exited so kubelet restarts them clean.
+    ///
+    /// The test writes a pelagos-style state.json (as `pelagos run` would),
+    /// runs the startup kill logic, and asserts the process is dead via
+    /// `try_wait()`.
+    ///
+    /// **Why it matters:** after a CRI restart, a re-adopted hostNetwork
+    /// container process holds its port in the HOST network namespace.  Any
+    /// subsequent `RunPodSandbox` for the same port fails with `EADDRINUSE`.
+    /// The startup kill releases the port and marks the container Exited so
+    /// kubelet recreates it cleanly (#457).
+    fn run_hostnetwork_startup_kill(pelagos_name: &str) -> bool {
+        let state_path = format!("/run/pelagos/containers/{}/state.json", pelagos_name);
+        let data = match std::fs::read_to_string(&state_path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let cs: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let pid = match cs.get("pid").and_then(|v| v.as_i64()) {
+            Some(p) if p > 1 => p as libc::pid_t,
+            _ => return false,
+        };
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn test_hostnetwork_startup_kills_container_process() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test_hostnetwork_startup_kills_container_process: requires root");
+            return;
+        }
+
+        let name = format!("pcri-hostnet-startup-{}", std::process::id());
+        let state_dir = format!("/run/pelagos/containers/{}", name);
+        let state_file = format!("{}/state.json", state_dir);
+        let _ = std::fs::create_dir_all(&state_dir);
+
+        // Spawn a process standing in for a re-adopted hostNetwork container.
+        let mut proc = Proc::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = proc.id() as libc::pid_t;
+
+        let state_json = serde_json::json!({
+            "name": name,
+            "status": "running",
+            "pid": pid,
+            "started_at": "2026-01-01T00:00:00Z",
+        });
+        std::fs::write(&state_file, state_json.to_string()).expect("write state.json");
+
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "process should be alive before startup kill"
+        );
+
+        let killed = run_hostnetwork_startup_kill(&name);
+        assert!(
+            killed,
+            "startup kill should have found and killed the hostNetwork process"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let exited = proc.try_wait().expect("try_wait").is_some();
+        if !exited {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = proc.wait();
+        }
+        assert!(
+            exited,
+            "hostNetwork container pid={pid} should be dead after startup kill (#457)"
+        );
+        let _ = proc.wait();
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

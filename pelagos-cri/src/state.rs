@@ -7,6 +7,30 @@ use tokio::sync::Mutex;
 
 const SANDBOXES_DIR: &str = "/run/pelagos-cri/sandboxes";
 const CONTAINERS_DIR: &str = "/run/pelagos-cri/containers";
+const PELAGOS_CONTAINERS_DIR: &str = "/run/pelagos/containers";
+
+/// SIGKILL every process in a named cgroup at startup (before tokio runtime
+/// is spun up, so we use the sync std API).  No-op if the cgroup is absent.
+fn kill_cgroup_on_startup(cgroup_name: &str) {
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(cgroup_name.trim_start_matches('/'));
+    if !dir.is_dir() {
+        return;
+    }
+    let kill_file = dir.join("cgroup.kill");
+    if kill_file.exists() {
+        let _ = std::fs::write(&kill_file, "1");
+        return;
+    }
+    if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+        for line in procs.lines() {
+            if let Ok(pid) = line.trim().parse::<libc::pid_t>() {
+                if pid > 1 {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+}
 
 // ── Namespace modes ──────────────────────────────────────────────────────────
 //
@@ -489,6 +513,81 @@ impl AppState {
         }
         for sid in &stale {
             log::info!("startup: removing stale sandbox {sid} (pause process gone)");
+        }
+
+        // #457 — hostNetwork container processes hold ports in the HOST network
+        // namespace.  A CRI restart re-adopts the sandbox (pause still alive,
+        // network namespace preserved) but leaves the container process running
+        // with its host-side port binding intact.  When kubelet later calls
+        // StopPodSandbox + RunPodSandbox for a replacement pod, the new
+        // container tries to bind the same port and fails with EADDRINUSE.
+        //
+        // Fix: on startup, SIGKILL the container process for every re-adopted
+        // hostNetwork container and mark it Exited.  Kubelet sees the container
+        // as dead and immediately calls StartContainer (or a full recreate cycle)
+        // — the replacement starts clean with no port conflict.
+        //
+        // Non-hostNetwork containers are NOT touched: their processes are in the
+        // pod's private network namespace and hold no host ports, so they survive
+        // the CRI restart harmlessly under #336 (zero churn).
+        //
+        // This is surgical: only the class of container that can cause EADDRINUSE
+        // gets restarted; the vast majority of workloads are unaffected.
+        let finished_at_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let host_network_ctrs: Vec<String> = inner
+            .containers
+            .values()
+            .filter(|c| c.state == ContainerState::Running)
+            .filter(|c| {
+                inner
+                    .sandboxes
+                    .get(&c.sandbox_id)
+                    .map(|s| s.namespaces.host_network())
+                    .unwrap_or(false)
+            })
+            .map(|c| c.id.clone())
+            .collect();
+
+        let mut host_net_killed: u32 = 0;
+        for cid in &host_network_ctrs {
+            let Some(c) = inner.containers.get_mut(cid) else {
+                continue;
+            };
+            let pelagos_name = c.pelagos_name.clone();
+
+            // Read the live PID from the pelagos state file and SIGKILL it.
+            let state_path = format!("{}/{}/state.json", PELAGOS_CONTAINERS_DIR, pelagos_name);
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(cs) = serde_json::from_str::<serde_json::Value>(&data) {
+                    let pid = cs.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as libc::pid_t;
+                    if pid > 1 && unsafe { libc::kill(pid, 0) } == 0 {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        log::info!(
+                            "startup: killed hostNetwork container process \
+                             pid={pid} ({pelagos_name}) — port binding released (#457)"
+                        );
+                        host_net_killed += 1;
+                    }
+                    // Also kill via cgroup to catch forked/setsid'd descendants.
+                    if let Some(cg) = cs.get("cgroup_name").and_then(|v| v.as_str()) {
+                        kill_cgroup_on_startup(cg);
+                    }
+                }
+            }
+
+            // Mark Exited so kubelet immediately schedules a container restart.
+            c.state = ContainerState::Exited;
+            c.finished_at_ns = finished_at_ns;
+            let _ = save_container(c);
+        }
+        if host_net_killed > 0 {
+            log::info!(
+                "startup: released {host_net_killed} hostNetwork port binding(s); \
+                 kubelet will restart those container(s)"
+            );
         }
 
         AppState {
