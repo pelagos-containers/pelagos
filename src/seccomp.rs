@@ -1176,10 +1176,11 @@ pub fn apply_filter_no_nnp(program: &BpfProgram) -> Result<(), io::Error> {
         )
     };
     if result != 0 {
-        Err(io::Error::other(format!(
-            "Failed to apply seccomp filter (no-nnp): {}",
-            io::Error::last_os_error()
-        )))
+        // Preserve the raw errno so pre_exec propagates the real error code
+        // (io::Error::other loses raw_os_error, which the error pipe serialises
+        // as EINVAL, hiding the actual cause — EACCES = no caps/no NNP,
+        // EFAULT = bad BPF pointer, EINVAL = invalid program).
+        Err(io::Error::last_os_error())
     } else {
         Ok(())
     }

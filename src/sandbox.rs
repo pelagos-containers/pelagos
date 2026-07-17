@@ -211,13 +211,25 @@ impl SandboxState {
         PathBuf::from(format!("/proc/{}/ns/pid", self.pause_pid))
     }
 
-    /// Returns true if the pause process is still alive.
+    /// Returns true if the pause process is still alive and not a zombie.
+    ///
+    /// `kill(pid, 0)` returns 0 for zombie processes (they remain in the process
+    /// table until reaped), causing false positives: a zombie pause would pass
+    /// the is_alive check but its /proc/<pid>/ns/{ipc,uts} may belong to a
+    /// different process if the PID was recycled.  Read /proc/status instead.
     pub fn is_alive(&self) -> bool {
         if self.pause_pid <= 0 {
             return false;
         }
-        // kill(pid, 0) — check existence without sending a signal.
-        unsafe { libc::kill(self.pause_pid, 0) == 0 }
+        match std::fs::read_to_string(format!("/proc/{}/status", self.pause_pid)) {
+            Err(_) => false,
+            Ok(s) => s
+                .lines()
+                .find(|l| l.starts_with("State:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(|c| !c.starts_with('Z'))
+                .unwrap_or(false),
+        }
     }
 }
 

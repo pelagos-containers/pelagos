@@ -5694,3 +5694,27 @@ under 4 s. **Why it matters:** `cmd_stop` uses `is_live_process(pid)` (reads
 that had already released its ports. A regression here means `pelagos stop` would hang for
 5 s on a zombie during the pod restart cycle, delaying the replacement pod unnecessarily
 (#459).
+
+## `issue_461_sandbox_zombie_liveness::test_sandbox_is_alive_false_for_zombie`
+**Requires root.** Spawns a `sleep` process, SIGKILLs it without calling `wait()` (leaving
+it as a zombie), constructs a `SandboxState` with the zombie's PID, and asserts
+`is_alive()` returns false. **Why it matters:** the old `kill(pid, 0)` implementation
+returns 0 for zombie processes (they remain in the process table until reaped), causing
+`with_sandbox()` to believe the pause is alive. It would then call `setns()` on the
+zombie's `/proc/<pid>/ns/{ipc,uts}`, which fails with EINVAL when the zombie's PID has
+been recycled. This was the root cause of containers with `seccompProfile: RuntimeDefault`
+reporting "Failed to spawn process: Invalid argument" (#461). The fix reads
+`/proc/<pid>/status` and checks the `State:` field.
+
+## `issue_461_sandbox_zombie_liveness::test_sandbox_is_alive_true_for_running`
+**Requires root.** Spawns a `sleep` process, constructs a `SandboxState` with its PID, and
+asserts `is_alive()` returns true. **Why it matters:** sanity-checks that the zombie-proof
+fix does not regress the normal case — a healthy pause process must still be considered
+alive so containers can join its namespaces.
+
+## `issue_461_sandbox_zombie_liveness::test_sandbox_is_alive_false_for_reaped`
+**Requires root.** Spawns a `sleep` process, SIGKILLs it, calls `wait()` to reap it (so
+`/proc/<pid>/` disappears entirely), then asserts `is_alive()` returns false. **Why it
+matters:** belt-and-suspenders coverage — once a zombie has been reaped, `/proc/<pid>/status`
+no longer exists and the function must handle the `Err(_)` branch, returning false without
+panicking.
