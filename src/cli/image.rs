@@ -365,6 +365,8 @@ async fn pull_image(
     password: Option<&str>,
     insecure: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use oci_client::client::current_platform_resolver;
+    use oci_client::manifest::OciManifest;
     use oci_client::{Client, Reference as OciRef};
 
     // For pinned (immutable) tags, skip the network entirely if the image and
@@ -390,36 +392,80 @@ async fn pull_image(
 
     let client = Client::new(oci_client_config(registry, insecure));
 
-    let manifest_result = client.pull_manifest_and_config(&oci_ref, &auth).await;
-    let (manifest, digest, config_json) = match manifest_result {
-        Ok(r) => r,
-        Err(e) if is_transport_error(&e) => {
-            // Stale pooled connection — create a fresh client and retry once.
-            log::debug!("pull: manifest transport error, retrying with fresh connection: {e}");
-            Client::new(oci_client_config(registry, insecure))
-                .pull_manifest_and_config(&oci_ref, &auth)
-                .await
-                .map_err(|e| format!("failed to pull manifest: {}", oci_err(registry, e)))?
-        }
-        Err(e) if is_dockerhub_library_not_found(registry, &oci_ref, &e) => {
-            // Docker Hub returns 401 for nonexistent public images to prevent
-            // name enumeration.  Surface this as "not found" with a colon hint
-            // when the user omitted the separator between image name and tag.
-            let image_name = oci_ref.repository().trim_start_matches("library/");
-            let mut msg = format!(
-                "image not found: '{}' does not exist on Docker Hub",
-                image_name
-            );
-            if !original_ref.contains(':') && !original_ref.contains('/') {
-                msg.push_str(&format!(
-                    "\n  hint: to specify a tag use a colon, e.g. '{}:<tag>'",
-                    original_ref
-                ));
+    // Pull the top-level manifest.  For multi-arch images this is an
+    // OciManifest::ImageIndex; for single-arch it is OciManifest::Image.
+    // We resolve the image index ourselves rather than delegating to
+    // pull_manifest_and_config so that the mirror registry + repository are
+    // provably preserved when fetching the platform child manifest.
+    // Delegating to oci-client's internal resolution can lose the repo context
+    // for certain mirror/registry combinations, producing a mangled
+    // `library/sha256` repository name and a cache miss on every multi-arch
+    // pull. (#407)
+    let (top_manifest, top_digest) = {
+        let r = client.pull_manifest(&oci_ref, &auth).await;
+        match r {
+            Ok(r) => r,
+            Err(e) if is_transport_error(&e) => {
+                log::debug!("pull: manifest transport error, retrying with fresh connection: {e}");
+                Client::new(oci_client_config(registry, insecure))
+                    .pull_manifest(&oci_ref, &auth)
+                    .await
+                    .map_err(|e| format!("failed to pull manifest: {}", oci_err(registry, e)))?
             }
-            return Err(msg.into());
+            Err(e) if is_dockerhub_library_not_found(registry, &oci_ref, &e) => {
+                let image_name = oci_ref.repository().trim_start_matches("library/");
+                let mut msg = format!(
+                    "image not found: '{}' does not exist on Docker Hub",
+                    image_name
+                );
+                if !original_ref.contains(':') && !original_ref.contains('/') {
+                    msg.push_str(&format!(
+                        "\n  hint: to specify a tag use a colon, e.g. '{}:<tag>'",
+                        original_ref
+                    ));
+                }
+                return Err(msg.into());
+            }
+            Err(e) => {
+                return Err(format!("failed to pull manifest: {}", oci_err(registry, e)).into())
+            }
         }
-        Err(e) => return Err(format!("failed to pull manifest: {}", oci_err(registry, e)).into()),
     };
+
+    // Resolve a multi-arch image index to the current platform manifest.
+    // The child reference is built with clone_with_digest on oci_ref so the
+    // mirror host + repository (`library/alpine`, not `library/sha256`) are
+    // preserved in every subsequent request. (#407)
+    let (manifest, resolved_ref, digest) = match top_manifest {
+        OciManifest::Image(m) => (m, oci_ref.clone(), top_digest),
+        OciManifest::ImageIndex(idx) => {
+            let platform_digest = current_platform_resolver(&idx.manifests)
+                .ok_or("image index contains no manifest for the current platform")?;
+            let child_ref = oci_ref.clone_with_digest(platform_digest.clone());
+            log::debug!(
+                "pull: multi-arch index resolved to platform digest {}",
+                platform_digest
+            );
+            let (child_manifest, child_digest) = client
+                .pull_manifest(&child_ref, &auth)
+                .await
+                .map_err(|e| format!("failed to pull platform manifest: {}", e))?;
+            match child_manifest {
+                OciManifest::Image(m) => (m, child_ref, child_digest),
+                OciManifest::ImageIndex(_) => return Err("nested image index not supported".into()),
+            }
+        }
+    };
+
+    // Pull config blob using the resolved (possibly child) reference so that
+    // blob requests also go to the correct mirror path. (#407)
+    let mut config_bytes: Vec<u8> = Vec::new();
+    client
+        .pull_blob(&resolved_ref, &manifest.config, &mut config_bytes)
+        .await
+        .map_err(|e| format!("failed to pull config blob: {}", e))?;
+    let config_json =
+        String::from_utf8(config_bytes).map_err(|_| "image config is not valid UTF-8")?;
 
     println!(
         "  Manifest: {} ({} layers)",
@@ -463,7 +509,7 @@ async fn pull_image(
 
         let mut blob_data: Vec<u8> = Vec::new();
         client
-            .pull_blob(&oci_ref, layer_desc, &mut blob_data)
+            .pull_blob(&resolved_ref, layer_desc, &mut blob_data)
             .await
             .map_err(|e| format!("failed to pull layer {}: {}", layer_digest, e))?;
 
