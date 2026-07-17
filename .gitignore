@@ -1,6 +1,9 @@
 /target
 alpine-rootfs/**
-.claude/
+.claude/*
+!.claude/workflows/
+.claude/workflows/**
+!.claude/workflows/*.js
 claude_session.txt
 *.tar.gz
 test_syscalls

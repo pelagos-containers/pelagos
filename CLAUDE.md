@@ -138,10 +138,13 @@ This is a hard requirement, not optional cleanup.
 5. Quietly implement — no step-by-step narration
 6. Create integration tests and run them to success locally
 7. Commit, push, open a PR
-8. **Poll CI with `ScheduleWakeup` (90 s interval) until all checks pass.**
-   If invoked with `/loop`, use `ScheduleWakeup` to keep the session alive overnight.
-   On each wake: check `gh pr checks <N>`; if green → merge + bump Cargo.toml version
-   + commit + tag + push tag → "Engage!" release flow; if failed → diagnose, fix, push.
+8. **Immediately launch the CI-merge-release workflow in the background:**
+   ```
+   Workflow({ name: "ci-merge-release", args: { pr: <PR_NUMBER> } })
+   ```
+   This polls CI every 90 s, merges when green, bumps Cargo.toml patch version,
+   commits, tags, and pushes — fully unattended. No `/loop` needed.
+   If CI fails the workflow returns the failing check names; diagnose, fix, push, re-run.
 9. Report: merged SHA, release version, CI URL
 
 **"Engage!"** — Tag, release, and monitor:
