@@ -1470,6 +1470,21 @@ discarded when the container exits.
 In rootless mode, Pelagos uses the `userxattr` mount option (kernel 5.11+) or falls back
 to `fuse-overlayfs` automatically. See [Rootless Overlay](#rootless-overlay) for details.
 
+#### Writable layer location
+
+The overlay's upper and work directories land on disk by default
+(`/var/lib/pelagos/scratch/` for root, `~/.local/share/pelagos/scratch/` for rootless).
+This avoids capping the writable layer at available RAM — large builds (e.g. `cargo build`,
+`npm install`) can exhaust a `/run` tmpfs on nodes with limited RAM.
+
+To use `/run` tmpfs instead (no disk I/O, gone on reboot):
+
+```bash
+pelagos run --overlay-tmpfs alpine /bin/sh
+# or
+PELAGOS_OVERLAY_TMPFS=1 pelagos run alpine /bin/sh
+```
+
 ---
 
 ## Security & Isolation

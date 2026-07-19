@@ -183,6 +183,45 @@ Command::new("/bin/sh")
 - **Fallback**: `fuse-overlayfs` is spawned by the parent process before fork.
   The child uses the pre-mounted FUSE filesystem transparently.
 
+### Writable Layer Location
+
+The ephemeral upper and work directories for a container's overlay are written to
+disk by default:
+
+| Mode     | Default path                                          |
+|----------|-------------------------------------------------------|
+| Root     | `/var/lib/pelagos/scratch/`                           |
+| Rootless | `~/.local/share/pelagos/scratch/`                     |
+
+Writing to disk means the upper directory survives a host reboot (pelagos cleans
+it up on the next run, but it isn't silently lost). It also means the writable
+layer is not bounded by available RAM, which matters for containers that produce
+large output (e.g. `cargo build` or `npm install`).
+
+**tmpfs opt-in:** if you want the old behaviour — writable layer in `/run`
+tmpfs, gone on reboot, but no disk I/O — pass `--overlay-tmpfs` or set
+`PELAGOS_OVERLAY_TMPFS=1`:
+
+```bash
+# CLI
+pelagos run --overlay-tmpfs alpine /bin/sh
+
+# Environment variable (affects all containers in the process)
+PELAGOS_OVERLAY_TMPFS=1 pelagos run alpine /bin/sh
+```
+
+```rust
+// Library API
+Command::new("/bin/sh")
+    .with_image_layers(layers)
+    .with_overlay_tmpfs(true)
+    .spawn()?;
+```
+
+When `--overlay-tmpfs` is set, stale scratch directories are gone after a reboot
+(tmpfs is not persistent), so no cleanup is needed. With the default disk
+location, `pelagos` sweeps orphaned scratch directories on startup.
+
 ### How the Build Engine Uses Overlay
 
 `pelagos build` uses overlay to snapshot each `RUN` instruction:
