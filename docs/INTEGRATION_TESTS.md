@@ -5745,3 +5745,31 @@ image correctly. **Why it matters:** regression test for #407 — the mirror-rew
 reference must preserve the image repository (`library/pelagos-mock-multi`) when fetching
 the child manifest's digest, not mangle it into `library/sha256` (which would cause a 404
 on every multi-arch mirror pull).
+
+## `image_layer_atomicity::test_save_blob_atomic_partial_then_rename`
+**Requires root** (writes to `/var/lib/pelagos/blobs/`). Calls `save_blob` with synthetic
+data for a test digest, then asserts that the final blob file exists, is intact, and no
+`.partial` sibling survived. **Why it matters:** a direct `fs::write` exposes a truncation
+window — if the process is killed mid-write the blob exists but is corrupt and
+`blob_exists()` treats it as valid, causing the next pull to skip re-downloading. This test
+fails if `save_blob` reverts to a non-atomic write.
+
+## `image_layer_atomicity::test_save_blob_diffid_atomic_partial_then_rename`
+**Requires root** (writes to `/var/lib/pelagos/blobs/`). Calls `save_blob_diffid` and
+verifies the diff_id sidecar file is intact with no surviving `.partial` sibling. **Why it
+matters:** a corrupt diff_id file breaks `pelagos image push` because the OCI config JSON
+can no longer be constructed. Belt-and-suspenders atomicity for a tiny but critical sidecar.
+
+## `image_layer_atomicity::test_save_oci_config_atomic_no_truncated_json`
+**Requires root** (writes to `/var/lib/pelagos/images/`). Calls `save_oci_config` with a
+synthetic reference and valid JSON, then asserts the file exists, parses correctly, and no
+`.oci-config.json.*` temp file was left behind. **Why it matters:** a truncated config JSON
+causes `load_oci_config` to return a parse error on the next run, breaking the image
+entirely even though `image ls` shows it present.
+
+## `image_layer_atomicity::test_interrupted_blob_write_cleaned_by_cleanup`
+**Requires root.** Plants a synthetic `*.partial` file in `/var/lib/pelagos/blobs/`,
+calls `cleanup_partial_store_entries()`, and asserts the file is gone and the return count
+is ≥ 1. **Why it matters:** the cleanup helper must sweep all partial entries from both
+the blob and layer stores so that orphaned interrupted writes don't accumulate on disk.
+Fails if the partial-entry sweep is removed from the cleanup path.

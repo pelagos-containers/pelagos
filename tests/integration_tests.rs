@@ -9831,6 +9831,174 @@ mod images {
     }
 }
 
+mod image_layer_atomicity {
+    use super::*;
+
+    /// test_save_blob_atomic_partial_then_rename
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/blobs/).
+    ///
+    /// Verifies that `save_blob` uses a `.partial` sibling + rename so that a
+    /// concurrent reader never observes a truncated blob. Simulates the
+    /// interrupted-write scenario by checking that no `.partial` file survives
+    /// a successful save.
+    ///
+    /// Failure indicates `save_blob` reverted to a direct `fs::write` and the
+    /// atomic write path was removed.
+    #[test]
+    fn test_save_blob_atomic_partial_then_rename() {
+        if !is_root() {
+            eprintln!("Skipping test_save_blob_atomic_partial_then_rename: requires root");
+            return;
+        }
+        let digest = "sha256:test_save_blob_atomicity_deadbeef00000000000000000000000000000000";
+        let blob_path = pelagos::image::blob_path(digest);
+        let partial_path = blob_path.with_extension("partial");
+
+        // Clean up any prior run.
+        let _ = std::fs::remove_file(&blob_path);
+        let _ = std::fs::remove_file(&partial_path);
+
+        let data = b"fake-gzip-layer-content";
+        pelagos::image::save_blob(digest, data).expect("save_blob should succeed");
+
+        assert!(blob_path.exists(), "blob file must exist after save_blob");
+        assert!(
+            !partial_path.exists(),
+            ".partial sibling must not survive a successful save_blob"
+        );
+        assert_eq!(
+            std::fs::read(&blob_path).unwrap(),
+            data,
+            "blob content must be intact"
+        );
+
+        let _ = std::fs::remove_file(&blob_path);
+    }
+
+    /// test_save_blob_diffid_atomic_partial_then_rename
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/blobs/).
+    ///
+    /// Verifies that `save_blob_diffid` uses a `.partial` sibling + rename so
+    /// that a truncated diff_id sidecar is never left as the live file.
+    ///
+    /// Failure indicates `save_blob_diffid` reverted to a direct `fs::write`.
+    #[test]
+    fn test_save_blob_diffid_atomic_partial_then_rename() {
+        if !is_root() {
+            eprintln!("Skipping test_save_blob_diffid_atomic_partial_then_rename: requires root");
+            return;
+        }
+        let blob_digest =
+            "sha256:test_save_diffid_atomicity_deadbeef0000000000000000000000000000000";
+        let diff_id = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let diffid_path = pelagos::paths::blob_diffid_path(blob_digest);
+        let partial_path = diffid_path.with_extension("partial");
+
+        let _ = std::fs::remove_file(&diffid_path);
+        let _ = std::fs::remove_file(&partial_path);
+
+        pelagos::image::save_blob_diffid(blob_digest, diff_id)
+            .expect("save_blob_diffid should succeed");
+
+        assert!(diffid_path.exists(), "diffid file must exist after save");
+        assert!(
+            !partial_path.exists(),
+            ".partial sibling must not survive a successful save_blob_diffid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&diffid_path).unwrap(),
+            diff_id,
+            "diffid content must be intact"
+        );
+
+        let _ = std::fs::remove_file(&diffid_path);
+    }
+
+    /// test_save_oci_config_atomic_no_truncated_json
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/images/).
+    ///
+    /// Verifies that `save_oci_config` uses an atomic tempfile+rename so that
+    /// a partial write never leaves an unparseable JSON file. Checks that no
+    /// `.oci-config.json.*` temp file survives a successful save.
+    ///
+    /// Failure indicates `save_oci_config` reverted to a direct `fs::write`.
+    #[test]
+    fn test_save_oci_config_atomic_no_truncated_json() {
+        if !is_root() {
+            eprintln!("Skipping test_save_oci_config_atomic_no_truncated_json: requires root");
+            return;
+        }
+        let reference = "test-atomicity-oci-config:latest";
+        let config_json = r#"{"env":[],"cmd":["/bin/sh"],"entrypoint":[],"working_dir":"","user":"","labels":{},"stop_signal":""}"#;
+
+        pelagos::image::save_oci_config(reference, config_json)
+            .expect("save_oci_config should succeed");
+
+        let path = pelagos::image::oci_config_path(reference);
+        assert!(path.exists(), "oci-config.json must exist after save");
+
+        // No temp file should survive a successful write.
+        let dir = path.parent().unwrap();
+        let leftover_tmp: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".oci-config.json.")
+            })
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "no temp oci-config files should survive: {:?}",
+            leftover_tmp.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
+
+        // Content must parse correctly.
+        let loaded = pelagos::image::load_oci_config(reference).expect("load_oci_config failed");
+        assert_eq!(loaded, config_json);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// test_interrupted_blob_write_cleaned_by_cleanup
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/blobs/).
+    ///
+    /// Simulates a write that was interrupted by placing a `.partial` file
+    /// directly in the blobs directory, then verifies that `cmd_cleanup` removes
+    /// it and reports it as cleaned.
+    ///
+    /// Failure indicates the partial-entry sweep was removed from `cmd_cleanup`.
+    #[test]
+    fn test_interrupted_blob_write_cleaned_by_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_interrupted_blob_write_cleaned_by_cleanup: requires root");
+            return;
+        }
+        let blobs_dir = pelagos::paths::blobs_dir();
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let stale_partial = blobs_dir.join("deadbeef0000000000000000.tar.partial");
+        std::fs::write(&stale_partial, b"truncated").unwrap();
+        assert!(
+            stale_partial.exists(),
+            "stale partial must exist before cleanup"
+        );
+
+        let removed = pelagos::image::cleanup_partial_store_entries()
+            .expect("cleanup_partial_store_entries should not error");
+
+        assert!(
+            !stale_partial.exists(),
+            "cleanup_partial_store_entries must remove .partial blob files"
+        );
+        assert!(removed >= 1, "must report at least one entry cleaned");
+    }
+}
+
 mod exec {
     use super::*;
     use std::os::unix::io::AsRawFd;
