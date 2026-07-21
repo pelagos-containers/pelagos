@@ -32,6 +32,10 @@ pub fn cmd_cleanup() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Stale hosts temp dirs: /run/pelagos/hosts-{pid}-{n}/
     cleaned += cleanup_dir_pattern("/run/pelagos", "hosts-")?;
 
+    // 5. Stale partial entries in the image store left by interrupted pulls or
+    //    builds: <layers_dir>/*.partial/ dirs and <blobs_dir>/*.partial files.
+    cleaned += pelagos::image::cleanup_partial_store_entries()?;
+
     if cleaned == 0 {
         println!("No stale resources found.");
     } else {

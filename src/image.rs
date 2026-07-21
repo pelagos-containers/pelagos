@@ -259,12 +259,17 @@ pub fn blob_exists(digest: &str) -> bool {
 }
 
 /// Persist the raw compressed blob bytes for the given digest.
+///
+/// Writes atomically via a `.partial` sibling + rename so that an interrupted
+/// write never leaves a truncated blob that `blob_exists()` would treat as valid.
 pub fn save_blob(digest: &str, data: &[u8]) -> io::Result<()> {
     let path = crate::paths::blob_path(digest);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, data)
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, data)?;
+    std::fs::rename(&partial, &path)
 }
 
 /// Load the raw compressed blob bytes for the given digest.
@@ -275,8 +280,13 @@ pub fn load_blob(digest: &str) -> io::Result<Vec<u8>> {
 /// Persist the uncompressed-tar diff_id for the given blob digest.
 ///
 /// The diff_id is the `"sha256:<hex>"` of the raw (uncompressed) tar stream.
+/// Written atomically via a `.partial` sibling + rename for consistency with
+/// the other blob-store writers.
 pub fn save_blob_diffid(blob_digest: &str, diff_id: &str) -> io::Result<()> {
-    std::fs::write(crate::paths::blob_diffid_path(blob_digest), diff_id)
+    let path = crate::paths::blob_diffid_path(blob_digest);
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, diff_id)?;
+    std::fs::rename(&partial, &path)
 }
 
 /// Load the uncompressed-tar diff_id for the given blob digest.
@@ -292,14 +302,32 @@ pub fn oci_config_path(reference: &str) -> std::path::PathBuf {
 }
 
 /// Save raw OCI config JSON to the image directory.
+///
+/// Uses the same tempfile-in-dir + persist pattern as `save_image` so that an
+/// interrupted write never leaves a truncated JSON file that parses as an error.
 pub fn save_oci_config(reference: &str, config_json: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
     let path = oci_config_path(reference);
-    if let Err(e) = std::fs::write(&path, config_json) {
-        if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("oci_config_path has no parent"))?;
+    create_store_dir(dir)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".oci-config.json.")
+        .tempfile_in(dir)?;
+    tmp.as_file().write_all(config_json.as_bytes())?;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
+    if let Err(e) = tmp.persist(&path) {
+        if matches!(
+            e.error.raw_os_error(),
+            Some(libc::EPERM) | Some(libc::EACCES)
+        ) {
+            let tmp_path = e.file.path().to_path_buf();
             let _ = std::fs::remove_file(&path);
-            std::fs::write(&path, config_json)?;
+            std::fs::rename(&tmp_path, &path)?;
         } else {
-            return Err(e);
+            return Err(io::Error::other(e.error.to_string()));
         }
     }
     Ok(())
@@ -679,6 +707,37 @@ pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf> {
         .map(|d| layer_dir(d))
         .filter(|p| seen.insert(p.clone()))
         .collect()
+}
+
+/// Remove any `*.partial` files or directories left in the layer and blob stores
+/// by interrupted extractions or writes. Returns the number of entries removed.
+///
+/// Called by `pelagos cleanup`. Safe to call concurrently with pulls/builds: a
+/// writer whose in-progress `.partial` is swept simply re-creates it on the next
+/// iteration.
+pub fn cleanup_partial_store_entries() -> io::Result<u32> {
+    let mut count = 0u32;
+    for dir in [crate::paths::layers_dir(), crate::paths::blobs_dir()] {
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            if !entry.file_name().to_string_lossy().ends_with(".partial") {
+                continue;
+            }
+            let path = entry.path();
+            let removed = if path.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
+            if removed {
+                log::info!("removed partial store entry: {}", path.display());
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

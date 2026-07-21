@@ -1909,11 +1909,17 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     image::save_blob(&digest, &tar_gz_bytes)?;
     image::save_blob_diffid(&digest, &diff_id)?;
 
-    // Copy directory contents to the layer store with group-writable permissions
-    // so that pelagos-group members can remove root-created layers.
+    // Copy directory contents to the layer store atomically: stage into a
+    // `.partial` sibling, then rename — so an interrupted build never leaves
+    // a partial directory that `layer_exists()` would treat as complete.
     let dest = image::layer_dir(&digest);
-    image::create_store_dir(&dest)?;
-    copy_dir_recursive(source_dir, &dest)?;
+    let partial = dest.with_extension("partial");
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial)?;
+    }
+    image::create_store_dir(&partial)?;
+    copy_dir_recursive(source_dir, &partial)?;
+    std::fs::rename(&partial, &dest)?;
 
     log::debug!("created layer {}", &hex[..12]);
     Ok(digest)
