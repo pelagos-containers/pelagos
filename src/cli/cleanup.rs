@@ -36,6 +36,10 @@ pub fn cmd_cleanup() -> Result<(), Box<dyn std::error::Error>> {
     //    builds: <layers_dir>/*.partial/ dirs and <blobs_dir>/*.partial files.
     cleaned += pelagos::image::cleanup_partial_store_entries()?;
 
+    // 6. Incomplete layer directories: rename(2) committed but data was lost in
+    //    the page cache (power loss). These lack the .pelagos_complete sentinel.
+    cleaned += pelagos::image::cleanup_incomplete_layers()?;
+
     if cleaned == 0 {
         println!("No stale resources found.");
     } else {
