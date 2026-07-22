@@ -31442,3 +31442,304 @@ mod issue_461_sandbox_zombie_liveness {
         );
     }
 }
+
+mod image_layer_integrity {
+    use super::*;
+    use pelagos::image;
+
+    /// Build a minimal single-file tar.gz that `extract_layer` can unpack.
+    fn make_fake_layer_tar_gz() -> tempfile::NamedTempFile {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+
+        let gz_enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(tmp.path()).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut ar = tar::Builder::new(gz_enc);
+        let data = b"hello from fake layer\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("hello.txt").unwrap();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        ar.append(&header, data.as_slice()).unwrap();
+        ar.finish().unwrap();
+
+        tmp
+    }
+
+    /// test_layer_complete_marker_written_on_extract
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/layers/).
+    ///
+    /// Verifies that `extract_layer` writes a `.pelagos_complete` sentinel file
+    /// inside the layer directory after a successful extraction.  The sentinel is
+    /// the durability proof that file data reached stable storage; its absence
+    /// signals a corrupt (power-loss-interrupted) layer.
+    ///
+    /// Failure indicates the sentinel was removed from `extract_layer` and
+    /// `layer_exists()` can no longer distinguish complete from corrupt layers.
+    #[test]
+    fn test_layer_complete_marker_written_on_extract() {
+        if !is_root() {
+            eprintln!("SKIP test_layer_complete_marker_written_on_extract: requires root");
+            return;
+        }
+
+        let digest = "sha256:467integrity0001marker00000000000000000000000000000000000000000000";
+        let ldir = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&ldir);
+
+        let tar = make_fake_layer_tar_gz();
+        image::extract_layer(
+            digest,
+            tar.path(),
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("extract_layer should succeed");
+
+        assert!(ldir.exists(), "layer dir must exist after extraction");
+        assert!(
+            ldir.join(".pelagos_complete").exists(),
+            ".pelagos_complete sentinel must be present after successful extraction"
+        );
+        assert!(
+            image::layer_exists(digest),
+            "layer_exists() must return true when sentinel is present"
+        );
+
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    /// test_layer_missing_marker_causes_re_extraction
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/layers/).
+    ///
+    /// Simulates a power-loss scenario: the layer directory exists (the rename
+    /// committed) but the `.pelagos_complete` sentinel is absent (file data was
+    /// still in the page cache at the moment of power loss).
+    ///
+    /// Verifies that:
+    ///  - `layer_exists()` returns `false` when the sentinel is missing
+    ///  - A subsequent `extract_layer()` call detects the missing sentinel,
+    ///    removes the corrupt directory, and re-extracts cleanly
+    ///  - The sentinel is present after the re-extraction
+    ///
+    /// Failure means a corrupt layer survives re-pull attempts and the container
+    /// will always fail with ENOENT (the bug filed as #467).
+    #[test]
+    fn test_layer_missing_marker_causes_re_extraction() {
+        if !is_root() {
+            eprintln!("SKIP test_layer_missing_marker_causes_re_extraction: requires root");
+            return;
+        }
+
+        let digest = "sha256:467integrity0002reextract0000000000000000000000000000000000000000";
+        let ldir = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&ldir);
+
+        // First extraction — produces a complete layer with the sentinel.
+        let tar = make_fake_layer_tar_gz();
+        image::extract_layer(
+            digest,
+            tar.path(),
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("first extract should succeed");
+        assert!(
+            ldir.join(".pelagos_complete").exists(),
+            "sentinel must exist after first extraction"
+        );
+
+        // Simulate corruption: remove the sentinel (as if power cut after rename).
+        std::fs::remove_file(ldir.join(".pelagos_complete"))
+            .expect("remove sentinel to simulate corruption");
+
+        assert!(
+            !image::layer_exists(digest),
+            "layer_exists() must return false when sentinel is missing"
+        );
+        assert!(ldir.exists(), "corrupt dir itself still exists on disk");
+
+        // Re-extract — extract_layer must detect the missing sentinel and re-extract.
+        let tar2 = make_fake_layer_tar_gz();
+        image::extract_layer(
+            digest,
+            tar2.path(),
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("re-extraction of corrupt layer should succeed");
+
+        assert!(
+            ldir.join(".pelagos_complete").exists(),
+            "sentinel must be present after re-extraction"
+        );
+        assert!(
+            image::layer_exists(digest),
+            "layer_exists() must return true after re-extraction"
+        );
+
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    /// test_image_rm_prunes_unreferenced_layers
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Verifies that `remove_image` deletes layer directories that are no longer
+    /// referenced by any remaining image manifest.  Before this fix (#470),
+    /// `remove_image` only removed the manifest directory; corrupt or stale layer
+    /// directories survived image removal and blocked re-pull from cleaning them.
+    ///
+    /// Failure indicates the layer GC was removed from `remove_image`, meaning
+    /// `pelagos image rm` + re-pull will not recover a corrupt layer.
+    #[test]
+    fn test_image_rm_prunes_unreferenced_layers() {
+        if !is_root() {
+            eprintln!("SKIP test_image_rm_prunes_unreferenced_layers: requires root");
+            return;
+        }
+
+        let reference = "pelagos-test-rm-prunes-layers:latest";
+        let digest = "sha256:470integrity0001rmprune000000000000000000000000000000000000000000";
+        let ldir = image::layer_dir(digest);
+
+        // Make sure neither the image nor the layer exists from a prior run.
+        let _ = image::remove_image(reference);
+        let _ = std::fs::remove_dir_all(&ldir);
+
+        // Create a fake complete layer directory.
+        std::fs::create_dir_all(&ldir).unwrap();
+        std::fs::File::create(ldir.join(".pelagos_complete")).unwrap();
+
+        // Register a manifest that references this layer.
+        let manifest = image::ImageManifest {
+            reference: reference.to_string(),
+            digest: "sha256:fake_manifest_digest".to_string(),
+            layers: vec![digest.to_string()],
+            layer_types: vec!["application/vnd.oci.image.layer.v1.tar+gzip".to_string()],
+            config: image::ImageConfig::default(),
+        };
+        image::save_image(&manifest).expect("save_image");
+
+        assert!(ldir.exists(), "layer dir must exist before rm");
+        assert!(
+            image::layer_exists(digest),
+            "layer_exists() must return true before rm"
+        );
+
+        // Remove the image — this should also GC the now-unreferenced layer.
+        image::remove_image(reference).expect("remove_image should succeed");
+
+        assert!(
+            !ldir.exists(),
+            "layer dir must be pruned after the last referencing image is removed"
+        );
+
+        // Clean up in case the assertion failed.
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    /// test_image_rm_keeps_shared_layers
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Verifies that `remove_image` does NOT prune a layer that is still
+    /// referenced by another image.  Layer sharing is a core property of the
+    /// content-addressable store; removing a shared layer would break the other
+    /// image.
+    ///
+    /// Failure means `remove_image` over-prunes and breaks images that share layers
+    /// (common in multi-stage builds or related image families).
+    #[test]
+    fn test_image_rm_keeps_shared_layers() {
+        if !is_root() {
+            eprintln!("SKIP test_image_rm_keeps_shared_layers: requires root");
+            return;
+        }
+
+        let ref_a = "pelagos-test-rm-shared-a:latest";
+        let ref_b = "pelagos-test-rm-shared-b:latest";
+        let shared_digest =
+            "sha256:470integrity0002shared0000000000000000000000000000000000000000000";
+        let ldir = image::layer_dir(shared_digest);
+
+        let _ = image::remove_image(ref_a);
+        let _ = image::remove_image(ref_b);
+        let _ = std::fs::remove_dir_all(&ldir);
+
+        std::fs::create_dir_all(&ldir).unwrap();
+        std::fs::File::create(ldir.join(".pelagos_complete")).unwrap();
+
+        let mk = |r: &str| image::ImageManifest {
+            reference: r.to_string(),
+            digest: format!("sha256:fake_{}", r),
+            layers: vec![shared_digest.to_string()],
+            layer_types: vec!["application/vnd.oci.image.layer.v1.tar+gzip".to_string()],
+            config: image::ImageConfig::default(),
+        };
+        image::save_image(&mk(ref_a)).expect("save image A");
+        image::save_image(&mk(ref_b)).expect("save image B");
+
+        // Remove only image A — the shared layer must survive because B still needs it.
+        image::remove_image(ref_a).expect("remove image A");
+
+        assert!(
+            ldir.exists(),
+            "shared layer dir must NOT be pruned while image B still references it"
+        );
+        assert!(
+            image::layer_exists(shared_digest),
+            "layer_exists() must still return true for the shared layer"
+        );
+
+        // Now remove image B — the layer should be pruned.
+        image::remove_image(ref_b).expect("remove image B");
+
+        assert!(
+            !ldir.exists(),
+            "layer dir must be pruned after the last referencing image (B) is removed"
+        );
+    }
+
+    /// test_cleanup_removes_incomplete_layer_dirs
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/layers/).
+    ///
+    /// Verifies that `cleanup_incomplete_layers()` removes layer directories that
+    /// are present on disk but lack the `.pelagos_complete` sentinel and are not
+    /// referenced by any stored image.  This is the recovery path for layers whose
+    /// rename committed but whose data was lost in the page cache at power loss.
+    ///
+    /// Failure indicates the incomplete-layer sweep was removed from the cleanup
+    /// path; corrupt layers would then accumulate on disk without a way to reclaim
+    /// the space or trigger re-extraction.
+    #[test]
+    fn test_cleanup_removes_incomplete_layer_dirs() {
+        if !is_root() {
+            eprintln!("SKIP test_cleanup_removes_incomplete_layer_dirs: requires root");
+            return;
+        }
+
+        let digest_hex = "467integrity0003cleanup00000000000000000000000000000000000000000";
+        let ldir = pelagos::paths::layers_dir().join(digest_hex);
+        let _ = std::fs::remove_dir_all(&ldir);
+
+        // Create a layer dir WITHOUT the completion sentinel (simulating corruption).
+        std::fs::create_dir_all(&ldir).unwrap();
+        assert!(ldir.exists(), "fake corrupt dir must exist before cleanup");
+        assert!(
+            !ldir.join(".pelagos_complete").exists(),
+            "no sentinel — simulates power-loss corruption"
+        );
+
+        let removed =
+            image::cleanup_incomplete_layers().expect("cleanup_incomplete_layers should not error");
+
+        assert!(
+            !ldir.exists(),
+            "cleanup_incomplete_layers must remove dirs without .pelagos_complete"
+        );
+        assert!(removed >= 1, "must report at least one entry cleaned");
+    }
+}

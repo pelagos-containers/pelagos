@@ -5773,3 +5773,45 @@ calls `cleanup_partial_store_entries()`, and asserts the file is gone and the re
 is ≥ 1. **Why it matters:** the cleanup helper must sweep all partial entries from both
 the blob and layer stores so that orphaned interrupted writes don't accumulate on disk.
 Fails if the partial-entry sweep is removed from the cleanup path.
+
+## `image_layer_integrity::test_layer_complete_marker_written_on_extract`
+**Requires root** (writes to `/var/lib/pelagos/layers/`). Calls `extract_layer` with a
+synthetic tar.gz, then asserts `.pelagos_complete` exists inside the extracted layer
+directory and `layer_exists()` returns `true`. **Why it matters:** the sentinel is the only
+way to distinguish a fully-written layer from one whose `rename(2)` committed but whose
+file data was still in the page cache at power loss. If the sentinel is absent,
+`layer_exists()` returns `false` and the next pull will re-extract cleanly instead of
+silently reusing a corrupt layer (the bug filed as #467).
+
+## `image_layer_integrity::test_layer_missing_marker_causes_re_extraction`
+**Requires root** (writes to `/var/lib/pelagos/layers/`). Extracts a layer, removes the
+`.pelagos_complete` sentinel to simulate a power-loss-corrupted layer, then calls
+`extract_layer` again and asserts: (a) `layer_exists()` returns `false` when the sentinel
+is absent, (b) `extract_layer` detects the missing sentinel, deletes the corrupt directory,
+and re-extracts cleanly, (c) the sentinel is present after re-extraction. **Why it
+matters:** without this re-extraction logic the re-pull path skips the layer (because the
+directory exists) and the container always fails with ENOENT (#467).
+
+## `image_layer_integrity::test_image_rm_prunes_unreferenced_layers`
+**Requires root** (writes to `/var/lib/pelagos/`). Saves a synthetic image manifest
+referencing a fake layer directory, calls `remove_image`, and asserts the layer directory
+was deleted. **Why it matters:** before #470 was fixed, `remove_image` only removed the
+manifest directory; the layer directory survived, so a corrupt layer persisted through
+`pelagos image rm` + re-pull — the re-pull found the directory and cached it, never
+re-extracting.
+
+## `image_layer_integrity::test_image_rm_keeps_shared_layers`
+**Requires root** (writes to `/var/lib/pelagos/`). Saves two image manifests that share
+one layer, removes image A, and asserts the shared layer is NOT pruned. Then removes image
+B and asserts the layer IS pruned. **Why it matters:** layer sharing is a core property of
+the content-addressable store; over-pruning on `image rm` would silently break any image
+that shares a layer with the deleted one.
+
+## `image_layer_integrity::test_cleanup_removes_incomplete_layer_dirs`
+**Requires root** (writes to `/var/lib/pelagos/layers/`). Creates a layer directory
+without the `.pelagos_complete` sentinel (simulating a power-loss-interrupted extraction
+where the rename committed but the data never reached disk), calls
+`cleanup_incomplete_layers()`, and asserts the directory is removed and the return count
+is ≥ 1. **Why it matters:** incomplete layer directories accumulate on disk and are
+invisible to `layer_exists()`, so the disk space is never reclaimed without an explicit
+sweep. This cleanup is called by `pelagos cleanup`.

@@ -243,9 +243,24 @@ pub fn layer_dir(digest: &str) -> PathBuf {
     crate::paths::layers_dir().join(hex)
 }
 
-/// Check whether a layer has already been extracted.
+/// Sentinel file written as the last step of a successful `extract_layer()`.
+///
+/// Its presence proves that the directory rename committed **and** the contents
+/// were flushed to stable storage (the file is `sync_all()`-ed before the
+/// directory rename completes). A directory that lacks the sentinel was left by
+/// an interrupted extraction (e.g. a power cut after `rename(2)` but before
+/// the write-back completed) and must be treated as corrupt.
+const LAYER_COMPLETE_MARKER: &str = ".pelagos_complete";
+
+/// Check whether a layer has already been fully extracted.
+///
+/// Returns `true` only when both the directory **and** the `LAYER_COMPLETE_MARKER`
+/// sentinel are present. A directory without the sentinel was left by an
+/// interrupted extraction and is treated as if it does not exist so that the next
+/// pull re-extracts it cleanly.
 pub fn layer_exists(digest: &str) -> bool {
-    layer_dir(digest).is_dir()
+    let dir = layer_dir(digest);
+    dir.is_dir() && dir.join(LAYER_COMPLETE_MARKER).exists()
 }
 
 /// Return the raw blob path for the given digest.
@@ -369,12 +384,23 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
     // never inside the layer dir (which becomes a container rootfs layer).
     let rootless_marker = dest.with_extension("rootless");
     if dest.is_dir() {
-        if rootless || !rootless_marker.exists() {
-            return Ok(dest); // rootless reuse, or root reusing a root-extracted layer
+        let complete = dest.join(LAYER_COMPLETE_MARKER);
+        if !complete.exists() {
+            // Directory exists but the completion marker is absent: the previous
+            // extraction was interrupted (power loss after rename but before the
+            // sentinel was synced). Delete and re-extract.
+            log::warn!(
+                "layer {} has no completion marker; deleting and re-extracting",
+                digest.get(..19).unwrap_or(digest)
+            );
+            std::fs::remove_dir_all(&dest)?;
+        } else if rootless || !rootless_marker.exists() {
+            return Ok(dest); // fully extracted; rootless reuse or root-extracted layer
+        } else {
+            // Root extraction over a rootless-degraded layer: re-extract from scratch.
+            std::fs::remove_dir_all(&dest)?;
+            let _ = std::fs::remove_file(&rootless_marker);
         }
-        // Root extraction over a rootless-degraded layer: re-extract from scratch.
-        std::fs::remove_dir_all(&dest)?;
-        let _ = std::fs::remove_file(&rootless_marker);
     }
 
     // Extract to a temporary sibling, then rename atomically.
@@ -470,6 +496,15 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&partial, &dest)?;
 
+    // Write the completion sentinel and fsync it so that it survives a power
+    // cut. Without this, the directory rename can be journaled while the file
+    // data (and the sentinel itself) are still in the page cache — leaving a
+    // directory that looks valid but is empty or corrupt.
+    {
+        let f = std::fs::File::create(dest.join(LAYER_COMPLETE_MARKER))?;
+        f.sync_all()?;
+    }
+
     // Record that this layer was extracted rootless (setuid/setgid bits stripped),
     // so a later ROOT extraction re-extracts it with full fidelity (#384).
     if rootless {
@@ -492,7 +527,14 @@ pub fn extract_wasm_layer(digest: &str, wasm_blob_path: &std::path::Path) -> io:
     ensure_image_dirs()?;
     let dest = layer_dir(digest);
     if dest.is_dir() {
-        return Ok(dest);
+        if dest.join(LAYER_COMPLETE_MARKER).exists() {
+            return Ok(dest);
+        }
+        log::warn!(
+            "wasm layer {} has no completion marker; re-extracting",
+            digest.get(..19).unwrap_or(digest)
+        );
+        std::fs::remove_dir_all(&dest)?;
     }
 
     let partial = dest.with_extension("partial");
@@ -505,6 +547,11 @@ pub fn extract_wasm_layer(digest: &str, wasm_blob_path: &std::path::Path) -> io:
 
     std::fs::create_dir_all(dest.parent().unwrap())?;
     std::fs::rename(&partial, &dest)?;
+
+    {
+        let f = std::fs::File::create(dest.join(LAYER_COMPLETE_MARKER))?;
+        f.sync_all()?;
+    }
 
     Ok(dest)
 }
@@ -684,14 +731,55 @@ pub fn list_images() -> Vec<ImageManifest> {
     manifests
 }
 
-/// Remove an image and its metadata (does not remove shared layers).
+/// Remove an image manifest and prune any layers that are no longer referenced
+/// by any other stored image.
+///
+/// Layers are shared across images — a layer is pruned only when this is the
+/// last manifest that references it. Blobs (compressed `.tar.gz` files) and
+/// their diff-id sidecars are pruned alongside the layer directory when present.
 pub fn remove_image(reference: &str) -> io::Result<()> {
     let dir = image_dir(reference);
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir)
-    } else {
-        Err(io::Error::other(format!("image '{}' not found", reference)))
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!("image '{}' not found", reference)));
     }
+    // Load manifest before removing the dir so we know which layers to GC.
+    let manifest = load_image(reference).ok();
+    std::fs::remove_dir_all(&dir)?;
+
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+
+    // Collect layers still referenced by the remaining images.
+    let still_referenced: std::collections::HashSet<String> = list_images()
+        .into_iter()
+        .flat_map(|m| m.layers.into_iter())
+        .collect();
+
+    for digest in &manifest.layers {
+        if still_referenced.contains(digest) {
+            continue;
+        }
+        let ldir = layer_dir(digest);
+        if ldir.is_dir() {
+            log::info!(
+                "pruning unreferenced layer {}",
+                digest.get(..19).unwrap_or(digest)
+            );
+            let _ = std::fs::remove_dir_all(&ldir);
+            let _ = std::fs::remove_file(ldir.with_extension("rootless"));
+        }
+        // Prune blobs and diff-id sidecars if they were persisted.
+        let blob = crate::paths::blob_path(digest);
+        if blob.exists() {
+            let _ = std::fs::remove_file(&blob);
+        }
+        let blob_diffid = crate::paths::blob_diffid_path(digest);
+        if blob_diffid.exists() {
+            let _ = std::fs::remove_file(&blob_diffid);
+        }
+    }
+    Ok(())
 }
 
 /// Return layer directories in top-first order (as overlayfs expects for `lowerdir=`).
@@ -735,6 +823,60 @@ pub fn cleanup_partial_store_entries() -> io::Result<u32> {
                 log::info!("removed partial store entry: {}", path.display());
                 count += 1;
             }
+        }
+    }
+    Ok(count)
+}
+
+/// Remove layer directories that are missing the `LAYER_COMPLETE_MARKER` sentinel.
+///
+/// Such directories were left by an extraction that was interrupted after the
+/// `rename(2)` committed to the journal but before the file data was flushed to
+/// disk (e.g. a power cut).  `layer_exists()` already returns `false` for these
+/// so the next pull will re-extract them — this function just reclaims the disk
+/// space eagerly.
+///
+/// Only removes directories that are NOT referenced by any stored image manifest,
+/// to avoid racing with a pull that is mid-extraction.  Returns the number of
+/// directories removed.
+pub fn cleanup_incomplete_layers() -> io::Result<u32> {
+    let layers_dir = crate::paths::layers_dir();
+    if !layers_dir.is_dir() {
+        return Ok(0);
+    }
+
+    // Build the set of digests (hex, no sha256: prefix) that are still
+    // referenced by at least one stored image so we never remove an in-progress
+    // or legitimately markerless (pre-#467) layer that a live pull depends on.
+    let referenced: std::collections::HashSet<String> = list_images()
+        .into_iter()
+        .flat_map(|m| m.layers.into_iter())
+        .map(|d| d.strip_prefix("sha256:").unwrap_or(&d).to_string())
+        .collect();
+
+    let mut count = 0u32;
+    for entry in std::fs::read_dir(&layers_dir)?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skip anything that isn't a plain hex digest directory.
+        if name.contains('.') {
+            continue;
+        }
+        if path.join(LAYER_COMPLETE_MARKER).exists() {
+            continue; // complete; leave it alone
+        }
+        if referenced.contains(name.as_ref()) {
+            // Still referenced — could be an in-progress pull from before this
+            // feature was added. Leave it; the next pull will re-extract if needed.
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            log::info!("removed incomplete layer dir: {}", path.display());
+            count += 1;
         }
     }
     Ok(count)
