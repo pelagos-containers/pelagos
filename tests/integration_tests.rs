@@ -31743,3 +31743,183 @@ mod image_layer_integrity {
         assert!(removed >= 1, "must report at least one entry cleaned");
     }
 }
+
+mod issue_472_watcher_orphan {
+    use super::*;
+
+    /// test_pdeathsig_kills_container_when_parent_dies
+    ///
+    /// Requires: root (spawns a real container via pelagos::container::Command).
+    ///
+    /// Verifies that a container process is killed when its parent (the detached
+    /// watcher process) exits unexpectedly, via PR_SET_PDEATHSIG set in the
+    /// pre_exec hook.
+    ///
+    /// Mechanism: fork a child that spawns the container and immediately exits.
+    /// Because Rust's Command::spawn() blocks the parent on the pre_exec error
+    /// pipe until the grandchild has exec'd (O_CLOEXEC closes the pipe on exec),
+    /// PDEATHSIG is guaranteed to be in place before spawn() returns — so there
+    /// is no race between the watcher exiting and the child setting PDEATHSIG.
+    ///
+    /// Failure indicates PR_SET_PDEATHSIG was removed from the pre_exec hook and
+    /// containers will outlive their watchers after an upgrade restart (#472).
+    #[test]
+    fn test_pdeathsig_kills_container_when_parent_dies() {
+        if !is_root() {
+            eprintln!("SKIP test_pdeathsig_kills_container_when_parent_dies: requires root");
+            return;
+        }
+
+        let pid_file = "/tmp/pdeathsig_test_container_pid_472";
+        let _ = std::fs::remove_file(pid_file);
+
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+
+        if child_pid == 0 {
+            // Child ("watcher"): spawn a long-running sleep via pelagos::Command
+            // (no chroot — we just need something that keeps running).  spawn()
+            // blocks until the grandchild has exec'd, so PDEATHSIG is already
+            // installed before we write the PID and exit.
+            let spawned = Command::new("/bin/sleep")
+                .args(&["60"])
+                .spawn()
+                .expect("spawn sleep in watcher child");
+
+            let pid = spawned.pid();
+            std::fs::write(pid_file, pid.to_string()).expect("write pid file");
+
+            // Forget the Child without waiting (simulates watcher crash).
+            std::mem::forget(spawned);
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: wait for the "watcher" child to exit.
+        let mut status = 0i32;
+        unsafe { libc::waitpid(child_pid, &mut status, 0) };
+
+        // Poll for the PID file written by the child.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let container_pid: i32 = loop {
+            if let Ok(s) = std::fs::read_to_string(pid_file) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    break p;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for container PID file");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let _ = std::fs::remove_file(pid_file);
+
+        // Poll until the container process disappears (PDEATHSIG fired) or 2s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut alive = true;
+        while std::time::Instant::now() < deadline {
+            alive = unsafe { libc::kill(container_pid, 0) == 0 };
+            if !alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            !alive,
+            "container process {} must have been killed by PDEATHSIG when              its parent (the watcher) exited, but it is still running after 2s",
+            container_pid
+        );
+    }
+
+    /// test_kill_orphaned_containers_startup_scan
+    ///
+    /// Requires: root (writes to /run/pelagos/containers/ and sends signals).
+    ///
+    /// Simulates the startup orphan-scan path: places a synthetic state.json
+    /// with status=running, a dead watcher_pid, and a live container pid (a real
+    /// sleeping process), then starts pelagos-cri briefly.  The scan runs during
+    /// startup (before the gRPC socket accepts connections), so the orphan must
+    /// be dead after the CRI has had a moment to start.
+    ///
+    /// Failure indicates the startup scan was removed from pelagos-cri; orphaned
+    /// container processes from a previous CRI lifetime would survive restarts
+    /// and hold ports, causing CrashLoopBackOff (#472).
+    #[test]
+    fn test_kill_orphaned_containers_startup_scan() {
+        if !is_root() {
+            eprintln!("SKIP test_kill_orphaned_containers_startup_scan: requires root");
+            return;
+        }
+
+        // Start a real process to act as the "orphaned container".
+        let mut orphan = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn orphan sleep");
+        let orphan_pid = orphan.id() as i32;
+
+        // Obtain a guaranteed-dead watcher PID by spawning and reaping a dummy.
+        let dead_watcher_pid = {
+            let mut dummy = std::process::Command::new("/bin/true")
+                .spawn()
+                .expect("spawn dummy");
+            let dp = dummy.id() as i32;
+            dummy.wait().expect("wait dummy");
+            dp
+        };
+
+        // Write a synthetic state.json for the "orphaned" container.
+        let container_name = format!("test-orphan-472-{}", orphan_pid);
+        let dir = format!("/run/pelagos/containers/{}", container_name);
+        std::fs::create_dir_all(&dir).expect("create container dir");
+        let state = format!(
+            r#"{{"name":"{}","status":"running","pid":{},"watcher_pid":{},"started_at":"2026-01-01T00:00:00Z","command":["sleep","60"]}}"#,
+            container_name, orphan_pid, dead_watcher_pid
+        );
+        std::fs::write(format!("{}/state.json", dir), &state).expect("write state.json");
+
+        // Find the pelagos-cri binary.
+        let cri_bin =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/pelagos-cri");
+        assert!(
+            cri_bin.exists(),
+            "pelagos-cri binary not found at {:?}; run cargo build first",
+            cri_bin
+        );
+
+        // Start pelagos-cri on a temp socket.  The startup orphan scan runs
+        // before the gRPC listener accepts connections; we just need to let it
+        // get through the startup path.
+        let sock = format!("/tmp/test-cri-472-{}.sock", orphan_pid);
+        let mut cri = std::process::Command::new(&cri_bin)
+            .args(["--socket", &sock, "--streaming-addr", "127.0.0.1:0"])
+            .spawn()
+            .expect("spawn pelagos-cri");
+
+        // Give the CRI time to run the startup scan.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        cri.kill().ok();
+        cri.wait().ok();
+        let _ = std::fs::remove_file(&sock);
+
+        // Reap the orphan now so we can observe its exit status (it may already
+        // be a zombie if the scan sent SIGKILL).  Resources (ports, file
+        // descriptors) are released on process exit, not on reap, so a zombie
+        // already represents a successfully-killed process.
+        let orphan_exit = orphan.wait().expect("wait orphan");
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The orphan must have exited (either killed by SIGKILL from the scan,
+        // or by our own orphan.kill() above — but we only killed it AFTER wait,
+        // so if it exited by then it was the scan that did it).
+        assert!(
+            !orphan_exit.success(),
+            "orphaned container process {} must have been killed by the CRI \
+             startup scan (non-zero exit), but it exited successfully — \
+             the scan may not have run or the wrong process was checked",
+            orphan_pid
+        );
+    }
+}

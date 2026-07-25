@@ -34,6 +34,69 @@ struct Args {
     streaming_addr: String,
 }
 
+/// Scan `/run/pelagos/containers/*/state.json` for containers that were
+/// `running` when the previous CRI instance died but whose watcher process is
+/// now gone.  Such orphans hold OS resources (bound ports, cgroup quota, netns)
+/// that block the next pod restart.
+///
+/// For each orphan found: send SIGKILL to the container process and log it.
+/// Runs synchronously before the gRPC server accepts connections so the kubelet
+/// never sees a pod fail to start because of an orphan from the last run (#472).
+fn kill_orphaned_containers() {
+    #[derive(serde::Deserialize)]
+    struct State {
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        pid: i32,
+        #[serde(default)]
+        watcher_pid: i32,
+    }
+
+    let containers_dir = std::path::Path::new("/run/pelagos/containers");
+    let Ok(entries) = std::fs::read_dir(containers_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let state_path = entry.path().join("state.json");
+        let Ok(data) = std::fs::read_to_string(&state_path) else {
+            continue;
+        };
+        let Ok(s) = serde_json::from_str::<State>(&data) else {
+            continue;
+        };
+        if s.status != "running" {
+            continue;
+        }
+        // watcher_pid == 0 means either a non-detached container or a very old
+        // state.json before this field was added — skip rather than guess.
+        if s.watcher_pid <= 0 {
+            continue;
+        }
+        let watcher_alive = unsafe { libc::kill(s.watcher_pid, 0) == 0 };
+        if watcher_alive {
+            continue;
+        }
+        // Watcher is dead. Check whether the container process is still running.
+        if s.pid <= 0 {
+            continue;
+        }
+        let container_alive = unsafe { libc::kill(s.pid, 0) == 0 };
+        if !container_alive {
+            continue;
+        }
+        log::warn!(
+            "orphaned container process {} (watcher {} dead) — sending SIGKILL (#472)",
+            s.pid,
+            s.watcher_pid
+        );
+        unsafe {
+            libc::kill(s.pid, libc::SIGKILL);
+        }
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -66,6 +129,14 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("pelagos-cri streaming server on {streaming_base_url}");
 
     let registry = streaming::new_registry();
+
+    // Before accepting any kubelet requests, kill container processes that were
+    // orphaned by a watcher that died during the previous CRI lifetime (e.g. a
+    // pelagos upgrade). If the watcher is gone but the container process is still
+    // running, it holds resources (ports, cgroup quota) that the next pod restart
+    // needs. PR_SET_PDEATHSIG (set since v0.65.62) prevents NEW orphans; this
+    // scan recovers PRE-EXISTING ones (#472).
+    kill_orphaned_containers();
 
     let app_state = AppState::new(args.pelagos_bin.clone());
 
