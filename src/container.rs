@@ -3980,6 +3980,16 @@ impl Command {
                 // runs shortly after and supersedes this; everywhere else pgid == pid.
                 libc::setpgid(0, 0);
 
+                // Pre-step: Ensure this process is killed when its parent (the
+                // detached watcher) dies for any reason, including SIGKILL (#472).
+                // Without this, the watcher dying (e.g. during a pelagos upgrade)
+                // leaves the container as an orphan reparented to PID 1 — it keeps
+                // running and holding ports, causing CrashLoopBackOff on restart.
+                //
+                // PR_SET_PDEATHSIG is preserved across execve() for non-setuid/
+                // setgid/file-cap binaries and is not affected by capability drops.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+
                 // Step 0: Add ourselves to the pre-created cgroup BEFORE unshare and
                 // exec, so all subsequent memory allocations (including the exec'd
                 // workload's) are charged to it and the OOM killer fires at the limit

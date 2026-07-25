@@ -70,6 +70,12 @@ struct PelagosContainerState {
     name: String,
     status: String,
     pid: i32,
+    /// PID of the detached watcher process (`pelagos run --detach`). Used by
+    /// the startup orphan scan to detect containers whose watcher died without
+    /// killing the container process (#472).
+    #[serde(default)]
+    #[allow(dead_code)]
+    watcher_pid: i32,
     #[allow(dead_code)]
     started_at: String,
     #[serde(default)]
