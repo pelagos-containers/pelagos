@@ -32025,16 +32025,29 @@ mod issue_474_stale_sandbox_kills_containers {
 
         // Start pelagos-cri — the startup stale-sandbox reap runs before the
         // gRPC listener accepts connections.
-        let cri_bin =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/pelagos-cri");
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cri_bin = manifest_dir.join("target/debug/pelagos-cri");
+        let pelagos_bin = manifest_dir.join("target/debug/pelagos");
         assert!(
             cri_bin.exists(),
             "pelagos-cri binary not found at {:?}; run cargo build first",
             cri_bin
         );
+        assert!(
+            pelagos_bin.exists(),
+            "pelagos binary not found at {:?}; run cargo build first",
+            pelagos_bin
+        );
         let sock = format!("/tmp/test-cri-474-{}.sock", unique);
         let mut cri = std::process::Command::new(&cri_bin)
-            .args(["--socket", &sock, "--streaming-addr", "127.0.0.1:0"])
+            .args([
+                "--socket",
+                &sock,
+                "--streaming-addr",
+                "127.0.0.1:0",
+                "--pelagos-bin",
+                pelagos_bin.to_str().unwrap(),
+            ])
             .spawn()
             .expect("spawn pelagos-cri");
 
