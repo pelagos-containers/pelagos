@@ -412,8 +412,14 @@ impl StateInner {
     }
 
     /// Reap sandboxes whose pause process is gone, taking their containers with
-    /// them; returns the reaped sandbox ids. `is_alive(pid)` reports whether a
-    /// pause pid is still live.
+    /// them. Returns `(stale_sandbox_ids, running_container_pelagos_names)`.
+    ///
+    /// `stale_sandbox_ids` — the IDs of sandboxes removed from state.
+    /// `running_container_pelagos_names` — the `pelagos_name`s of containers
+    /// that were in `Running` state inside those sandboxes. The caller **must**
+    /// kill those processes (e.g. via `pelagos stop --time 0 <name>`) after
+    /// returning, outside any held async lock. Processes in non-Running state
+    /// (Created, Exited) are omitted — they are harmless or already dead.
     ///
     /// A sandbox with a dead pause is unusable — its network namespace and
     /// processes are gone. Pelagos has always reaped these at startup; the same
@@ -425,9 +431,23 @@ impl StateInner {
     /// state: only Running sandboxes with a dead pause are phantoms; a NotReady
     /// sandbox whose pause is dead was explicitly stopped via StopPodSandbox and
     /// must survive until RemovePodSandbox is called (#438).
-    pub(crate) fn reap_stale_sandboxes<F: Fn(i32) -> bool>(&mut self, is_alive: F) -> Vec<String> {
+    pub(crate) fn reap_stale_sandboxes<F: Fn(i32) -> bool>(
+        &mut self,
+        is_alive: F,
+    ) -> (Vec<String>, Vec<String>) {
         let stale = stale_sandbox_ids(&self.sandboxes, is_alive);
+        let mut to_kill: Vec<String> = Vec::new();
         for sid in &stale {
+            // Collect Running container names before removing — caller will kill
+            // them outside the lock (#474). All container types are included:
+            // non-hostNetwork containers can hold file locks (BoltDB, SQLite),
+            // Unix sockets, and shared-memory segments that are just as
+            // disruptive as host port bindings (#457).
+            for c in self.containers.values() {
+                if &c.sandbox_id == sid && c.state == ContainerState::Running {
+                    to_kill.push(c.pelagos_name.clone());
+                }
+            }
             // Remove all containers that belonged to this sandbox.
             let stale_ctrs: Vec<String> = self
                 .containers
@@ -443,7 +463,7 @@ impl StateInner {
             remove_sandbox_file(sid);
             remove_pelagos_sandbox_state(sid);
         }
-        stale
+        (stale, to_kill)
     }
 }
 
@@ -480,8 +500,33 @@ impl AppState {
         // runtime) are purged, taking their containers with them, so the kubelet
         // recreates just those pods rather than every pod on the node.
         let total_before = inner.sandboxes.len();
-        let stale = inner
+        let (stale, stale_to_kill) = inner
             .reap_stale_sandboxes(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists());
+
+        // Kill container processes whose sandboxes were reaped (#474).
+        // We do this at startup before accepting any kubelet requests so that
+        // port bindings, file locks (BoltDB/SQLite), Unix sockets, and any
+        // other OS resources held by the orphaned processes are released before
+        // the kubelet tries to schedule replacements.
+        //
+        // `pelagos stop --time 0` uses cgroup.kill (kills watcher + container
+        // in one shot) with SIGKILL fallback — the same path as #457.  It is
+        // safe to call for all container types, not only hostNetwork ones.
+        for pelagos_name in &stale_to_kill {
+            let ok = std::process::Command::new(&inner.pelagos_bin)
+                .args(["stop", "--time", "0", pelagos_name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                log::warn!("startup: killed container {pelagos_name} (sandbox pause gone, #474)");
+            } else {
+                log::warn!(
+                    "startup: pelagos stop returned non-zero for {pelagos_name} \
+                     (may have already exited)"
+                );
+            }
+        }
 
         let adopted = total_before - stale.len();
         if adopted > 0 {
@@ -576,10 +621,21 @@ impl AppState {
     /// kubelet discovers it as an orphan and garbage-collects it, the path that
     /// deleted the host `/bin` (#347). Mirrors the startup reconciliation.
     pub async fn reconcile_stale_sandboxes(&self) {
-        let reaped = {
+        let (reaped, to_kill, bin) = {
             let mut st = self.inner.lock().await;
-            st.reap_stale_sandboxes(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
+            let (r, k) = st.reap_stale_sandboxes(|pid| {
+                std::path::Path::new(&format!("/proc/{}", pid)).exists()
+            });
+            (r, k, st.pelagos_bin.clone())
         };
+        // Kill outside the lock so we don't hold the async mutex during subprocess
+        // calls that could take tens of milliseconds (#474).
+        for pelagos_name in &to_kill {
+            let _ = std::process::Command::new(&bin)
+                .args(["stop", "--time", "0", pelagos_name])
+                .output();
+            log::warn!("reconcile: killed container {pelagos_name} (sandbox pause gone, #474)");
+        }
         for sid in &reaped {
             log::info!("reconcile: removed stale sandbox {sid} (pause process gone)");
         }
@@ -864,12 +920,21 @@ mod tests {
         };
 
         // pid 1001 (alive) is live; 1002 (dead) is gone.
-        let reaped = inner.reap_stale_sandboxes(|pid| pid == 1001);
+        let (reaped, to_kill) = inner.reap_stale_sandboxes(|pid| pid == 1001);
 
         assert_eq!(
             reaped,
             vec!["dead".to_string()],
             "only the dead sandbox reaped"
+        );
+        // Both containers of the dead sandbox were Running → both should be
+        // returned as names to kill (#474).
+        let mut kill_sorted = to_kill.clone();
+        kill_sorted.sort();
+        assert_eq!(
+            kill_sorted,
+            vec!["pcri-c-dead1".to_string(), "pcri-c-dead2".to_string()],
+            "running containers of the reaped sandbox must be returned for killing"
         );
         assert!(inner.sandboxes.contains_key("alive"), "live sandbox kept");
         assert!(
@@ -883,6 +948,42 @@ mod tests {
         assert!(
             !inner.containers.contains_key("c-dead1") && !inner.containers.contains_key("c-dead2"),
             "the phantom's containers must be removed with it"
+        );
+    }
+
+    /// #474: only Running containers of reaped sandboxes are returned in `to_kill`.
+    /// Exited/Created containers are harmless and must not be re-killed.
+    #[test]
+    fn reap_returns_only_running_containers_to_kill() {
+        fn container_with_state(id: &str, sandbox_id: &str, state: &str) -> CriContainer {
+            let json = format!(
+                r#"{{"id":"{id}","sandbox_id":"{sandbox_id}","pelagos_name":"pcri-{id}",
+                     "name":"c","image":"img","entrypoint":[],"args":[],"envs":[],
+                     "working_dir":"","mounts":[],"labels":{{}},"annotations":{{}},
+                     "created_at_ns":0,"started_at_ns":0,"finished_at_ns":0,
+                     "state":"{state}","exit_code":0}}"#
+            );
+            serde_json::from_str(&json).expect("valid container json")
+        }
+
+        let mut inner = StateInner {
+            sandboxes: map(vec![sandbox("dead", 1002)]),
+            containers: vec![
+                container_with_state("running", "dead", "Running"),
+                container_with_state("exited", "dead", "Exited"),
+                container_with_state("created", "dead", "Created"),
+            ]
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect(),
+            pelagos_bin: String::new(),
+        };
+
+        let (_reaped, to_kill) = inner.reap_stale_sandboxes(|_pid| false);
+        assert_eq!(
+            to_kill,
+            vec!["pcri-running".to_string()],
+            "only the Running container must appear in to_kill"
         );
     }
 }

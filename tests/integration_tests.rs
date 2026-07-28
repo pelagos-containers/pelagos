@@ -31923,3 +31923,142 @@ mod issue_472_watcher_orphan {
         );
     }
 }
+
+/// Tests for issue #474: stale sandbox removal must kill running container processes.
+///
+/// When pelagos-cri finds a sandbox whose pause process is gone (stale), it must
+/// kill all Running container processes belonging to that sandbox before discarding
+/// the state — not just remove the CRI metadata and leave them alive holding ports,
+/// file locks, and other OS resources.
+mod issue_474_stale_sandbox_kills_containers {
+    use super::*;
+
+    /// Verifies that when pelagos-cri starts and finds a Running sandbox whose pause
+    /// process is dead, it kills the container process associated with that sandbox.
+    ///
+    /// Requires root (pelagos-cri startup, pelagos stop).
+    ///
+    /// Setup:
+    ///   - Spawns a real `sleep 60` process as the stand-in "container process".
+    ///   - Obtains a guaranteed-dead PID for the fake sandbox pause process.
+    ///   - Writes a minimal pelagos container state.json so `pelagos stop` can find
+    ///     the PID via the Phase 3 direct-SIGKILL path (no cgroup needed).
+    ///   - Writes fake CRI sandbox + container JSON with state=Running.
+    ///   - Starts pelagos-cri, which runs the stale-sandbox reap at startup and
+    ///     calls `pelagos stop --time 0 <name>` for each Running container in a
+    ///     reaped sandbox.
+    ///
+    /// Asserts: the sleep process is dead after the CRI runs the startup reap.
+    #[test]
+    fn test_stale_sandbox_kills_running_container() {
+        if !is_root() {
+            eprintln!("SKIP test_stale_sandbox_kills_running_container: requires root");
+            return;
+        }
+
+        // Process to act as the "container process".
+        let mut orphan = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn orphan sleep");
+        let orphan_pid = orphan.id() as i32;
+
+        // A dead PID to use as the sandbox's pause_pid (triggers stale detection).
+        let dead_pause_pid = {
+            let mut dummy = std::process::Command::new("/bin/true")
+                .spawn()
+                .expect("spawn dummy");
+            let dp = dummy.id() as i32;
+            dummy.wait().expect("wait dummy");
+            dp
+        };
+
+        // The test process itself is alive — use it as watcher_pid so the #472
+        // startup scan (watcher dead → kill container) does NOT fire; only the
+        // #474 stale-sandbox path should fire.
+        let live_watcher_pid = std::process::id() as i32;
+
+        let unique = orphan_pid;
+        let pelagos_name = format!("test-stale-474-{}", unique);
+        let sandbox_id = format!("test-sbx-474-{}", unique);
+        let container_id = format!("test-ctr-474-{}", unique);
+
+        // Write pelagos container state so `pelagos stop --time 0` can kill the PID.
+        let pelagos_dir = format!("/run/pelagos/containers/{}", pelagos_name);
+        std::fs::create_dir_all(&pelagos_dir).expect("create pelagos container dir");
+        let pelagos_state = format!(
+            r#"{{"name":"{name}","rootfs":"","status":"running","pid":{pid},"watcher_pid":{wpid},"started_at":"2026-01-01T00:00:00Z","command":["sleep","60"]}}"#,
+            name = pelagos_name,
+            pid = orphan_pid,
+            wpid = live_watcher_pid,
+        );
+        std::fs::write(format!("{}/state.json", pelagos_dir), &pelagos_state)
+            .expect("write pelagos state.json");
+
+        // Write CRI sandbox state with dead pause_pid (stale sandbox).
+        std::fs::create_dir_all("/run/pelagos-cri/sandboxes").expect("create sandboxes dir");
+        let sandbox_json = format!(
+            r#"{{"id":"{sid}","name":"test-pod-474","namespace":"default","uid":"uid-474-{u}","attempt":0,"labels":{{}},"annotations":{{}},"created_at_ns":0,"state":"Running","pause_pid":{ppid}}}"#,
+            sid = sandbox_id,
+            u = unique,
+            ppid = dead_pause_pid,
+        );
+        std::fs::write(
+            format!("/run/pelagos-cri/sandboxes/{}.json", sandbox_id),
+            &sandbox_json,
+        )
+        .expect("write sandbox json");
+
+        // Write CRI container state pointing at the pelagos container.
+        std::fs::create_dir_all("/run/pelagos-cri/containers").expect("create containers dir");
+        let ctr_json = format!(
+            r#"{{"id":"{cid}","sandbox_id":"{sid}","pelagos_name":"{pname}","name":"sleep","image":"alpine","entrypoint":[],"args":[],"envs":[],"working_dir":"","mounts":[],"labels":{{}},"annotations":{{}},"created_at_ns":0,"started_at_ns":0,"finished_at_ns":0,"state":"Running","exit_code":0}}"#,
+            cid = container_id,
+            sid = sandbox_id,
+            pname = pelagos_name,
+        );
+        std::fs::write(
+            format!("/run/pelagos-cri/containers/{}.json", container_id),
+            &ctr_json,
+        )
+        .expect("write container json");
+
+        // Start pelagos-cri — the startup stale-sandbox reap runs before the
+        // gRPC listener accepts connections.
+        let cri_bin =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/pelagos-cri");
+        assert!(
+            cri_bin.exists(),
+            "pelagos-cri binary not found at {:?}; run cargo build first",
+            cri_bin
+        );
+        let sock = format!("/tmp/test-cri-474-{}.sock", unique);
+        let mut cri = std::process::Command::new(&cri_bin)
+            .args(["--socket", &sock, "--streaming-addr", "127.0.0.1:0"])
+            .spawn()
+            .expect("spawn pelagos-cri");
+
+        // Give the CRI time to run the startup reap and issue the kill.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        cri.kill().ok();
+        cri.wait().ok();
+        let _ = std::fs::remove_file(&sock);
+
+        // Reap the orphan to observe exit status.
+        let orphan_exit = orphan.wait().expect("wait orphan");
+
+        // Cleanup fake CRI state.
+        let _ = std::fs::remove_dir_all(&pelagos_dir);
+        let _ = std::fs::remove_file(format!("/run/pelagos-cri/sandboxes/{}.json", sandbox_id));
+        let _ = std::fs::remove_file(format!("/run/pelagos-cri/containers/{}.json", container_id));
+
+        assert!(
+            !orphan_exit.success(),
+            "container process {} must have been killed when the stale sandbox was reaped (#474), \
+             but it exited successfully (still alive when CRI was stopped) — the kill path \
+             in reap_stale_sandboxes may not have fired",
+            orphan_pid
+        );
+    }
+}
