@@ -40,11 +40,11 @@ echo "==> Installing on ${NODE}..."
 ssh "${NODE}" bash -s << 'REMOTE'
 set -euo pipefail
 INSTALL_DIR=/usr/local/bin
-install -m 755 /tmp/pelagos        "${INSTALL_DIR}/pelagos"
-install -m 755 /tmp/pelagos-cri    "${INSTALL_DIR}/pelagos-cri"
-install -m 755 /tmp/pelagos-dns    "${INSTALL_DIR}/pelagos-dns"
-install -m 755 /tmp/pelagos-shim-wasm "${INSTALL_DIR}/pelagos-shim-wasm"
-install -m 755 /tmp/pelagos-shim-wasm "${INSTALL_DIR}/containerd-shim-pelagos-wasm-v1"
+sudo install -m 755 /tmp/pelagos        "${INSTALL_DIR}/pelagos"
+sudo install -m 755 /tmp/pelagos-cri    "${INSTALL_DIR}/pelagos-cri"
+sudo install -m 755 /tmp/pelagos-dns    "${INSTALL_DIR}/pelagos-dns"
+sudo install -m 755 /tmp/pelagos-shim-wasm "${INSTALL_DIR}/pelagos-shim-wasm"
+sudo install -m 755 /tmp/pelagos-shim-wasm "${INSTALL_DIR}/containerd-shim-pelagos-wasm-v1"
 echo "Installed: $(pelagos --version)"
 REMOTE
 
