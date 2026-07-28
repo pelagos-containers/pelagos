@@ -1355,10 +1355,26 @@ impl RuntimeService for RuntimeSvc {
         // builds the response — means it can never see one to garbage-collect.
         // The periodic reaper (see `main`) only *bounds* that window; doing it on
         // read *closes* it (the path that deleted the host /bin, #347/#351).
-        let reaped =
+        let (reaped, to_kill) =
             st.reap_stale_sandboxes(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists());
         for sid in &reaped {
             log::info!("list_pod_sandbox: reaped stale sandbox {sid} (pause process gone)");
+        }
+        // Kill orphaned container processes outside the lock — spawn a background
+        // task so the gRPC response is not delayed by subprocess calls (#474).
+        if !to_kill.is_empty() {
+            let bin = st.pelagos_bin.clone();
+            tokio::task::spawn_blocking(move || {
+                for pelagos_name in &to_kill {
+                    let _ = std::process::Command::new(&bin)
+                        .args(["stop", "--time", "0", pelagos_name])
+                        .output();
+                    log::warn!(
+                        "list_pod_sandbox: killed container {pelagos_name} \
+                         (sandbox pause gone, #474)"
+                    );
+                }
+            });
         }
 
         let items: Vec<PodSandbox> = st
