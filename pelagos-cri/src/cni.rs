@@ -97,8 +97,10 @@ pub fn cni_add(
     netns_path: &str,
     conf_path: &Path,
     cap_args: &serde_json::Value,
+    pod_name: &str,
+    pod_namespace: &str,
 ) -> Result<String, String> {
-    let result = invoke_cni("ADD", sandbox_id, netns_path, conf_path, cap_args)?;
+    let result = invoke_cni("ADD", sandbox_id, netns_path, conf_path, cap_args, pod_name, pod_namespace)?;
     let ip = result
         .get("ips")
         .and_then(|v| v.as_array())
@@ -111,8 +113,15 @@ pub fn cni_add(
 }
 
 /// Run CNI DEL for a sandbox.  Best-effort; errors are logged but not returned.
-pub fn cni_del(sandbox_id: &str, netns_path: &str, conf_path: &Path, cap_args: &serde_json::Value) {
-    if let Err(e) = invoke_cni("DEL", sandbox_id, netns_path, conf_path, cap_args) {
+pub fn cni_del(
+    sandbox_id: &str,
+    netns_path: &str,
+    conf_path: &Path,
+    cap_args: &serde_json::Value,
+    pod_name: &str,
+    pod_namespace: &str,
+) {
+    if let Err(e) = invoke_cni("DEL", sandbox_id, netns_path, conf_path, cap_args, pod_name, pod_namespace) {
         log::warn!("CNI DEL for {}: {}", sandbox_id, e);
     }
 }
@@ -144,8 +153,16 @@ fn run_plugin(
     netns_path: &str,
     plugin_type: &str,
     config_json: &str,
+    pod_name: &str,
+    pod_namespace: &str,
 ) -> Result<Option<serde_json::Value>, String> {
     let bin = find_plugin_bin(plugin_type)?;
+    // CNI_ARGS carries Kubernetes pod identity required by CNI plugins (e.g. Cilium)
+    // to assign security identities and enforce NetworkPolicy.
+    let cni_args = format!(
+        "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={}",
+        pod_namespace, pod_name, sandbox_id
+    );
 
     let mut child = Command::new(&bin)
         .env("CNI_COMMAND", command)
@@ -153,6 +170,7 @@ fn run_plugin(
         .env("CNI_NETNS", netns_path)
         .env("CNI_IFNAME", "eth0")
         .env("CNI_PATH", cni_path_env())
+        .env("CNI_ARGS", cni_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,14 +220,16 @@ fn invoke_cni(
     netns_path: &str,
     conf_path: &Path,
     cap_args: &serde_json::Value,
+    pod_name: &str,
+    pod_namespace: &str,
 ) -> Result<serde_json::Value, String> {
     let raw = std::fs::read_to_string(conf_path)
         .map_err(|e| format!("read {}: {}", conf_path.display(), e))?;
 
     if conf_path.extension().and_then(|x| x.to_str()) == Some("conflist") {
-        invoke_conflist(command, sandbox_id, netns_path, &raw, cap_args)
+        invoke_conflist(command, sandbox_id, netns_path, &raw, cap_args, pod_name, pod_namespace)
     } else {
-        invoke_conf(command, sandbox_id, netns_path, &raw)
+        invoke_conf(command, sandbox_id, netns_path, &raw, pod_name, pod_namespace)
     }
 }
 
@@ -218,10 +238,12 @@ fn invoke_conf(
     sandbox_id: &str,
     netns_path: &str,
     raw: &str,
+    pod_name: &str,
+    pod_namespace: &str,
 ) -> Result<serde_json::Value, String> {
     let conf: Conf = serde_json::from_str(raw).map_err(|e| format!("parse .conf: {}", e))?;
     Ok(
-        run_plugin(command, sandbox_id, netns_path, &conf.plugin_type, raw)?
+        run_plugin(command, sandbox_id, netns_path, &conf.plugin_type, raw, pod_name, pod_namespace)?
             .unwrap_or_else(|| serde_json::json!({})),
     )
 }
@@ -281,6 +303,8 @@ fn invoke_conflist(
     netns_path: &str,
     raw: &str,
     cap_args: &serde_json::Value,
+    pod_name: &str,
+    pod_namespace: &str,
 ) -> Result<serde_json::Value, String> {
     let conflist: ConfList =
         serde_json::from_str(raw).map_err(|e| format!("parse .conflist: {}", e))?;
@@ -320,7 +344,7 @@ fn invoke_conflist(
         let config_str = serde_json::to_string(&config)
             .map_err(|e| format!("serialize config for '{}': {}", plugin_type, e))?;
 
-        if let Some(result) = run_plugin(command, sandbox_id, netns_path, plugin_type, &config_str)?
+        if let Some(result) = run_plugin(command, sandbox_id, netns_path, plugin_type, &config_str, pod_name, pod_namespace)?
         {
             prev_result = Some(result.clone());
             last_result = result;
@@ -368,6 +392,25 @@ mod tests {
                 {"hostPort":5353,"containerPort":53,"protocol":"udp","hostIP":"127.0.0.1"}
             ]})
         );
+    }
+
+    /// #476: CNI_ARGS must carry K8S_POD_NAMESPACE, K8S_POD_NAME, K8S_POD_INFRA_CONTAINER_ID
+    /// in the semicolon-separated format required by Kubernetes-aware CNI plugins (Cilium, Calico).
+    #[test]
+    fn test_cni_args_format() {
+        let pod_namespace = "kube-system";
+        let pod_name = "cilium-abc123";
+        let sandbox_id = "deadbeef0123456789abcdef";
+        let cni_args = format!(
+            "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={}",
+            pod_namespace, pod_name, sandbox_id
+        );
+        assert!(cni_args.contains("K8S_POD_NAMESPACE=kube-system"));
+        assert!(cni_args.contains("K8S_POD_NAME=cilium-abc123"));
+        assert!(cni_args.contains(&format!("K8S_POD_INFRA_CONTAINER_ID={}", sandbox_id)));
+        // Semicolon-separated, no trailing semicolon.
+        let parts: Vec<&str> = cni_args.split(';').collect();
+        assert_eq!(parts.len(), 3);
     }
 
     /// #354: portmap (capabilities.portMappings) gets runtimeConfig injected;
