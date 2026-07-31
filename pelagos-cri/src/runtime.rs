@@ -1434,13 +1434,20 @@ impl RuntimeService for RuntimeSvc {
         let id = generate_id();
         let pelagos_name = format!("pcri-{}", &id[..12]);
 
+        // Decode env var values from proto bytes. The CRI KeyValue.value is a bytes
+        // field (not string), so strip any trailing NUL bytes before converting to
+        // String — a trailing NUL causes bash word-splitting when the var is expanded
+        // unquoted (e.g. "${BIN_PATH}/bin" becomes "/usr/bin\0/bin" which splits
+        // into two words, making the second word the effective command). (#483)
         let envs: Vec<(String, String)> = config
             .envs
             .iter()
             .map(|kv| {
+                let raw = &kv.value;
+                let trimmed = raw.strip_suffix(b"\0").unwrap_or(raw.as_slice());
                 (
                     kv.key.clone(),
-                    String::from_utf8_lossy(&kv.value).into_owned(),
+                    String::from_utf8_lossy(trimmed).into_owned(),
                 )
             })
             .collect();

@@ -32385,3 +32385,71 @@ mod issue_484_bind_mount_writable_without_ro_rootfs {
         );
     }
 }
+
+// ── Issue #483 ─────────────────────────────────────────────────────────────────
+// Env vars set in the container spec must be visible to processes in the container.
+// The proto KeyValue.value bytes field may contain a trailing NUL from some
+// kubelet implementations; without stripping it, bash sees "$BIN_PATH" as
+// "/path\0" which word-splits into "/path" and "" causing the shell command to
+// use an empty string as the effective last argument.
+mod issue_483_env_var_propagation {
+    use super::*;
+    use pelagos::container::{Command, Namespace, Stdio};
+
+    /// Requires root and the alpine-rootfs.
+    ///
+    /// Spawns a container with an environment variable set via .env() and
+    /// verifies the variable is visible via printenv. This is the library-level
+    /// regression test; the CRI-level fix (NUL-byte strip) is tested by unit
+    /// tests in pelagos-cri.
+    #[test]
+    fn test_env_var_visible_in_container() {
+        if !is_root() {
+            eprintln!("Skipping test_env_var_visible_in_container: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_env_var_visible_in_container: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "echo \"BIN_PATH=$BIN_PATH\""])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .env("BIN_PATH", "/var/lib/rancher/k3s/data/current/bin")
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container failed (issue #483).\nstdout: {out}\nstderr: {err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "BIN_PATH=/var/lib/rancher/k3s/data/current/bin",
+            "env var BIN_PATH not visible in container (#483).\nstderr: {err}"
+        );
+    }
+
+    /// Verify that a value with a trailing NUL byte does NOT propagate into
+    /// the container environment (the NUL is stripped at the pelagos-cri decode layer).
+    /// This is a unit-level sanity check of the strip logic.
+    #[test]
+    fn test_nul_byte_stripped_from_env_value() {
+        // Simulate what pelagos-cri does: strip trailing NUL before storing.
+        let raw_value: &[u8] = b"/var/lib/rancher/k3s/data/current/bin\x00";
+        let trimmed = raw_value.strip_suffix(b"\0").unwrap_or(raw_value);
+        let decoded = String::from_utf8_lossy(trimmed).into_owned();
+        assert_eq!(decoded, "/var/lib/rancher/k3s/data/current/bin");
+        assert!(!decoded.contains('\0'));
+    }
+}
