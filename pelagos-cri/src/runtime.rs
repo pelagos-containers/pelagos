@@ -915,7 +915,14 @@ impl RuntimeService for RuntimeSvc {
             let netns_path = cni::create_netns(&ns_name)
                 .map_err(|e| Status::internal(format!("create netns for CNI sandbox: {}", e)))?;
 
-            let ip = match cni::cni_add(&id, &netns_path, &conf_path, &cni_cap_args, &meta.name, &meta.namespace) {
+            let ip = match cni::cni_add(
+                &id,
+                &netns_path,
+                &conf_path,
+                &cni_cap_args,
+                &meta.name,
+                &meta.namespace,
+            ) {
                 Ok(ip) => ip,
                 Err(e) => {
                     cni::delete_netns(&ns_name);

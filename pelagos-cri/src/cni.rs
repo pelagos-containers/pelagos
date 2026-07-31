@@ -100,7 +100,15 @@ pub fn cni_add(
     pod_name: &str,
     pod_namespace: &str,
 ) -> Result<String, String> {
-    let result = invoke_cni("ADD", sandbox_id, netns_path, conf_path, cap_args, pod_name, pod_namespace)?;
+    let result = invoke_cni(
+        "ADD",
+        sandbox_id,
+        netns_path,
+        conf_path,
+        cap_args,
+        pod_name,
+        pod_namespace,
+    )?;
     let ip = result
         .get("ips")
         .and_then(|v| v.as_array())
@@ -121,7 +129,15 @@ pub fn cni_del(
     pod_name: &str,
     pod_namespace: &str,
 ) {
-    if let Err(e) = invoke_cni("DEL", sandbox_id, netns_path, conf_path, cap_args, pod_name, pod_namespace) {
+    if let Err(e) = invoke_cni(
+        "DEL",
+        sandbox_id,
+        netns_path,
+        conf_path,
+        cap_args,
+        pod_name,
+        pod_namespace,
+    ) {
         log::warn!("CNI DEL for {}: {}", sandbox_id, e);
     }
 }
@@ -227,9 +243,24 @@ fn invoke_cni(
         .map_err(|e| format!("read {}: {}", conf_path.display(), e))?;
 
     if conf_path.extension().and_then(|x| x.to_str()) == Some("conflist") {
-        invoke_conflist(command, sandbox_id, netns_path, &raw, cap_args, pod_name, pod_namespace)
+        invoke_conflist(
+            command,
+            sandbox_id,
+            netns_path,
+            &raw,
+            cap_args,
+            pod_name,
+            pod_namespace,
+        )
     } else {
-        invoke_conf(command, sandbox_id, netns_path, &raw, pod_name, pod_namespace)
+        invoke_conf(
+            command,
+            sandbox_id,
+            netns_path,
+            &raw,
+            pod_name,
+            pod_namespace,
+        )
     }
 }
 
@@ -242,10 +273,16 @@ fn invoke_conf(
     pod_namespace: &str,
 ) -> Result<serde_json::Value, String> {
     let conf: Conf = serde_json::from_str(raw).map_err(|e| format!("parse .conf: {}", e))?;
-    Ok(
-        run_plugin(command, sandbox_id, netns_path, &conf.plugin_type, raw, pod_name, pod_namespace)?
-            .unwrap_or_else(|| serde_json::json!({})),
-    )
+    Ok(run_plugin(
+        command,
+        sandbox_id,
+        netns_path,
+        &conf.plugin_type,
+        raw,
+        pod_name,
+        pod_namespace,
+    )?
+    .unwrap_or_else(|| serde_json::json!({})))
 }
 
 /// For a conflist, call each plugin in order (ADD) or reverse (DEL), forwarding
@@ -344,8 +381,15 @@ fn invoke_conflist(
         let config_str = serde_json::to_string(&config)
             .map_err(|e| format!("serialize config for '{}': {}", plugin_type, e))?;
 
-        if let Some(result) = run_plugin(command, sandbox_id, netns_path, plugin_type, &config_str, pod_name, pod_namespace)?
-        {
+        if let Some(result) = run_plugin(
+            command,
+            sandbox_id,
+            netns_path,
+            plugin_type,
+            &config_str,
+            pod_name,
+            pod_namespace,
+        )? {
             prev_result = Some(result.clone());
             last_result = result;
         }
