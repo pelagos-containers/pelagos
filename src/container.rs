@@ -5063,6 +5063,15 @@ impl Command {
                                 ptr::null(),
                             );
                         }
+                        // #477: The new mount namespace inherits the host's mounts.
+                        // If the target path is already a mountpoint (e.g. /sys/fs/bpf
+                        // from the host's inherited sysfs/bpffs), a plain bind would
+                        // stack a second entry on top. Cilium reads /proc/self/mountinfo
+                        // and aborts when it finds two entries at /sys/fs/bpf. Detach
+                        // any inherited mount first so the bind produces exactly one
+                        // mountinfo entry. EINVAL means no existing mountpoint — ignore.
+                        let _ = libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH);
+
                         // Step 1: establish the bind. Use a RECURSIVE bind so any
                         // submounts under the source (e.g. a tmpfs the caller mounted
                         // inside the volume) are carried into the container. The

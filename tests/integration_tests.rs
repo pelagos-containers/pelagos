@@ -32075,3 +32075,84 @@ mod issue_474_stale_sandbox_kills_containers {
         );
     }
 }
+
+/// Issue #477: a bind mount to a path that is already a mountpoint in the
+/// inherited host mount namespace must not produce duplicate entries in
+/// /proc/self/mountinfo. Cilium inspects mountinfo for /sys/fs/bpf and aborts
+/// if it finds more than one entry there.
+///
+/// The fix calls umount2(target, MNT_DETACH) before each hostPath bind to
+/// displace any inherited mountpoint at the same path.
+mod issue_477_no_duplicate_inherited_mounts {
+    use super::*;
+
+    /// Requires root.
+    ///
+    /// Bind-mounts a host directory onto /sys/fs/bpf (a path that typically has
+    /// an inherited bpffs mountpoint in the new MOUNT namespace) and verifies
+    /// that /proc/self/mountinfo inside the container contains exactly one entry
+    /// for that path. A duplicate entry would indicate the inherited mountpoint
+    /// was not displaced before the bind.
+    #[test]
+    fn test_no_duplicate_mountinfo_on_inherited_mountpoint() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_no_duplicate_mountinfo_on_inherited_mountpoint: requires root"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_no_duplicate_mountinfo_on_inherited_mountpoint: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Use a tmpdir as the bind-mount source — guaranteed to be a plain dir with
+        // no submounts, so the bind itself never produces duplicate entries for any
+        // other reason.
+        let src = tempfile::tempdir().expect("tempdir for bind source");
+        std::fs::write(src.path().join("sentinel"), b"477").expect("write sentinel");
+
+        // Bind /sys/fs/bpf → our tmpdir.  In the host's mount namespace this path
+        // has an inherited bpffs mount; umount2(MNT_DETACH) must displace it first.
+        let target = "/sys/fs/bpf";
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                // Count mountinfo lines whose second field (mount point) is exactly
+                // our target.  Exactly 1 is correct; 0 means the bind failed; 2+
+                // means the inherited mount was not displaced (#477 regression).
+                &format!(
+                    "awk '$5==\"{target}\"{{count++}} END{{print count+0}}' /proc/self/mountinfo"
+                ),
+            ])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_sys_mount()
+            .with_bind_mount(src.path(), target)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container exited with error (issue #477 test).\nstdout: {out}\nstderr: {err}"
+        );
+
+        let count: u32 = out.trim().parse().unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 mountinfo entry for {target}, got {count} — \
+             duplicate entries indicate an inherited mountpoint was not displaced \
+             before the hostPath bind (issue #477).\nstderr: {err}"
+        );
+    }
+}
