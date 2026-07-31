@@ -989,6 +989,127 @@ fn mount_setattr_rdonly_recursive(target: &std::ffi::CStr) -> bool {
     rc == 0
 }
 
+/// Clear the `MS_RDONLY` flag on a bind-mounted path so that a writable host
+/// directory bound into the container is actually writable inside it (#484).
+///
+/// A bind mount inherits the per-mount flags of the *source mount*, including
+/// `MS_RDONLY` if the source was mounted (or propagated) read-only.  The old
+/// `MS_REMOUNT|MS_BIND` call without additional flags can fail with `EINVAL` if
+/// the source mount has flags like `MS_NOSUID`/`MS_NODEV` that must be preserved
+/// — the kernel requires a bind-remount to specify ALL current flags or it rejects
+/// the call.  This function:
+///   1. Tries `mount_setattr(2)` with `attr_clr=MOUNT_ATTR_RDONLY` (Linux ≥ 5.12) —
+///      the modern, flag-preserving API that never requires specifying other flags.
+///   2. Falls back to a legacy `MS_REMOUNT|MS_BIND` with the current per-mount flags
+///      read from `/proc/self/mountinfo`, so only `MS_RDONLY` is removed and all
+///      other flags are preserved.
+///
+/// Returns `true` if the mount is now writable (or was already writable), `false`
+/// if both attempts fail.
+fn clear_mount_rdonly(target: &std::ffi::CStr, target_path: &std::path::Path) -> bool {
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    const SYS_MOUNT_SETATTR: libc::c_long = 442;
+
+    // Attempt 1: mount_setattr(attr_clr=RDONLY) — preserves all other flags.
+    let attr = MountAttr {
+        attr_set: 0,
+        attr_clr: MOUNT_ATTR_RDONLY,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let rc = unsafe {
+        libc::syscall(
+            SYS_MOUNT_SETATTR,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            0u32,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+
+    // Attempt 2: legacy MS_REMOUNT|MS_BIND with full current flags minus RDONLY.
+    // Read the current mount flags from /proc/self/mountinfo so we can pass all
+    // of them to the remount, preventing the kernel from rejecting the call with
+    // EINVAL due to "changed" flags we didn't intend to clear.
+    let current_flags = read_mountinfo_flags(target_path);
+    let remount_flags =
+        (current_flags & !libc::MS_RDONLY as libc::c_ulong) | libc::MS_REMOUNT | libc::MS_BIND;
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            remount_flags,
+            std::ptr::null(),
+        )
+    };
+    if ret == 0 {
+        return true;
+    }
+    log::warn!(
+        "container: could not clear MS_RDONLY on writable bind mount {}: {} \
+         (mount_setattr errno {}, remount errno {}); bind may be read-only inside container",
+        target_path.display(),
+        io::Error::last_os_error(),
+        unsafe { *libc::__errno_location() },
+        unsafe { *libc::__errno_location() },
+    );
+    false
+}
+
+/// Parse `/proc/self/mountinfo` and return the per-mount flags for the mount
+/// whose mountpoint matches `target`.  Returns `0` if the path is not found or
+/// the file cannot be read — the caller should still attempt the remount with
+/// `MS_REMOUNT|MS_BIND` alone.
+fn read_mountinfo_flags(target: &std::path::Path) -> libc::c_ulong {
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return 0;
+    };
+    let target_str = target.to_string_lossy();
+    for line in content.lines() {
+        // Format: mountid parentid major:minor root mountpoint mount-options ...
+        let mut it = line.splitn(7, ' ');
+        let _mountid = it.next();
+        let _parentid = it.next();
+        let _devno = it.next();
+        let _root = it.next();
+        let mountpoint = it.next().unwrap_or("");
+        let opts = it.next().unwrap_or("");
+        if mountpoint != target_str {
+            continue;
+        }
+        let mut flags: libc::c_ulong = 0;
+        for opt in opts.split(',') {
+            match opt {
+                "ro" => flags |= libc::MS_RDONLY,
+                "nosuid" => flags |= libc::MS_NOSUID,
+                "nodev" => flags |= libc::MS_NODEV,
+                "noexec" => flags |= libc::MS_NOEXEC,
+                "sync" => flags |= libc::MS_SYNCHRONOUS,
+                "dirsync" => flags |= libc::MS_DIRSYNC,
+                "mandlock" => flags |= libc::MS_MANDLOCK,
+                "noatime" => flags |= libc::MS_NOATIME,
+                "nodiratime" => flags |= libc::MS_NODIRATIME,
+                "relatime" => flags |= libc::MS_RELATIME,
+                _ => {}
+            }
+        }
+        return flags;
+    }
+    0
+}
+
 /// Default propagation flags for the container's root mount when
 /// `linux.rootfsPropagation` is not explicitly set (#341).
 ///
@@ -5105,18 +5226,12 @@ impl Command {
                             ));
                         }
                         // Step 2 (if writable): clear any inherited MS_RDONLY flag.
-                        // A bind mount inherits the source mount's flags, including
-                        // MS_RDONLY if the source filesystem was temporarily or
-                        // conditionally read-only. A plain MS_REMOUNT|MS_BIND without
-                        // MS_RDONLY strips that flag. This matches containerd's approach.
+                        // A bind mount inherits the per-mount flags of the *source* mount,
+                        // including MS_RDONLY when the source was mounted read-only.  Use
+                        // mount_setattr (Linux ≥5.12) or a mountinfo-preserving remount
+                        // (#484) to remove only MS_RDONLY without disturbing other flags.
                         if !bm.readonly {
-                            let _ = libc::mount(
-                                ptr::null(),
-                                tgt_c.as_ptr(),
-                                ptr::null(),
-                                libc::MS_REMOUNT | libc::MS_BIND,
-                                ptr::null(),
-                            );
+                            clear_mount_rdonly(&tgt_c, &host_target);
                         }
                         // Step 3 (if readonly): make the mount read-only.
                         if bm.readonly {
@@ -8091,6 +8206,9 @@ impl Command {
                                 ),
                                 io::Error::last_os_error(),
                             ));
+                        }
+                        if !bm.readonly {
+                            clear_mount_rdonly(&tgt_c, &host_target);
                         }
                         if bm.readonly {
                             // Recursive RO (#356) via mount_setattr(AT_RECURSIVE);
