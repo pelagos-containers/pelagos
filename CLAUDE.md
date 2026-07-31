@@ -189,6 +189,48 @@ Glob, WebSearch, WebFetch — use them freely without asking.
 
 ---
 
+## Agent Coordination
+
+The cluster agent (`~/Projects/k3s-experiments/`) runs Pelagos as the k3s CRI and files
+GitHub issues when it finds runtime bugs. A shared blackboard at
+`~/Projects/agent-coordinator/state/` keeps both agents synchronized.
+
+### On startup — read the blackboard
+
+```bash
+cat ~/Projects/agent-coordinator/state/cluster.json
+```
+
+Check `signals_out.to_pelagos`:
+- `"new-cluster-bugs"` → the k3s agent filed new issues; add `new_issue_numbers` to your
+  work queue and prioritize them. Clear the signal (set to `null`) and commit.
+
+### After a release — write the blackboard
+
+After `pelagos.json` in the repo is bumped and the tag is pushed, update coordinator state:
+
+```bash
+# Read current state first, then write merged update
+cat ~/Projects/agent-coordinator/state/pelagos.json
+# Write back with:
+#   latest_release = "<new version>"
+#   release_status = "released"
+#   release_timestamp = "<ISO 8601>"
+#   signals_out.to_k3s = "upgrade-and-test"
+#   signals_out.target_version = "<new version>"
+#   signals_out.issues_to_validate = [<issue numbers fixed in this release>]
+#   updated_by = "pelagos-agent"
+#   updated_at = "<ISO 8601>"
+cd ~/Projects/agent-coordinator && git add state/ && git commit -m "chore: pelagos-agent post-release state update v<version>"
+```
+
+### During active work — keep `in_progress` current
+
+When starting work on a branch: set `in_progress.branch` and `in_progress.issues`.
+When merging: clear them back to `null` / `[]`.
+
+---
+
 ## Project Overview
 
 Pelagos is a modern, lightweight Linux container runtime written in Rust. It provides a safe, ergonomic API for creating containerized processes using Linux namespaces, seccomp filtering, capabilities, and resource limits.
