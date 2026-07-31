@@ -90,6 +90,15 @@ pub fn delete_netns(name: &str) {
     let _ = Command::new("ip").args(["netns", "del", name]).output();
 }
 
+// ── Internals ─────────────────────────────────────────────────────────────────
+
+/// Pod identity fields passed as CNI_ARGS to plugin binaries.
+struct PodId<'a> {
+    name: &'a str,
+    namespace: &'a str,
+    uid: &'a str,
+}
+
 /// Run CNI ADD for a sandbox.
 /// Returns the assigned IPv4 address (without prefix length) on success.
 pub fn cni_add(
@@ -99,16 +108,14 @@ pub fn cni_add(
     cap_args: &serde_json::Value,
     pod_name: &str,
     pod_namespace: &str,
+    pod_uid: &str,
 ) -> Result<String, String> {
-    let result = invoke_cni(
-        "ADD",
-        sandbox_id,
-        netns_path,
-        conf_path,
-        cap_args,
-        pod_name,
-        pod_namespace,
-    )?;
+    let pod = PodId {
+        name: pod_name,
+        namespace: pod_namespace,
+        uid: pod_uid,
+    };
+    let result = invoke_cni("ADD", sandbox_id, netns_path, conf_path, cap_args, &pod)?;
     let ip = result
         .get("ips")
         .and_then(|v| v.as_array())
@@ -128,21 +135,17 @@ pub fn cni_del(
     cap_args: &serde_json::Value,
     pod_name: &str,
     pod_namespace: &str,
+    pod_uid: &str,
 ) {
-    if let Err(e) = invoke_cni(
-        "DEL",
-        sandbox_id,
-        netns_path,
-        conf_path,
-        cap_args,
-        pod_name,
-        pod_namespace,
-    ) {
+    let pod = PodId {
+        name: pod_name,
+        namespace: pod_namespace,
+        uid: pod_uid,
+    };
+    if let Err(e) = invoke_cni("DEL", sandbox_id, netns_path, conf_path, cap_args, &pod) {
         log::warn!("CNI DEL for {}: {}", sandbox_id, e);
     }
 }
-
-// ── Internals ─────────────────────────────────────────────────────────────────
 
 fn cni_path_env() -> String {
     CNI_BIN_DIRS.join(":")
@@ -169,15 +172,16 @@ fn run_plugin(
     netns_path: &str,
     plugin_type: &str,
     config_json: &str,
-    pod_name: &str,
-    pod_namespace: &str,
+    pod: &PodId<'_>,
 ) -> Result<Option<serde_json::Value>, String> {
     let bin = find_plugin_bin(plugin_type)?;
-    // CNI_ARGS carries Kubernetes pod identity required by CNI plugins (e.g. Cilium)
-    // to assign security identities and enforce NetworkPolicy.
+    // CNI_ARGS carries Kubernetes pod identity in semicolon-separated K=V format.
+    // Cilium 1.19.x K8sArgs only recognises K8S_POD_NAMESPACE, K8S_POD_NAME, and
+    // K8S_POD_UID (IgnoreUnknown=false); K8S_POD_INFRA_CONTAINER_ID is rejected.
+    // Modern runtimes (containerd 1.7+) send exactly these three fields.
     let cni_args = format!(
-        "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={}",
-        pod_namespace, pod_name, sandbox_id
+        "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_UID={}",
+        pod.namespace, pod.name, pod.uid
     );
 
     let mut child = Command::new(&bin)
@@ -236,31 +240,14 @@ fn invoke_cni(
     netns_path: &str,
     conf_path: &Path,
     cap_args: &serde_json::Value,
-    pod_name: &str,
-    pod_namespace: &str,
+    pod: &PodId<'_>,
 ) -> Result<serde_json::Value, String> {
     let raw = std::fs::read_to_string(conf_path)
         .map_err(|e| format!("read {}: {}", conf_path.display(), e))?;
-
     if conf_path.extension().and_then(|x| x.to_str()) == Some("conflist") {
-        invoke_conflist(
-            command,
-            sandbox_id,
-            netns_path,
-            &raw,
-            cap_args,
-            pod_name,
-            pod_namespace,
-        )
+        invoke_conflist(command, sandbox_id, netns_path, &raw, cap_args, pod)
     } else {
-        invoke_conf(
-            command,
-            sandbox_id,
-            netns_path,
-            &raw,
-            pod_name,
-            pod_namespace,
-        )
+        invoke_conf(command, sandbox_id, netns_path, &raw, pod)
     }
 }
 
@@ -269,20 +256,13 @@ fn invoke_conf(
     sandbox_id: &str,
     netns_path: &str,
     raw: &str,
-    pod_name: &str,
-    pod_namespace: &str,
+    pod: &PodId<'_>,
 ) -> Result<serde_json::Value, String> {
     let conf: Conf = serde_json::from_str(raw).map_err(|e| format!("parse .conf: {}", e))?;
-    Ok(run_plugin(
-        command,
-        sandbox_id,
-        netns_path,
-        &conf.plugin_type,
-        raw,
-        pod_name,
-        pod_namespace,
-    )?
-    .unwrap_or_else(|| serde_json::json!({})))
+    Ok(
+        run_plugin(command, sandbox_id, netns_path, &conf.plugin_type, raw, pod)?
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
 }
 
 /// For a conflist, call each plugin in order (ADD) or reverse (DEL), forwarding
@@ -340,8 +320,7 @@ fn invoke_conflist(
     netns_path: &str,
     raw: &str,
     cap_args: &serde_json::Value,
-    pod_name: &str,
-    pod_namespace: &str,
+    pod: &PodId<'_>,
 ) -> Result<serde_json::Value, String> {
     let conflist: ConfList =
         serde_json::from_str(raw).map_err(|e| format!("parse .conflist: {}", e))?;
@@ -387,8 +366,7 @@ fn invoke_conflist(
             netns_path,
             plugin_type,
             &config_str,
-            pod_name,
-            pod_namespace,
+            pod,
         )? {
             prev_result = Some(result.clone());
             last_result = result;
@@ -438,20 +416,24 @@ mod tests {
         );
     }
 
-    /// #476: CNI_ARGS must carry K8S_POD_NAMESPACE, K8S_POD_NAME, K8S_POD_INFRA_CONTAINER_ID
-    /// in the semicolon-separated format required by Kubernetes-aware CNI plugins (Cilium, Calico).
+    /// #476/#482: CNI_ARGS must carry K8S_POD_NAMESPACE, K8S_POD_NAME, K8S_POD_UID in the
+    /// semicolon-separated format required by Kubernetes-aware CNI plugins. Cilium 1.19.x
+    /// K8sArgs only recognises these three fields (IgnoreUnknown=false); K8S_POD_INFRA_CONTAINER_ID
+    /// is NOT included — Cilium rejects it with "unknown args".
     #[test]
     fn test_cni_args_format() {
         let pod_namespace = "kube-system";
         let pod_name = "cilium-abc123";
-        let sandbox_id = "deadbeef0123456789abcdef";
+        let pod_uid = "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb";
         let cni_args = format!(
-            "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={}",
-            pod_namespace, pod_name, sandbox_id
+            "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_UID={}",
+            pod_namespace, pod_name, pod_uid
         );
         assert!(cni_args.contains("K8S_POD_NAMESPACE=kube-system"));
         assert!(cni_args.contains("K8S_POD_NAME=cilium-abc123"));
-        assert!(cni_args.contains(&format!("K8S_POD_INFRA_CONTAINER_ID={}", sandbox_id)));
+        assert!(cni_args.contains(&format!("K8S_POD_UID={}", pod_uid)));
+        // Must NOT include K8S_POD_INFRA_CONTAINER_ID — Cilium 1.19.x rejects it.
+        assert!(!cni_args.contains("K8S_POD_INFRA_CONTAINER_ID"));
         // Semicolon-separated, no trailing semicolon.
         let parts: Vec<&str> = cni_args.split(';').collect();
         assert_eq!(parts.len(), 3);
