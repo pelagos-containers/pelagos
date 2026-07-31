@@ -1456,12 +1456,7 @@ impl RuntimeService for RuntimeSvc {
                     );
                 }
                 let value = String::from_utf8_lossy(&clean).into_owned();
-                log::debug!(
-                    "create_container {}: env {}={:?}",
-                    meta.name,
-                    kv.key,
-                    value
-                );
+                log::debug!("create_container {}: env {}={:?}", meta.name, kv.key, value);
                 (kv.key.clone(), value)
             })
             .collect();

@@ -32452,7 +32452,12 @@ mod issue_484_bind_mount_writable_without_ro_rootfs {
                 std::ptr::null(),
             )
         };
-        assert_eq!(r, 0, "bind sockets failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            r,
+            0,
+            "bind sockets failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         // Step 3: remount sockets bind as RO.  MS_BIND|MS_REMOUNT|MS_RDONLY sets
         // MNT_RDONLY on the bind ONLY — SB_RDONLY of the underlying tmpfs is
@@ -32466,7 +32471,12 @@ mod issue_484_bind_mount_writable_without_ro_rootfs {
                 std::ptr::null(),
             )
         };
-        assert_eq!(r, 0, "remount sockets RO failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            r,
+            0,
+            "remount sockets RO failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         // Step 4: pelagos binds the parent (with the nested per-mount-RO sockets)
         // into the container.  AT_RECURSIVE must clear MNT_RDONLY so writes work.
