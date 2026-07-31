@@ -32156,3 +32156,98 @@ mod issue_477_no_duplicate_inherited_mounts {
         );
     }
 }
+
+/// Issue #478: a bind mount onto a path under /var/run (which on Ubuntu 24.04+
+/// is a symlink to /run) must remain writable in the container even when
+/// readOnlyRootFilesystem is set — because the bind mount source is on a
+/// writable tmpfs, not on the read-only overlay.
+///
+/// The root cause: source paths like /var/run/cilium/envoy/sockets go through
+/// a host-side symlink (/var/run -> /run). Without canonicalization the raw
+/// symlink path is passed to mount(2); on some kernel/filesystem configurations
+/// this can cause the mount to not be properly associated with the underlying
+/// tmpfs. The fix calls canonicalize() on the source before mount(2).
+mod issue_478_var_run_writable_with_readonly_rootfs {
+    use super::*;
+
+    /// Requires root and the alpine-rootfs.
+    ///
+    /// Creates a container rootfs whose /var/run is an absolute symlink to /run
+    /// (matching Ubuntu 24.04+ container images). Sets readOnlyRootFilesystem.
+    /// Bind-mounts a host tmpfs directory onto /var/run/test-478 (which resolves
+    /// to /run/test-478 via the symlink). Verifies the container can write a file
+    /// inside the mount. Before the fix, EROFS would occur because the source
+    /// canonicalization was missing, causing edge-case mount failures.
+    #[test]
+    fn test_bind_mount_via_var_run_symlink_writable_with_readonly_rootfs() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_bind_mount_via_var_run_symlink_writable_with_readonly_rootfs: requires root"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_bind_mount_via_var_run_symlink_writable_with_readonly_rootfs: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Build an isolated rootfs copy with /var/run -> /run (absolute symlink,
+        // matching Ubuntu OCI base images and Ubuntu 24.04+ hosts).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let test_root = tmp.path().join("root");
+        let cp = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&rootfs)
+            .arg(&test_root)
+            .status()
+            .expect("cp -a rootfs");
+        assert!(cp.success(), "failed to copy rootfs");
+
+        let var_run = test_root.join("var/run");
+        let _ = std::fs::remove_dir_all(&var_run);
+        let _ = std::fs::remove_file(&var_run);
+        std::fs::create_dir_all(test_root.join("run")).expect("mkdir run");
+        std::os::unix::fs::symlink("/run", &var_run).expect("symlink var/run -> /run");
+
+        // Tmpfs-backed source directory on the host — simulates the host path for
+        // /var/run/cilium/envoy/sockets (a live tmpfs, not part of any overlay).
+        let src = tempfile::tempdir().expect("source tmpdir");
+
+        // Bind-mount the source onto /var/run/test-478 inside the container, then
+        // verify the container can write to it despite readOnlyRootFilesystem.
+        let target = "/var/run/test-478";
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "echo writable-478 > /var/run/test-478/out && cat /var/run/test-478/out",
+            ])
+            .with_chroot(&test_root)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(src.path(), target)
+            .with_readonly_rootfs(true)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container failed to write through /var/run -> /run symlink with readOnlyRootFilesystem \
+             (issue #478).\nstdout: {out}\nstderr: {err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "writable-478",
+            "expected 'writable-478' from the mounted path, got: '{out}' — \
+             the bind mount via /var/run symlink may not be writable (#478).\nstderr: {err}"
+        );
+    }
+}

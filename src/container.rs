@@ -5047,7 +5047,15 @@ impl Command {
                                     .map_err(|e| pre_exec_err("bind mount mkfile", e))?;
                             }
                         }
-                        let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
+                        // #478: canonicalize the source path so that symlinks in the
+                        // host mount path (e.g. /var/run -> /run) are resolved to the
+                        // actual filesystem path before passing to mount(2). This ensures
+                        // the is_dir() check above and the bind syscall operate on the
+                        // same inode. Falls back to the original path if the source
+                        // does not yet exist (will have been created above).
+                        let canonical_source =
+                            std::fs::canonicalize(&bm.source).unwrap_or_else(|_| bm.source.clone());
+                        let src_c = CString::new(canonical_source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
                         // #341: for bidirectional propagation the SOURCE must be a shared
                         // mount (member of a peer group) so the bind joins that group and
