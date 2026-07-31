@@ -922,6 +922,7 @@ impl RuntimeService for RuntimeSvc {
                 &cni_cap_args,
                 &meta.name,
                 &meta.namespace,
+                &uid,
             ) {
                 Ok(ip) => ip,
                 Err(e) => {
@@ -1238,6 +1239,7 @@ impl RuntimeService for RuntimeSvc {
                         &cap_args,
                         &sb.name,
                         &sb.namespace,
+                        &sb.uid,
                     );
                     log::debug!("StopPodSandbox {} step=cni_del DONE", sandbox_id);
                 }
