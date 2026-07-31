@@ -32384,6 +32384,130 @@ mod issue_484_bind_mount_writable_without_ro_rootfs {
             "expected 'writable-484-symlink', got: '{out}' (#484).\nstderr: {err}"
         );
     }
+
+    /// Verifies that a writable bind mount remains writable even when the source
+    /// directory contains a nested read-only tmpfs mount — the AT_RECURSIVE fix for
+    /// clear_mount_rdonly ensures the nested RO flag is also cleared.
+    ///
+    /// This simulates the cilium-envoy scenario: a prior Cilium run may leave a
+    /// tmpfs at /run/cilium/envoy/sockets (with MS_RDONLY); when pelagos binds
+    /// /run/cilium/envoy (or /var/run/cilium/envoy via symlink) into the container
+    /// as writable with MS_BIND|MS_REC, the nested RO tmpfs propagates. Without
+    /// AT_RECURSIVE only the top mount is cleared; with it, all nested mounts too.
+    ///
+    /// Requires root and the alpine-rootfs.
+    #[test]
+    // Tests that a nested mount with MNT_RDONLY (but NOT SB_RDONLY) is cleared
+    // by the AT_RECURSIVE fix.  This is the realistic Cilium scenario: a prior
+    // container run bound a writable tmpfs, then remounted it RO via
+    // MS_BIND|MS_REMOUNT|MS_RDONLY (per-mount flag only).  When pelagos binds
+    // the parent directory with MS_BIND|MS_REC, the nested bind inherits
+    // MNT_RDONLY.  clear_mount_rdonly(AT_RECURSIVE) must clear it so the
+    // container's write path sees the underlying writable tmpfs.
+    fn test_writable_bind_with_nested_mnt_rdonly() {
+        if !is_root() {
+            eprintln!("Skipping test_writable_bind_with_nested_mnt_rdonly: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_writable_bind_with_nested_mnt_rdonly: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let parent = tempfile::tempdir().expect("parent tmpdir");
+        let sockets = parent.path().join("sockets");
+        std::fs::create_dir_all(&sockets).expect("mkdir sockets");
+
+        // Step 1: mount a writable tmpfs as the source fs.
+        let source = tempfile::tempdir().expect("source tmpdir");
+        let c_source = std::ffi::CString::new(source.path().to_str().unwrap()).unwrap();
+        let r = unsafe {
+            libc::mount(
+                b"tmpfs\0".as_ptr() as *const libc::c_char,
+                c_source.as_ptr(),
+                b"tmpfs\0".as_ptr() as *const libc::c_char,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if r != 0 {
+            eprintln!(
+                "Skipping test_writable_bind_with_nested_mnt_rdonly: \
+                 could not mount source tmpfs (errno {})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Step 2: bind source → sockets.
+        let c_sockets = std::ffi::CString::new(sockets.to_str().unwrap()).unwrap();
+        let r = unsafe {
+            libc::mount(
+                c_source.as_ptr(),
+                c_sockets.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(r, 0, "bind sockets failed: {}", std::io::Error::last_os_error());
+
+        // Step 3: remount sockets bind as RO.  MS_BIND|MS_REMOUNT|MS_RDONLY sets
+        // MNT_RDONLY on the bind ONLY — SB_RDONLY of the underlying tmpfs is
+        // unchanged, so the filesystem is still writable at the superblock level.
+        let r = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c_sockets.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(r, 0, "remount sockets RO failed: {}", std::io::Error::last_os_error());
+
+        // Step 4: pelagos binds the parent (with the nested per-mount-RO sockets)
+        // into the container.  AT_RECURSIVE must clear MNT_RDONLY so writes work.
+        let target = "/test-484-mntrdonly";
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "echo nested-writable > /test-484-mntrdonly/sockets/out && \
+                 cat /test-484-mntrdonly/sockets/out",
+            ])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(parent.path(), target)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+
+        // Cleanup: inner bind first, then source tmpfs.
+        unsafe { libc::umount2(c_sockets.as_ptr(), libc::MNT_DETACH) };
+        unsafe { libc::umount2(c_source.as_ptr(), libc::MNT_DETACH) };
+
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container failed: nested bind with MNT_RDONLY (SB_RDONLY=false) still RO \
+             after AT_RECURSIVE fix (#484).\nstdout: {out}\nstderr: {err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "nested-writable",
+            "expected 'nested-writable', got '{out}' — AT_RECURSIVE did not clear nested \
+             MNT_RDONLY (#484).\nstderr: {err}"
+        );
+    }
 }
 
 // ── Issue #483 ─────────────────────────────────────────────────────────────────
