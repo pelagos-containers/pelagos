@@ -32445,11 +32445,20 @@ mod issue_483_env_var_propagation {
     /// This is a unit-level sanity check of the strip logic.
     #[test]
     fn test_nul_byte_stripped_from_env_value() {
-        // Simulate what pelagos-cri does: strip trailing NUL before storing.
+        // Simulate what pelagos-cri does: strip ALL NUL bytes before storing.
+        // A single trailing NUL is the common case, but mid-string NULs must
+        // also be removed so that bash sees a clean string.
         let raw_value: &[u8] = b"/var/lib/rancher/k3s/data/current/bin\x00";
-        let trimmed = raw_value.strip_suffix(b"\0").unwrap_or(raw_value);
-        let decoded = String::from_utf8_lossy(trimmed).into_owned();
+        let clean: Vec<u8> = raw_value.iter().copied().filter(|&b| b != 0).collect();
+        let decoded = String::from_utf8_lossy(&clean).into_owned();
         assert_eq!(decoded, "/var/lib/rancher/k3s/data/current/bin");
         assert!(!decoded.contains('\0'));
+
+        // Also verify mid-string NULs are stripped (strip_suffix wouldn't catch these).
+        let mid_nul: &[u8] = b"/path\x00with\x00nuls";
+        let clean2: Vec<u8> = mid_nul.iter().copied().filter(|&b| b != 0).collect();
+        let decoded2 = String::from_utf8_lossy(&clean2).into_owned();
+        assert_eq!(decoded2, "/pathwithnuls");
+        assert!(!decoded2.contains('\0'));
     }
 }

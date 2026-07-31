@@ -686,6 +686,13 @@ fn build_image_run(
         .add_namespaces(Namespace::UTS | pid_ns | ipc_ns | Namespace::CGROUP);
     cmd = cmd.with_overlay_tmpfs(args.overlay_tmpfs);
 
+    // Clear the inherited host environment so the container receives only its
+    // explicitly defined variables (image ENV + pod --env).  Without this, the
+    // pelagos process environment leaks into the container, which can mask pod
+    // env vars that were not stored or passed correctly (#483).  Matches Docker
+    // and containerd behaviour: containers never inherit the daemon's environment.
+    cmd = cmd.env_clear();
+
     // Apply image config environment.  This includes any PATH set by Dockerfile
     // ENV instructions.  apply_cli_options no longer injects a fallback PATH
     // (doing so unconditionally would clobber the image's custom PATH — issue #114).
