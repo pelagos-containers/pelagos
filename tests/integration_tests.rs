@@ -32251,3 +32251,137 @@ mod issue_478_var_run_writable_with_readonly_rootfs {
         );
     }
 }
+
+// ── Issue #484 ─────────────────────────────────────────────────────────────────
+// hostPath bind mount must be writable even when readOnlyRootFilesystem is not set.
+// A bind mount may inherit the source mount's MS_RDONLY flag; without an explicit
+// MS_REMOUNT|MS_BIND to clear it, writing into the mount fails with EROFS even
+// though the source directory is writable on the host.
+mod issue_484_bind_mount_writable_without_ro_rootfs {
+    use super::*;
+    use pelagos::container::{Command, Namespace, Stdio};
+
+    /// Requires root and the alpine-rootfs.
+    ///
+    /// Bind-mounts a writable host directory into the container with readOnly=false
+    /// (and readOnlyRootFilesystem also false). Verifies the container can write a
+    /// file into the mount. Before the fix, an inherited MS_RDONLY flag on the bind
+    /// could silently make it read-only.
+    #[test]
+    fn test_writable_bind_without_readonly_rootfs() {
+        if !is_root() {
+            eprintln!("Skipping test_writable_bind_without_readonly_rootfs: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_writable_bind_without_readonly_rootfs: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let src = tempfile::tempdir().expect("source tmpdir");
+        let target = "/bind-test-484";
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "echo writable-484 > /bind-test-484/out && cat /bind-test-484/out",
+            ])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(src.path(), target)
+            // readOnlyRootFilesystem is NOT set — default writable rootfs.
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container failed to write through bind mount without readOnlyRootFilesystem \
+             (issue #484).\nstdout: {out}\nstderr: {err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "writable-484",
+            "expected 'writable-484' from the mounted path, got: '{out}' — \
+             the bind mount is read-only despite readOnly=false (#484).\nstderr: {err}"
+        );
+    }
+
+    /// Same scenario but with /var/run -> /run symlink in the container rootfs,
+    /// matching the cilium-envoy hostPath of /var/run/cilium/envoy/sockets.
+    ///
+    /// Requires root and the alpine-rootfs.
+    #[test]
+    fn test_writable_bind_via_var_run_symlink_without_ro_rootfs() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_writable_bind_via_var_run_symlink_without_ro_rootfs: requires root"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_writable_bind_via_var_run_symlink_without_ro_rootfs: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let tmp = tempfile::tempdir().expect("test_root tmpdir");
+        let test_root = tmp.path().join("root");
+        let cp = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&rootfs)
+            .arg(&test_root)
+            .status()
+            .expect("cp -a rootfs");
+        assert!(cp.success(), "failed to copy rootfs");
+
+        // Recreate /var/run as a symlink -> /run, like Ubuntu 24.04+.
+        let var_run = test_root.join("var/run");
+        let _ = std::fs::remove_dir_all(&var_run);
+        let _ = std::fs::remove_file(&var_run);
+        std::fs::create_dir_all(test_root.join("run")).expect("mkdir run");
+        std::os::unix::fs::symlink("/run", &var_run).expect("symlink var/run -> /run");
+
+        let src = tempfile::tempdir().expect("source tmpdir");
+        let target = "/var/run/test-484";
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "echo writable-484-symlink > /var/run/test-484/out && cat /var/run/test-484/out",
+            ])
+            .with_chroot(&test_root)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_bind_mount(src.path(), target)
+            // readOnlyRootFilesystem is NOT set.
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container failed to write through /var/run -> /run symlink bind mount \
+             without readOnlyRootFilesystem (issue #484).\nstdout: {out}\nstderr: {err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "writable-484-symlink",
+            "expected 'writable-484-symlink', got: '{out}' (#484).\nstderr: {err}"
+        );
+    }
+}
