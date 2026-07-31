@@ -5104,7 +5104,21 @@ impl Command {
                                 io::Error::last_os_error(),
                             ));
                         }
-                        // Step 2 (if readonly): make the mount read-only.
+                        // Step 2 (if writable): clear any inherited MS_RDONLY flag.
+                        // A bind mount inherits the source mount's flags, including
+                        // MS_RDONLY if the source filesystem was temporarily or
+                        // conditionally read-only. A plain MS_REMOUNT|MS_BIND without
+                        // MS_RDONLY strips that flag. This matches containerd's approach.
+                        if !bm.readonly {
+                            let _ = libc::mount(
+                                ptr::null(),
+                                tgt_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_REMOUNT | libc::MS_BIND,
+                                ptr::null(),
+                            );
+                        }
+                        // Step 3 (if readonly): make the mount read-only.
                         if bm.readonly {
                             // Recursive RO (#356 recursive_read_only): mount_setattr
                             // with AT_RECURSIVE marks the top mount AND every submount
