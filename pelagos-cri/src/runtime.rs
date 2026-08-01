@@ -2154,6 +2154,14 @@ impl RuntimeService for RuntimeSvc {
         args.extend(effective_cmd);
 
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        // Diagnostic: log the full pelagos run argv at trace level so that
+        // RUST_LOG=pelagos_cri=trace captures exactly what we pass, including
+        // all --env args.  Helps trace env var loss (#483) across sessions.
+        log::trace!(
+            "start_container {}: full pelagos argv: {:?}",
+            container_id,
+            args_ref
+        );
         // Under systemd, wrap `pelagos run --detach` in a transient scope under
         // `pelagos.slice` so the watcher it forks lives outside the
         // `pelagos-cri.service` cgroup and survives a runtime restart (#336). The
@@ -2185,6 +2193,16 @@ impl RuntimeService for RuntimeSvc {
                 "pelagos run failed: {}",
                 out.stderr.trim()
             )));
+        }
+        // Always surface pelagos run's diagnostic output (RUST_LOG=pelagos=debug)
+        // at trace level so env var tracing (#483) is visible without needing a
+        // failed run.  Harmless when empty (the common case without RUST_LOG).
+        if !out.stderr.is_empty() {
+            log::trace!(
+                "start_container {}: pelagos run stderr:\n{}",
+                container_id,
+                out.stderr.trim()
+            );
         }
 
         let (log_directory, log_path_rel) = {

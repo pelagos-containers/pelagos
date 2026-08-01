@@ -4116,6 +4116,14 @@ impl Command {
             None
         };
 
+        // Sort bind mounts by destination path depth (ascending) so parent
+        // paths are established before child paths.  Without this ordering,
+        // a child bind processed before its parent can leave the child path
+        // unreachable: the kernel walks through the parent bind's source
+        // directory which may be empty, causing ENOENT or EROFS (#484).
+        // containerd/CRI-O apply the same sort before mounting.
+        bind_mounts.sort_by_key(|bm| bm.target.components().count());
+
         // Install our combined pre_exec hook
         unsafe {
             self.inner.pre_exec(move || {
@@ -7307,6 +7315,8 @@ impl Command {
         } else {
             None
         };
+
+        bind_mounts.sort_by_key(|bm| bm.target.components().count());
 
         unsafe {
             self.inner.pre_exec(move || {
