@@ -31,6 +31,23 @@ use std::sync::OnceLock;
 /// first referenced; an optional shipped `pelagos.slice` may set properties.
 pub const SLICE: &str = "pelagos.slice";
 
+/// Escape a string for use as a systemd ExecStart argument.
+///
+/// systemd performs `$VAR` / `${VAR}` expansion on every token of an ExecStart line,
+/// including the arguments of a transient unit created by `systemd-run`. If a
+/// container's command or environment value contains a `$` reference (e.g. bash
+/// scripts that use `${BIN_PATH}`), systemd expands it against the *scope*
+/// environment — where the variable is unset — replacing it with an empty string
+/// before the container process ever runs.
+///
+/// The fix is to escape every `$` as `$$`. systemd interprets `$$` as a literal `$`
+/// and passes it through unchanged, so the container process (bash in this case)
+/// receives the original `${BIN_PATH}` and expands it correctly using the env vars
+/// set by pelagos via `Command::env()`.
+fn escape_systemd_arg(s: &str) -> String {
+    s.replace('$', "$$")
+}
+
 /// Whether this host is running under systemd and `systemd-run` is usable.
 ///
 /// Requires both a live systemd (`/run/systemd/system`) and `systemd-run` on PATH.
@@ -97,9 +114,9 @@ pub fn build_scope_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
         format!("--unit={}", unit),
         "--quiet".to_string(),
         "--".to_string(),
-        bin.to_string(),
+        escape_systemd_arg(bin),
     ];
-    v.extend(args.iter().map(|s| s.to_string()));
+    v.extend(args.iter().map(|s| escape_systemd_arg(s)));
     v
 }
 
@@ -118,9 +135,9 @@ pub fn build_service_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
         "--property=KillMode=mixed".to_string(),
         "--quiet".to_string(),
         "--".to_string(),
-        bin.to_string(),
+        escape_systemd_arg(bin),
     ];
-    v.extend(args.iter().map(|s| s.to_string()));
+    v.extend(args.iter().map(|s| escape_systemd_arg(s)));
     v
 }
 
@@ -191,6 +208,33 @@ mod tests {
         let sep = argv.iter().position(|s| s == "--").unwrap();
         assert_eq!(argv[sep + 1], "/usr/local/bin/pelagos");
         assert_eq!(argv[sep + 2], "sandbox");
+    }
+
+    #[test]
+    fn dollar_signs_in_args_are_escaped_for_systemd() {
+        // systemd expands $VAR / ${VAR} in ExecStart args; we must escape $ → $$
+        // so container bash scripts that reference env vars like ${BIN_PATH} are
+        // not expanded prematurely by systemd before the container runs.
+        let script = "bash -ec 'nsenter \"${BIN_PATH}/tool\"'";
+        let argv = build_scope_argv(
+            "pelagos-ctr-pcri-abc.scope",
+            "/usr/local/bin/pelagos",
+            &[
+                "run",
+                "--env",
+                "BIN_PATH=/k3s/bin",
+                "--",
+                "img",
+                "bash",
+                "-ec",
+                script,
+            ],
+        );
+        let escaped_script = argv.last().unwrap();
+        assert_eq!(escaped_script, "bash -ec 'nsenter \"$${BIN_PATH}/tool\"'");
+        // args without $ are unchanged
+        assert!(argv.contains(&"--env".to_string()));
+        assert!(argv.contains(&"BIN_PATH=/k3s/bin".to_string()));
     }
 
     #[test]
