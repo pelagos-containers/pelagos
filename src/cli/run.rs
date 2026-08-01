@@ -749,6 +749,14 @@ fn build_image_run(
         }
     }
 
+    // Diagnostic: log CLI env vars before applying so RUST_LOG=pelagos=debug
+    // shows exactly which vars reach build_image_run (#483 tracing).
+    log::debug!(
+        "build_image_run {}: {} CLI env var(s): {:?}",
+        container_name,
+        args.env.len(),
+        args.env
+    );
     // Apply shared CLI options (network, volumes, security, etc.)
     // Pass layer_dirs so --user NAME is resolved against the image's /etc/passwd.
     cmd = apply_cli_options(

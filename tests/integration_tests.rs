@@ -32518,6 +32518,102 @@ mod issue_484_bind_mount_writable_without_ro_rootfs {
              MNT_RDONLY (#484).\nstderr: {err}"
         );
     }
+
+    /// Overlapping bind mounts — parent + child at a sub-path — must both be
+    /// reachable and writable even when the child bind is registered BEFORE the
+    /// parent in the API call order.
+    ///
+    /// Without depth-ordering, the child bind is established first and the parent
+    /// bind then covers the intermediate directory with an empty source, making the
+    /// child bind unreachable (kernel walks through the parent source's empty dir
+    /// instead of the established child mount → ENOENT or EROFS).  After the fix,
+    /// bind mounts are sorted by path depth (ascending) so the parent is always
+    /// established first.
+    ///
+    /// Mirrors the cilium-envoy hostPath pattern: `/run/cilium` parent bind +
+    /// `/var/run/cilium/envoy/sockets` child bind (with /var/run → /run symlink).
+    ///
+    /// Requires root and the alpine-rootfs.
+    #[test]
+    fn test_overlapping_bind_mounts_child_before_parent() {
+        if !is_root() {
+            eprintln!("Skipping test_overlapping_bind_mounts_child_before_parent: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_overlapping_bind_mounts_child_before_parent: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Set up a rootfs with /var/run -> /run (Ubuntu-like).
+        let tmp = tempfile::tempdir().expect("test_root tmpdir");
+        let test_root = tmp.path().join("root");
+        let cp = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&rootfs)
+            .arg(&test_root)
+            .status()
+            .expect("cp -a rootfs");
+        assert!(cp.success(), "failed to copy rootfs");
+        let var_run = test_root.join("var/run");
+        let _ = std::fs::remove_dir_all(&var_run);
+        let _ = std::fs::remove_file(&var_run);
+        std::fs::create_dir_all(test_root.join("run")).expect("mkdir run");
+        std::os::unix::fs::symlink("/run", &var_run).expect("symlink var/run -> /run");
+
+        // Parent bind source: empty directory (simulates /var/run/cilium host path
+        // that hasn't yet had sub-dirs created by the running container).
+        let parent_src = tempfile::tempdir().expect("parent src tmpdir");
+
+        // Child bind source: a separate directory with content the child owns.
+        let child_src = tempfile::tempdir().expect("child src tmpdir");
+
+        // Register binds in the WRONG (child-first) order that would fail before
+        // the depth-sort fix was applied.  After the fix the library sorts them so
+        // the parent (/run/cilium) is mounted before the child
+        // (/run/cilium/envoy/sockets), making the child path reachable.
+        let child_target = "/var/run/cilium/envoy/sockets"; // via /var/run -> /run symlink
+        let parent_target = "/run/cilium";
+
+        let mut child_proc = Command::new("/bin/sh")
+            .args([
+                "-c",
+                // Write through the child mount and verify it's reachable.
+                "echo ok-484-order > /run/cilium/envoy/sockets/test.txt \
+                 && cat /run/cilium/envoy/sockets/test.txt",
+            ])
+            .with_chroot(&test_root)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            // Register child BEFORE parent (wrong depth order on purpose).
+            .with_bind_mount(child_src.path(), child_target)
+            .with_bind_mount(parent_src.path(), parent_target)
+            .with_readonly_rootfs(true)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child_proc.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "overlapping bind mounts (child registered before parent) failed — \
+             bind mount ordering fix (#484) may be missing or incomplete.\n\
+             stdout: {out}\nstderr: {err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "ok-484-order",
+            "expected 'ok-484-order' from child bind mount, got '{out}' (#484).\n\
+             stderr: {err}"
+        );
+    }
 }
 
 // ── Issue #483 ─────────────────────────────────────────────────────────────────
