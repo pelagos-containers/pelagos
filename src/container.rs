@@ -1165,8 +1165,8 @@ fn log_nested_ro_mounts(prefix: &std::path::Path) {
 }
 
 /// Emit trace-level mountinfo lines for a given container target path.
-/// Called in pre_exec after each bind mount so duplicate-entry bugs (#492)
-/// are visible in cluster logs when RUST_LOG includes pelagos=trace.
+/// Called after non-deferred bind mounts (and after deferred /sys re-binds)
+/// so mount-table anomalies are visible when RUST_LOG includes pelagos=trace.
 fn log_mountinfo_for_target(target: &std::path::Path) {
     if !log::log_enabled!(log::Level::Trace) {
         return;
@@ -1193,7 +1193,7 @@ fn log_mountinfo_for_target(target: &std::path::Path) {
     }
     if count > 1 {
         log::warn!(
-            "container: {} mountinfo entries at {} after bind (#492 duplicate)",
+            "container: {} mountinfo entries at {} — unexpected duplicate",
             count,
             target_str
         );
@@ -1212,6 +1212,10 @@ fn log_mountinfo_for_target(target: &std::path::Path) {
 /// (the bind sources) in their peer groups, which is exactly what lets a
 /// propagated bind join the host's peer group; each bind then gets its own
 /// explicit propagation applied after it is established.
+///
+/// Note: /sys-targeted non-private binds are applied post-pivot (after sysfs is
+/// mounted) via the stash mechanism in #492b; `MS_SLAVE` is still the right
+/// choice because the initial root propagation must be set before any bind runs.
 fn default_rootfs_propagation(bind_mounts: &[BindMount]) -> libc::c_ulong {
     let needs_propagation = bind_mounts
         .iter()
@@ -5325,8 +5329,8 @@ impl Command {
                                     io::Error::last_os_error(),
                                 ));
                             }
-                            // Detach the inherited source; after pivot it goes to
-                            // /.pivot_root_old which is then MNT_DETACH'd anyway.
+                            // Detach the inherited host-side mount so it does not
+                            // linger in the child namespace during pivot_root.
                             let _ = libc::umount2(src_c.as_ptr(), libc::MNT_DETACH);
                             // Post-pivot path: effective_root prefix disappears.
                             let stash_post_pivot = PathBuf::from(format!("/{stash_name}"));
@@ -5718,6 +5722,12 @@ impl Command {
                     // Detach and remove the stash.
                     let _ = libc::umount2(stash_c.as_ptr(), libc::MNT_DETACH);
                     let _ = std::fs::remove_dir(stash_path);
+
+                    log::trace!(
+                        "deferred /sys bind {}: mountinfo after re-bind:",
+                        bm.target.display()
+                    );
+                    log_mountinfo_for_target(&bm.target);
                 }
 
                 // Mount tmpfs filesystems AFTER chroot — tmpfs has no host-side source
