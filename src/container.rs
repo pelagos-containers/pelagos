@@ -1164,6 +1164,42 @@ fn log_nested_ro_mounts(prefix: &std::path::Path) {
     }
 }
 
+/// Emit trace-level mountinfo lines for a given container target path.
+/// Called in pre_exec after each bind mount so duplicate-entry bugs (#492)
+/// are visible in cluster logs when RUST_LOG includes pelagos=trace.
+fn log_mountinfo_for_target(target: &std::path::Path) {
+    if !log::log_enabled!(log::Level::Trace) {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let target_str = target.to_string_lossy();
+    let mut count = 0usize;
+    for line in content.lines() {
+        let mut it = line.splitn(7, ' ');
+        let _mountid = it.next();
+        let _parentid = it.next();
+        let _devno = it.next();
+        let _root = it.next();
+        let mountpoint = it.next().unwrap_or("");
+        if mountpoint == target_str.as_ref() || mountpoint.starts_with(&format!("{}/", target_str))
+        {
+            log::trace!("[mountinfo] {}", line);
+            if mountpoint == target_str.as_ref() {
+                count += 1;
+            }
+        }
+    }
+    if count > 1 {
+        log::warn!(
+            "container: {} mountinfo entries at {} after bind (#492 duplicate)",
+            count,
+            target_str
+        );
+    }
+}
+
 /// Default propagation flags for the container's root mount when
 /// `linux.rootfsPropagation` is not explicitly set (#341).
 ///
@@ -4755,6 +4791,12 @@ impl Command {
                 // /sys/fs/cgroup so path traversal through sysfs finds it correctly.
                 let mut cgroup_staged = false;
 
+                // #492b: stash paths for deferred /sys bind mounts (see below).
+                // Declared here (outer scope) so they survive pivot_root and are
+                // visible to the post-sysfs re-bind pass which runs at this level.
+                let mut deferred_sys_mounts: Vec<(PathBuf, BindMount)> = Vec::new();
+                let mut sys_stash_idx: usize = 0;
+
                 // Step 4: Change root if specified
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
@@ -5240,6 +5282,58 @@ impl Command {
                             std::fs::canonicalize(&bm.source).unwrap_or_else(|_| bm.source.clone());
                         let src_c = CString::new(canonical_source.as_os_str().as_bytes()).unwrap();
                         let tgt_c = CString::new(host_target.as_os_str().as_bytes()).unwrap();
+
+                        // #492b: defer /sys-targeted non-private binds to after sysfs.
+                        // Bind them now into a stash dir inside the overlay so the bpffs
+                        // (or other /sys source) survives pivot_root, then re-bind after
+                        // sysfs is mounted so the bind lands at the sysfs dentry rather
+                        // than the hidden overlay dentry.
+                        if mount_sys
+                            && bm.propagation != MountPropagation::Private
+                            && bm.target.starts_with("/sys")
+                        {
+                            let stash_name = format!(".pelagos_sys_stash_{sys_stash_idx}");
+                            sys_stash_idx += 1;
+                            let stash_host = effective_root.join(&stash_name);
+                            let _ = std::fs::create_dir_all(&stash_host);
+                            let stash_c = CString::new(stash_host.as_os_str().as_bytes()).unwrap();
+                            // For Bidirectional: join the host peer group before stashing
+                            // so the stash is already a peer (the re-bind inherits it).
+                            if bm.propagation == MountPropagation::Bidirectional {
+                                let _ = libc::mount(
+                                    ptr::null(),
+                                    src_c.as_ptr(),
+                                    ptr::null(),
+                                    libc::MS_SHARED | libc::MS_REC,
+                                    ptr::null(),
+                                );
+                            }
+                            let r = libc::mount(
+                                src_c.as_ptr(),
+                                stash_c.as_ptr(),
+                                ptr::null(),
+                                libc::MS_BIND | libc::MS_REC,
+                                ptr::null(),
+                            );
+                            if r != 0 {
+                                return Err(pre_exec_err(
+                                    &format!(
+                                        "sys stash bind {} -> {}",
+                                        canonical_source.display(),
+                                        stash_host.display()
+                                    ),
+                                    io::Error::last_os_error(),
+                                ));
+                            }
+                            // Detach the inherited source; after pivot it goes to
+                            // /.pivot_root_old which is then MNT_DETACH'd anyway.
+                            let _ = libc::umount2(src_c.as_ptr(), libc::MNT_DETACH);
+                            // Post-pivot path: effective_root prefix disappears.
+                            let stash_post_pivot = PathBuf::from(format!("/{stash_name}"));
+                            deferred_sys_mounts.push((stash_post_pivot, bm.clone()));
+                            continue;
+                        }
+
                         // #341: for bidirectional propagation the SOURCE must be a shared
                         // mount (member of a peer group) so the bind joins that group and
                         // mounts the container creates propagate back to the host. The
@@ -5259,9 +5353,9 @@ impl Command {
                         // from the host's inherited sysfs/bpffs), a plain bind would
                         // stack a second entry on top. Cilium reads /proc/self/mountinfo
                         // and aborts when it finds two entries at /sys/fs/bpf. Detach
-                        // any inherited mount first so the bind produces exactly one
-                        // mountinfo entry. EINVAL means no existing mountpoint — ignore.
-                        let _ = libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH);
+                        // ALL stacked mounts at the target first (loop: EINVAL = no more
+                        // mountpoints to detach).
+                        while libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH) == 0 {}
 
                         // Step 1: establish the bind. Use a RECURSIVE bind so any
                         // submounts under the source (e.g. a tmpfs the caller mounted
@@ -5287,6 +5381,8 @@ impl Command {
                                 io::Error::last_os_error(),
                             ));
                         }
+                        log::trace!("bind mount {}: mountinfo after bind:", bm.target.display());
+                        log_mountinfo_for_target(&bm.target);
                         // Step 2 (if writable): clear any inherited MS_RDONLY flag.
                         // A bind mount inherits the per-mount flags of the *source* mount,
                         // including MS_RDONLY when the source was mounted read-only.  Use
@@ -5569,6 +5665,59 @@ impl Command {
                             return Err(pre_exec_err("move cgroupfs", io::Error::last_os_error()));
                         }
                     }
+                }
+
+                // #492b: re-bind any /sys-targeted mounts that were deferred above.
+                // Sysfs is now at /sys, so a bind at /sys/fs/bpf lands at the correct
+                // sysfs dentry instead of the (now-shadowed) overlay dentry.
+                for (stash_path, bm) in &deferred_sys_mounts {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let stash_c = CString::new(stash_path.as_os_str().as_bytes()).unwrap();
+                    let tgt_c = CString::new(bm.target.as_os_str().as_bytes()).unwrap();
+
+                    // Target dir must exist within sysfs (it normally does for /sys/fs/bpf).
+                    let _ = std::fs::create_dir_all(&bm.target);
+
+                    // Detach any pre-existing mount at the target (no-op if none).
+                    while libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH) == 0 {}
+
+                    // Bind from stash — now goes to (sysfs, /fs/bpf dentry).
+                    let r = libc::mount(
+                        stash_c.as_ptr(),
+                        tgt_c.as_ptr(),
+                        ptr::null(),
+                        libc::MS_BIND | libc::MS_REC,
+                        ptr::null(),
+                    );
+                    if r != 0 {
+                        return Err(pre_exec_err(
+                            &format!("deferred sys bind {}", bm.target.display()),
+                            io::Error::last_os_error(),
+                        ));
+                    }
+
+                    // Clear any inherited MS_RDONLY from the source.
+                    if !bm.readonly {
+                        clear_mount_rdonly(&tgt_c, &bm.target);
+                    }
+
+                    // Apply requested propagation.
+                    let prop_flags = match bm.propagation {
+                        MountPropagation::Private => libc::MS_PRIVATE | libc::MS_REC,
+                        MountPropagation::HostToContainer => libc::MS_SLAVE | libc::MS_REC,
+                        MountPropagation::Bidirectional => libc::MS_SHARED | libc::MS_REC,
+                    };
+                    let _ = libc::mount(
+                        ptr::null(),
+                        tgt_c.as_ptr(),
+                        ptr::null(),
+                        prop_flags,
+                        ptr::null(),
+                    );
+
+                    // Detach and remove the stash.
+                    let _ = libc::umount2(stash_c.as_ptr(), libc::MNT_DETACH);
+                    let _ = std::fs::remove_dir(stash_path);
                 }
 
                 // Mount tmpfs filesystems AFTER chroot — tmpfs has no host-side source

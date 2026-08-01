@@ -32157,6 +32157,119 @@ mod issue_477_no_duplicate_inherited_mounts {
     }
 }
 
+/// Issue #492: a hostPath bind mount of /sys/fs/bpf with Bidirectional
+/// propagation (MS_SHARED) must not produce a duplicate mountinfo entry for
+/// that path inside the container. Cilium's pre-flight check fails with
+/// "multiple mount points detected at /sys/fs/bpf" when a second entry is
+/// present — one inherited via shared propagation and one from the explicit bind.
+///
+/// Root cause: making the source MS_SHARED (so the bind joins the host's bpffs
+/// peer group) leaves an inherited copy of the mount visible in the child
+/// namespace. The fix removes the inherited source from the child namespace
+/// immediately after the bind is established (the bind itself, now a peer, is
+/// sufficient for bidirectional propagation).
+mod issue_492_no_duplicate_mountinfo_bidirectional {
+    use super::*;
+
+    /// Requires root.
+    ///
+    /// Bind-mounts /sys/fs/bpf with Bidirectional propagation (rshared) inside
+    /// a container that uses an overlay rootfs, matching the exact scenario that
+    /// causes Cilium to fail on Pelagos. Verifies that /proc/self/mountinfo
+    /// inside the container contains exactly one entry for /sys/fs/bpf.
+    #[test]
+    fn test_no_duplicate_mountinfo_bidirectional_bpf() {
+        if !is_root() {
+            eprintln!("Skipping test_no_duplicate_mountinfo_bidirectional_bpf: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_no_duplicate_mountinfo_bidirectional_bpf: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Only meaningful if the host actually has a bpffs at /sys/fs/bpf in
+        // a shared peer group — which is the scenario that triggers #492.
+        let host_mountinfo =
+            std::fs::read_to_string("/proc/self/mountinfo").expect("read /proc/self/mountinfo");
+        // mountinfo format: id parentid major:minor root mntpoint mountopts [optfields] - fstype ...
+        // optional fields (e.g. "shared:N") come AFTER mountopts; scan the whole line.
+        let host_has_shared_bpf = host_mountinfo.lines().any(|l| {
+            let mut fields = l.splitn(6, ' ');
+            let _ = fields.next(); // id
+            let _ = fields.next(); // parentid
+            let _ = fields.next(); // major:minor
+            let _ = fields.next(); // root
+            let mntpoint = fields.next().unwrap_or("");
+            let rest = fields.next().unwrap_or("");
+            mntpoint == "/sys/fs/bpf" && rest.contains("shared:")
+        });
+        if !host_has_shared_bpf {
+            eprintln!(
+                "Skipping test_no_duplicate_mountinfo_bidirectional_bpf: \
+                 host /sys/fs/bpf is not a shared mount (peer-group entry required to \
+                 reproduce #492)"
+            );
+            return;
+        }
+
+        let target = "/sys/fs/bpf";
+
+        // Use an overlay so this matches the exact CRI path (pivot_root via overlay
+        // merged dir) rather than the simpler chroot path exercised by the #477 test.
+        let tmp = tempfile::tempdir().expect("tempdir for overlay");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "awk '$5==\"{target}\"{{count++}} END{{print count+0}}' \
+                     /proc/self/mountinfo"
+                ),
+            ])
+            .with_chroot(&rootfs)
+            .with_overlay(upper, work)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_sys_mount()
+            .with_bind_mount_propagated(
+                "/sys/fs/bpf",
+                target,
+                false,
+                false,
+                pelagos::container::MountPropagation::Bidirectional,
+            )
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "container exited with error (issue #492 test).\nstdout: {out}\nstderr: {err}"
+        );
+
+        let count: u32 = out.trim().parse().unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 mountinfo entry for {target}, got {count} — \
+             duplicate entries from shared-propagation + explicit bind (#492). \
+             Cilium would fail with 'multiple mount points detected'.\nstderr: {err}"
+        );
+    }
+}
+
 /// Issue #478: a bind mount onto a path under /var/run (which on Ubuntu 24.04+
 /// is a symlink to /run) must remain writable in the container even when
 /// readOnlyRootFilesystem is set — because the bind mount source is on a
