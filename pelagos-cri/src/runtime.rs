@@ -1442,8 +1442,22 @@ impl RuntimeService for RuntimeSvc {
             .envs
             .iter()
             .map(|kv| {
+                let raw_len = kv.value.len();
                 let clean: Vec<u8> = kv.value.iter().copied().filter(|&b| b != 0).collect();
-                (kv.key.clone(), String::from_utf8_lossy(&clean).into_owned())
+                if clean.len() != raw_len {
+                    log::info!(
+                        "create_container {}: env var '{}' had {} NUL byte(s) stripped \
+                         (raw {} bytes → {} bytes after strip)",
+                        meta.name,
+                        kv.key,
+                        raw_len - clean.len(),
+                        raw_len,
+                        clean.len(),
+                    );
+                }
+                let value = String::from_utf8_lossy(&clean).into_owned();
+                log::debug!("create_container {}: env {}={:?}", meta.name, kv.key, value);
+                (kv.key.clone(), value)
             })
             .collect();
 
@@ -1787,6 +1801,12 @@ impl RuntimeService for RuntimeSvc {
         }
 
         for (k, v) in &container.envs {
+            log::debug!(
+                "start_container {}: passing env {}={:?}",
+                container_id,
+                k,
+                v
+            );
             args.push("--env".into());
             args.push(format!("{}={}", k, v));
         }

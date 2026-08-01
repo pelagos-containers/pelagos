@@ -998,11 +998,13 @@ fn mount_setattr_rdonly_recursive(target: &std::ffi::CStr) -> bool {
 /// the source mount has flags like `MS_NOSUID`/`MS_NODEV` that must be preserved
 /// — the kernel requires a bind-remount to specify ALL current flags or it rejects
 /// the call.  This function:
-///   1. Tries `mount_setattr(2)` with `attr_clr=MOUNT_ATTR_RDONLY` (Linux ≥ 5.12) —
-///      the modern, flag-preserving API that never requires specifying other flags.
+///   1. Tries `mount_setattr(2)` with `attr_clr=MOUNT_ATTR_RDONLY` and
+///      `AT_RECURSIVE` (Linux ≥ 5.12) — the modern, flag-preserving API that
+///      clears RDONLY on the top-level bind AND any nested mounts (e.g. a tmpfs
+///      a previous Cilium run left at /run/cilium/envoy/sockets).
 ///   2. Falls back to a legacy `MS_REMOUNT|MS_BIND` with the current per-mount flags
 ///      read from `/proc/self/mountinfo`, so only `MS_RDONLY` is removed and all
-///      other flags are preserved.
+///      other flags are preserved (non-recursive; covers the common single-mount case).
 ///
 /// Returns `true` if the mount is now writable (or was already writable), `false`
 /// if both attempts fail.
@@ -1015,9 +1017,18 @@ fn clear_mount_rdonly(target: &std::ffi::CStr, target_path: &std::path::Path) ->
         userns_fd: u64,
     }
     const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
     const SYS_MOUNT_SETATTR: libc::c_long = 442;
 
-    // Attempt 1: mount_setattr(attr_clr=RDONLY) — preserves all other flags.
+    log::debug!(
+        "container: clear_mount_rdonly: target={} flags_before={}",
+        target_path.display(),
+        read_mountinfo_flags(target_path)
+    );
+
+    // Attempt 1: mount_setattr(AT_RECURSIVE | attr_clr=RDONLY) — preserves all
+    // other flags and recursively clears RDONLY on nested mounts (#484: a prior
+    // Cilium run may leave a read-only tmpfs at the same path on the host).
     let attr = MountAttr {
         attr_set: 0,
         attr_clr: MOUNT_ATTR_RDONLY,
@@ -1029,14 +1040,19 @@ fn clear_mount_rdonly(target: &std::ffi::CStr, target_path: &std::path::Path) ->
             SYS_MOUNT_SETATTR,
             libc::AT_FDCWD,
             target.as_ptr(),
-            0u32,
+            AT_RECURSIVE,
             &attr as *const MountAttr,
             std::mem::size_of::<MountAttr>(),
         )
     };
     if rc == 0 {
+        log::debug!(
+            "container: clear_mount_rdonly: mount_setattr(AT_RECURSIVE) succeeded for {}",
+            target_path.display()
+        );
         return true;
     }
+    let setattr_errno = unsafe { *libc::__errno_location() };
 
     // Attempt 2: legacy MS_REMOUNT|MS_BIND with full current flags minus RDONLY.
     // Read the current mount flags from /proc/self/mountinfo so we can pass all
@@ -1057,13 +1073,14 @@ fn clear_mount_rdonly(target: &std::ffi::CStr, target_path: &std::path::Path) ->
     if ret == 0 {
         return true;
     }
+    let remount_errno = unsafe { *libc::__errno_location() };
     log::warn!(
-        "container: could not clear MS_RDONLY on writable bind mount {}: {} \
-         (mount_setattr errno {}, remount errno {}); bind may be read-only inside container",
+        "container: could not clear MS_RDONLY on writable bind mount {}: \
+         mount_setattr(AT_RECURSIVE) errno={}, remount errno={}; \
+         bind may be read-only inside container",
         target_path.display(),
-        io::Error::last_os_error(),
-        unsafe { *libc::__errno_location() },
-        unsafe { *libc::__errno_location() },
+        setattr_errno,
+        remount_errno,
     );
     false
 }
@@ -1108,6 +1125,43 @@ fn read_mountinfo_flags(target: &std::path::Path) -> libc::c_ulong {
         return flags;
     }
     0
+}
+
+/// Log all mounts under `prefix` that appear read-only in `/proc/self/mountinfo`.
+/// Called (at debug level) after establishing a writable bind mount so that any
+/// nested RO sub-mounts are visible in the logs even when `clear_mount_rdonly`
+/// returns `true` (mount_setattr succeeded but an inner mount is still blocked).
+fn log_nested_ro_mounts(prefix: &std::path::Path) {
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let prefix_str = prefix.to_string_lossy();
+    for line in content.lines() {
+        let mut it = line.splitn(7, ' ');
+        let _mountid = it.next();
+        let _parentid = it.next();
+        let _devno = it.next();
+        let _root = it.next();
+        let mountpoint = it.next().unwrap_or("");
+        let opts = it.next().unwrap_or("");
+        if !mountpoint.starts_with(prefix_str.as_ref()) {
+            continue;
+        }
+        if opts.split(',').any(|o| o == "ro") {
+            log::warn!(
+                "container: nested mount {} is still read-only after RDONLY clear \
+                 (opts={}); writes to this path will fail with EROFS (#484)",
+                mountpoint,
+                opts
+            );
+        } else {
+            log::debug!(
+                "container: nested mount {} is writable (opts={})",
+                mountpoint,
+                opts
+            );
+        }
+    }
 }
 
 /// Default propagation flags for the container's root mount when
@@ -5232,6 +5286,8 @@ impl Command {
                         // (#484) to remove only MS_RDONLY without disturbing other flags.
                         if !bm.readonly {
                             clear_mount_rdonly(&tgt_c, &host_target);
+                            // Log any nested mounts that are still RO after clearing (#484).
+                            log_nested_ro_mounts(&host_target);
                         }
                         // Step 3 (if readonly): make the mount read-only.
                         if bm.readonly {
@@ -8209,6 +8265,7 @@ impl Command {
                         }
                         if !bm.readonly {
                             clear_mount_rdonly(&tgt_c, &host_target);
+                            log_nested_ro_mounts(&host_target);
                         }
                         if bm.readonly {
                             // Recursive RO (#356) via mount_setattr(AT_RECURSIVE);
