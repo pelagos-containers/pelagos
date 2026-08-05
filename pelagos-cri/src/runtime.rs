@@ -912,18 +912,30 @@ impl RuntimeService for RuntimeSvc {
             let id = generate_id();
             let ns_name = format!("pcri-{}", &id[..12]);
 
-            let netns_path = cni::create_netns(&ns_name)
+            // `ip netns add` and CNI ADD both shell out. CNI ADD in particular can
+            // block for the plugin's full retry/timeout window (e.g. 30s while
+            // Cilium's agent socket doesn't exist yet). Both run on the blocking
+            // pool so a burst of concurrent sandbox creations after a reboot
+            // cannot pin down the async worker threads and starve unrelated RPCs;
+            // CNI ADD is additionally concurrency-bounded so that burst can't
+            // thundering-herd the CNI provider itself (#494).
+            let ns_name_bg = ns_name.clone();
+            let netns_path = tokio::task::spawn_blocking(move || cni::create_netns(&ns_name_bg))
+                .await
+                .map_err(|e| Status::internal(format!("create netns task join: {}", e)))?
                 .map_err(|e| Status::internal(format!("create netns for CNI sandbox: {}", e)))?;
 
-            let ip = match cni::cni_add(
-                &id,
-                &netns_path,
-                &conf_path,
-                &cni_cap_args,
-                &meta.name,
-                &meta.namespace,
-                &uid,
-            ) {
+            let ip = match cni::cni_add_bounded(
+                id.clone(),
+                netns_path.clone(),
+                conf_path.clone(),
+                cni_cap_args.clone(),
+                meta.name.clone(),
+                meta.namespace.clone(),
+                uid.clone(),
+            )
+            .await
+            {
                 Ok(ip) => ip,
                 Err(e) => {
                     cni::delete_netns(&ns_name);
@@ -1232,19 +1244,26 @@ impl RuntimeService for RuntimeSvc {
                         sandbox_id,
                         sb.netns
                     );
-                    cni::cni_del(
-                        &sandbox_id,
-                        &netns_path,
-                        std::path::Path::new(&sb.cni_conf),
-                        &cap_args,
-                        &sb.name,
-                        &sb.namespace,
-                        &sb.uid,
-                    );
+                    // CNI DEL shells out to the plugin binary and can block for its
+                    // full retry window; run on the (concurrency-bounded) blocking
+                    // pool (#494).
+                    cni::cni_del_bounded(
+                        sandbox_id.clone(),
+                        netns_path.clone(),
+                        std::path::PathBuf::from(&sb.cni_conf),
+                        cap_args,
+                        sb.name.clone(),
+                        sb.namespace.clone(),
+                        sb.uid.clone(),
+                    )
+                    .await;
                     log::debug!("StopPodSandbox {} step=cni_del DONE", sandbox_id);
                 }
                 log::debug!("StopPodSandbox {} step=delete_netns", sandbox_id);
-                cni::delete_netns(&sb.netns);
+                {
+                    let ns_bg = sb.netns.clone();
+                    let _ = tokio::task::spawn_blocking(move || cni::delete_netns(&ns_bg)).await;
+                }
                 log::debug!("StopPodSandbox {} step=delete_netns DONE", sandbox_id);
                 state::remove_pelagos_sandbox_state(&sandbox_id);
             } else {

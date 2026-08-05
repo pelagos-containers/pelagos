@@ -99,6 +99,98 @@ struct PodId<'a> {
     uid: &'a str,
 }
 
+/// Caps how many CNI plugin processes (ADD/DEL) run at once.
+///
+/// After a node reboot, kubelet can reconcile dozens of pods simultaneously;
+/// each triggers `RunPodSandbox` → CNI ADD. If the CNI provider (e.g. Cilium)
+/// isn't up yet, every one of those plugin invocations blocks retrying its
+/// connection to the same not-yet-existing agent socket. Left unbounded, that
+/// thundering herd competes with — and slows down — the very agent pod they're
+/// all waiting on, on top of the raw process/fd load of dozens of concurrent
+/// plugin binaries. `spawn_blocking` (see `*_bounded` below) keeps this off the
+/// gRPC server's async worker threads; this semaphore keeps it from overwhelming
+/// the CNI provider itself. See #494.
+const MAX_CONCURRENT_CNI_CALLS: usize = 8;
+
+fn cni_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_CNI_CALLS))
+}
+
+/// Runs a blocking closure on the blocking thread pool, gated by
+/// [`cni_semaphore`]. Shared by [`cni_add_bounded`] / [`cni_del_bounded`];
+/// pulled out as its own function so the concurrency-bounding behavior can
+/// be exercised directly in tests without needing a real CNI plugin binary
+/// on disk. See #494.
+async fn run_bounded<F, T>(f: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let _permit = cni_semaphore()
+        .acquire()
+        .await
+        .expect("cni semaphore is never closed");
+    tokio::task::spawn_blocking(f).await
+}
+
+/// Async, concurrency-bounded wrapper around [`cni_add`].
+///
+/// Runs the blocking plugin invocation on the blocking thread pool (so it
+/// can't starve the gRPC server's async workers) and limits how many such
+/// invocations run at once (so a reconciliation burst can't thundering-herd
+/// the CNI provider). See [`MAX_CONCURRENT_CNI_CALLS`] and #494.
+#[allow(clippy::too_many_arguments)]
+pub async fn cni_add_bounded(
+    sandbox_id: String,
+    netns_path: String,
+    conf_path: PathBuf,
+    cap_args: serde_json::Value,
+    pod_name: String,
+    pod_namespace: String,
+    pod_uid: String,
+) -> Result<String, String> {
+    run_bounded(move || {
+        cni_add(
+            &sandbox_id,
+            &netns_path,
+            &conf_path,
+            &cap_args,
+            &pod_name,
+            &pod_namespace,
+            &pod_uid,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("CNI ADD task join: {}", e)))
+}
+
+/// Async, concurrency-bounded wrapper around [`cni_del`]. Best-effort, like
+/// `cni_del` — errors are logged, not returned. See [`cni_add_bounded`].
+#[allow(clippy::too_many_arguments)]
+pub async fn cni_del_bounded(
+    sandbox_id: String,
+    netns_path: String,
+    conf_path: PathBuf,
+    cap_args: serde_json::Value,
+    pod_name: String,
+    pod_namespace: String,
+    pod_uid: String,
+) {
+    let _ = run_bounded(move || {
+        cni_del(
+            &sandbox_id,
+            &netns_path,
+            &conf_path,
+            &cap_args,
+            &pod_name,
+            &pod_namespace,
+            &pod_uid,
+        )
+    })
+    .await;
+}
+
 /// Run CNI ADD for a sandbox.
 /// Returns the assigned IPv4 address (without prefix length) on success.
 pub fn cni_add(
@@ -456,5 +548,75 @@ mod tests {
         // Capability declared but no matching arg → nothing injected.
         let bw = serde_json::json!({"type":"bandwidth","capabilities":{"bandwidth":true}});
         assert!(capability_runtime_config(&bw, &cap_args).is_none());
+    }
+
+    /// #494: a burst of concurrent CNI calls must never exceed
+    /// `MAX_CONCURRENT_CNI_CALLS` in flight at once, regardless of how many are
+    /// requested at once (simulating ~40 pods reconciling after a reboot).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_bounded_limits_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_CNI_CALLS * 3) {
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(run_bounded(move || {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                active.fetch_sub(1, Ordering::SeqCst);
+            })));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        let seen = max_seen.load(Ordering::SeqCst);
+        assert!(
+            seen <= MAX_CONCURRENT_CNI_CALLS,
+            "observed {} concurrent CNI calls in flight, semaphore cap is {} (#494)",
+            seen,
+            MAX_CONCURRENT_CNI_CALLS
+        );
+    }
+
+    /// #494: `run_bounded`'s blocking work must run on the blocking thread pool,
+    /// not inline on an async worker thread. Regression test for the original
+    /// bug: `cni_add`/`cni_del` were `std::process::Command` calls made directly
+    /// inside async gRPC handlers, so a blocked CNI call (e.g. 30s waiting on
+    /// Cilium's not-yet-existing socket) fully pinned a worker thread and starved
+    /// unrelated RPCs. With a single-worker-thread runtime, if `run_bounded` ever
+    /// regresses to running its closure inline, this test's own async sleep would
+    /// be stuck behind the closures' `std::thread::sleep` and blow past the
+    /// generous timing assertion below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_run_bounded_does_not_block_async_worker() {
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(tokio::spawn(run_bounded(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            })));
+        }
+
+        // Unrelated async work on the (sole) worker thread must still complete
+        // promptly while those "CNI calls" are blocked in flight.
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "async sleep took {:?}; the sole worker thread appears blocked by \
+             run_bounded's closures instead of them running on the blocking pool (#494)",
+            elapsed
+        );
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
     }
 }
