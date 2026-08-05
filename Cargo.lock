@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "pelagos"
-version = "0.65.76"
+version = "0.65.77"
 dependencies = [
  "bitflags 2.11.0",
  "bzip2",
@@ -2684,6 +2684,8 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tower-layer",
+ "tower-service",
  "uuid",
 ]
 
