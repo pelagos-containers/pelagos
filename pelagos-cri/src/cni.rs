@@ -148,27 +148,64 @@ pub fn start_semaphore_gauge_sampler() {
     });
 }
 
+/// Why [`run_bounded`] returns this instead of the plugin invocation's own
+/// error type directly.
+#[derive(Debug)]
+pub enum RunBoundedError {
+    /// The semaphore was already at capacity — see [`MAX_CONCURRENT_CNI_CALLS`].
+    /// Callers map this to gRPC `RESOURCE_EXHAUSTED` so kubelet gets an
+    /// immediate, explicit signal to retry later, instead of the request
+    /// hanging for however long the queue takes to drain (#500).
+    ResourceExhausted,
+    /// The blocking task panicked or was cancelled.
+    Join(tokio::task::JoinError),
+}
+
 /// Runs a blocking closure on the blocking thread pool, gated by
 /// [`cni_semaphore`]. Shared by [`cni_add_bounded`] / [`cni_del_bounded`];
 /// pulled out as its own function so the concurrency-bounding behavior can
 /// be exercised directly in tests without needing a real CNI plugin binary
 /// on disk. See #494.
 ///
-/// `op` labels the latency histogram (`"add"` or `"del"`) — see #499.
-async fn run_bounded<F, T>(op: &'static str, f: F) -> Result<T, tokio::task::JoinError>
+/// `op` labels the latency/rejection metrics (`"add"` or `"del"`) — see #499.
+///
+/// Fails fast (`try_acquire`) rather than queuing on `acquire().await` — see
+/// #500. This applies to **both** ADD and DEL, including DEL's best-effort
+/// cleanup path: a saturated DEL is now skipped immediately rather than
+/// delayed, which means the CNI plugin's IPAM/veth release for that sandbox
+/// does not run at all for this call (no automatic retry). This is a real
+/// tradeoff — silently skipped cleanup vs. bounded delay — made deliberately
+/// symmetric with ADD for simplicity; the rejection counter below exists
+/// specifically so a spike in dropped DELs is visible to operators rather
+/// than a silent leak.
+async fn run_bounded<F, T>(op: &'static str, f: F) -> Result<T, RunBoundedError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    metrics::describe_counter!(
+        "pelagos_cri_cni_semaphore_rejected_total",
+        "CNI calls rejected with RESOURCE_EXHAUSTED because the semaphore was already at capacity, by op"
+    );
+
     let started = std::time::Instant::now();
-    let _permit = cni_semaphore()
-        .acquire()
-        .await
-        .expect("cni semaphore is never closed");
+    let _permit = match cni_semaphore().try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            metrics::counter!("pelagos_cri_cni_semaphore_rejected_total", "op" => op).increment(1);
+            if op == "del" {
+                log::error!(
+                    "CNI DEL rejected (semaphore saturated, {} in flight) — cleanup for this call will NOT run, possible IPAM/veth leak (#500)",
+                    MAX_CONCURRENT_CNI_CALLS
+                );
+            }
+            return Err(RunBoundedError::ResourceExhausted);
+        }
+    };
     let result = tokio::task::spawn_blocking(f).await;
     metrics::histogram!("pelagos_cri_cni_call_duration_seconds", "op" => op)
         .record(started.elapsed().as_secs_f64());
-    result
+    result.map_err(RunBoundedError::Join)
 }
 
 /// Async, concurrency-bounded wrapper around [`cni_add`].
@@ -186,8 +223,8 @@ pub async fn cni_add_bounded(
     pod_name: String,
     pod_namespace: String,
     pod_uid: String,
-) -> Result<String, String> {
-    run_bounded("add", move || {
+) -> Result<String, CniAddError> {
+    match run_bounded("add", move || {
         cni_add(
             &sandbox_id,
             &netns_path,
@@ -199,7 +236,31 @@ pub async fn cni_add_bounded(
         )
     })
     .await
-    .unwrap_or_else(|e| Err(format!("CNI ADD task join: {}", e)))
+    {
+        Ok(inner) => inner.map_err(CniAddError::Plugin),
+        Err(RunBoundedError::ResourceExhausted) => Err(CniAddError::ResourceExhausted),
+        Err(RunBoundedError::Join(e)) => {
+            Err(CniAddError::Plugin(format!("CNI ADD task join: {}", e)))
+        }
+    }
+}
+
+/// Distinguishes semaphore saturation (maps to gRPC `RESOURCE_EXHAUSTED`,
+/// see #500) from an actual CNI plugin failure (maps to `INTERNAL`, as
+/// before). See [`cni_add_bounded`].
+#[derive(Debug)]
+pub enum CniAddError {
+    ResourceExhausted,
+    Plugin(String),
+}
+
+impl std::fmt::Display for CniAddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CniAddError::ResourceExhausted => write!(f, "CNI semaphore at capacity"),
+            CniAddError::Plugin(msg) => write!(f, "{}", msg),
+        }
+    }
 }
 
 /// Async, concurrency-bounded wrapper around [`cni_del`]. Best-effort, like
@@ -509,6 +570,7 @@ fn invoke_conflist(
 mod tests {
     use super::*;
     use crate::state::CriPortMapping;
+    use serial_test::serial;
 
     #[test]
     fn test_port_mapping_cap_args() {
@@ -590,8 +652,19 @@ mod tests {
     /// #494: a burst of concurrent CNI calls must never exceed
     /// `MAX_CONCURRENT_CNI_CALLS` in flight at once, regardless of how many are
     /// requested at once (simulating ~40 pods reconciling after a reboot).
+    ///
+    /// #500 changed `run_bounded` from queuing (`acquire().await`) to failing
+    /// fast (`try_acquire()`), so unlike the pre-#500 version of this test,
+    /// calls beyond the semaphore's capacity are no longer expected to
+    /// eventually succeed — they're rejected immediately with
+    /// `RunBoundedError::ResourceExhausted`. The 100ms hold (vs. the
+    /// pre-#500 30ms) gives ample margin for all `MAX_CONCURRENT_CNI_CALLS *
+    /// 3` tasks to reach their `try_acquire()` call before any of the
+    /// successful ones release their permit, even on a loaded CI runner —
+    /// otherwise the exact `ok_count` assertion below would be flaky.
+    #[serial(cni_semaphore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_run_bounded_limits_concurrency() {
+    async fn test_run_bounded_limits_concurrency_and_fails_fast_over_capacity() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -605,12 +678,19 @@ mod tests {
             handles.push(tokio::spawn(run_bounded("test", move || {
                 let n = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(n, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(30));
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 active.fetch_sub(1, Ordering::SeqCst);
             })));
         }
+
+        let mut ok_count = 0;
+        let mut rejected_count = 0;
         for h in handles {
-            h.await.unwrap().unwrap();
+            match h.await.unwrap() {
+                Ok(()) => ok_count += 1,
+                Err(RunBoundedError::ResourceExhausted) => rejected_count += 1,
+                Err(e) => panic!("unexpected error: {:?}", e),
+            }
         }
 
         let seen = max_seen.load(Ordering::SeqCst);
@@ -619,6 +699,15 @@ mod tests {
             "observed {} concurrent CNI calls in flight, semaphore cap is {} (#494)",
             seen,
             MAX_CONCURRENT_CNI_CALLS
+        );
+        assert_eq!(
+            ok_count, MAX_CONCURRENT_CNI_CALLS,
+            "expected exactly the semaphore capacity worth of calls to succeed when 3x capacity is requested simultaneously (#500)"
+        );
+        assert_eq!(
+            rejected_count,
+            MAX_CONCURRENT_CNI_CALLS * 2,
+            "expected the remaining 2x capacity worth of calls to be rejected fast, not queued (#500)"
         );
     }
 
@@ -631,6 +720,7 @@ mod tests {
     /// regresses to running its closure inline, this test's own async sleep would
     /// be stuck behind the closures' `std::thread::sleep` and blow past the
     /// generous timing assertion below.
+    #[serial(cni_semaphore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_run_bounded_does_not_block_async_worker() {
         let mut handles = Vec::new();
@@ -665,6 +755,7 @@ mod tests {
     /// points in `run_bounded` — a multi-thread runtime could resume on a
     /// different OS thread after `spawn_blocking(f).await`, missing the
     /// thread-local recorder entirely.
+    #[serial(cni_semaphore)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_cni_metrics_recorded_for_add_and_del() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -720,5 +811,65 @@ mod tests {
                 "expected exactly one duration sample for op={op}, snapshot: {snapshot:?}"
             );
         }
+    }
+
+    /// #500: when the semaphore is fully held, `cni_add_bounded` must return
+    /// `CniAddError::ResourceExhausted` specifically (so `runtime.rs` can map
+    /// it to gRPC `RESOURCE_EXHAUSTED` rather than a generic `INTERNAL`
+    /// error) and increment `pelagos_cri_cni_semaphore_rejected_total{op="add"}`.
+    /// `current_thread` runtime for the same reason as
+    /// `test_cni_metrics_recorded_for_add_and_del`: the thread-local test
+    /// recorder must stay active across `run_bounded`'s `.await` points.
+    #[serial(cni_semaphore)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cni_add_bounded_fails_fast_with_resource_exhausted_when_saturated() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Hold every permit so the next cni_add_bounded call is guaranteed to
+        // be rejected rather than racing a real acquire/release.
+        let permits = cni_semaphore()
+            .try_acquire_many(MAX_CONCURRENT_CNI_CALLS as u32)
+            .expect("semaphore should be fully available at test start");
+
+        let result = cni_add_bounded(
+            "sandbox".to_string(),
+            "/run/netns/test".to_string(),
+            PathBuf::from("/nonexistent.conf"),
+            serde_json::json!({}),
+            "pod".to_string(),
+            "default".to_string(),
+            "uid".to_string(),
+        )
+        .await;
+
+        drop(permits);
+
+        assert!(
+            matches!(result, Err(CniAddError::ResourceExhausted)),
+            "expected ResourceExhausted when semaphore is fully held, got: {:?}",
+            result
+        );
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let rejected = snapshot.iter().find_map(|(ck, _, _, v)| {
+            let matches = ck.key().name() == "pelagos_cri_cni_semaphore_rejected_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "op" && l.value() == "add");
+            matches.then_some(v).and_then(|v| match v {
+                DebugValue::Counter(n) => Some(*n),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            rejected,
+            Some(1),
+            "expected the rejection counter to increment, snapshot: {snapshot:?}"
+        );
     }
 }

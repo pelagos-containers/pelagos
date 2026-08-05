@@ -937,7 +937,16 @@ impl RuntimeService for RuntimeSvc {
             .await
             {
                 Ok(ip) => ip,
-                Err(e) => {
+                Err(cni::CniAddError::ResourceExhausted) => {
+                    cni::delete_netns(&ns_name);
+                    // kubelet retries RunPodSandbox on RESOURCE_EXHAUSTED via its normal
+                    // sync-loop backoff — an explicit, immediate signal instead of the
+                    // request hanging behind a full CNI semaphore queue (#500).
+                    return Err(Status::resource_exhausted(
+                        "CNI call semaphore at capacity, retry later",
+                    ));
+                }
+                Err(e @ cni::CniAddError::Plugin(_)) => {
                     cni::delete_netns(&ns_name);
                     return Err(Status::internal(format!("CNI ADD: {}", e)));
                 }
