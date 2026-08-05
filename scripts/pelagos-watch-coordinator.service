@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch agent-coordinator blackboard and run autonomous Pelagos fix/release cycles
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/pelagos/scripts/watch-coordinator.sh watch
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
