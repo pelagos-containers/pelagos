@@ -137,6 +137,7 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let registry = streaming::new_registry();
 
     cri_metrics::install(args.metrics_addr.parse()?)?;
+    cni::start_semaphore_gauge_sampler();
 
     // Before accepting any kubelet requests, kill container processes that were
     // orphaned by a watcher that died during the previous CRI lifetime (e.g. a

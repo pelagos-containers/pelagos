@@ -21,9 +21,12 @@ pub fn install(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 
     describe_gauge!(
         "pelagos_cri_build_info",
-        "Always 1; labeled with the running pelagos-cri version"
+        "Always 1; labeled with the running pelagos release version"
     );
-    gauge!("pelagos_cri_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+    // Not CARGO_PKG_VERSION: pelagos-cri's own crate version never changes
+    // (it's a workspace member, not what gets released/tagged). The release
+    // version is emitted by build.rs from the workspace root Cargo.toml.
+    gauge!("pelagos_cri_build_info", "version" => env!("PELAGOS_RELEASE_VERSION")).set(1.0);
 
     describe_gauge!(
         "pelagos_cri_uptime_seconds",
@@ -86,7 +89,7 @@ mod tests {
         assert!(
             body.contains(&format!(
                 "pelagos_cri_build_info{{version=\"{}\"}} 1",
-                env!("CARGO_PKG_VERSION")
+                env!("PELAGOS_RELEASE_VERSION")
             )),
             "expected build_info gauge with version label in response body: {body}"
         );
