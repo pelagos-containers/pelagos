@@ -49,13 +49,18 @@ run_once() {
 
   # Clear the inbound signal immediately so we don't reprocess it, and so
   # concurrent filings accumulate into the *next* signal instead of being lost.
+  #
+  # agent-coordinator has NO git remote (confirmed: `git remote -v` is empty)
+  # — it's a local-only repo both agents share by filesystem path on this
+  # host, not something to push. Commit only. A `git push` here previously
+  # aborted the whole cycle (set -e) after the signal was already cleared,
+  # silently swallowing issue #496 — do not reintroduce it.
   (
     cd "$COORD_DIR"
     jq '.signals_out.to_pelagos = null | .signals_out.new_issue_numbers = []' "$CLUSTER_JSON" >"$CLUSTER_JSON.tmp"
     mv "$CLUSTER_JSON.tmp" "$CLUSTER_JSON"
     git add state/cluster.json
     git commit -m "chore: pelagos-agent claiming issues $issues for autonomous fix cycle"
-    git push
   ) >>"$LOG_FILE" 2>&1
 
   local prompt
@@ -84,7 +89,10 @@ $PELAGOS_JSON per CLAUDE.md's 'After a release' section:
 - signals_out.issues_to_validate = $issues
 - updated_by = pelagos-agent
 - updated_at = now
-Commit and push agent-coordinator with that update as the final step.
+Commit agent-coordinator with that update as the final step. Do NOT run
+'git push' in agent-coordinator — it has no remote (confirmed: 'git remote -v'
+is empty); it's a local-only repo shared by filesystem path with the k3s
+agent on this host. A push there will fail and abort the cycle.
 
 Do not touch cluster.json beyond what was already cleared. Do not act on
 cluster state beyond filing/releasing (no kubectl, no cluster SSH) — that
