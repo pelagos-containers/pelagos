@@ -6,6 +6,7 @@ pub mod cri {
 }
 
 mod cni;
+mod cri_metrics;
 mod image;
 mod invoke;
 mod runtime;
@@ -32,6 +33,11 @@ struct Args {
     /// TCP address for the SPDY streaming server (exec/attach/port-forward).
     #[clap(long, default_value = "127.0.0.1:0")]
     streaming_addr: String,
+    /// TCP address for the Prometheus /metrics HTTP endpoint. Loopback-only
+    /// by default — this is operational telemetry, not meant to be exposed
+    /// beyond the node without an explicit operator choice.
+    #[clap(long, default_value = "127.0.0.1:9091")]
+    metrics_addr: String,
 }
 
 /// Scan `/run/pelagos/containers/*/state.json` for containers that were
@@ -129,6 +135,8 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("pelagos-cri streaming server on {streaming_base_url}");
 
     let registry = streaming::new_registry();
+
+    cri_metrics::install(args.metrics_addr.parse()?)?;
 
     // Before accepting any kubelet requests, kill container processes that were
     // orphaned by a watcher that died during the previous CRI lifetime (e.g. a
