@@ -1,4 +1,5 @@
-//! Per-RPC request count + latency metrics for the CRI gRPC server.
+//! Per-RPC request count + latency metrics, plus an in-flight gauge, for the
+//! CRI gRPC server.
 //!
 //! A generic Tower layer wrapping the whole tonic server, rather than
 //! per-handler instrumentation — every `RuntimeService`/`ImageService` call
@@ -29,7 +30,31 @@ impl<S> Layer<S> for MetricsLayer {
             "pelagos_cri_grpc_request_duration_seconds",
             "CRI gRPC request duration in seconds, labeled by method"
         );
+        metrics::describe_gauge!(
+            "pelagos_cri_grpc_requests_in_flight",
+            "CRI gRPC requests currently in flight, across all methods (early warning before full saturation)"
+        );
         MetricsService { inner }
+    }
+}
+
+/// Increments the in-flight gauge on construction, decrements it on `Drop`.
+/// A guard (not a plain increment-then-decrement pair around the `.await`)
+/// because a client disconnecting mid-request drops the future without
+/// running any code after the `.await` point — without this, a cancelled
+/// request would leak a permanently-stuck +1 on the gauge. See #501.
+struct InFlightGuard;
+
+impl InFlightGuard {
+    fn new() -> Self {
+        metrics::gauge!("pelagos_cri_grpc_requests_in_flight").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("pelagos_cri_grpc_requests_in_flight").decrement(1.0);
     }
 }
 
@@ -64,6 +89,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
+            let _in_flight = InFlightGuard::new();
             metrics::counter!("pelagos_cri_grpc_requests_total", "method" => method).increment(1);
             let result = inner.call(req).await;
             metrics::histogram!("pelagos_cri_grpc_request_duration_seconds", "method" => method)
@@ -141,6 +167,126 @@ mod tests {
         fn call(&mut self, _req: http::Request<()>) -> Self::Future {
             Box::pin(async { Ok(http::Response::new(())) })
         }
+    }
+
+    /// A `Service` whose response doesn't resolve until the test releases it —
+    /// needed to observe the in-flight gauge mid-request rather than only
+    /// before/after.
+    #[derive(Clone)]
+    struct SlowEchoService {
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl Service<http::Request<()>> for SlowEchoService {
+        type Response = http::Response<()>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+            let release = self.release.clone();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(http::Response::new(()))
+            })
+        }
+    }
+
+    fn gauge_value(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            metrics_util::debugging::DebugValue,
+        )],
+        name: &str,
+    ) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        snapshot.iter().find_map(|(ck, _, _, v)| {
+            (ck.key().name() == name)
+                .then_some(v)
+                .and_then(|v| match v {
+                    DebugValue::Gauge(g) => Some(g.into_inner()),
+                    _ => None,
+                })
+        })
+    }
+
+    /// #501: the in-flight gauge must reflect a request that is genuinely
+    /// still pending, not just increment-then-immediately-decrement around a
+    /// call that always resolves synchronously. `metrics_util`'s
+    /// `DebuggingRecorder` reports gauges as the delta since the last
+    /// snapshot (its `Snapshotter::snapshot()` swaps the stored value to 0),
+    /// so — deliberately — this test takes exactly one snapshot, while the
+    /// request is still pending. See `test_in_flight_gauge_nets_to_zero_...`
+    /// below for the balanced increment/decrement check via a second,
+    /// independent single-snapshot test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_in_flight_gauge_reflects_pending_request() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut svc = MetricsLayer.layer(SlowEchoService {
+            release: release.clone(),
+        });
+        let req = http::Request::builder()
+            .uri("/runtime.v1.RuntimeService/ExecSync")
+            .body(())
+            .unwrap();
+
+        let call_future = svc.call(req);
+        let handle = tokio::task::spawn(call_future);
+        // Let the spawned task actually run up to its `.await` point before
+        // we inspect the gauge.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            gauge_value(&snapshot, "pelagos_cri_grpc_requests_in_flight"),
+            Some(1.0),
+            "expected in-flight gauge to read 1 while a request is genuinely pending, snapshot: {snapshot:?}"
+        );
+
+        // Release the held request so the spawned task doesn't leak past the test.
+        release.notify_one();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// #501: companion to the test above — over the full lifecycle of one
+    /// request (increment on start, decrement on completion), the net change
+    /// reported by a single snapshot taken after completion must be zero.
+    /// A missing decrement would show +1; a missing increment (impossible
+    /// given the current code, but this is what would catch it) would show
+    /// -1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_in_flight_gauge_nets_to_zero_after_request_completes() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut svc = MetricsLayer.layer(EchoService);
+        let req = http::Request::builder()
+            .uri("/runtime.v1.RuntimeService/ExecSync")
+            .body(())
+            .unwrap();
+        svc.call(req).await.unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            gauge_value(&snapshot, "pelagos_cri_grpc_requests_in_flight"),
+            Some(0.0),
+            "expected increment (+1) and decrement (-1) to net to zero after the request completed, snapshot: {snapshot:?}"
+        );
     }
 
     /// #498: a request through `MetricsLayer` must record both a request
