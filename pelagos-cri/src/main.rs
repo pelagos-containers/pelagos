@@ -7,6 +7,7 @@ pub mod cri {
 
 mod cni;
 mod cri_metrics;
+mod grpc_metrics;
 mod image;
 mod invoke;
 mod runtime;
@@ -186,6 +187,7 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut sigterm = signal(SignalKind::terminate())?;
 
     tonic::transport::Server::builder()
+        .layer(grpc_metrics::MetricsLayer)
         .add_service(cri::runtime_service_server::RuntimeServiceServer::new(
             runtime_svc,
         ))
