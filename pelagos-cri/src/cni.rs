@@ -117,21 +117,58 @@ fn cni_semaphore() -> &'static tokio::sync::Semaphore {
     SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_CNI_CALLS))
 }
 
+/// Starts a background task that samples the CNI semaphore's permit counts
+/// into gauges every 2s. A periodic sampler (rather than recording only at
+/// call boundaries) keeps the gauge meaningful between calls too — e.g. a
+/// value that's been pinned at 0 available for the last 10s is a much
+/// stronger saturation signal than one that only ever appears instantaneously
+/// in a histogram. See #499 (CNI invocation metrics, sub-issue of #496).
+pub fn start_semaphore_gauge_sampler() {
+    metrics::describe_gauge!(
+        "pelagos_cri_cni_semaphore_permits_available",
+        "CNI call semaphore permits currently available (max is pelagos_cri_cni_semaphore_permits_max)"
+    );
+    metrics::describe_gauge!(
+        "pelagos_cri_cni_semaphore_permits_max",
+        "CNI call semaphore capacity (MAX_CONCURRENT_CNI_CALLS)"
+    );
+    metrics::gauge!("pelagos_cri_cni_semaphore_permits_max").set(MAX_CONCURRENT_CNI_CALLS as f64);
+    metrics::describe_histogram!(
+        "pelagos_cri_cni_call_duration_seconds",
+        "End-to-end CNI call duration in seconds, including time spent waiting for a semaphore permit"
+    );
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            metrics::gauge!("pelagos_cri_cni_semaphore_permits_available")
+                .set(cni_semaphore().available_permits() as f64);
+        }
+    });
+}
+
 /// Runs a blocking closure on the blocking thread pool, gated by
 /// [`cni_semaphore`]. Shared by [`cni_add_bounded`] / [`cni_del_bounded`];
 /// pulled out as its own function so the concurrency-bounding behavior can
 /// be exercised directly in tests without needing a real CNI plugin binary
 /// on disk. See #494.
-async fn run_bounded<F, T>(f: F) -> Result<T, tokio::task::JoinError>
+///
+/// `op` labels the latency histogram (`"add"` or `"del"`) — see #499.
+async fn run_bounded<F, T>(op: &'static str, f: F) -> Result<T, tokio::task::JoinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let started = std::time::Instant::now();
     let _permit = cni_semaphore()
         .acquire()
         .await
         .expect("cni semaphore is never closed");
-    tokio::task::spawn_blocking(f).await
+    let result = tokio::task::spawn_blocking(f).await;
+    metrics::histogram!("pelagos_cri_cni_call_duration_seconds", "op" => op)
+        .record(started.elapsed().as_secs_f64());
+    result
 }
 
 /// Async, concurrency-bounded wrapper around [`cni_add`].
@@ -150,7 +187,7 @@ pub async fn cni_add_bounded(
     pod_namespace: String,
     pod_uid: String,
 ) -> Result<String, String> {
-    run_bounded(move || {
+    run_bounded("add", move || {
         cni_add(
             &sandbox_id,
             &netns_path,
@@ -177,7 +214,7 @@ pub async fn cni_del_bounded(
     pod_namespace: String,
     pod_uid: String,
 ) {
-    let _ = run_bounded(move || {
+    let _ = run_bounded("del", move || {
         cni_del(
             &sandbox_id,
             &netns_path,
@@ -565,7 +602,7 @@ mod tests {
         for _ in 0..(MAX_CONCURRENT_CNI_CALLS * 3) {
             let active = active.clone();
             let max_seen = max_seen.clone();
-            handles.push(tokio::spawn(run_bounded(move || {
+            handles.push(tokio::spawn(run_bounded("test", move || {
                 let n = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(n, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(30));
@@ -598,7 +635,7 @@ mod tests {
     async fn test_run_bounded_does_not_block_async_worker() {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            handles.push(tokio::spawn(run_bounded(|| {
+            handles.push(tokio::spawn(run_bounded("test", || {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             })));
         }
@@ -617,6 +654,71 @@ mod tests {
 
         for h in handles {
             h.await.unwrap().unwrap();
+        }
+    }
+
+    /// #499: `run_bounded` must record a `pelagos_cri_cni_call_duration_seconds`
+    /// histogram sample labeled by `op`, and `start_semaphore_gauge_sampler` must
+    /// immediately expose the semaphore's capacity as a gauge. Uses a
+    /// `current_thread` runtime so the thread-local test recorder (set via
+    /// `metrics::set_default_local_recorder`) stays active across the `.await`
+    /// points in `run_bounded` — a multi-thread runtime could resume on a
+    /// different OS thread after `spawn_blocking(f).await`, missing the
+    /// thread-local recorder entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cni_metrics_recorded_for_add_and_del() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        start_semaphore_gauge_sampler();
+
+        run_bounded("add", || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        })
+        .await
+        .unwrap();
+        run_bounded("del", || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        })
+        .await
+        .unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        let max_permits = snapshot.iter().find_map(|(ck, _, _, v)| {
+            (ck.key().name() == "pelagos_cri_cni_semaphore_permits_max")
+                .then_some(v)
+                .and_then(|v| match v {
+                    DebugValue::Gauge(g) => Some(g.into_inner()),
+                    _ => None,
+                })
+        });
+        assert_eq!(
+            max_permits,
+            Some(MAX_CONCURRENT_CNI_CALLS as f64),
+            "permits_max gauge should be set synchronously by start_semaphore_gauge_sampler, snapshot: {snapshot:?}"
+        );
+
+        for op in ["add", "del"] {
+            let histogram_samples = snapshot.iter().find_map(|(ck, _, _, v)| {
+                let matches = ck.key().name() == "pelagos_cri_cni_call_duration_seconds"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "op" && l.value() == op);
+                matches.then_some(v).and_then(|v| match v {
+                    DebugValue::Histogram(samples) => Some(samples.len()),
+                    _ => None,
+                })
+            });
+            assert_eq!(
+                histogram_samples,
+                Some(1),
+                "expected exactly one duration sample for op={op}, snapshot: {snapshot:?}"
+            );
         }
     }
 }
