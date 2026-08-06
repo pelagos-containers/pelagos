@@ -101,7 +101,12 @@ not local-checkout state.
 
 Follow CLAUDE.md's \"Once more into the breach!\" macro for each issue, fully
 autonomously, with these adjustments to that macro (per explicit user direction,
-2026-08-05):
+2026-08-05 and 2026-08-06):
+- Step 2 (create a worktree) is ALREADY DONE — this script created
+  $worktree_dir for you. Do not create another worktree; just \`cd\` there
+  (already done, you're running from it) and \`git checkout -b\` your feature
+  branch directly. Step 9 (remove the worktree) is also this script's job,
+  not yours — do not run 'git worktree remove' yourself.
 - Skip interactive plan approval, but still WRITE the plan as a comment on the
   issue before implementing, so the reasoning is preserved.
 - After CI goes green and ci-merge-release completes the merge/tag/release,
