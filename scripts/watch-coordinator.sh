@@ -13,11 +13,13 @@ STATE_DIR="$COORD_DIR/state"
 CLUSTER_JSON="$STATE_DIR/cluster.json"
 PELAGOS_JSON="$STATE_DIR/pelagos.json"
 PELAGOS_REPO="$HOME/Projects/pelagos"
+PELAGOS_REMOTE="pelagos-containers/pelagos"
 LOG_DIR="$HOME/.local/state/pelagos-watch"
 LOG_FILE="$LOG_DIR/watch.log"
 LOCK_FILE="$LOG_DIR/watch.lock"
+WORKTREE_BASE="$LOG_DIR/worktrees"
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$WORKTREE_BASE"
 
 log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG_FILE"
@@ -63,10 +65,39 @@ run_once() {
     git commit -m "chore: pelagos-agent claiming issues $issues for autonomous fix cycle"
   ) >>"$LOG_FILE" 2>&1
 
+  # Record the current latest release BEFORE the cycle runs, so we can
+  # deterministically detect whether a new one landed afterward — see the
+  # "Deterministic coordinator-board write" comment below for why this
+  # doesn't rely on the headless agent remembering to do it itself.
+  local release_before
+  release_before=$(gh release list --repo "$PELAGOS_REMOTE" --limit 1 --json tagName --jq '.[0].tagName // ""' 2>>"$LOG_FILE" || echo "")
+
+  # Isolated worktree, not the shared checkout this same machine may have an
+  # interactive Claude Code session working in at the same time. Sharing a
+  # checkout is a real hazard, not a hypothetical one: the first headless
+  # cycle run under this script (issue #507) happened to run concurrently
+  # with an interactive session in the same ~/Projects/pelagos checkout, and
+  # `git status` in that session showed the headless cycle's uncommitted
+  # changes. A worktree gives every cycle its own working directory and
+  # index, checked out from a fresh `origin/main`, while still sharing the
+  # same .git object store (cheap — no full clone).
+  git -C "$PELAGOS_REPO" fetch origin main >>"$LOG_FILE" 2>&1
+  local worktree_dir
+  worktree_dir="$WORKTREE_BASE/wt-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  git -C "$PELAGOS_REPO" worktree add "$worktree_dir" origin/main --detach >>"$LOG_FILE" 2>&1
+  log "created worktree $worktree_dir for issues=$issues"
+
   local prompt
   prompt="Autonomous release cycle triggered by the agent-coordinator blackboard.
 
 The cluster agent (k3s-experiments) filed these GitHub issues against this repo: $issues
+
+You are working in an isolated git worktree at $worktree_dir, checked out from
+origin/main — NOT the primary ~/Projects/pelagos checkout, which may have an
+interactive session using it concurrently. Do all git operations (branch,
+commit, push) from within $worktree_dir. Pushing branches/tags to origin and
+opening PRs via gh is fine and expected — those are shared remote operations,
+not local-checkout state.
 
 Follow CLAUDE.md's \"Once more into the breach!\" macro for each issue, fully
 autonomously, with these adjustments to that macro (per explicit user direction,
@@ -78,21 +109,10 @@ autonomously, with these adjustments to that macro (per explicit user direction,
 - If multiple issues are filed, batch them into one release cycle where it
   makes sense (one version bump covering all fixes), same as recent releases.
 
-When the release is fully published (GitHub release + Cargo.toml bump +
-crates.io/AUR best-effort per existing known issues), update
-$PELAGOS_JSON per CLAUDE.md's 'After a release' section:
-- latest_release = the new version
-- release_status = released
-- release_timestamp = actual release time
-- signals_out.to_k3s = upgrade-and-test
-- signals_out.target_version = the new version
-- signals_out.issues_to_validate = $issues
-- updated_by = pelagos-agent
-- updated_at = now
-Commit agent-coordinator with that update as the final step. Do NOT run
-'git push' in agent-coordinator — it has no remote (confirmed: 'git remote -v'
-is empty); it's a local-only repo shared by filesystem path with the k3s
-agent on this host. A push there will fail and abort the cycle.
+Do NOT touch agent-coordinator or pelagos.json yourself — the watcher script
+handles the post-release coordinator-board write deterministically after this
+cycle finishes (a prior cycle's own attempt at this final step didn't
+reliably happen, so it's no longer this agent's responsibility).
 
 Do not touch cluster.json beyond what was already cleared. Do not act on
 cluster state beyond filing/releasing (no kubectl, no cluster SSH) — that
@@ -100,10 +120,52 @@ remains the k3s agent's job."
 
   log "invoking headless claude for issues=$issues"
   (
-    cd "$PELAGOS_REPO"
+    cd "$worktree_dir"
     claude -p "$prompt" --output-format text
   ) >>"$LOG_FILE" 2>&1
   log "headless cycle finished for issues=$issues"
+
+  git -C "$PELAGOS_REPO" worktree remove "$worktree_dir" --force >>"$LOG_FILE" 2>&1 \
+    || log "warning: failed to remove worktree $worktree_dir (may need manual cleanup)"
+
+  # Deterministic coordinator-board write. Not delegated to the headless
+  # agent's own judgment of "when am I done" — issue #507's cycle merged,
+  # tagged, and released v0.65.80 successfully, but its last logged output
+  # was just "Continuing to wait for the release workflow to finish; no
+  # action needed right now" — it never reached its final instruction to
+  # write pelagos.json. A single-shot `claude -p` invocation has no durable
+  # path to resume after a backgrounded Workflow's completion notification
+  # the way an interactive session does, so treat the coordinator write as
+  # this script's job, verified against actual GitHub state, not the
+  # headless agent's self-report.
+  local release_after
+  release_after=$(gh release list --repo "$PELAGOS_REMOTE" --limit 1 --json tagName --jq '.[0].tagName // ""' 2>>"$LOG_FILE" || echo "")
+
+  if [ -n "$release_after" ] && [ "$release_after" != "$release_before" ]; then
+    local version="${release_after#v}"
+    local created_at
+    created_at=$(gh release view "$release_after" --repo "$PELAGOS_REMOTE" --json createdAt --jq '.createdAt' 2>>"$LOG_FILE")
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    (
+      cd "$COORD_DIR"
+      jq --arg v "$version" --arg ts "$created_at" --arg now "$now" --argjson issues "$issues" \
+        '.latest_release = $v
+         | .release_status = "released"
+         | .release_timestamp = $ts
+         | .signals_out.to_k3s = "upgrade-and-test"
+         | .signals_out.target_version = $v
+         | .signals_out.issues_to_validate = $issues
+         | .updated_by = "pelagos-agent"
+         | .updated_at = $now' "$PELAGOS_JSON" >"$PELAGOS_JSON.tmp"
+      mv "$PELAGOS_JSON.tmp" "$PELAGOS_JSON"
+      git add state/pelagos.json
+      git commit -m "chore: pelagos-agent post-release state update $release_after (issues $issues)"
+    ) >>"$LOG_FILE" 2>&1
+    log "deterministically wrote coordinator board for $release_after (issues=$issues)"
+  else
+    log "no new release detected after headless cycle for issues=$issues — NOT writing coordinator board (check watch.log for the cycle's own output; CI may have failed or nothing shippable was found)"
+  fi
 }
 
 case "${1:-watch}" in

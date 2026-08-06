@@ -97,21 +97,49 @@ Follow-ups below.
   temp path, not the target, so a watch using only `close_write` never
   triggers on git-committed files.
 - On `cluster.json`'s `signals_out.to_pelagos == "new-cluster-bugs"`:
-  1. Claims the issues — clears the signal, commits + pushes
-     agent-coordinator immediately (so concurrent filings land in the *next*
-     signal instead of racing).
-  2. Runs `claude -p "<prompt>"` headlessly in the pelagos repo, instructing
-     it to follow `CLAUDE.md`'s **"Once more into the breach!"** macro per
-     issue — plan posted as an issue comment (no interactive approval wait),
-     implement, test, PR, auto-merge on green CI via the existing
-     `ci-merge-release` workflow.
-  3. On successful release, the headless run writes `pelagos.json` back
-     (`to_k3s: upgrade-and-test`, `target_version`, `issues_to_validate`) and
-     pushes agent-coordinator — this is CLAUDE.md's existing "after a
-     release" step, just done unattended.
+  1. Claims the issues — clears the signal, commits agent-coordinator
+     immediately (so concurrent filings land in the *next* signal instead of
+     racing). No push — see "no remote" note above.
+  2. Records the current latest GitHub release tag (`gh release list`), then
+     creates an **isolated git worktree** under
+     `~/.local/state/pelagos-watch/worktrees/` from a fresh `origin/main`,
+     and runs `claude -p "<prompt>"` headlessly **inside that worktree**,
+     instructing it to follow `CLAUDE.md`'s **"Once more into the breach!"**
+     macro per issue — plan posted as an issue comment (no interactive
+     approval wait), implement, test, PR, auto-merge on green CI via the
+     existing `ci-merge-release` workflow. The worktree is removed after the
+     cycle finishes either way.
+  3. **Deterministically**, not left to the headless agent: re-checks the
+     latest release tag. If it changed, writes `pelagos.json` back
+     (`to_k3s: upgrade-and-test`, `target_version`, `issues_to_validate`)
+     itself, verified against `gh release view`, and commits
+     agent-coordinator. If it didn't change, logs that no release was
+     detected rather than writing a stale/fake entry.
 - `flock` on `~/.local/state/pelagos-watch/watch.lock` prevents overlapping
   cycles (a single `git commit` can fire `moved_to` more than once).
 - Logs: `~/.local/state/pelagos-watch/watch.log`.
+
+**Both of the above were real bugs, not hypothetical, found running this
+system live:**
+- **No git remote on agent-coordinator.** The script originally ran `git
+  push` after claiming issue #496 — it failed (`fatal: No configured push
+  destination`), and because the script used `set -e`, that failure aborted
+  the whole cycle *after* the signal was already cleared and committed,
+  silently swallowing the issue. `agent-coordinator` is local-only, shared
+  by filesystem path between both agents on this host — commit is
+  sufficient, push was never valid here.
+- **Shared checkout + non-deterministic final step.** Issue #507's headless
+  cycle ran in the same `~/Projects/pelagos` checkout an interactive session
+  was using at the same time (a real collision, not just a risk), and its
+  release (v0.65.80) shipped successfully but the cycle never reached its
+  final "write the coordinator board" instruction — its last logged output
+  was just `"Continuing to wait for the release workflow to finish; no
+  action needed right now"`. A single-shot `claude -p` invocation has no
+  durable path to resume after a backgrounded Workflow's completion
+  notification the way an interactive session does. Fixed by moving the
+  coordinator write out of the LLM's free-form last step and into the
+  script itself (deterministic, verified against actual GitHub state), and
+  by giving every cycle its own worktree.
 
 ### k3s side: `/watch-pelagos-release` skill
 
@@ -178,6 +206,8 @@ test after editing the script):
 | Stuck lock | `rm ~/.local/state/pelagos-watch/watch.lock` if a prior headless run crashed mid-cycle without releasing it (check the log first to see why it crashed) |
 | Headless `claude -p` cycle failing | Check `~/.local/state/pelagos-watch/watch.log` for its full transcript output; confirm `pelagos/.claude/settings.local.json` still grants the tool access the cycle needs (Bash, Edit, Write, Workflow) |
 | k3s side never picks up `to_k3s` | No persistent watcher exists on that side yet (see Follow-ups) — manually run `/watch-pelagos-release` in a k3s-experiments session, or start a new session (it checks on startup per that repo's CLAUDE.md) |
+| Coordinator board not updated despite a release shipping | Check `watch.log` for `"no new release detected"` (means the script's own pre/post `gh release list` comparison found nothing new — investigate why separately) vs a crash before reaching that step. The write is deterministic and script-owned now (not delegated to the headless agent's self-report), so if a release genuinely shipped and the board is still stale, that's a bug in the script's release-tag comparison, not a headless-agent-forgot-a-step issue anymore. |
+| Stale worktree left behind | `git -C ~/Projects/pelagos worktree list` — a crashed cycle can leave one under `~/.local/state/pelagos-watch/worktrees/`; remove with `git -C ~/Projects/pelagos worktree remove <path> --force` |
 
 ## Explicit non-goals / scope boundaries
 
