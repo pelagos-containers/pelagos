@@ -4,6 +4,14 @@
 
 - **Default / integration branch: `main`** — there is no `master` branch.
   All work lands on `main` directly or via PRs targeting `main`.
+- **The primary `~/Projects/pelagos` clone is read-only / tracking-`main`
+  only.** All issue/feature work (mine or the autonomous coordinator
+  watcher's) happens in an isolated `git worktree`, never checked out
+  directly in the primary clone — see "Once more into the breach!" below and
+  `docs/AGENT_COORDINATION.md`. The primary clone and the watcher's
+  background cycles are both long-lived; sharing a working directory between
+  them is a real collision, not a hypothetical one (hit directly during
+  issue #507).
 
 ## ⚠️ CRITICAL RULES FOR CLAUDE ⚠️
 
@@ -132,20 +140,35 @@ This is a hard requirement, not optional cleanup.
 
 **"Once more into the breach!"** — Create issue, branch, plan, implement, test, PR, merge, release:
 1. Create a GitHub issue describing the work (plan lives in the issue body)
-2. Create a feature branch named after the issue (e.g. `feat/description-NNN`)
-3. Move to that branch
-4. Present the plan to the user (from the issue body)
-5. Quietly implement — no step-by-step narration
-6. Create integration tests and run them to success locally
-7. Commit, push, open a PR
-8. **Immediately launch the CI-merge-release workflow in the background:**
+2. **Create an isolated git worktree**, not a branch checkout in the primary
+   `~/Projects/pelagos` clone:
+   ```
+   git -C ~/Projects/pelagos fetch origin main
+   git -C ~/Projects/pelagos worktree add ~/.local/state/pelagos-dev/worktrees/issue-NNN origin/main --detach
+   ```
+   Then `cd` into that worktree and create the feature branch there
+   (`git checkout -b feat/description-NNN`). The primary clone is
+   read-only/tracking-main only now — never do issue work directly in it.
+   Why: the autonomous coordinator watcher (`pelagos-watch-coordinator.service`)
+   is a persistent background process that can start its own cycle in the
+   primary clone at any moment; sharing a working directory with it is a real
+   collision, not a hypothetical one (hit directly during #507's cycle —
+   see `docs/AGENT_COORDINATION.md`). `git worktree remove` the directory
+   once the PR merges.
+3. Present the plan to the user (from the issue body)
+4. Quietly implement — no step-by-step narration
+5. Create integration tests and run them to success locally
+6. Commit, push, open a PR
+7. **Immediately launch the CI-merge-release workflow in the background:**
    ```
    Workflow({ name: "ci-merge-release", args: { pr: <PR_NUMBER> } })
    ```
    This polls CI every 90 s, merges when green, bumps Cargo.toml patch version,
    commits, tags, and pushes — fully unattended. No `/loop` needed.
    If CI fails the workflow returns the failing check names; diagnose, fix, push, re-run.
-9. Report: merged SHA, release version, CI URL
+8. Report: merged SHA, release version, CI URL
+9. `git worktree remove` the worktree created in step 2 — the primary clone
+   was never touched, so there's nothing to clean up there.
 
 **"Engage!"** — Tag, release, and monitor:
 1. **Bump `version` in `Cargo.toml` to match the release version** — commit this first.
