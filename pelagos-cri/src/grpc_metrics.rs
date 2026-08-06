@@ -100,24 +100,57 @@ where
 }
 
 /// Maps a gRPC request path (`/runtime.v1.RuntimeService/RunPodSandbox`) to a
-/// metric label. Hot-path methods get their own label; everything else
-/// collapses to `"other"` deliberately — the full ~40-method surface isn't
-/// labeled individually yet (that's a separate, later pass), and an
-/// intentionally bounded label set is the whole point of doing this as a
-/// match statement instead of using the raw method name as the label
+/// metric label. Covers the full CRI v1 RPC surface (`pelagos-cri/proto/api.proto`)
+/// so steady-state polling traffic (PLEG relist, stats collection, health
+/// checks) is attributable instead of collapsing into `"other"`. An
+/// intentionally bounded label set is still the whole point of doing this as
+/// a match statement instead of using the raw method name as the label
 /// (unbounded cardinality from a malformed/unexpected path would otherwise
-/// leak straight into Prometheus).
+/// leak straight into Prometheus) — `_ => "other"` remains the catch-all for
+/// anything not in the proto. See #507.
 fn grpc_method_label(path: &str) -> &'static str {
     match path.rsplit('/').next().unwrap_or("") {
         "RunPodSandbox" => "RunPodSandbox",
         "StopPodSandbox" => "StopPodSandbox",
         "RemovePodSandbox" => "RemovePodSandbox",
+        "PodSandboxStatus" => "PodSandboxStatus",
+        "ListPodSandbox" => "ListPodSandbox",
+        "StreamPodSandboxes" => "StreamPodSandboxes",
         "CreateContainer" => "CreateContainer",
         "StartContainer" => "StartContainer",
         "StopContainer" => "StopContainer",
         "RemoveContainer" => "RemoveContainer",
+        "ListContainers" => "ListContainers",
+        "StreamContainers" => "StreamContainers",
+        "ContainerStatus" => "ContainerStatus",
+        "UpdateContainerResources" => "UpdateContainerResources",
+        "ReopenContainerLog" => "ReopenContainerLog",
         "ExecSync" => "ExecSync",
+        "Exec" => "Exec",
+        "Attach" => "Attach",
+        "PortForward" => "PortForward",
+        "ContainerStats" => "ContainerStats",
+        "ListContainerStats" => "ListContainerStats",
+        "StreamContainerStats" => "StreamContainerStats",
+        "PodSandboxStats" => "PodSandboxStats",
+        "ListPodSandboxStats" => "ListPodSandboxStats",
+        "StreamPodSandboxStats" => "StreamPodSandboxStats",
+        "UpdateRuntimeConfig" => "UpdateRuntimeConfig",
+        "Status" => "Status",
+        "CheckpointContainer" => "CheckpointContainer",
+        "GetContainerEvents" => "GetContainerEvents",
+        "ListMetricDescriptors" => "ListMetricDescriptors",
+        "ListPodSandboxMetrics" => "ListPodSandboxMetrics",
+        "StreamPodSandboxMetrics" => "StreamPodSandboxMetrics",
+        "RuntimeConfig" => "RuntimeConfig",
+        "UpdatePodSandboxResources" => "UpdatePodSandboxResources",
+        "ListImages" => "ListImages",
+        "StreamImages" => "StreamImages",
+        "ImageStatus" => "ImageStatus",
         "PullImage" => "PullImage",
+        "RemoveImage" => "RemoveImage",
+        "ImageFsInfo" => "ImageFsInfo",
+        "Version" => "Version",
         _ => "other",
     }
 }
@@ -138,10 +171,44 @@ mod tests {
         );
     }
 
+    /// #507: the steady-state PLEG/stats/health-polling methods that used to
+    /// collapse into `"other"` now get their own label.
+    #[test]
+    fn test_grpc_method_label_steady_state_polling_methods() {
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/ListPodSandbox"),
+            "ListPodSandbox"
+        );
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/ListContainers"),
+            "ListContainers"
+        );
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/PodSandboxStatus"),
+            "PodSandboxStatus"
+        );
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/ContainerStatus"),
+            "ContainerStatus"
+        );
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/ListContainerStats"),
+            "ListContainerStats"
+        );
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/Status"),
+            "Status"
+        );
+        assert_eq!(
+            grpc_method_label("/runtime.v1.RuntimeService/Version"),
+            "Version"
+        );
+    }
+
     #[test]
     fn test_grpc_method_label_unlisted_methods_collapse_to_other() {
         assert_eq!(
-            grpc_method_label("/runtime.v1.RuntimeService/Version"),
+            grpc_method_label("/runtime.v1.RuntimeService/NotARealCriMethod"),
             "other"
         );
         assert_eq!(grpc_method_label("/not/a/grpc/path/at/all"), "other");
