@@ -182,18 +182,31 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                         break;
                     }
                 }
-                let parts: Vec<&str> = cursor.splitn(2, char::is_whitespace).collect();
-                if parts.len() < 2 || parts[0].is_empty() {
+                let args: Vec<&str> = cursor.split_whitespace().collect();
+                if args.len() < 2 {
                     return Err(BuildError::Parse {
                         line: line_num,
                         message: "COPY requires <src> <dest>".to_string(),
                     });
                 }
-                instructions.push(Instruction::Copy {
-                    src: parts[0].to_string(),
-                    dest: parts[1].trim().to_string(),
-                    from_stage,
-                });
+                let (srcs, dest) = args.split_at(args.len() - 1);
+                let dest = dest[0];
+                if srcs.len() > 1 && !dest.ends_with('/') {
+                    return Err(BuildError::Parse {
+                        line: line_num,
+                        message: format!(
+                            "COPY with multiple sources requires a directory destination ending in '/': got '{}'",
+                            dest
+                        ),
+                    });
+                }
+                for src in srcs {
+                    instructions.push(Instruction::Copy {
+                        src: src.to_string(),
+                        dest: dest.to_string(),
+                        from_stage: from_stage.clone(),
+                    });
+                }
             }
             "CMD" => {
                 let cmd = parse_cmd_value(rest).map_err(|msg| BuildError::Parse {
@@ -318,9 +331,6 @@ fn parse_cmd_value(rest: &str) -> Result<Vec<String>, String> {
         // JSON array form: ["cmd", "arg1", "arg2"]
         let parsed: Vec<String> =
             serde_json::from_str(trimmed).map_err(|e| format!("invalid CMD JSON: {}", e))?;
-        if parsed.is_empty() {
-            return Err("CMD cannot be empty".to_string());
-        }
         Ok(parsed)
     } else {
         // Shell form: wrap in /bin/sh -c
@@ -2514,6 +2524,16 @@ CMD ["/bin/sh", "-c", "echo hello"]"#;
         );
     }
 
+    /// #510: `CMD []` is a valid, standard Docker idiom that clears an
+    /// inherited CMD (typically paired with a distinct ENTRYPOINT); it must
+    /// parse rather than error.
+    #[test]
+    fn test_parse_cmd_empty_json_array() {
+        let content = "FROM alpine\nENTRYPOINT [\"/bin/echo\"]\nCMD []";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(instructions[2], Instruction::Cmd(vec![]));
+    }
+
     #[test]
     fn test_parse_env_equals_form() {
         let content = "FROM alpine\nENV MY_VAR=hello_world";
@@ -3091,6 +3111,64 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
                 from_stage: None,
             }
         );
+    }
+
+    /// #509: `COPY a.txt b.txt ./` must expand into one Copy instruction per
+    /// source, all sharing the same directory destination — not a single
+    /// malformed instruction with `dest` = "b.txt ./".
+    #[test]
+    fn test_parse_copy_multi_source() {
+        let content = "FROM alpine\nCOPY a.txt b.txt ./";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "a.txt".into(),
+                dest: "./".into(),
+                from_stage: None,
+            }
+        );
+        assert_eq!(
+            instructions[2],
+            Instruction::Copy {
+                src: "b.txt".into(),
+                dest: "./".into(),
+                from_stage: None,
+            }
+        );
+    }
+
+    /// #509: multiple sources with flags still expand correctly, preserving
+    /// `from_stage` on every generated instruction.
+    #[test]
+    fn test_parse_copy_multi_source_with_from_stage() {
+        let content = "FROM alpine\nCOPY --from=builder a.txt b.txt /app/";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Copy {
+                src: "a.txt".into(),
+                dest: "/app/".into(),
+                from_stage: Some("builder".into()),
+            }
+        );
+        assert_eq!(
+            instructions[2],
+            Instruction::Copy {
+                src: "b.txt".into(),
+                dest: "/app/".into(),
+                from_stage: Some("builder".into()),
+            }
+        );
+    }
+
+    /// #509: multiple sources with a non-directory destination (no trailing
+    /// slash) is rejected, matching Docker's own requirement.
+    #[test]
+    fn test_parse_copy_multi_source_requires_dir_dest() {
+        let content = "FROM alpine\nCOPY a.txt b.txt dest";
+        let err = parse_remfile(content).unwrap_err();
+        assert!(err.to_string().contains("directory destination"));
     }
 
     #[test]
