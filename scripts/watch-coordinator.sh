@@ -126,7 +126,17 @@ remains the k3s agent's job."
   log "invoking headless claude for issues=$issues"
   (
     cd "$worktree_dir"
-    claude -p "$prompt" --output-format text
+    # Without this, the harness kills any background task (including this
+    # cycle's own ci-merge-release Workflow poll, which can take 15-20min
+    # for CI) after a 600s ceiling and the headless invocation exits early —
+    # hit directly on issue #509/#510's cycle: its own release-workflow
+    # monitor got killed, it exited having merged+tagged but before the
+    # release actually finished publishing, and this script's (then
+    # single-shot) post-check ran in the ~2min gap before the release
+    # workflow completed, finding nothing and skipping the coordinator
+    # write. The retry loop below is defense in depth on top of this fix,
+    # not a replacement for it.
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p "$prompt" --output-format text
   ) >>"$LOG_FILE" 2>&1
   log "headless cycle finished for issues=$issues"
 
@@ -143,18 +153,33 @@ remains the k3s agent's job."
   # the way an interactive session does, so treat the coordinator write as
   # this script's job, verified against actual GitHub state, not the
   # headless agent's self-report.
-  local release_after
-  release_after=$(gh release list --repo "$PELAGOS_REMOTE" --limit 1 --json tagName --jq '.[0].tagName // ""' 2>>"$LOG_FILE" || echo "")
+  #
+  # Retry, not a single check: issue #509/#510's cycle showed the release
+  # workflow can still be mid-flight (lint+unit+integration tests, ~15min)
+  # even after the headless invocation itself has exited. Poll for up to
+  # 20 minutes rather than giving up on the first miss.
+  local release_after=""
+  local attempt
+  for attempt in $(seq 1 20); do
+    release_after=$(gh release list --repo "$PELAGOS_REMOTE" --limit 1 --json tagName --jq '.[0].tagName // ""' 2>>"$LOG_FILE" || echo "")
+    if [ -n "$release_after" ] && [ "$release_after" != "$release_before" ]; then
+      break
+    fi
+    release_after=""
+    if [ "$attempt" -lt 20 ]; then
+      sleep 60
+    fi
+  done
 
-  if [ -n "$release_after" ] && [ "$release_after" != "$release_before" ]; then
+  if [ -n "$release_after" ]; then
     local version="${release_after#v}"
-    local created_at
-    created_at=$(gh release view "$release_after" --repo "$PELAGOS_REMOTE" --json createdAt --jq '.createdAt' 2>>"$LOG_FILE")
+    local published_at
+    published_at=$(gh release view "$release_after" --repo "$PELAGOS_REMOTE" --json publishedAt --jq '.publishedAt' 2>>"$LOG_FILE")
     local now
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     (
       cd "$COORD_DIR"
-      jq --arg v "$version" --arg ts "$created_at" --arg now "$now" --argjson issues "$issues" \
+      jq --arg v "$version" --arg ts "$published_at" --arg now "$now" --argjson issues "$issues" \
         '.latest_release = $v
          | .release_status = "released"
          | .release_timestamp = $ts
@@ -169,7 +194,7 @@ remains the k3s agent's job."
     ) >>"$LOG_FILE" 2>&1
     log "deterministically wrote coordinator board for $release_after (issues=$issues)"
   else
-    log "no new release detected after headless cycle for issues=$issues — NOT writing coordinator board (check watch.log for the cycle's own output; CI may have failed or nothing shippable was found)"
+    log "no new release detected after 20min of polling for issues=$issues — NOT writing coordinator board (check watch.log for the cycle's own output; CI may have failed or nothing shippable was found)"
   fi
 }
 
