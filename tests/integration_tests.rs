@@ -5918,6 +5918,175 @@ mod oci_lifecycle {
         );
     }
 
+    /// Run a pelagos subcommand with extra environment variables set (rather than
+    /// inherited from the test process), so `PELAGOS_CDI_SPEC_DIRS` overrides don't
+    /// leak into the shared test-binary environment across parallel tests.
+    fn run_pelagos_with_env(args: &[&str], env: &[(&str, &str)]) -> (String, String, bool) {
+        if args.first() == Some(&"create") {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile for stderr");
+            let stderr_file = tmp.reopen().expect("reopen stderr tempfile");
+            let status = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+                .args(args)
+                .envs(env.iter().cloned())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(stderr_file))
+                .status()
+                .expect("failed to run pelagos create");
+            let stderr = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+            return (String::new(), stderr, status.success());
+        }
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(args)
+            .envs(env.iter().cloned())
+            .output()
+            .expect("failed to run pelagos binary");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    /// test_oci_cdi_device_resolution
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Regression test for #512. Writes a fake CDI spec (`test.pelagos.dev/gpu`)
+    /// to a temp directory pointed at via `PELAGOS_CDI_SPEC_DIRS`, and a bundle
+    /// `config.json` that requests it via a `cdi.k8s.io/`-prefixed annotation
+    /// (`cdi.k8s.io/test-claim: test.pelagos.dev/gpu=0`) instead of listing the
+    /// device node / mount / env var directly. The container writes proof of each
+    /// resolved edit to a host-visible bind mount:
+    /// - the CDI-spec-defined device node exists at `/dev/cditest0`
+    /// - the CDI-spec-defined mount exposes the fake driver file's contents
+    /// - the CDI-spec-defined env var is present in the process environment
+    ///
+    /// Failure indicates `apply_cdi_devices()` in `oci.rs` is not parsing CDI
+    /// specs, not resolving the requested device name, or not merging one of the
+    /// three edit categories (deviceNodes / mounts / env) into the OCI config
+    /// before spawn.
+    #[test]
+    fn test_oci_cdi_device_resolution() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_cdi_device_resolution: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_cdi_device_resolution: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        // Fake CDI spec dir + fake driver library the spec's mount points at.
+        let cdi_dir = tempfile::tempdir().expect("tempdir");
+        let driver_dir = tempfile::tempdir().expect("tempdir");
+        let driver_path = driver_dir.path().join("libcditest.so");
+        std::fs::write(&driver_path, "CDI_DRIVER_CONTENTS").unwrap();
+
+        let spec = format!(
+            r#"
+cdiVersion: "0.6.0"
+kind: "test.pelagos.dev/gpu"
+devices:
+  - name: "0"
+    containerEdits:
+      deviceNodes:
+        - path: "/dev/cditest0"
+          type: "c"
+          major: 511
+          minor: 0
+      mounts:
+        - hostPath: "{}"
+          containerPath: "/opt/cdi/libcditest.so"
+          options: ["ro", "bind"]
+containerEdits:
+  env:
+    - "CDI_TEST_VAR=present"
+"#,
+            driver_path.display()
+        );
+        std::fs::write(cdi_dir.path().join("vendor.yaml"), spec).unwrap();
+
+        // Host-visible dir the container writes its findings into.
+        let out_dir = tempfile::tempdir().expect("tempdir");
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
+        let config = format!(
+            r#"{{
+      "ociVersion": "1.0.2",
+      "root": {{"path": "rootfs"}},
+      "process": {{
+        "args": ["/bin/sh", "-c", "{{ test -c /dev/cditest0 && echo DEVICE_OK || echo DEVICE_MISSING; cat /opt/cdi/libcditest.so 2>&1; env | grep CDI_TEST_VAR; }} > /cdi-out/result.txt 2>&1"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      }},
+      "mounts": [
+        {{"destination": "/cdi-out", "type": "bind", "source": "{}", "options": ["bind"]}}
+      ],
+      "linux": {{
+        "namespaces": [
+          {{"type": "mount"}},
+          {{"type": "uts"}},
+          {{"type": "pid"}}
+        ]
+      }},
+      "annotations": {{
+        "cdi.k8s.io/test-claim": "test.pelagos.dev/gpu=0"
+      }}
+    }}"#,
+            out_dir.path().display()
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let id = format!("test-oci-cdi-{}", std::process::id());
+        let cdi_env = [("PELAGOS_CDI_SPEC_DIRS", cdi_dir.path().to_str().unwrap())];
+
+        let (_, stderr, ok) = run_pelagos_with_env(
+            &["create", &id, bundle_dir.path().to_str().unwrap()],
+            &cdi_env,
+        );
+        assert!(ok, "pelagos create (CDI) failed: {}", stderr);
+
+        let (_, stderr, ok) = run_pelagos_with_env(&["start", &id], &cdi_env);
+        assert!(ok, "pelagos start (CDI) failed: {}", stderr);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_pelagos(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                run_pelagos(&["delete", &id]);
+                panic!("CDI test container did not stop within 5 seconds");
+            }
+        }
+        let (_, stderr, ok) = run_pelagos(&["delete", &id]);
+        assert!(ok, "pelagos delete (CDI) failed: {}", stderr);
+
+        let result = std::fs::read_to_string(out_dir.path().join("result.txt"))
+            .expect("result.txt should have been written by the container");
+        assert!(
+            result.contains("DEVICE_OK"),
+            "CDI deviceNodes edit was not applied — /dev/cditest0 missing. Output:\n{}",
+            result
+        );
+        assert!(
+            result.contains("CDI_DRIVER_CONTENTS"),
+            "CDI mounts edit was not applied — driver file not visible. Output:\n{}",
+            result
+        );
+        assert!(
+            result.contains("CDI_TEST_VAR=present"),
+            "CDI env edit was not applied — env var missing. Output:\n{}",
+            result
+        );
+    }
+
     /// test_oci_capabilities
     ///
     /// Requires: root, alpine-rootfs.

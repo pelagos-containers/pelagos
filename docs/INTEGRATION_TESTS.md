@@ -1215,6 +1215,23 @@ to `/scratch/test.txt`. Runs the full create→start→stopped lifecycle and ass
 `pelagos delete` succeeds. Failure indicates that OCI `mounts` entries are not being
 applied from `config.json`, or that tmpfs mount handling in `build_command()` is broken.
 
+### `test_oci_cdi_device_resolution`
+**Requires:** root, rootfs
+
+Regression test for #512 (NVIDIA GPU passthrough / CDI support). Writes a fake CDI
+spec (`test.pelagos.dev/gpu`) defining a device node, a driver-library mount, and a
+spec-level env var, to a temp directory pointed at via `PELAGOS_CDI_SPEC_DIRS`. The
+bundle's `config.json` requests the device only via a `cdi.k8s.io/`-prefixed
+annotation (`cdi.k8s.io/test-claim: test.pelagos.dev/gpu=0`) — it does not list the
+device node, mount, or env var directly. The container writes proof of each resolved
+edit to a host-visible bind mount and the test asserts all three are present:
+`/dev/cditest0` exists, the driver file's contents are visible at the CDI-specified
+mount destination, and the CDI-specified env var is in the process environment.
+Failure indicates `apply_cdi_devices()` in `oci.rs` is not parsing CDI spec files, not
+resolving the requested device name against the registry, or not merging one of the
+three `ContainerEdits` categories (deviceNodes / mounts / env) into the OCI config
+before spawn.
+
 ### `test_oci_capabilities`
 **Requires:** root, rootfs
 
