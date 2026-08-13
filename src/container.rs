@@ -5268,8 +5268,9 @@ impl Command {
                     // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
                     // being covered by it.  Source paths are still host paths here
                     // (chroot has not happened yet).
-                    for bm in &bind_mounts {
+                    for (bm_idx, bm) in bind_mounts.iter().enumerate() {
                         use std::os::unix::ffi::OsStrExt as _;
+                        diag522(&format!("bind_mounts[{}] START source={:?} target={:?}", bm_idx, bm.source, bm.target));
                         // Target inside the effective root on the host side, with any
                         // symlinked parent dirs in the image rootfs resolved (e.g.
                         // /var/run -> /run) so the bind lands where the container
@@ -5283,28 +5284,31 @@ impl Command {
                         // (e.g. KubeVirt's virt-handler) work without manual pre-creation.
                         if !bm.source.exists() {
                             std::fs::create_dir_all(&bm.source)
-                                .map_err(|e| pre_exec_err("bind mount mkdir source", e))?;
+                                .map_err(|e| {
+                                    diag522(&format!("bind_mounts[{}] mkdir SOURCE FAILED: {} raw_os_error={:?}", bm_idx, e, e.raw_os_error()));
+                                    pre_exec_err("bind mount mkdir source", e)
+                                })?;
                         }
                         if bm.source.is_dir() {
                             std::fs::create_dir_all(&host_target)
-                                .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
+                                .map_err(|e| {
+                                    diag522(&format!("bind_mounts[{}] mkdir TARGET(dir) FAILED: {} raw_os_error={:?}", bm_idx, e, e.raw_os_error()));
+                                    pre_exec_err("bind mount mkdir", e)
+                                })?;
                         } else {
                             if let Some(parent) = host_target.parent() {
-                                log::debug!(
-                                    "DIAG522: about to create_dir_all parent={:?} for bind target={:?} source={:?}",
-                                    parent, host_target, bm.source
-                                );
+                                diag522(&format!("bind_mounts[{}] mkdir PARENT(file-target) about to run parent={:?}", bm_idx, parent));
                                 std::fs::create_dir_all(parent)
                                     .map_err(|e| {
-                                        log::error!("DIAG522: create_dir_all FAILED parent={:?}: {} (raw_os_error={:?})", parent, e, e.raw_os_error());
+                                        diag522(&format!("bind_mounts[{}] mkdir PARENT FAILED parent={:?}: {} raw_os_error={:?}", bm_idx, parent, e, e.raw_os_error()));
                                         pre_exec_err("bind mount mkdir", e)
                                     })?;
-                                log::debug!("DIAG522: create_dir_all OK parent={:?}", parent);
+                                diag522(&format!("bind_mounts[{}] mkdir PARENT OK parent={:?}", bm_idx, parent));
                             }
                             if !host_target.exists() {
                                 std::fs::File::create(&host_target)
                                     .map_err(|e| {
-                                        log::error!("DIAG522: File::create FAILED target={:?}: {} (raw_os_error={:?})", host_target, e, e.raw_os_error());
+                                        diag522(&format!("bind_mounts[{}] File::create FAILED target={:?}: {} raw_os_error={:?}", bm_idx, host_target, e, e.raw_os_error()));
                                         pre_exec_err("bind mount mkfile", e)
                                     })?;
                             }
@@ -5408,6 +5412,8 @@ impl Command {
                             libc::MS_BIND | libc::MS_REC,
                             ptr::null(),
                         );
+                        let bind_errno = io::Error::last_os_error();
+                        diag522(&format!("bind_mounts[{}] MOUNT r={} errno={:?}", bm_idx, r, bind_errno.raw_os_error()));
                         if r != 0 {
                             return Err(pre_exec_err(
                                 &format!(
@@ -5415,7 +5421,7 @@ impl Command {
                                     bm.source.display(),
                                     host_target.display()
                                 ),
-                                io::Error::last_os_error(),
+                                bind_errno,
                             ));
                         }
                         log::trace!("bind mount {}: mountinfo after bind:", bm.target.display());
@@ -8435,21 +8441,18 @@ impl Command {
                                 .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                         } else {
                             if let Some(parent) = host_target.parent() {
-                                log::debug!(
-                                    "DIAG522: about to create_dir_all parent={:?} for bind target={:?} source={:?}",
-                                    parent, host_target, bm.source
-                                );
+                                diag522(&format!("bind_mounts[?] mkdir PARENT(file-target) about to run parent={:?}", parent));
                                 std::fs::create_dir_all(parent)
                                     .map_err(|e| {
-                                        log::error!("DIAG522: create_dir_all FAILED parent={:?}: {} (raw_os_error={:?})", parent, e, e.raw_os_error());
+                                        diag522(&format!("bind_mounts[?] mkdir PARENT FAILED parent={:?}: {} raw_os_error={:?}", parent, e, e.raw_os_error()));
                                         pre_exec_err("bind mount mkdir", e)
                                     })?;
-                                log::debug!("DIAG522: create_dir_all OK parent={:?}", parent);
+                                diag522(&format!("bind_mounts[?] mkdir PARENT OK parent={:?}", parent));
                             }
                             if !host_target.exists() {
                                 std::fs::File::create(&host_target)
                                     .map_err(|e| {
-                                        log::error!("DIAG522: File::create FAILED target={:?}: {} (raw_os_error={:?})", host_target, e, e.raw_os_error());
+                                        diag522(&format!("bind_mounts[?] File::create FAILED target={:?}: {} raw_os_error={:?}", host_target, e, e.raw_os_error()));
                                         pre_exec_err("bind mount mkfile", e)
                                     })?;
                             }
