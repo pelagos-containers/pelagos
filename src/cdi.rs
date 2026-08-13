@@ -111,26 +111,34 @@ pub struct CdiHook {
 }
 
 impl CdiHook {
-    /// If this hook is `nvidia-ctk hook create-symlinks` (the hook
-    /// `nvidia-ctk cdi generate` embeds to recreate the driver's SONAME
-    /// symlink chain, e.g. `libnvidia-ml.so.580.173.02` ->
-    /// `libnvidia-ml.so.1` -> `libnvidia-ml.so`), parse its `--link
-    /// TARGET::LINK_PATH` args into `(target, link_path)` pairs — `target`
-    /// is the (relative) symlink target, `link_path` is the absolute path
-    /// (inside the container) where the symlink should be created,
-    /// matching `ln -sf TARGET LINK_PATH` semantics.
+    /// If this hook's `args` invoke a `create-symlinks` subcommand with
+    /// `--link TARGET::LINK_PATH` pairs — the convention `nvidia-ctk cdi
+    /// generate` embeds to recreate the driver's SONAME symlink chain, e.g.
+    /// `libnvidia-ml.so.580.173.02` -> `libnvidia-ml.so.1` ->
+    /// `libnvidia-ml.so` — parse those pairs out. `target` is the (relative)
+    /// symlink target, `link_path` is the absolute path (inside the
+    /// container) where the symlink should be created, matching `ln -sf
+    /// TARGET LINK_PATH` semantics.
     ///
-    /// Returns `None` for any other hook — Pelagos does not execute
-    /// arbitrary CDI hook binaries (see module docs for why: by the time a
-    /// createContainer-equivalent point is reached, pelagos has already
-    /// chrooted, so a host-side hook binary like `nvidia-ctk` would not be
-    /// found inside the container's rootfs). `create-symlinks` is handled
-    /// as a native built-in instead, since its behavior is fully described
-    /// by these args and needs no external binary.
-    pub fn nvidia_create_symlinks_pairs(&self) -> Option<Vec<(String, String)>> {
-        let is_create_symlinks =
-            self.path.ends_with("nvidia-ctk") && self.args.iter().any(|a| a == "create-symlinks");
-        if !is_create_symlinks {
+    /// Deliberately does NOT check `path` / the invoking binary's name.
+    /// nvidia-container-toolkit has shipped this exact `create-symlinks
+    /// --link A::B` convention under at least two different binaries
+    /// (`nvidia-ctk hook create-symlinks` on older toolkit versions,
+    /// `nvidia-cdi-hook create-symlinks` on 1.17+) — see #518, where
+    /// pattern-matching on `path == ".../nvidia-ctk"` silently broke on a
+    /// system using the newer binary. The `--link` args fully describe the
+    /// hook's behavior regardless of what its binary happens to be called,
+    /// so recognition is keyed on the args shape alone.
+    ///
+    /// Returns `None` for any hook that isn't this convention — Pelagos does
+    /// not execute arbitrary CDI hook binaries on the CLI path (see module
+    /// docs for why: by the time a createContainer-equivalent point is
+    /// reached, pelagos has already chrooted, so a host-side hook binary
+    /// would not be found inside the container's rootfs). `create-symlinks`
+    /// is handled as a native built-in instead, since its behavior is fully
+    /// described by its own args and needs no external binary.
+    pub fn create_symlinks_pairs(&self) -> Option<Vec<(String, String)>> {
+        if !self.args.iter().any(|a| a == "create-symlinks") {
             return None;
         }
         let mut pairs = Vec::new();
@@ -428,7 +436,43 @@ devices:
             ],
             env: vec![],
         };
-        let pairs = hook.nvidia_create_symlinks_pairs().unwrap();
+        let pairs = hook.create_symlinks_pairs().unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "libnvidia-ml.so.580.173.02".to_string(),
+                    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1".to_string()
+                ),
+                (
+                    "libnvidia-ml.so.1".to_string(),
+                    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_symlinks_recognized_regardless_of_binary_name() {
+        // Regression test for #518: nvidia-container-toolkit 1.17+ ships this
+        // exact create-symlinks/--link convention under a different binary,
+        // `nvidia-cdi-hook`, not `nvidia-ctk`. Recognition must not depend on
+        // `path`.
+        let hook = CdiHook {
+            hook_name: "createContainer".to_string(),
+            path: "/usr/bin/nvidia-cdi-hook".to_string(),
+            args: vec![
+                "nvidia-cdi-hook".to_string(),
+                "create-symlinks".to_string(),
+                "--link".to_string(),
+                "libnvidia-ml.so.580.173.02::/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1"
+                    .to_string(),
+                "--link".to_string(),
+                "libnvidia-ml.so.1::/usr/lib/aarch64-linux-gnu/libnvidia-ml.so".to_string(),
+            ],
+            env: vec![],
+        };
+        let pairs = hook.create_symlinks_pairs().unwrap();
         assert_eq!(
             pairs,
             vec![
@@ -452,6 +496,6 @@ devices:
             args: vec!["some-other-tool".to_string(), "do-something".to_string()],
             env: vec![],
         };
-        assert!(hook.nvidia_create_symlinks_pairs().is_none());
+        assert!(hook.create_symlinks_pairs().is_none());
     }
 }

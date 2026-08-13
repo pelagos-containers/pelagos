@@ -448,9 +448,25 @@ libnvidia-ml.so" despite the versioned file being present. Asserts the two-hop s
 chain (`libcditest.so` -> `libcditest.so.1` -> `libcditest.so.1.2.3`) resolves to the
 mounted file's actual contents when read through the unversioned name, the same way
 `dlopen("libnvidia-ml.so")` would. Failure indicates
-`CdiHook::nvidia_create_symlinks_pairs()` in `cdi.rs` is not parsing `--link
+`CdiHook::create_symlinks_pairs()` in `cdi.rs` is not parsing `--link
 TARGET::LINK_PATH` args correctly, or `add_cdi_device()` in `run.rs` is not wiring the
 parsed pairs into `with_dev_symlink()`.
+
+### `test_cli_device_flag_cdi_create_symlinks_hook_nvidia_cdi_hook_binary`
+**Requires:** root, rootfs
+
+Regression test for #518. Identical to `test_cli_device_flag_cdi_create_symlinks_hook`
+except the hook's `path`/`args[0]` is `nvidia-cdi-hook` instead of `nvidia-ctk hook` —
+the exact real-world shape from #518's repro on nvidia-container-toolkit 1.17+, which
+ships the same `create-symlinks --link A::B` convention under a different binary.
+Before this fix, `CdiHook::create_symlinks_pairs()` pattern-matched on
+`path == ".../nvidia-ctk"` and silently skipped any other binary name, even though the
+args fully describe the same operation — this was the actual root cause of #518 (the
+fix for #516 only worked for the older toolkit's binary name). Uses a distinct
+container path (`/opt/cdi-hooks2/`) from the sibling `nvidia-ctk` test to avoid
+cross-test artifact collisions on the shared, non-ephemeral `alpine-rootfs`. Failure
+indicates `create_symlinks_pairs()` regressed back to checking `path` / the invoking
+binary's name instead of the `args` shape alone.
 
 ### `test_bind_mount_into_dev`
 **Requires:** root, rootfs
