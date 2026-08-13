@@ -110,6 +110,44 @@ pub struct CdiHook {
     pub env: Vec<String>,
 }
 
+impl CdiHook {
+    /// If this hook is `nvidia-ctk hook create-symlinks` (the hook
+    /// `nvidia-ctk cdi generate` embeds to recreate the driver's SONAME
+    /// symlink chain, e.g. `libnvidia-ml.so.580.173.02` ->
+    /// `libnvidia-ml.so.1` -> `libnvidia-ml.so`), parse its `--link
+    /// TARGET::LINK_PATH` args into `(target, link_path)` pairs — `target`
+    /// is the (relative) symlink target, `link_path` is the absolute path
+    /// (inside the container) where the symlink should be created,
+    /// matching `ln -sf TARGET LINK_PATH` semantics.
+    ///
+    /// Returns `None` for any other hook — Pelagos does not execute
+    /// arbitrary CDI hook binaries (see module docs for why: by the time a
+    /// createContainer-equivalent point is reached, pelagos has already
+    /// chrooted, so a host-side hook binary like `nvidia-ctk` would not be
+    /// found inside the container's rootfs). `create-symlinks` is handled
+    /// as a native built-in instead, since its behavior is fully described
+    /// by these args and needs no external binary.
+    pub fn nvidia_create_symlinks_pairs(&self) -> Option<Vec<(String, String)>> {
+        let is_create_symlinks =
+            self.path.ends_with("nvidia-ctk") && self.args.iter().any(|a| a == "create-symlinks");
+        if !is_create_symlinks {
+            return None;
+        }
+        let mut pairs = Vec::new();
+        let mut iter = self.args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == "--link" {
+                if let Some(spec) = iter.next() {
+                    if let Some((target, link_path)) = spec.split_once("::") {
+                        pairs.push((target.to_string(), link_path.to_string()));
+                    }
+                }
+            }
+        }
+        Some(pairs)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CdiDevice {
     pub name: String,
@@ -371,5 +409,49 @@ devices:
         ann.insert("other.annotation".to_string(), "ignored".to_string());
         let names = devices_from_annotations(&ann);
         assert_eq!(names, vec!["vendor.com/gpu=0", "vendor.com/gpu=1"]);
+    }
+
+    #[test]
+    fn nvidia_create_symlinks_parses_link_pairs() {
+        let hook = CdiHook {
+            hook_name: "createContainer".to_string(),
+            path: "/usr/bin/nvidia-ctk".to_string(),
+            args: vec![
+                "nvidia-ctk".to_string(),
+                "hook".to_string(),
+                "create-symlinks".to_string(),
+                "--link".to_string(),
+                "libnvidia-ml.so.580.173.02::/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1"
+                    .to_string(),
+                "--link".to_string(),
+                "libnvidia-ml.so.1::/usr/lib/aarch64-linux-gnu/libnvidia-ml.so".to_string(),
+            ],
+            env: vec![],
+        };
+        let pairs = hook.nvidia_create_symlinks_pairs().unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "libnvidia-ml.so.580.173.02".to_string(),
+                    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1".to_string()
+                ),
+                (
+                    "libnvidia-ml.so.1".to_string(),
+                    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn nvidia_create_symlinks_ignores_other_hooks() {
+        let hook = CdiHook {
+            hook_name: "createContainer".to_string(),
+            path: "/usr/bin/some-other-tool".to_string(),
+            args: vec!["some-other-tool".to_string(), "do-something".to_string()],
+            env: vec![],
+        };
+        assert!(hook.nvidia_create_symlinks_pairs().is_none());
     }
 }

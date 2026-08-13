@@ -1389,13 +1389,30 @@ fn add_cdi_device(
             cmd = cmd.env(k, v);
         }
     }
-    if !edits.hooks.is_empty() {
-        log::warn!(
-            "CDI device '{}' defines {} hook(s); OCI lifecycle hooks are not yet \
-             supported on the `pelagos run` CLI path (only on the OCI bundle path) — ignoring",
-            qualified_name,
-            edits.hooks.len()
-        );
+    for hook in &edits.hooks {
+        match hook.nvidia_create_symlinks_pairs() {
+            Some(pairs) => {
+                for (target, link_path) in pairs {
+                    cmd = cmd.with_dev_symlink(link_path, target);
+                }
+            }
+            None => {
+                // Pelagos does not execute arbitrary CDI hook binaries on the CLI
+                // path — see CdiHook::nvidia_create_symlinks_pairs() for why
+                // (chroot already happened by the time a createContainer-equivalent
+                // point is reached, so a host-side binary wouldn't be found inside
+                // the container). create-symlinks is handled as a native built-in
+                // above; anything else is logged and skipped rather than silently
+                // pretending to have run it.
+                log::warn!(
+                    "CDI device '{}' defines a '{}' hook ({}) that pelagos does not \
+                     know how to execute natively on the `pelagos run` CLI path — ignoring",
+                    qualified_name,
+                    hook.hook_name,
+                    hook.path
+                );
+            }
+        }
     }
     Ok(cmd)
 }
