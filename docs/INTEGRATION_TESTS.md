@@ -419,6 +419,21 @@ This tests the `run.rs` parser path (distinct from `test_bind_mount_ro` which ca
 `:ro`/`:rw` from the mount-target path has regressed, causing the suffix to be treated
 as part of the filesystem path instead of a mount option.
 
+### `test_cli_device_flag_cdi_resolution`
+**Requires:** root, rootfs
+
+Regression test for #513 (NVIDIA GPU passthrough / CDI support on the `pelagos run`
+CLI path). Writes a fake CDI spec (`test.pelagos.dev/gpu`) defining a device node, a
+driver-library mount, and a spec-level env var, to a temp dir pointed at via
+`PELAGOS_CDI_SPEC_DIRS`. Runs `pelagos run --device test.pelagos.dev/gpu=0` (a value
+not starting with `/`, so `run.rs` dispatches it to `add_cdi_device()` instead of the
+existing host-device-path `add_device()`). Asserts the resolved device node exists,
+the resolved mount's contents are visible, and the resolved env var is set inside the
+container — the CLI-path counterpart to #512's `test_oci_cdi_device_resolution`.
+Failure indicates `add_cdi_device()` in `run.rs` is not resolving CDI device names
+passed via `--device`, or not merging one of the three `ContainerEdits` categories
+(deviceNodes/mounts/env) into the `Command` before spawn.
+
 ### `test_bind_mount_into_dev`
 **Requires:** root, rootfs
 

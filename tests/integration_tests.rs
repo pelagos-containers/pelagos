@@ -2162,6 +2162,107 @@ mod filesystem {
         );
     }
 
+    /// test_cli_device_flag_cdi_resolution
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Regression test for #513 (GPU passthrough on the `pelagos run` CLI /
+    /// non-bundle path). Writes a fake CDI spec (`test.pelagos.dev/gpu`) to a
+    /// temp dir pointed at via `PELAGOS_CDI_SPEC_DIRS`, then runs `pelagos run
+    /// --device test.pelagos.dev/gpu=0` (a CDI-qualified name, not a host
+    /// path) via the CLI binary so it exercises `run.rs`'s `add_cdi_device()`
+    /// dispatch (values not starting with `/` are treated as CDI device
+    /// names, distinct from the existing host-device-path `--device` form).
+    /// Asserts the resolved device node exists, the resolved mount's contents
+    /// are visible, and the resolved env var is set — the same three
+    /// `ContainerEdits` categories verified for the OCI bundle path in #512's
+    /// `test_oci_cdi_device_resolution`.
+    ///
+    /// Failure indicates `add_cdi_device()` in `run.rs` is not resolving CDI
+    /// device names passed via `--device`, or not merging deviceNodes/mounts/
+    /// env into the `Command` before spawn.
+    #[test]
+    fn test_cli_device_flag_cdi_resolution() {
+        if !is_root() {
+            eprintln!("Skipping test_cli_device_flag_cdi_resolution: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cli_device_flag_cdi_resolution: alpine-rootfs not found");
+            return;
+        };
+
+        let cdi_dir = tempfile::tempdir().expect("tempdir");
+        let driver_dir = tempfile::tempdir().expect("tempdir");
+        let driver_path = driver_dir.path().join("libcditest.so");
+        std::fs::write(&driver_path, "CDI_DRIVER_CONTENTS").unwrap();
+
+        let spec = format!(
+            r#"
+cdiVersion: "0.6.0"
+kind: "test.pelagos.dev/gpu"
+devices:
+  - name: "0"
+    containerEdits:
+      deviceNodes:
+        - path: "/dev/cditest0"
+          type: "c"
+          major: 511
+          minor: 1
+      mounts:
+        - hostPath: "{}"
+          containerPath: "/opt/cdi/libcditest.so"
+          options: ["ro", "bind"]
+containerEdits:
+  env:
+    - "CDI_TEST_VAR=present"
+"#,
+            driver_path.display()
+        );
+        std::fs::write(cdi_dir.path().join("vendor.yaml"), spec).unwrap();
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .env("PELAGOS_CDI_SPEC_DIRS", cdi_dir.path())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--device",
+                "test.pelagos.dev/gpu=0",
+                "/bin/sh",
+                "-c",
+                "test -c /dev/cditest0 && echo DEVICE_OK || echo DEVICE_MISSING; \
+                 cat /opt/cdi/libcditest.so 2>&1; env | grep CDI_TEST_VAR",
+            ])
+            .output()
+            .expect("pelagos run --device <cdi>");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("DEVICE_OK"),
+            "CDI deviceNodes edit was not applied via --device — /dev/cditest0 missing. \
+             stdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("CDI_DRIVER_CONTENTS"),
+            "CDI mounts edit was not applied via --device — driver file not visible. \
+             stdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("CDI_TEST_VAR=present"),
+            "CDI env edit was not applied via --device — env var missing. \
+             stdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+    }
+
     /// test_bind_mount_into_dev
     ///
     /// Requires: root, rootfs.

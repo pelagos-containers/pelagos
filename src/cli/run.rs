@@ -112,11 +112,18 @@ pub struct RunArgs {
     #[clap(long = "bind-ro")]
     pub bind_ro: Vec<String>,
 
-    /// Expose a host device inside the container.
-    /// Format: /host/path[:/container/path]
-    /// The host file is stat'd to obtain device type, major/minor, and mode.
-    /// Defaults container_path to host_path when omitted.
-    /// (repeatable)
+    /// Expose a host device inside the container, OR request a CDI
+    /// (Container Device Interface) device.
+    ///
+    /// Host device form: /host/path[:/container/path] — the host file is
+    /// stat'd to obtain device type, major/minor, and mode. container_path
+    /// defaults to host_path when omitted.
+    ///
+    /// CDI form (any value not starting with '/'): a fully-qualified CDI
+    /// device name, e.g. `nvidia.com/gpu=0` or `nvidia.com/gpu=all`.
+    /// Resolved against CDI spec files in /etc/cdi and /var/run/cdi
+    /// (nvidia-ctk cdi generate writes these); the resulting device nodes,
+    /// mounts, and env vars are merged into the container. (repeatable)
     #[clap(long = "device")]
     pub device: Vec<String>,
 
@@ -1024,7 +1031,11 @@ fn apply_cli_options(
         cmd = cmd.with_bind_mount_ro(src, tgt);
     }
     for d in &args.device {
-        cmd = add_device(cmd, d)?;
+        cmd = if d.starts_with('/') {
+            add_device(cmd, d)?
+        } else {
+            add_cdi_device(cmd, d)?
+        };
     }
     for t in &args.tmpfs {
         let (path, opts) = t.split_once(':').unwrap_or((t.as_str(), ""));
@@ -1334,6 +1345,59 @@ fn add_device(cmd: Command, spec: &str) -> Result<Command, Box<dyn std::error::E
         uid: 0,
         gid: 0,
     }))
+}
+
+/// Resolve a fully-qualified CDI device name (`vendor.com/class=name`, e.g.
+/// `nvidia.com/gpu=all`) against the on-disk CDI registry (`/etc/cdi`,
+/// `/var/run/cdi`, overridable via `PELAGOS_CDI_SPEC_DIRS`) and merge the
+/// resulting device nodes, mounts, and env vars into `cmd`.
+///
+/// Mirrors `apply_cdi_devices()` in `oci.rs` (used by the OCI bundle path,
+/// #512) for the everyday `pelagos run` CLI path (#513).
+fn add_cdi_device(
+    mut cmd: Command,
+    qualified_name: &str,
+) -> Result<Command, Box<dyn std::error::Error>> {
+    let registry = pelagos::cdi::CdiRegistry::load(&pelagos::cdi::spec_dirs())
+        .map_err(|e| format!("--device {}: {}", qualified_name, e))?;
+    let edits = registry
+        .resolve(qualified_name)
+        .map_err(|e| format!("--device {}: {}", qualified_name, e))?;
+
+    for dn in &edits.device_nodes {
+        let kind = dn.kind.chars().next().unwrap_or('c');
+        cmd = cmd.with_device(container::DeviceNode {
+            path: std::path::PathBuf::from(&dn.path),
+            kind,
+            major: dn.major.unwrap_or(0) as u64,
+            minor: dn.minor.unwrap_or(0) as u64,
+            mode: dn.file_mode.unwrap_or(0o666),
+            uid: dn.uid.unwrap_or(0),
+            gid: dn.gid.unwrap_or(0),
+        });
+    }
+    for m in &edits.mounts {
+        let is_ro = m.options.iter().any(|o| o == "ro");
+        cmd = if is_ro {
+            cmd.with_bind_mount_ro(&m.host_path, &m.container_path)
+        } else {
+            cmd.with_bind_mount(&m.host_path, &m.container_path)
+        };
+    }
+    for e in &edits.env {
+        if let Some((k, v)) = e.split_once('=') {
+            cmd = cmd.env(k, v);
+        }
+    }
+    if !edits.hooks.is_empty() {
+        log::warn!(
+            "CDI device '{}' defines {} hook(s); OCI lifecycle hooks are not yet \
+             supported on the `pelagos run` CLI path (only on the OCI bundle path) — ignoring",
+            qualified_name,
+            edits.hooks.len()
+        );
+    }
+    Ok(cmd)
 }
 
 // ---------------------------------------------------------------------------
