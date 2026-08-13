@@ -5213,7 +5213,7 @@ impl Command {
                     // without needing mknod.  (The mknod fallback in step 4.72 will then
                     // see EEXIST and chmod the bind-mounted path instead.)
                     diag522(&format!("reached pre-chroot device bind-mount block, devices.len()={}", devices.len()));
-                    if (is_rootless || namespaces.contains(Namespace::USER)) && !devices.is_empty()
+                    if false && (is_rootless || namespaces.contains(Namespace::USER)) && !devices.is_empty()
                     {
                         use std::os::unix::ffi::OsStrExt as _;
                         for dev in &devices {
