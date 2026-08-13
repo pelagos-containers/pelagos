@@ -90,7 +90,7 @@ pub struct OciUser {
     pub umask: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct OciLinux {
     #[serde(default)]
@@ -462,6 +462,98 @@ pub fn config_from_bundle(bundle: &Path) -> io::Result<OciConfig> {
     let config_path = bundle.join("config.json");
     let content = fs::read(&config_path)?;
     serde_json::from_slice(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+// ---------------------------------------------------------------------------
+// CDI (Container Device Interface) resolution
+// ---------------------------------------------------------------------------
+
+/// If `config.annotations` names any CDI devices (via `cdi.k8s.io/*` keys), resolve
+/// them against the on-disk CDI registry and merge the resulting device nodes,
+/// mounts, env vars, and hooks into `config` in place. No-op when no CDI devices
+/// are requested — hosts without a GPU never touch `/etc/cdi`.
+fn apply_cdi_devices(config: &mut OciConfig) -> io::Result<()> {
+    let names = match &config.annotations {
+        Some(annotations) => crate::cdi::devices_from_annotations(annotations),
+        None => Vec::new(),
+    };
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let registry = crate::cdi::CdiRegistry::load(&crate::cdi::spec_dirs())
+        .map_err(|e| io::Error::other(format!("CDI: {e}")))?;
+    let edits = registry
+        .resolve_all(&names)
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("CDI: {e}")))?;
+
+    if !edits.device_nodes.is_empty() {
+        let linux = config.linux.get_or_insert_with(OciLinux::default);
+        for dn in &edits.device_nodes {
+            let kind = dn.kind.chars().next().unwrap_or('c');
+            linux.devices.push(OciDevice {
+                path: dn.path.clone(),
+                kind: kind.to_string(),
+                major: dn.major.map(|m| m as u64),
+                minor: dn.minor.map(|m| m as u64),
+                file_mode: dn.file_mode.unwrap_or(0o666),
+                uid: dn.uid.unwrap_or(0),
+                gid: dn.gid.unwrap_or(0),
+            });
+        }
+    }
+
+    for m in &edits.mounts {
+        let mut options = m.options.clone();
+        if options.is_empty() {
+            options.push("bind".to_string());
+        }
+        config.mounts.push(OciMount {
+            destination: m.container_path.clone(),
+            mount_type: Some("bind".to_string()),
+            source: Some(m.host_path.clone()),
+            options,
+        });
+    }
+
+    if !edits.env.is_empty() {
+        let process = config.process.get_or_insert_with(|| OciProcess {
+            args: Vec::new(),
+            cwd: "/".to_string(),
+            env: Vec::new(),
+            user: None,
+            no_new_privileges: false,
+            terminal: false,
+            capabilities: None,
+            rlimits: Vec::new(),
+            oom_score_adj: None,
+        });
+        process.env.extend(edits.env.iter().cloned());
+    }
+
+    if !edits.hooks.is_empty() {
+        let hooks = config.hooks.get_or_insert_with(OciHooks::default);
+        for h in &edits.hooks {
+            let hook = OciHook {
+                path: h.path.clone(),
+                args: h.args.clone(),
+                env: h.env.clone(),
+                timeout: None,
+            };
+            match h.hook_name.as_str() {
+                "createRuntime" => hooks.create_runtime.push(hook),
+                "createContainer" => hooks.create_container.push(hook),
+                "startContainer" => hooks.start_container.push(hook),
+                "poststart" => hooks.poststart.push(hook),
+                "poststop" => hooks.poststop.push(hook),
+                // "prestart" and any unrecognized hookName default to prestart,
+                // matching the legacy (pre-hookName) CDI hook behavior.
+                _ => hooks.prestart.push(hook),
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,7 +1641,8 @@ pub fn cmd_create(
     }
 
     let bundle = bundle_path.canonicalize()?;
-    let config = config_from_bundle(&bundle)?;
+    let mut config = config_from_bundle(&bundle)?;
+    apply_cdi_devices(&mut config)?;
     fs::create_dir_all(&dir)?;
 
     // Ready pipe: grandchild writes PID → parent reads it.

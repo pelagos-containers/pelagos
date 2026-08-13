@@ -9,6 +9,7 @@ compile_error!(
 );
 
 pub mod build;
+pub mod cdi;
 pub mod cgroup;
 pub mod cgroup_rootless;
 pub mod compose;
