@@ -5655,6 +5655,10 @@ impl Command {
                             libc::MS_MOVE,
                             ptr::null(),
                         );
+                        // Capture errno immediately after MS_MOVE, before any other
+                        // syscall (remount, rmdir) can clobber it (#520: rmdir() below
+                        // was overwriting the real MS_MOVE failure's errno).
+                        let move_err = io::Error::last_os_error();
                         if r == 0 && !privileged {
                             libc::mount(
                                 ptr::null(),
@@ -5666,7 +5670,7 @@ impl Command {
                         }
                         libc::rmdir(cg_src.as_ptr());
                         if r != 0 && !is_rootless && !lacks_sys_admin {
-                            return Err(pre_exec_err("move cgroupfs", io::Error::last_os_error()));
+                            return Err(pre_exec_err("move cgroupfs", move_err));
                         }
                     }
                 }
@@ -8664,6 +8668,10 @@ impl Command {
                             libc::MS_MOVE,
                             ptr::null(),
                         );
+                        // Capture errno immediately after MS_MOVE, before any other
+                        // syscall (remount, rmdir) can clobber it (#520: rmdir() below
+                        // was overwriting the real MS_MOVE failure's errno).
+                        let move_err = io::Error::last_os_error();
                         if r == 0 && !privileged {
                             libc::mount(
                                 ptr::null(),
@@ -8675,7 +8683,7 @@ impl Command {
                         }
                         libc::rmdir(cg_src.as_ptr());
                         if r != 0 && !is_rootless && !lacks_sys_admin {
-                            return Err(pre_exec_err("move cgroupfs", io::Error::last_os_error()));
+                            return Err(pre_exec_err("move cgroupfs", move_err));
                         }
                     }
                 }
