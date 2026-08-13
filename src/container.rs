@@ -4212,6 +4212,7 @@ impl Command {
                 // PR_SET_PDEATHSIG is preserved across execve() for non-setuid/
                 // setgid/file-cap binaries and is not affected by capability drops.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+                eprintln!("DIAG522: pre_exec closure entered");
 
                 // Step 0: Add ourselves to the pre-created cgroup BEFORE unshare and
                 // exec, so all subsequent memory allocations (including the exec'd
@@ -4775,6 +4776,7 @@ impl Command {
                                 0,
                                 opts.as_ptr() as *const libc::c_void,
                             );
+                            eprintln!("DIAG522: native overlay mount ret={} errno={:?}", ret, io::Error::last_os_error().raw_os_error());
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }
@@ -7975,6 +7977,7 @@ impl Command {
                                 0,
                                 opts.as_ptr() as *const libc::c_void,
                             );
+                            eprintln!("DIAG522: native overlay mount ret={} errno={:?}", ret, io::Error::last_os_error().raw_os_error());
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }
