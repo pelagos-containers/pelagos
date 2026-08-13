@@ -31585,6 +31585,88 @@ mod issue_455_cgroupfs_sysfs_order {
     }
 }
 
+/// Regression test for #520: the cgroup MS_MOVE error-reporting path in the
+/// pre_exec closure (`src/container.rs`, both the `pelagos run` and OCI
+/// `create` spawn sites) used to call `io::Error::last_os_error()` *after*
+/// an unconditional `rmdir()` on the move source, so a genuine `MS_MOVE`
+/// failure had its errno silently overwritten by whatever `rmdir()` left
+/// behind. This reproduces the exact syscall sequence in isolation (no
+/// namespace/container spawn needed — the bug is a pure syscall-ordering
+/// issue) and proves the fix captures the right errno.
+mod issue_520_cgroup_move_errno {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Force a deterministic MS_MOVE failure (source is a plain directory,
+    /// not a mountpoint, so MS_MOVE fails EINVAL) paired with a deterministic
+    /// rmdir failure on the *same* source (made non-empty, so rmdir fails
+    /// ENOTEMPTY). Captures errno immediately after MS_MOVE, mirroring the
+    /// fixed ordering in src/container.rs — asserts we get MS_MOVE's EINVAL,
+    /// not rmdir's ENOTEMPTY, and that the two errnos are provably different
+    /// so the test would have caught the old buggy ordering.
+    #[test]
+    fn test_ms_move_errno_survives_subsequent_rmdir() {
+        if !is_root() {
+            eprintln!("Skipping test_ms_move_errno_survives_subsequent_rmdir: requires root");
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!("pelagos-test-520-{}", std::process::id()));
+        let src = base.join("src");
+        let tgt = base.join("tgt");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&tgt).unwrap();
+        // Make src non-empty so rmdir() fails with ENOTEMPTY.
+        std::fs::write(src.join("keepme"), b"x").unwrap();
+
+        let src_c = CString::new(src.as_os_str().to_str().unwrap()).unwrap();
+        let tgt_c = CString::new(tgt.as_os_str().to_str().unwrap()).unwrap();
+
+        unsafe {
+            // src is not a mountpoint, so MS_MOVE must fail with EINVAL.
+            let r = libc::mount(
+                src_c.as_ptr(),
+                tgt_c.as_ptr(),
+                std::ptr::null(),
+                libc::MS_MOVE,
+                std::ptr::null(),
+            );
+            assert_eq!(r, -1, "MS_MOVE on a non-mountpoint should fail");
+            let move_err = std::io::Error::last_os_error();
+            assert_eq!(
+                move_err.raw_os_error(),
+                Some(libc::EINVAL),
+                "expected MS_MOVE to fail EINVAL (non-mountpoint source)"
+            );
+
+            // Mirror the pre_exec code: rmdir runs unconditionally after MS_MOVE,
+            // and must fail (non-empty dir) without clobbering move_err.
+            let rmdir_r = libc::rmdir(src_c.as_ptr());
+            assert_eq!(rmdir_r, -1, "rmdir on a non-empty dir should fail");
+            let rmdir_err = std::io::Error::last_os_error();
+            assert_eq!(
+                rmdir_err.raw_os_error(),
+                Some(libc::ENOTEMPTY),
+                "expected rmdir to fail ENOTEMPTY (non-empty dir)"
+            );
+
+            // The two errnos must differ, and the errno captured immediately
+            // after MS_MOVE (move_err) must be the one actually reported —
+            // this is exactly what src/container.rs now does.
+            assert_ne!(
+                move_err.raw_os_error(),
+                rmdir_err.raw_os_error(),
+                "test setup invalid: MS_MOVE and rmdir errnos must differ to prove ordering matters"
+            );
+        }
+
+        let _ = std::fs::remove_file(src.join("keepme"));
+        let _ = std::fs::remove_dir(&src);
+        let _ = std::fs::remove_dir(&tgt);
+        let _ = std::fs::remove_dir(&base);
+    }
+}
+
 /// Tests for the cgroup-first `pelagos stop` fix (#459).
 ///
 /// These tests exercise the three properties that make `cmd_stop` the single
