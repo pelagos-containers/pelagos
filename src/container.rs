@@ -5268,12 +5268,23 @@ impl Command {
                                 .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                         } else {
                             if let Some(parent) = host_target.parent() {
+                                log::debug!(
+                                    "DIAG522: about to create_dir_all parent={:?} for bind target={:?} source={:?}",
+                                    parent, host_target, bm.source
+                                );
                                 std::fs::create_dir_all(parent)
-                                    .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
+                                    .map_err(|e| {
+                                        log::error!("DIAG522: create_dir_all FAILED parent={:?}: {} (raw_os_error={:?})", parent, e, e.raw_os_error());
+                                        pre_exec_err("bind mount mkdir", e)
+                                    })?;
+                                log::debug!("DIAG522: create_dir_all OK parent={:?}", parent);
                             }
                             if !host_target.exists() {
                                 std::fs::File::create(&host_target)
-                                    .map_err(|e| pre_exec_err("bind mount mkfile", e))?;
+                                    .map_err(|e| {
+                                        log::error!("DIAG522: File::create FAILED target={:?}: {} (raw_os_error={:?})", host_target, e, e.raw_os_error());
+                                        pre_exec_err("bind mount mkfile", e)
+                                    })?;
                             }
                         }
                         // #478: canonicalize the source path so that symlinks in the
@@ -8397,12 +8408,23 @@ impl Command {
                                 .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
                         } else {
                             if let Some(parent) = host_target.parent() {
+                                log::debug!(
+                                    "DIAG522: about to create_dir_all parent={:?} for bind target={:?} source={:?}",
+                                    parent, host_target, bm.source
+                                );
                                 std::fs::create_dir_all(parent)
-                                    .map_err(|e| pre_exec_err("bind mount mkdir", e))?;
+                                    .map_err(|e| {
+                                        log::error!("DIAG522: create_dir_all FAILED parent={:?}: {} (raw_os_error={:?})", parent, e, e.raw_os_error());
+                                        pre_exec_err("bind mount mkdir", e)
+                                    })?;
+                                log::debug!("DIAG522: create_dir_all OK parent={:?}", parent);
                             }
                             if !host_target.exists() {
                                 std::fs::File::create(&host_target)
-                                    .map_err(|e| pre_exec_err("bind mount mkfile", e))?;
+                                    .map_err(|e| {
+                                        log::error!("DIAG522: File::create FAILED target={:?}: {} (raw_os_error={:?})", host_target, e, e.raw_os_error());
+                                        pre_exec_err("bind mount mkfile", e)
+                                    })?;
                             }
                         }
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
