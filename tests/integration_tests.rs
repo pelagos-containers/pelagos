@@ -2263,6 +2263,102 @@ containerEdits:
         );
     }
 
+    /// test_cli_device_flag_cdi_create_symlinks_hook
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Regression test for #516. Reproduces the real NVIDIA CDI spec shape
+    /// (issue repro): a `mounts` entry for a versioned driver lib
+    /// (`libcditest.so.1.2.3`) plus a `createContainer` hook whose `args`
+    /// are literally `nvidia-ctk hook create-symlinks --link A::B --link C::D`
+    /// — the exact syntax `nvidia-ctk cdi generate` embeds to recreate the
+    /// SONAME symlink chain. Before this fix, `pelagos run` resolved the
+    /// mount but silently skipped the hook (logged a warning), leaving the
+    /// unversioned symlink name missing — mirroring the real bug where
+    /// `nvidia-smi` failed with "couldn't find libnvidia-ml.so" despite the
+    /// versioned file being present. Asserts the two-hop symlink chain
+    /// (`libcditest.so` -> `libcditest.so.1` -> `libcditest.so.1.2.3`)
+    /// resolves to the mounted file's actual contents when read through the
+    /// unversioned name, the same way `dlopen("libnvidia-ml.so")` would.
+    ///
+    /// Failure indicates `CdiHook::nvidia_create_symlinks_pairs()` in
+    /// `cdi.rs` is not parsing `--link TARGET::LINK_PATH` args correctly, or
+    /// `add_cdi_device()` in `run.rs` is not wiring the parsed pairs into
+    /// `with_dev_symlink()`.
+    #[test]
+    fn test_cli_device_flag_cdi_create_symlinks_hook() {
+        if !is_root() {
+            eprintln!("Skipping test_cli_device_flag_cdi_create_symlinks_hook: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_cli_device_flag_cdi_create_symlinks_hook: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let cdi_dir = tempfile::tempdir().expect("tempdir");
+        let driver_dir = tempfile::tempdir().expect("tempdir");
+        let driver_path = driver_dir.path().join("libcditest.so.1.2.3");
+        std::fs::write(&driver_path, "CDI_SYMLINK_HOOK_CONTENTS").unwrap();
+
+        let spec = format!(
+            r#"
+cdiVersion: "0.6.0"
+kind: "test.pelagos.dev/gpu"
+devices:
+  - name: "0"
+    containerEdits:
+      mounts:
+        - hostPath: "{driver}"
+          containerPath: "/opt/cdi-hooks/libcditest.so.1.2.3"
+          options: ["ro", "bind"]
+      hooks:
+        - hookName: createContainer
+          path: /usr/bin/nvidia-ctk
+          args:
+            - nvidia-ctk
+            - hook
+            - create-symlinks
+            - --link
+            - libcditest.so.1.2.3::/opt/cdi-hooks/libcditest.so.1
+            - --link
+            - libcditest.so.1::/opt/cdi-hooks/libcditest.so
+"#,
+            driver = driver_path.display()
+        );
+        std::fs::write(cdi_dir.path().join("vendor.yaml"), spec).unwrap();
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .env("PELAGOS_CDI_SPEC_DIRS", cdi_dir.path())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--device",
+                "test.pelagos.dev/gpu=0",
+                "/bin/sh",
+                "-c",
+                "ls -la /opt/cdi-hooks/; cat /opt/cdi-hooks/libcditest.so 2>&1",
+            ])
+            .output()
+            .expect("pelagos run --device <cdi with create-symlinks hook>");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("CDI_SYMLINK_HOOK_CONTENTS"),
+            "reading through the unversioned symlink (libcditest.so -> \
+             libcditest.so.1 -> libcditest.so.1.2.3) did not return the mounted \
+             file's contents — create-symlinks hook was not executed. \
+             stdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+    }
+
     /// test_bind_mount_into_dev
     ///
     /// Requires: root, rootfs.

@@ -434,6 +434,24 @@ Failure indicates `add_cdi_device()` in `run.rs` is not resolving CDI device nam
 passed via `--device`, or not merging one of the three `ContainerEdits` categories
 (deviceNodes/mounts/env) into the `Command` before spawn.
 
+### `test_cli_device_flag_cdi_create_symlinks_hook`
+**Requires:** root, rootfs
+
+Regression test for #516. Reproduces the real NVIDIA CDI spec shape from the issue's
+repro: a `mounts` entry for a versioned driver lib (`libcditest.so.1.2.3`) plus a
+`createContainer` hook whose `args` are literally `nvidia-ctk hook create-symlinks
+--link A::B --link C::D` — the exact syntax `nvidia-ctk cdi generate` embeds to
+recreate the SONAME symlink chain. Before this fix, `pelagos run` resolved the mount
+but silently skipped the hook (logged a warning), leaving the unversioned symlink name
+missing — mirroring the real bug where `nvidia-smi` failed with "couldn't find
+libnvidia-ml.so" despite the versioned file being present. Asserts the two-hop symlink
+chain (`libcditest.so` -> `libcditest.so.1` -> `libcditest.so.1.2.3`) resolves to the
+mounted file's actual contents when read through the unversioned name, the same way
+`dlopen("libnvidia-ml.so")` would. Failure indicates
+`CdiHook::nvidia_create_symlinks_pairs()` in `cdi.rs` is not parsing `--link
+TARGET::LINK_PATH` args correctly, or `add_cdi_device()` in `run.rs` is not wiring the
+parsed pairs into `with_dev_symlink()`.
+
 ### `test_bind_mount_into_dev`
 **Requires:** root, rootfs
 
