@@ -159,6 +159,19 @@ fn pre_exec_err<E: Into<io::Error>>(ctx: &str, e: E) -> io::Error {
     }
 }
 
+/// TEMPORARY diagnostic for #522 — writes directly to a file instead of
+/// stderr, since stderr is Stdio::Piped and never drained on a failed spawn.
+fn diag522(msg: &str) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/diag522.txt")
+    {
+        let _ = writeln!(f, "[{}] {}", std::process::id(), msg);
+    }
+}
+
 /// Returns `true` if the calling thread holds `CAP_SYS_ADMIN` in its effective
 /// capability set.
 ///
@@ -4212,7 +4225,7 @@ impl Command {
                 // PR_SET_PDEATHSIG is preserved across execve() for non-setuid/
                 // setgid/file-cap binaries and is not affected by capability drops.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-                eprintln!("DIAG522: pre_exec closure entered");
+                { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522.txt").and_then(|mut f| std::io::Write::write_all(&mut f, b"pre_exec closure entered\n")); }
 
                 // Step 0: Add ourselves to the pre-created cgroup BEFORE unshare and
                 // exec, so all subsequent memory allocations (including the exec'd
@@ -4776,7 +4789,7 @@ impl Command {
                                 0,
                                 opts.as_ptr() as *const libc::c_void,
                             );
-                            eprintln!("DIAG522: native overlay mount ret={} errno={:?}", ret, io::Error::last_os_error().raw_os_error());
+                            diag522(&format!("native overlay mount ret={} errno={:?}", ret, io::Error::last_os_error().raw_os_error()));
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }
@@ -4804,7 +4817,7 @@ impl Command {
                 let mut sys_stash_idx: usize = 0;
 
                 // Step 4: Change root if specified
-                eprintln!("DIAG522: reached step 4 (change root)");
+                { let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522.txt").and_then(|mut f| std::io::Write::write_all(&mut f, b"reached step 4\n")); }
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
@@ -4999,7 +5012,7 @@ impl Command {
                     }
 
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
-                    eprintln!("DIAG522: reached mount_dev block, mount_dev={}", mount_dev);
+                    diag522(&format!("reached mount_dev block, mount_dev={}", mount_dev));
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
                         let dev_host = resolve_mount_target_in_root(
@@ -5199,12 +5212,12 @@ impl Command {
                     // corresponding host devices before chroot so they exist at step 4.72
                     // without needing mknod.  (The mknod fallback in step 4.72 will then
                     // see EEXIST and chmod the bind-mounted path instead.)
-                    eprintln!("DIAG522: reached pre-chroot device bind-mount block, devices.len()={}", devices.len());
+                    diag522(&format!("reached pre-chroot device bind-mount block, devices.len()={}", devices.len()));
                     if (is_rootless || namespaces.contains(Namespace::USER)) && !devices.is_empty()
                     {
                         use std::os::unix::ffi::OsStrExt as _;
                         for dev in &devices {
-                            eprintln!("DIAG522: pre-chroot device loop iter, dev.path={:?}", dev.path);
+                            diag522(&format!("pre-chroot device loop iter, dev.path={:?}", dev.path));
                             if dev.kind != 'c' && dev.kind != 'b' {
                                 continue; // FIFOs don't need special handling
                             }
@@ -5238,7 +5251,7 @@ impl Command {
                                 libc::MS_BIND,
                                 ptr::null(),
                             );
-                            eprintln!("DIAG522: pre-chroot device bind-mount result r={} errno={:?} dev={:?}", r, io::Error::last_os_error().raw_os_error(), dev.path);
+                            diag522(&format!("pre-chroot device bind-mount result r={} errno={:?} dev={:?}", r, io::Error::last_os_error().raw_os_error(), dev.path));
                             if r != 0 {
                                 log::debug!(
                                     "user-ns device bind-mount {} failed: {}",
@@ -5247,9 +5260,9 @@ impl Command {
                                 );
                             }
                         }
-                        eprintln!("DIAG522: finished pre-chroot device bind-mount loop");
+                        diag522(&format!("finished pre-chroot device bind-mount loop"));
                     }
-                    eprintln!("DIAG522: about to enter bind_mounts loop, count={}", bind_mounts.len());
+                    diag522(&format!("about to enter bind_mounts loop, count={}", bind_mounts.len()));
 
                     // Bind mounts run after /dev/ tmpfs setup so that mounts targeting
                     // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
@@ -7977,7 +7990,7 @@ impl Command {
                                 0,
                                 opts.as_ptr() as *const libc::c_void,
                             );
-                            eprintln!("DIAG522: native overlay mount ret={} errno={:?}", ret, io::Error::last_os_error().raw_os_error());
+                            diag522(&format!("native overlay mount ret={} errno={:?}", ret, io::Error::last_os_error().raw_os_error()));
                             if ret != 0 {
                                 return Err(io::Error::last_os_error());
                             }
@@ -8170,7 +8183,7 @@ impl Command {
                     }
 
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
-                    eprintln!("DIAG522: reached mount_dev block, mount_dev={}", mount_dev);
+                    diag522(&format!("reached mount_dev block, mount_dev={}", mount_dev));
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
                         let dev_host = resolve_mount_target_in_root(
@@ -8390,7 +8403,7 @@ impl Command {
                                 libc::MS_BIND,
                                 ptr::null(),
                             );
-                            eprintln!("DIAG522: pre-chroot device bind-mount result r={} errno={:?} dev={:?}", r, io::Error::last_os_error().raw_os_error(), dev.path);
+                            diag522(&format!("pre-chroot device bind-mount result r={} errno={:?} dev={:?}", r, io::Error::last_os_error().raw_os_error(), dev.path));
                             if r != 0 {
                                 log::debug!(
                                     "user-ns device bind-mount {} failed: {}",
@@ -8399,9 +8412,9 @@ impl Command {
                                 );
                             }
                         }
-                        eprintln!("DIAG522: finished pre-chroot device bind-mount loop");
+                        diag522(&format!("finished pre-chroot device bind-mount loop"));
                     }
-                    eprintln!("DIAG522: about to enter bind_mounts loop, count={}", bind_mounts.len());
+                    diag522(&format!("about to enter bind_mounts loop, count={}", bind_mounts.len()));
 
                     // Bind mounts run after /dev/ tmpfs setup so that mounts targeting
                     // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
