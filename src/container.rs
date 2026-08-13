@@ -4802,6 +4802,7 @@ impl Command {
                 let mut sys_stash_idx: usize = 0;
 
                 // Step 4: Change root if specified
+                eprintln!("DIAG522: reached step 4 (change root)");
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
@@ -4996,6 +4997,7 @@ impl Command {
                     }
 
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
+                    eprintln!("DIAG522: reached mount_dev block, mount_dev={}", mount_dev);
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
                         let dev_host = resolve_mount_target_in_root(
@@ -5195,10 +5197,12 @@ impl Command {
                     // corresponding host devices before chroot so they exist at step 4.72
                     // without needing mknod.  (The mknod fallback in step 4.72 will then
                     // see EEXIST and chmod the bind-mounted path instead.)
+                    eprintln!("DIAG522: reached pre-chroot device bind-mount block, devices.len()={}", devices.len());
                     if (is_rootless || namespaces.contains(Namespace::USER)) && !devices.is_empty()
                     {
                         use std::os::unix::ffi::OsStrExt as _;
                         for dev in &devices {
+                            eprintln!("DIAG522: pre-chroot device loop iter, dev.path={:?}", dev.path);
                             if dev.kind != 'c' && dev.kind != 'b' {
                                 continue; // FIFOs don't need special handling
                             }
@@ -5232,6 +5236,7 @@ impl Command {
                                 libc::MS_BIND,
                                 ptr::null(),
                             );
+                            eprintln!("DIAG522: pre-chroot device bind-mount result r={} errno={:?} dev={:?}", r, io::Error::last_os_error().raw_os_error(), dev.path);
                             if r != 0 {
                                 log::debug!(
                                     "user-ns device bind-mount {} failed: {}",
@@ -5240,7 +5245,9 @@ impl Command {
                                 );
                             }
                         }
+                        eprintln!("DIAG522: finished pre-chroot device bind-mount loop");
                     }
+                    eprintln!("DIAG522: about to enter bind_mounts loop, count={}", bind_mounts.len());
 
                     // Bind mounts run after /dev/ tmpfs setup so that mounts targeting
                     // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
@@ -8160,6 +8167,7 @@ impl Command {
                     }
 
                     // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
+                    eprintln!("DIAG522: reached mount_dev block, mount_dev={}", mount_dev);
                     if mount_dev {
                         use std::os::unix::ffi::OsStrExt as _;
                         let dev_host = resolve_mount_target_in_root(
@@ -8379,6 +8387,7 @@ impl Command {
                                 libc::MS_BIND,
                                 ptr::null(),
                             );
+                            eprintln!("DIAG522: pre-chroot device bind-mount result r={} errno={:?} dev={:?}", r, io::Error::last_os_error().raw_os_error(), dev.path);
                             if r != 0 {
                                 log::debug!(
                                     "user-ns device bind-mount {} failed: {}",
@@ -8387,7 +8396,9 @@ impl Command {
                                 );
                             }
                         }
+                        eprintln!("DIAG522: finished pre-chroot device bind-mount loop");
                     }
+                    eprintln!("DIAG522: about to enter bind_mounts loop, count={}", bind_mounts.len());
 
                     // Bind mounts run after /dev/ tmpfs setup so that mounts targeting
                     // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
