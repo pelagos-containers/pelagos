@@ -2181,7 +2181,15 @@ mod filesystem {
     /// Failure indicates `add_cdi_device()` in `run.rs` is not resolving CDI
     /// device names passed via `--device`, or not merging deviceNodes/mounts/
     /// env into the `Command` before spawn.
+    ///
+    /// `#[serial(cdi_rootfs)]`: this and the other `--device <cdi>` CLI tests
+    /// all run `pelagos run --rootfs <shared alpine-rootfs>` directly
+    /// (non-ephemeral, no overlay) — running them concurrently races on the
+    /// same physical directory tree and produces spurious "Failed to spawn
+    /// process: No such file or directory" failures unrelated to CDI logic
+    /// (confirmed via `--test-threads=1`, see #518 session notes).
     #[test]
+    #[serial(cdi_rootfs)]
     fn test_cli_device_flag_cdi_resolution() {
         if !is_root() {
             eprintln!("Skipping test_cli_device_flag_cdi_resolution: requires root");
@@ -2281,11 +2289,12 @@ containerEdits:
     /// resolves to the mounted file's actual contents when read through the
     /// unversioned name, the same way `dlopen("libnvidia-ml.so")` would.
     ///
-    /// Failure indicates `CdiHook::nvidia_create_symlinks_pairs()` in
+    /// Failure indicates `CdiHook::create_symlinks_pairs()` in
     /// `cdi.rs` is not parsing `--link TARGET::LINK_PATH` args correctly, or
     /// `add_cdi_device()` in `run.rs` is not wiring the parsed pairs into
     /// `with_dev_symlink()`.
     #[test]
+    #[serial(cdi_rootfs)]
     fn test_cli_device_flag_cdi_create_symlinks_hook() {
         if !is_root() {
             eprintln!("Skipping test_cli_device_flag_cdi_create_symlinks_hook: requires root");
@@ -2354,6 +2363,100 @@ devices:
              libcditest.so.1 -> libcditest.so.1.2.3) did not return the mounted \
              file's contents — create-symlinks hook was not executed. \
              stdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+    }
+
+    /// test_cli_device_flag_cdi_create_symlinks_hook_nvidia_cdi_hook_binary
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Regression test for #518. Identical to
+    /// `test_cli_device_flag_cdi_create_symlinks_hook` except the hook's
+    /// `path`/`args[0]` is `nvidia-cdi-hook` instead of `nvidia-ctk hook` —
+    /// the exact real-world shape from #518's repro on nvidia-container-toolkit
+    /// 1.17+, which ships the same `create-symlinks --link A::B` convention
+    /// under a different binary. Before this fix, `create_symlinks_pairs()`
+    /// pattern-matched on `path == ".../nvidia-ctk"` and silently skipped any
+    /// other binary name, even though the args fully describe the same
+    /// operation. Uses a distinct container path
+    /// (`/opt/cdi-hooks2/`) from the sibling `nvidia-ctk` test to avoid
+    /// cross-test artifact collisions on the shared, non-ephemeral
+    /// `alpine-rootfs` (see #516 memory notes on this gotcha).
+    ///
+    /// Failure indicates `CdiHook::create_symlinks_pairs()` regressed back to
+    /// checking `path` / the invoking binary's name.
+    #[test]
+    #[serial(cdi_rootfs)]
+    fn test_cli_device_flag_cdi_create_symlinks_hook_nvidia_cdi_hook_binary() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_cli_device_flag_cdi_create_symlinks_hook_nvidia_cdi_hook_binary: requires root"
+            );
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_cli_device_flag_cdi_create_symlinks_hook_nvidia_cdi_hook_binary: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let cdi_dir = tempfile::tempdir().expect("tempdir");
+        let driver_dir = tempfile::tempdir().expect("tempdir");
+        let driver_path = driver_dir.path().join("libcditest.so.1.2.3");
+        std::fs::write(&driver_path, "CDI_HOOK_BINARY_CONTENTS").unwrap();
+
+        let spec = format!(
+            r#"
+cdiVersion: "0.6.0"
+kind: "test.pelagos.dev/gpu"
+devices:
+  - name: "0"
+    containerEdits:
+      mounts:
+        - hostPath: "{driver}"
+          containerPath: "/opt/cdi-hooks2/libcditest.so.1.2.3"
+          options: ["ro", "bind"]
+      hooks:
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - create-symlinks
+            - --link
+            - libcditest.so.1.2.3::/opt/cdi-hooks2/libcditest.so.1
+            - --link
+            - libcditest.so.1::/opt/cdi-hooks2/libcditest.so
+"#,
+            driver = driver_path.display()
+        );
+        std::fs::write(cdi_dir.path().join("vendor.yaml"), spec).unwrap();
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .env("PELAGOS_CDI_SPEC_DIRS", cdi_dir.path())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--device",
+                "test.pelagos.dev/gpu=0",
+                "/bin/sh",
+                "-c",
+                "ls -la /opt/cdi-hooks2/; cat /opt/cdi-hooks2/libcditest.so 2>&1",
+            ])
+            .output()
+            .expect("pelagos run --device <cdi with nvidia-cdi-hook create-symlinks>");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("CDI_HOOK_BINARY_CONTENTS"),
+            "reading through the unversioned symlink did not return the mounted \
+             file's contents — create-symlinks hook was not executed for the \
+             nvidia-cdi-hook binary shape. stdout:\n{}\nstderr:\n{}",
             stdout,
             stderr
         );
