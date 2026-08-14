@@ -151,6 +151,16 @@ pub use crate::seccomp::SeccompProfile;
 #[inline]
 fn pre_exec_err<E: Into<io::Error>>(ctx: &str, e: E) -> io::Error {
     let e: io::Error = e.into();
+    {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/diag522b.txt")
+        {
+            let _ = writeln!(f, "[{}] pre_exec_err: {}: {}", std::process::id(), ctx, e);
+        }
+    }
     if let Some(eno) = e.raw_os_error() {
         log::debug!("pre_exec: {}: {}", ctx, e);
         io::Error::from_raw_os_error(eno)
