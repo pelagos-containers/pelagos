@@ -4107,6 +4107,12 @@ impl Command {
         // bind-mount target: pre-create the needed parent directory (and, for
         // file-target binds, an empty placeholder file) directly in the upper
         // dir before fork, so the kernel never has to copy up that path.
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                let _ = writeln!(f, "PARENT: preseed loop start, bind_mounts.len()={} is_rootless={} overlay_some={}", bind_mounts.len(), is_rootless, self.overlay.is_some());
+            }
+        }
         if is_rootless {
             if let Some(ref ov) = self.overlay {
                 let lower_base: Option<&std::path::Path> = ov
@@ -4131,6 +4137,12 @@ impl Command {
                         }
                     }
                 }
+            }
+        }
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                let _ = writeln!(f, "PARENT: preseed loop done");
             }
         }
 
@@ -4283,6 +4295,12 @@ impl Command {
                 // PR_SET_PDEATHSIG is preserved across execve() for non-setuid/
                 // setgid/file-cap binaries and is not affected by capability drops.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: pre_exec entered", std::process::id());
+                    }
+                }
 
                 // Step 0: Add ourselves to the pre-created cgroup BEFORE unshare and
                 // exec, so all subsequent memory allocations (including the exec'd
@@ -7507,6 +7525,12 @@ impl Command {
         // pre-create bind-mount targets directly in the overlay upper dir
         // before fork, to avoid a kernel copy-up EOVERFLOW under rootless
         // native-overlay+userxattr.
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                let _ = writeln!(f, "PARENT: preseed loop start, bind_mounts.len()={} is_rootless={} overlay_some={}", bind_mounts.len(), is_rootless, self.overlay.is_some());
+            }
+        }
         if is_rootless {
             if let Some(ref ov) = self.overlay {
                 let lower_base: Option<&std::path::Path> = ov
@@ -7531,6 +7555,12 @@ impl Command {
                         }
                     }
                 }
+            }
+        }
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                let _ = writeln!(f, "PARENT: preseed loop done");
             }
         }
 
