@@ -1566,16 +1566,20 @@ pub struct Command {
 /// # Safety
 /// Must be called from a child process that has already called
 /// `unshare(CLONE_NEWNS)` and made mounts private (`MS_PRIVATE|MS_REC`).
-unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::Result<()> {
+unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str, diag_fd: i32) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-            let _ = writeln!(f, "[{}] do_pivot_root ENTERED", std::process::id());
-        }
+    macro_rules! dw {
+        ($($arg:tt)*) => {{
+            if diag_fd >= 0 {
+                let s = format!($($arg)*) + "\n";
+                libc::write(diag_fd, s.as_ptr() as *const libc::c_void, s.len());
+            }
+        }};
     }
+
+    dw!("[{}] do_pivot_root ENTERED", std::process::id());
 
     let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
 
@@ -1588,12 +1592,7 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
         libc::MS_BIND | libc::MS_REC,
         std::ptr::null(),
     );
-    {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-            let _ = writeln!(f, "[{}] do_pivot_root self-bind rc={} errno={:?}", std::process::id(), bind_rc, io::Error::last_os_error().raw_os_error());
-        }
-    }
+    dw!("[{}] do_pivot_root self-bind rc={} errno={:?}", std::process::id(), bind_rc, io::Error::last_os_error().raw_os_error());
     // EINVAL usually means it is already a mountpoint — ignore.
     if bind_rc != 0 {
         let e = io::Error::last_os_error();
@@ -1609,12 +1608,7 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     // The name was generated in the parent process and is unique per container.
     let put_old = new_root.join(put_old_name);
     let mkdir_res = std::fs::create_dir_all(&put_old);
-    {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-            let _ = writeln!(f, "[{}] do_pivot_root create_dir_all(put_old) res={:?}", std::process::id(), mkdir_res.as_ref().map_err(|e| e.raw_os_error()));
-        }
-    }
+    dw!("[{}] do_pivot_root create_dir_all(put_old) res={:?}", std::process::id(), mkdir_res.as_ref().map_err(|e| e.raw_os_error()));
     mkdir_res?;
     let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
 
@@ -1623,13 +1617,9 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     #[cfg(target_arch = "aarch64")]
     const SYS_PIVOT_ROOT: i64 = 41;
 
+    dw!("[{}] do_pivot_root about to call raw syscall({}, {:?}, {:?})", std::process::id(), SYS_PIVOT_ROOT, new_root, put_old);
     let rc = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
-    {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-            let _ = writeln!(f, "[{}] do_pivot_root syscall rc={} errno={:?}", std::process::id(), rc, io::Error::last_os_error().raw_os_error());
-        }
-    }
+    dw!("[{}] do_pivot_root syscall rc={} errno={:?}", std::process::id(), rc, io::Error::last_os_error().raw_os_error());
     if rc != 0 {
         return Err(pre_exec_err(
             &format!("pivot_root({}, {})", new_root.display(), put_old.display()),
@@ -4133,12 +4123,6 @@ impl Command {
         // bind-mount target: pre-create the needed parent directory (and, for
         // file-target binds, an empty placeholder file) directly in the upper
         // dir before fork, so the kernel never has to copy up that path.
-        {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                let _ = writeln!(f, "PARENT[pid={}]: preseed loop start, bind_mounts.len()={} is_rootless={} overlay_some={}", std::process::id(), bind_mounts.len(), is_rootless, self.overlay.is_some());
-            }
-        }
         if is_rootless {
             if let Some(ref ov) = self.overlay {
                 let lower_base: Option<&std::path::Path> = ov
@@ -4147,19 +4131,8 @@ impl Command {
                     .map(|p| p.as_path())
                     .or(self.chroot_dir.as_deref());
                 if let Some(lower_base) = lower_base {
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let _ = writeln!(f, "[{}] CHILD: reached bind_mounts_loop_start count={}", std::process::id(), bind_mounts.len());
-                        }
-                    }
                     for (bm_idx522, bm) in bind_mounts.iter().enumerate() {
-                        {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                                let _ = writeln!(f, "[{}] CHILD: bind_mounts[{}] source={:?} target={:?}", std::process::id(), bm_idx522, bm.source, bm.target);
-                            }
-                        }
+                        let _ = bm_idx522;
 
                         let resolved_target = resolve_mount_target_in_root(lower_base, &bm.target);
                         let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
@@ -4338,12 +4311,22 @@ impl Command {
                 // PR_SET_PDEATHSIG is preserved across execve() for non-setuid/
                 // setgid/file-cap binaries and is not affected by capability drops.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[pid={} ppid={}] CHILD: pre_exec entered", std::process::id(), libc::getppid());
-                    }
+                // DIAG522: open the diag file ONCE, keep the raw fd — an already-open
+                // fd stays valid across pivot_root even though "/tmp/..." path lookups
+                // stop working after the root changes.
+                let diag522_fd: i32 = {
+                    let p = std::ffi::CString::new("/tmp/diag522c.txt").unwrap();
+                    libc::open(p.as_ptr(), libc::O_CREAT | libc::O_WRONLY | libc::O_APPEND, 0o666)
+                };
+                macro_rules! diag522w {
+                    ($($arg:tt)*) => {{
+                        if diag522_fd >= 0 {
+                            let s = format!($($arg)*) + "\n";
+                            libc::write(diag522_fd, s.as_ptr() as *const libc::c_void, s.len());
+                        }
+                    }};
                 }
+                diag522w!("[pid={} ppid={}] CHILD: pre_exec entered (diag522_fd={})", std::process::id(), libc::getppid(), diag522_fd);
 
                 // Step 0: Add ourselves to the pre-created cgroup BEFORE unshare and
                 // exec, so all subsequent memory allocations (including the exec'd
@@ -4372,12 +4355,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step1_unshare", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step1_unshare", std::process::id());
                 // Step 1: Unshare namespaces.
                 if !namespaces.is_empty() {
                     if is_rootless && namespaces.contains(Namespace::USER) {
@@ -4573,12 +4551,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step1_65_pidns", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step1_65_pidns", std::process::id());
                 // Step 1.65: PID namespace double-fork.
                 //
                 // Two cases handled here:
@@ -4750,12 +4723,7 @@ impl Command {
                     -1
                 };
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step2_idmap", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step2_idmap", std::process::id());
                 // Step 2: UID/GID mapping for root-created user namespaces.
                 // Maps are written by the parent process (via needs_parent_idmap pipe),
                 // not by the child — the child loses CAP_SETUID in the parent user
@@ -4763,12 +4731,7 @@ impl Command {
                 // (Rootless maps were written early in Step 1 by the child itself, which
                 // is allowed because the child's own UID is in the mapped range.)
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step3_5_overlay", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step3_5_overlay", std::process::id());
                 // Step 3.5: Mount overlayfs (if configured).
                 // The merged dir becomes the effective root for chroot and bind mounts.
                 let overlay_merged: Option<&std::ffi::CString> =
@@ -4957,12 +4920,7 @@ impl Command {
                 let mut deferred_sys_mounts: Vec<(PathBuf, BindMount)> = Vec::new();
                 let mut sys_stash_idx: usize = 0;
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_chroot", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_chroot", std::process::id());
                 // Step 4: Change root if specified
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
@@ -4976,12 +4934,7 @@ impl Command {
                         .map(|m| std::path::Path::new(m.to_str().unwrap()))
                         .unwrap_or(dir.as_path());
 
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let _ = writeln!(f, "[{}] CHILD: reached dns_start", std::process::id());
-                        }
-                    }
+                    diag522w!("[{}] CHILD: reached dns_start", std::process::id());
                     // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
                     // Done here (before chroot) using the host-side effective_root path.
                     // Because Namespace::MOUNT is required, the bind mount is scoped to this
@@ -5020,12 +4973,7 @@ impl Command {
                         }
                     }
 
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let _ = writeln!(f, "[{}] CHILD: reached ca_start", std::process::id());
-                        }
-                    }
+                    diag522w!("[{}] CHILD: reached ca_start", std::process::id());
                     // CA certs: bind-mount host trust store read-only for pasta containers.
                     // Alpine/scratch images lack ca-certificates; this lets wget/curl verify TLS.
                     //
@@ -5073,12 +5021,7 @@ impl Command {
                         }
                     }
 
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let _ = writeln!(f, "[{}] CHILD: reached hosts_start", std::process::id());
-                        }
-                    }
+                    diag522w!("[{}] CHILD: reached hosts_start", std::process::id());
                     // Hosts: bind-mount the per-container hosts file over /etc/hosts.
                     // Same mechanism as DNS — scoped to this container's mount namespace.
                     if let Some(ref hosts_src) = hosts_temp_file_cstring {
@@ -5368,12 +5311,7 @@ impl Command {
                         }
                     }
 
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let _ = writeln!(f, "[{}] CHILD: reached devbind_start", std::process::id());
-                        }
-                    }
+                    diag522w!("[{}] CHILD: reached devbind_start", std::process::id());
                     // Pre-chroot device bind-mounts for USER namespace containers.
                     // mknod(2) for character/block devices requires CAP_MKNOD in the
                     // initial user namespace — it always fails with EPERM inside a user
@@ -5433,12 +5371,7 @@ impl Command {
                     // being covered by it.  Source paths are still host paths here
                     // (chroot has not happened yet).
                     for (real_bm_idx, bm) in bind_mounts.iter().enumerate() {
-                        {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                                let _ = writeln!(f, "[{}] REALLOOP[{}] source={:?} target={:?}", std::process::id(), real_bm_idx, bm.source, bm.target);
-                            }
-                        }
+                        diag522w!("[{}] REALLOOP[{}] source={:?} target={:?}", std::process::id(), real_bm_idx, bm.source, bm.target);
                         use std::os::unix::ffi::OsStrExt as _;
                         // Target inside the effective root on the host side, with any
                         // symlinked parent dirs in the image rootfs resolved (e.g.
@@ -5724,21 +5657,11 @@ impl Command {
                     }
 
                     let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let put_old_full = effective_root.join(put_old_name);
-                            let _ = writeln!(f, "[{}] about to pivot_root, put_old_name={:?} exists_before={} effective_root={:?}", std::process::id(), put_old_name, put_old_full.exists(), effective_root);
-                        }
-                    }
-                    let pivot_result = do_pivot_root(effective_root, put_old_name);
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                            let _ = writeln!(f, "[{}] pivot_root result={:?}", std::process::id(), pivot_result.as_ref().map_err(|e| e.raw_os_error()));
-                        }
-                    }
+                    diag522w!("[{}] about to pivot_root, put_old_name={:?} effective_root={:?}", std::process::id(), put_old_name, effective_root);
+                    let pivot_result = do_pivot_root(effective_root, put_old_name, diag522_fd);
+                    diag522w!("[{}] pivot_root result={:?}", std::process::id(), pivot_result.as_ref().map_err(|e| e.raw_os_error()));
                     pivot_result?;
+                    diag522w!("[{}] AFTER pivot_root, continuing", std::process::id());
 
                     // Apply container working directory (defaults to /).
                     let cwd = container_cwd
@@ -5750,12 +5673,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_5", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_5", std::process::id());
                 // Step 4.5: Perform automatic mounts if requested.
                 // IMPORTANT: Use absolute paths for mount targets — cwd may not
                 // be "/" if the caller used with_cwd().
@@ -5973,12 +5891,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_65", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_65", std::process::id());
                 // Step 4.65: Propagation-only remounts (MS_SHARED, MS_SLAVE, etc.)
                 // These must come after the initial mount; passing propagation flags
                 // in the initial mount(2) call returns EINVAL on Linux.
@@ -5999,12 +5912,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_7", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_7", std::process::id());
                 // Step 4.7: Apply sysctl settings (write to /proc/sys/)
                 for (key, value) in &sysctl {
                     // Convert "net.ipv4.ip_forward" -> "/proc/sys/net/ipv4/ip_forward"
@@ -6023,12 +5931,7 @@ impl Command {
                     // Ignore errors — sysctl may not exist in this namespace
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_72", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_72", std::process::id());
                 // Step 4.72: Create device nodes
                 if !devices.is_empty() {
                     // Clear umask so mknod creates devices with the exact mode
@@ -6072,12 +5975,7 @@ impl Command {
                     libc::umask(old_umask);
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_73", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_73", std::process::id());
                 // Step 4.73: Create /dev symlinks (OCI default symlinks for fresh /dev tmpfs).
                 // symlink(target, linkpath) — ignore errors (may already exist).
                 for (link, target) in &dev_symlinks {
@@ -6089,12 +5987,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_8", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_8", std::process::id());
                 // Step 4.8: Mask sensitive paths
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
@@ -6128,12 +6021,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_82", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_82", std::process::id());
                 // Step 4.82: Make specific paths read-only (linux.readonlyPaths)
                 if !readonly_paths.is_empty() {
                     for path in &readonly_paths {
@@ -6164,12 +6052,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_85", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_85", std::process::id());
                 // Step 4.85: Make rootfs read-only if requested.
                 // MUST come after all mounts (/proc, /sys, /dev, masked paths).
                 // The self-bind done before pivot_root made "/" a bind-mount,
@@ -6188,12 +6071,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_855", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_855", std::process::id());
                 // Step 4.855: Join path-specified namespaces.
                 //
                 // MUST come before capability drop (step 4.86) because setns(2)
@@ -6212,12 +6090,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step4_9", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step4_9", std::process::id());
                 // Step 4.9: Set resource limits BEFORE capability drops.
                 //
                 // MUST come before step 4.86 (capability drops) because raising a
@@ -6336,12 +6209,7 @@ impl Command {
                     }
                 }
 
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: reached step5", std::process::id());
-                    }
-                }
+                diag522w!("[{}] CHILD: reached step5", std::process::id());
                 // Step 5: Run user-provided pre_exec callback
                 // MUST run before setuid — exec's callback does setns(CLONE_NEWNS)
                 // which requires CAP_SYS_ADMIN.
@@ -7708,12 +7576,6 @@ impl Command {
         // pre-create bind-mount targets directly in the overlay upper dir
         // before fork, to avoid a kernel copy-up EOVERFLOW under rootless
         // native-overlay+userxattr.
-        {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                let _ = writeln!(f, "PARENT: preseed loop start, bind_mounts.len()={} is_rootless={} overlay_some={}", bind_mounts.len(), is_rootless, self.overlay.is_some());
-            }
-        }
         if is_rootless {
             if let Some(ref ov) = self.overlay {
                 let lower_base: Option<&std::path::Path> = ov
@@ -8899,7 +8761,7 @@ impl Command {
                     }
 
                     let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
-                    do_pivot_root(effective_root, put_old_name)?;
+                    do_pivot_root(effective_root, put_old_name, -1)?;
                     let cwd = container_cwd
                         .as_deref()
                         .unwrap_or(std::path::Path::new("/"));
