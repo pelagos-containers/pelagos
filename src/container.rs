@@ -4152,10 +4152,14 @@ impl Command {
                 }
             }
         }
-        {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                let _ = writeln!(f, "PARENT[pid={}]: preseed loop done", std::process::id());
+        // #522 (continued): do_pivot_root() creates its own bookkeeping directory
+        // (put_old_name, e.g. ".pivot_root_old") directly under the merged root —
+        // NOT part of bind_mounts, so the pre-seed loop above never touches it.
+        // It hits the exact same copy-up EOVERFLOW for the same reason. Pre-seed
+        // it too.
+        if is_rootless {
+            if let (Some(ref ov), Some(ref put_old_name)) = (&self.overlay, &pivot_put_old_name) {
+                let _ = std::fs::create_dir_all(ov.upper_dir.join(put_old_name));
             }
         }
 
@@ -7696,10 +7700,11 @@ impl Command {
                 }
             }
         }
-        {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                let _ = writeln!(f, "PARENT: preseed loop done");
+        // #522 (continued): see the matching block in spawn() — do_pivot_root()'s
+        // own bookkeeping directory isn't part of bind_mounts, pre-seed it too.
+        if is_rootless {
+            if let (Some(ref ov), Some(ref put_old_name)) = (&self.overlay, &pivot_put_old_name) {
+                let _ = std::fs::create_dir_all(ov.upper_dir.join(put_old_name));
             }
         }
 
