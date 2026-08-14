@@ -4224,6 +4224,37 @@ impl Command {
                 (-1, -1, -1, -1)
             };
 
+        // Create pasta sync pipes before the pre_exec closure, same shape as the
+        // idmap pipes above: the child announces its own pid once its NET/USER
+        // namespaces are set up (but *before* the PID-namespace double-fork that
+        // would spawn the eventual command process), then blocks until the
+        // parent's helper thread has finished handing that pid to `pasta` and
+        // signals go-ahead.
+        //
+        // This replaces an earlier approach of a plain `kill(pid, SIGSTOP)` from
+        // the parent *after* `self.inner.spawn()` returns: `std::process::Command`
+        // only returns once the child has actually exec'd (its internal CLOEXEC
+        // status pipe only closes on exec or error), so by the time the parent
+        // could look up and signal the pid, a fast-exiting command (e.g. `true`)
+        // could already be gone — the double-forked intermediate reaps it and
+        // exits within milliseconds under Namespace::PID (#526). Racing a signal
+        // after the fact can't close that window; blocking the child *before* it
+        // ever reaches exec, using the same pre-spawn background-thread pattern
+        // as the idmap handshake above, can — the child simply never proceeds to
+        // exec until the parent has already succeeded.
+        let (pasta_pid_w, pasta_go_r, pasta_pid_r, pasta_go_w) = if is_pasta {
+            let mut pid_fds = [0i32; 2];
+            let mut go_fds = [0i32; 2];
+            if unsafe { libc::pipe(pid_fds.as_mut_ptr()) } != 0
+                || unsafe { libc::pipe(go_fds.as_mut_ptr()) } != 0
+            {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            (pid_fds[1], go_fds[0], pid_fds[0], go_fds[1])
+        } else {
+            (-1, -1, -1, -1)
+        };
+
         // Pre-compile user_notif BPF filter and create socketpair for fd transfer.
         // Done in parent (pre-fork) because BPF compilation requires allocation.
         let user_notif_handler = self.user_notif_handler.take();
@@ -4577,6 +4608,26 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::last_os_error());
                         }
+                    }
+                }
+
+                // Step 1.63: Pasta — announce our own pid to the parent, then
+                // block until its background thread (spawned before
+                // self.inner.spawn(), see there for the full rationale) has
+                // handed that pid to `pasta` and signals go-ahead. We do this
+                // before the PID-namespace double-fork below, i.e. before the
+                // eventual command process even exists, so there is no window
+                // in which the pid we announced could already have exited.
+                if is_pasta {
+                    let pid = libc::getpid() as u32;
+                    let pid_bytes = pid.to_ne_bytes();
+                    libc::write(pasta_pid_w, pid_bytes.as_ptr() as *const libc::c_void, 4);
+                    libc::close(pasta_pid_w);
+                    let mut buf = [0u8; 1];
+                    let n = libc::read(pasta_go_r, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                    libc::close(pasta_go_r);
+                    if n != 1 || buf[0] == 0 {
+                        return Err(io::Error::other("pasta network setup failed"));
                     }
                 }
 
@@ -6539,6 +6590,41 @@ impl Command {
             });
         }
 
+        // Spawn the pasta helper thread *before* self.inner.spawn() below, so it
+        // runs concurrently with that blocking call — same reasoning as the
+        // idmap helper thread above. It reads the child's announced pid, hands
+        // it to `pasta` via setup_pasta_network, and signals go-ahead; the
+        // result (including the process handle needed for teardown) comes back
+        // over `pasta_result_rx` once available.
+        let pasta_result_rx = if is_pasta {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let ready_r = pasta_pid_r;
+            let go_w = pasta_go_w;
+            let port_forwards = self.port_forwards.clone();
+            std::thread::spawn(move || {
+                let mut pid_bytes = [0u8; 4];
+                let n =
+                    unsafe { libc::read(ready_r, pid_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
+                unsafe { libc::close(ready_r) };
+                if n != 4 {
+                    let _ = result_tx.send(Err(io::Error::other(
+                        "pasta: container process exited before namespace setup completed",
+                    )));
+                    unsafe { libc::close(go_w) };
+                    return;
+                }
+                let pid = u32::from_ne_bytes(pid_bytes);
+                let setup_result = crate::network::setup_pasta_network(pid, &port_forwards);
+                let status: u8 = u8::from(setup_result.is_ok());
+                let _ = result_tx.send(setup_result);
+                unsafe { libc::write(go_w, [status].as_ptr() as *const libc::c_void, 1) };
+                unsafe { libc::close(go_w) };
+            });
+            Some(result_rx)
+        } else {
+            None
+        };
+
         // Spawn the process
         let child_inner = match self.inner.spawn() {
             Ok(c) => c,
@@ -6548,6 +6634,18 @@ impl Command {
                     unsafe { libc::close(idmap_ready_w) };
                     unsafe { libc::close(idmap_done_r) };
                 }
+                if is_pasta {
+                    unsafe { libc::close(pasta_pid_w) };
+                    unsafe { libc::close(pasta_go_r) };
+                    // If pasta setup itself caused the pre_exec failure, surface
+                    // its detailed error instead of the generic message the
+                    // child could report (it only knows a 0/1 go/no-go byte).
+                    if let Some(rx) = pasta_result_rx {
+                        if let Ok(Err(pasta_err)) = rx.recv() {
+                            return Err(Error::Io(pasta_err));
+                        }
+                    }
+                }
                 return Err(Error::Spawn(e));
             }
         };
@@ -6556,6 +6654,10 @@ impl Command {
         if use_id_helpers || needs_parent_idmap {
             unsafe { libc::close(idmap_ready_w) };
             unsafe { libc::close(idmap_done_r) };
+        }
+        if is_pasta {
+            unsafe { libc::close(pasta_pid_w) };
+            unsafe { libc::close(pasta_go_r) };
         }
 
         // Keep join_ns_files alive until here so file descriptors remain valid
@@ -6598,32 +6700,26 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        // Pasta: spawn the relay after the child has unshared its NET namespace.
+        // Pasta: the helper thread spawned before self.inner.spawn() above has
+        // already handed the child's announced pid to `pasta` and signalled it
+        // to proceed (or to abort, on failure — in which case self.inner.spawn()
+        // itself would have returned Err and we would not be here). Its result,
+        // including the PastaSetup process handle needed for teardown, is
+        // waiting on the channel by now.
         //
-        // In root mode the child bind-mounts its own netns to
-        // /run/pelagos/pasta-ns/{pid} in pre_exec (step 1.61), before exec.
-        // setup_pasta_network detects the existing bind-mount and skips re-creating
-        // it.  This avoids the race where a fast command exits before the parent
-        // reaches this point.
-        //
-        // SIGSTOP/SIGCONT below prevents the container from making network syscalls
-        // before pasta has configured the TAP interface.
-        let pasta: Option<crate::network::PastaSetup> = if is_pasta {
-            // find_container_pid returns C's host PID for PID-ns containers, or
-            // child_inner.id() itself for non-PID-ns containers.
-            let container_pid =
-                find_container_pid(child_inner.id()).unwrap_or_else(|| child_inner.id());
-            // Pause the container so it can't make network syscalls until pasta is ready.
-            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGSTOP) };
-            let setup = crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
-                .map_err(|e| {
-                    // Resume the container before propagating the error.
-                    unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
-                    Error::Io(e)
-                })?;
-            // Resume the container; pasta has configured the TAP and routes.
-            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
-            Some(setup)
+        // In root mode the child additionally bind-mounts its own netns to
+        // /run/pelagos/pasta-ns/{pid} in pre_exec (step 1.61), before exec, so
+        // setup_pasta_network works even independent of this synchronization.
+        let pasta: Option<crate::network::PastaSetup> = if let Some(rx) = pasta_result_rx {
+            match rx.recv() {
+                Ok(Ok(setup)) => Some(setup),
+                Ok(Err(e)) => return Err(Error::Io(e)),
+                Err(_) => {
+                    return Err(Error::Io(io::Error::other(
+                        "pasta setup thread disconnected unexpectedly",
+                    )));
+                }
+            }
         } else {
             None
         };
@@ -7624,6 +7720,23 @@ impl Command {
                 (-1, -1, -1, -1)
             };
 
+        // Pasta sync pipes — see spawn()'s equivalent block for the full
+        // rationale (blocking the child before it reaches exec, using the same
+        // pre-spawn background-thread pattern as the idmap handshake above, to
+        // avoid the fast-exiting-command race in #526).
+        let (pasta_pid_w_i, pasta_go_r_i, pasta_pid_r_i, pasta_go_w_i) = if is_pasta {
+            let mut pid_fds = [0i32; 2];
+            let mut go_fds = [0i32; 2];
+            if unsafe { libc::pipe(pid_fds.as_mut_ptr()) } != 0
+                || unsafe { libc::pipe(go_fds.as_mut_ptr()) } != 0
+            {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            (pid_fds[1], go_fds[0], pid_fds[0], go_fds[1])
+        } else {
+            (-1, -1, -1, -1)
+        };
+
         // Pre-compile user_notif BPF filter and create socketpair for fd transfer.
         let user_notif_handler_i = self.user_notif_handler.take();
         let (user_notif_bpf_i, notif_parent_sock_i, notif_child_sock_i): (
@@ -7872,6 +7985,24 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::last_os_error());
                         }
+                    }
+                }
+
+                // Pasta — announce our pid and block for parent go-ahead. See
+                // spawn() Step 1.63 for the full explanation of why this must
+                // happen here (before this process forks the eventual command
+                // process) rather than as a post-fork kill(SIGSTOP) from the
+                // parent — the latter races fast-exiting commands (#526).
+                if is_pasta {
+                    let pid = libc::getpid() as u32;
+                    let pid_bytes = pid.to_ne_bytes();
+                    libc::write(pasta_pid_w_i, pid_bytes.as_ptr() as *const libc::c_void, 4);
+                    libc::close(pasta_pid_w_i);
+                    let mut buf = [0u8; 1];
+                    let n = libc::read(pasta_go_r_i, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                    libc::close(pasta_go_r_i);
+                    if n != 1 || buf[0] == 0 {
+                        return Err(io::Error::other("pasta network setup failed"));
                     }
                 }
 
@@ -9401,6 +9532,36 @@ impl Command {
             });
         }
 
+        // Spawn the pasta helper thread (same logic as in spawn()).
+        let pasta_result_rx_i = if is_pasta {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let ready_r = pasta_pid_r_i;
+            let go_w = pasta_go_w_i;
+            let port_forwards = self.port_forwards.clone();
+            std::thread::spawn(move || {
+                let mut pid_bytes = [0u8; 4];
+                let n =
+                    unsafe { libc::read(ready_r, pid_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
+                unsafe { libc::close(ready_r) };
+                if n != 4 {
+                    let _ = result_tx.send(Err(io::Error::other(
+                        "pasta: container process exited before namespace setup completed",
+                    )));
+                    unsafe { libc::close(go_w) };
+                    return;
+                }
+                let pid = u32::from_ne_bytes(pid_bytes);
+                let setup_result = crate::network::setup_pasta_network(pid, &port_forwards);
+                let status: u8 = u8::from(setup_result.is_ok());
+                let _ = result_tx.send(setup_result);
+                unsafe { libc::write(go_w, [status].as_ptr() as *const libc::c_void, 1) };
+                unsafe { libc::close(go_w) };
+            });
+            Some(result_rx)
+        } else {
+            None
+        };
+
         // Spawn the process
         let child_inner = match self.inner.spawn() {
             Ok(c) => c,
@@ -9410,6 +9571,15 @@ impl Command {
                     unsafe { libc::close(idmap_ready_w_i) };
                     unsafe { libc::close(idmap_done_r_i) };
                 }
+                if is_pasta {
+                    unsafe { libc::close(pasta_pid_w_i) };
+                    unsafe { libc::close(pasta_go_r_i) };
+                    if let Some(rx) = pasta_result_rx_i {
+                        if let Ok(Err(pasta_err)) = rx.recv() {
+                            return Err(Error::Io(pasta_err));
+                        }
+                    }
+                }
                 return Err(Error::Spawn(e));
             }
         };
@@ -9418,6 +9588,10 @@ impl Command {
         if use_id_helpers || needs_parent_idmap {
             unsafe { libc::close(idmap_ready_w_i) };
             unsafe { libc::close(idmap_done_r_i) };
+        }
+        if is_pasta {
+            unsafe { libc::close(pasta_pid_w_i) };
+            unsafe { libc::close(pasta_go_r_i) };
         }
 
         // Close the slave in the parent — only the child should have it.
@@ -9458,19 +9632,19 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        // Pasta: spawn the relay after the child has exec'd.  SIGSTOP/SIGCONT ensures
-        // the container doesn't make network syscalls before pasta has configured the TAP.
-        let pasta: Option<crate::network::PastaSetup> = if is_pasta {
-            let container_pid =
-                find_container_pid(child_inner.id()).unwrap_or_else(|| child_inner.id());
-            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGSTOP) };
-            let setup = crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
-                .map_err(|e| {
-                    unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
-                    Error::Io(e)
-                })?;
-            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
-            Some(setup)
+        // Pasta: the helper thread spawned before self.inner.spawn() above has
+        // already handed the child's announced pid to `pasta` and signalled it
+        // to proceed — see spawn()'s equivalent block for the full rationale.
+        let pasta: Option<crate::network::PastaSetup> = if let Some(rx) = pasta_result_rx_i {
+            match rx.recv() {
+                Ok(Ok(setup)) => Some(setup),
+                Ok(Err(e)) => return Err(Error::Io(e)),
+                Err(_) => {
+                    return Err(Error::Io(io::Error::other(
+                        "pasta setup thread disconnected unexpectedly",
+                    )));
+                }
+            }
         } else {
             None
         };

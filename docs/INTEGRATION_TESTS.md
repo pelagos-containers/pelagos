@@ -1572,15 +1572,34 @@ auto-detection path: `Namespace::USER` is not set explicitly — Pelagos adds it
 when `getuid() != 0`. Confirms that the USER+NET two-phase unshare and pasta still coexist
 correctly when rootless mode is triggered implicitly.
 
+### `test_pasta_rootless_pid_ns_fast_exit_no_race`
+**Requires:** non-root user, rootfs, pasta installed
+
+Regression test for #526: rootless pasta combined with `Namespace::PID` and a
+fast-exiting command (e.g. `/bin/true`) failed nondeterministically (~56% on the
+reporter's hardware) with `pasta exited ... Couldn't open network namespace: No
+such file or directory`. Root cause: with `Namespace::PID`, `spawn()`
+double-forks — an intermediate process reaps the real container and exits the
+instant it does, so a post-fork `kill(pid, SIGSTOP)` from the parent (the old
+mechanism) could arrive after the pid — and therefore `/proc/{pid}/ns/*` — was
+already gone. Fixed by a pre-fork pipe handshake (mirroring the existing idmap
+parent-thread pattern): the child blocks *before* the PID-namespace
+double-fork, and a background thread spawned before `self.inner.spawn()` hands
+its pid to pasta and only then signals go-ahead — closing the race rather than
+narrowing it. Runs `/bin/true` through rootless pasta with `Namespace::PID` 20
+times back-to-back and asserts zero failures; before the fix this flaked well
+over half the time.
+
 ### `test_pasta_connectivity`
 **Requires:** non-root user, rootfs, pasta installed, outbound internet access
 
 Spawns a container with `NetworkMode::Pasta` and runs `wget -q -T 5 --spider http://1.1.1.1/`
 (HEAD request — no body to write, avoiding `/dev/null` which doesn't exist as a device node
 in the chroot). Asserts the command exits 0 and prints `CONNECTED`. No `sleep` is needed
-because `spawn()` uses SIGSTOP/SIGCONT to ensure pasta has configured the TAP before the
-container runs. Failure indicates pasta's packet relay is broken or outbound internet is
-unavailable in the test environment.
+because `spawn()` synchronizes pasta setup with the container via a pre-fork pipe handshake
+before the container ever execs, ensuring pasta has configured the TAP first. Failure
+indicates pasta's packet relay is broken or outbound internet is unavailable in the test
+environment.
 
 ### `test_pasta_dns`
 **Requires:** non-root user, rootfs, pasta installed

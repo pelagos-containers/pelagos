@@ -8203,6 +8203,91 @@ mod rootless {
         );
     }
 
+    /// Regression test for #526: rootless pasta + Namespace::PID + a
+    /// fast-exiting command (e.g. `true`) used to fail nondeterministically
+    /// (~56% on the reporter's hardware) with "pasta exited ... Couldn't
+    /// open network namespace: No such file or directory".
+    ///
+    /// Root cause: with Namespace::PID, `Command::spawn()` double-forks — an
+    /// intermediate process (P) forks the real container (G, PID 1 in the new
+    /// namespace) and immediately blocks in `waitpid`, exiting the instant G
+    /// exits. `setup_pasta_network`'s rootless "PID form" opens
+    /// `/proc/{P}/ns/{user,net}` directly; when G's command completes fast
+    /// enough, P has already reaped G and exited before the runtime gets
+    /// around to invoking pasta with P's pid, so the /proc entries are
+    /// already gone.
+    ///
+    /// Fixed by synchronizing pasta setup through a pre-fork pipe handshake
+    /// (mirroring the existing idmap parent-thread pattern): the child
+    /// announces its own pid and blocks *before* the PID-namespace
+    /// double-fork (i.e. before the eventual command process even exists),
+    /// while a background thread spawned before `self.inner.spawn()` hands
+    /// that pid to pasta and only then signals go-ahead. This closes the
+    /// race entirely rather than narrowing it.
+    ///
+    /// Non-root only. Runs a fast no-op command through rootless pasta with
+    /// Namespace::PID many times back-to-back — the exact repro shape from
+    /// the issue — and asserts zero failures. Before the fix this flaked
+    /// well over half the time; a single retained failure here means the
+    /// race has regressed.
+    #[test]
+    fn test_pasta_rootless_pid_ns_fast_exit_no_race() {
+        if is_root() {
+            eprintln!(
+                "Skipping test_pasta_rootless_pid_ns_fast_exit_no_race: must run as non-root (no sudo)"
+            );
+            return;
+        }
+        if !is_pasta_available() {
+            eprintln!("Skipping test_pasta_rootless_pid_ns_fast_exit_no_race: pasta not installed");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "Skipping test_pasta_rootless_pid_ns_fast_exit_no_race: alpine-rootfs not found"
+                );
+                return;
+            }
+        };
+
+        const ITERATIONS: usize = 20;
+        let mut failures = Vec::new();
+        for i in 0..ITERATIONS {
+            let result = Command::new("/bin/true")
+                .with_chroot(&rootfs)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .with_proc_mount()
+                .with_network(NetworkMode::Pasta)
+                .env("PATH", ALPINE_PATH)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .and_then(|mut child| child.wait_with_output());
+
+            match result {
+                Ok((status, _, _)) if status.success() => {}
+                Ok((status, _, stderr)) => {
+                    failures.push(format!(
+                        "iteration {i}: exited with {:?}: {}",
+                        status,
+                        String::from_utf8_lossy(&stderr)
+                    ));
+                }
+                Err(e) => failures.push(format!("iteration {i}: spawn/wait failed: {}", e)),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "pasta rootless + Namespace::PID + fast-exiting command raced ({}/{} iterations failed):\n{}",
+            failures.len(),
+            ITERATIONS,
+            failures.join("\n")
+        );
+    }
+
     /// Verify actual end-to-end internet connectivity through pasta.
     ///
     /// Non-root only. Spawns with `NetworkMode::Pasta`, sleeps briefly to let pasta
