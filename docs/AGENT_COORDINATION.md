@@ -70,6 +70,48 @@ agents commit/push to it directly).
 `signals_out.to_k3s == "upgrade-and-test"` tells the k3s-agent a new release
 is ready at `target_version`, fixing `issues_to_validate`.
 
+## How writes happen — `bin/write-state.sh`, mandatory for both sides
+
+**Never edit `state/*.json` directly and commit separately.** That leaves a
+window between writing the file and running `git commit` where the other
+agent can read your uncommitted change, act on it, and commit first — your
+later commit then silently overwrites theirs. No error, no conflict marker,
+just a lost update. This happened for real in a k3s-agent session on
+2026-08-13: an edit sat uncommitted long enough for pelagos-agent's own live
+session to read it, correctly claim the issue it named, and commit — and the
+k3s-agent's later commit landed on top and re-raised a signal that had
+already been legitimately claimed, misreading pelagos-agent's action as data
+corruption.
+
+Both sides MUST go through `agent-coordinator/bin/write-state.sh` for every
+blackboard write:
+
+```
+~/Projects/agent-coordinator/bin/write-state.sh <pelagos.json|cluster.json> '<jq filter>' "<commit message>"
+```
+
+It `flock`s `agent-coordinator/.blackboard.lock` (30s wait, then fails
+loudly rather than silently proceeding unlocked), re-reads the file **fresh
+after acquiring the lock** (not whatever you read earlier — that copy may
+already be stale), applies the jq filter, validates the result is real JSON
+before touching the target file, and commits. A bad filter or a no-op change
+exits cleanly without writing or committing anything.
+
+The lock only protects you if **both** sides use it — a bare `Edit` on one
+side still bypasses it entirely, so this only works if it's the sole write
+path for both agents, no exceptions.
+
+### Single-writer boundary, and the exception to it
+
+The rule per file is `cluster.json` — k3s-agent writes, pelagos-agent reads;
+`pelagos.json` — pelagos-agent writes, k3s-agent reads. The one deliberate
+exception: pelagos-agent's claim step (below) clears
+`cluster.json.signals_out.to_pelagos` — a cross-write into the other side's
+file. That's intentional (it's how a claim is visible without k3s-agent
+having to poll), but it means `write-state.sh`'s lock is genuinely load
+-bearing for that one field, not just defense-in-depth. Don't add further
+cross-file writes without the same lock discipline.
+
 ## How each side watches the blackboard
 
 The two sides use **different mechanisms** — this is intentional, not
