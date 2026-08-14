@@ -1292,6 +1292,78 @@ fn resolve_mount_target_in_root(root: &std::path::Path, target: &std::path::Path
     root.join(resolved)
 }
 
+/// Like [`resolve_mount_target_in_root`], but checks a *stack* of layer
+/// roots (topmost first, matching overlayfs `lowerdir=A:B:C` priority —
+/// `A` wins) instead of a single root. Needed because a path component can
+/// be a symlink that only exists in a lower-priority (or even the very
+/// bottom) layer — checking only the topmost layer silently treats it as a
+/// literal directory name instead of following the redirect (#522: this
+/// caused `/lib` — a symlink to `usr/lib` present only in the base OS
+/// layer of a 5-layer image — to be mis-resolved as a literal path, and a
+/// real directory created there in the overlay upperdir then shadowed the
+/// symlink entirely, making `/lib` vanish from the merged view and
+/// breaking the dynamic linker).
+fn resolve_mount_target_in_layers(roots: &[&std::path::Path], target: &std::path::Path) -> PathBuf {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let Some(&primary_root) = roots.first() else {
+        return target.to_path_buf();
+    };
+
+    let to_queue = |p: &std::path::Path| -> Vec<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let mut pending: VecDeque<OsString> = to_queue(target).into();
+    let mut resolved = PathBuf::new();
+    let mut link_budget = 40u32;
+
+    while let Some(comp) = pending.pop_front() {
+        if comp == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&comp);
+        // Check each layer, topmost first, for an entry at this path — the
+        // first layer that has ANYTHING there (symlink or not) wins,
+        // matching overlayfs's own top-layer-priority merge semantics.
+        let mut link_target: Option<PathBuf> = None;
+        for root in roots {
+            match std::fs::symlink_metadata(root.join(&candidate)) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    if let Ok(link) = std::fs::read_link(root.join(&candidate)) {
+                        link_target = Some(link);
+                    }
+                    break;
+                }
+                Ok(_) => break, // real entry (file/dir) at this layer — not a symlink, stop searching
+                Err(_) => continue, // not present in this layer, check the next
+            }
+        }
+        if let (Some(link), true) = (link_target, link_budget > 0) {
+            link_budget -= 1;
+            if link.is_absolute() {
+                resolved = PathBuf::new();
+            }
+            for seg in to_queue(&link).into_iter().rev() {
+                pending.push_front(seg);
+            }
+        } else {
+            resolved = candidate;
+        }
+    }
+
+    primary_root.join(resolved)
+}
+
 /// A tmpfs mount inside the container.
 #[derive(Debug, Clone)]
 pub struct TmpfsMount {
@@ -4082,6 +4154,59 @@ impl Command {
         } else {
             None
         };
+
+        // #522: under rootless native-overlay+userxattr (even with a full
+        // subordinate uid/gid range), the kernel's copy-up of a lower-layer
+        // path that has not yet been materialized into the upper dir can
+        // fail with EOVERFLOW on `mkdirat`/`openat` inside pre_exec (root
+        // cause not fully understood on the kernel/overlayfs side). The
+        // /etc/hosts and /etc/resolv.conf pre-seeding above already
+        // sidesteps this by writing directly into the upper dir on the host
+        // filesystem before the overlay is even mounted (originally to work
+        // around a DIFFERENT bug — EINVAL bind-mounting a tmpfs file onto
+        // overlayfs — but it happens to avoid the copy-up path entirely,
+        // which is how this fix was found). Apply the same technique to
+        // every bind-mount target: pre-create the needed parent directory
+        // (and, for file-target binds, an empty placeholder file) directly
+        // in the upper dir before fork, so the kernel never has to copy up
+        // that path. Symlinks in the path (e.g. `/lib` -> `usr/lib`) must be
+        // resolved against ALL lower layers, not just the topmost one —
+        // resolve_mount_target_in_layers() handles that.
+        if is_rootless {
+            if let Some(ref ov) = self.overlay {
+                let layer_roots: Vec<&std::path::Path> = if !ov.lower_dirs.is_empty() {
+                    ov.lower_dirs.iter().map(|p| p.as_path()).collect()
+                } else {
+                    self.chroot_dir.as_deref().into_iter().collect()
+                };
+                if let Some(&lower_base) = layer_roots.first() {
+                    for bm in &bind_mounts {
+                        let resolved_target =
+                            resolve_mount_target_in_layers(&layer_roots, &bm.target);
+                        let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
+                            continue;
+                        };
+                        let upper_target = ov.upper_dir.join(rel);
+                        let source_is_dir = !bm.source.exists() || bm.source.is_dir();
+                        if source_is_dir {
+                            let _ = std::fs::create_dir_all(&upper_target);
+                        } else if let Some(parent) = upper_target.parent() {
+                            if std::fs::create_dir_all(parent).is_ok() && !upper_target.exists() {
+                                let _ = std::fs::File::create(&upper_target);
+                            }
+                        }
+                    }
+                }
+                // do_pivot_root() creates its own bookkeeping directory
+                // (put_old_name, e.g. ".pivot_root_old_<pid>_<n>") directly
+                // under the merged root — not part of bind_mounts, so the
+                // loop above never touches it, but it hits the exact same
+                // copy-up EOVERFLOW for the same reason. Pre-seed it too.
+                if let Some(ref put_old_name) = pivot_put_old_name {
+                    let _ = std::fs::create_dir_all(ov.upper_dir.join(put_old_name));
+                }
+            }
+        }
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         // (ready_w, done_r) go into the child closure; (ready_r, done_w) stay for the parent thread.
@@ -7451,6 +7576,38 @@ impl Command {
         } else {
             None
         };
+
+        // #522: see the matching block in spawn() for the full explanation.
+        if is_rootless {
+            if let Some(ref ov) = self.overlay {
+                let layer_roots: Vec<&std::path::Path> = if !ov.lower_dirs.is_empty() {
+                    ov.lower_dirs.iter().map(|p| p.as_path()).collect()
+                } else {
+                    self.chroot_dir.as_deref().into_iter().collect()
+                };
+                if let Some(&lower_base) = layer_roots.first() {
+                    for bm in &bind_mounts {
+                        let resolved_target =
+                            resolve_mount_target_in_layers(&layer_roots, &bm.target);
+                        let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
+                            continue;
+                        };
+                        let upper_target = ov.upper_dir.join(rel);
+                        let source_is_dir = !bm.source.exists() || bm.source.is_dir();
+                        if source_is_dir {
+                            let _ = std::fs::create_dir_all(&upper_target);
+                        } else if let Some(parent) = upper_target.parent() {
+                            if std::fs::create_dir_all(parent).is_ok() && !upper_target.exists() {
+                                let _ = std::fs::File::create(&upper_target);
+                            }
+                        }
+                    }
+                }
+                if let Some(ref put_old_name) = pivot_put_old_name {
+                    let _ = std::fs::create_dir_all(ov.upper_dir.join(put_old_name));
+                }
+            }
+        }
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         let (idmap_ready_w_i, idmap_done_r_i, idmap_ready_r_i, idmap_done_w_i) =

@@ -12333,6 +12333,134 @@ mod rootless_idmap {
             out.trim()
         );
     }
+
+    /// test_rootless_bind_mount_resolves_symlink_in_non_top_layer
+    ///
+    /// Rootless (non-root), requires the shared alpine-rootfs.
+    ///
+    /// Regression test for #522: a first attempt at pre-seeding bind-mount
+    /// targets into the overlay upper dir (to avoid the rootless native-
+    /// overlay+userxattr copy-up EOVERFLOW — see
+    /// `test_rootless_single_uid_overlay_copy_up_avoids_eoverflow` above for
+    /// that mechanism) only resolved path symlinks against the TOPMOST
+    /// overlay layer. A symlink present only in a deeper layer (e.g. `/lib`
+    /// -> `usr/lib`, common in real Debian/Ubuntu-based images and present
+    /// only in the base OS layer) was silently treated as a literal
+    /// directory name, and a real directory was created at that literal
+    /// path in the upper dir — shadowing the real symlink entirely and
+    /// making it vanish from the merged view (this broke the dynamic
+    /// linker on real hardware: `/lib/ld-linux-*.so` became unreachable
+    /// and every exec in the container failed with ENOENT).
+    ///
+    /// Builds a synthetic two-layer image: the bottom layer has `/lib` as a
+    /// symlink to `usr/lib` (with real content already in `usr/lib`); the
+    /// top layer has no `/lib` entry at all, so a resolver that only checks
+    /// the top layer cannot see the symlink. Binds a file to
+    /// `/lib/newfile` (forcing resolution through the symlink) and asserts:
+    /// (1) the container succeeds, (2) `/lib` is still a symlink to
+    /// `usr/lib` afterward (not shadowed by a real directory), and (3) the
+    /// bound file landed at the symlink-resolved location
+    /// (`/usr/lib/newfile`), not literally at `/lib/newfile`.
+    ///
+    /// Failure indicates the single-layer symlink resolution regression
+    /// from #522 is back.
+    #[test]
+    fn test_rootless_bind_mount_resolves_symlink_in_non_top_layer() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let bottom = tmp.path().join("bottom");
+        let top = tmp.path().join("top");
+        std::fs::create_dir_all(&bottom).unwrap();
+        std::fs::create_dir_all(&top).unwrap();
+        let rsync_status = std::process::Command::new("rsync")
+            .args(["-a", "--exclude=/sys", "--exclude=/proc", "--exclude=/dev"])
+            .arg(rootfs.to_str().unwrap().to_string() + "/")
+            .arg(bottom.to_str().unwrap().to_string() + "/")
+            .status()
+            .expect("rsync rootfs to layer (is rsync installed?)");
+        assert!(rsync_status.success(), "rsync should succeed");
+        std::fs::create_dir_all(bottom.join("proc")).unwrap();
+        std::fs::create_dir_all(bottom.join("sys")).unwrap();
+        std::fs::create_dir_all(bottom.join("dev")).unwrap();
+
+        // Construct the symlink deterministically, regardless of whatever
+        // layout the shared alpine-rootfs happens to use natively: remove
+        // any existing /lib in the bottom layer, ensure usr/lib exists with
+        // real content, then symlink lib -> usr/lib.
+        let bottom_lib = bottom.join("lib");
+        let bottom_usr_lib = bottom.join("usr/lib");
+        if bottom_lib.is_dir() && !bottom_lib.is_symlink() {
+            // Merge any real /lib content into usr/lib before removing /lib,
+            // so the symlink target still has real content (matching the
+            // real-world case where usr/lib has genuine libc/ld.so files).
+            std::fs::create_dir_all(&bottom_usr_lib).unwrap();
+            let _ = std::process::Command::new("cp")
+                .args(["-a"])
+                .arg(bottom_lib.join(".").to_str().unwrap().to_string() + "/.")
+                .arg(&bottom_usr_lib)
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&bottom_lib);
+        let _ = std::fs::remove_file(&bottom_lib);
+        std::fs::create_dir_all(&bottom_usr_lib).unwrap();
+        std::fs::write(bottom_usr_lib.join("marker"), "real content").unwrap();
+        std::os::unix::fs::symlink("usr/lib", &bottom_lib).expect("create /lib symlink");
+
+        // top layer intentionally has nothing at all under lib/ or usr/ —
+        // a resolver checking only the top layer cannot see the symlink.
+
+        let source_file = tmp.path().join("source.txt");
+        std::fs::write(&source_file, "bound content").unwrap();
+
+        let layers = vec![top.clone(), bottom.clone()]; // top-first, as with_image_layers expects
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "readlink /lib && echo LINKOK && test -f /usr/lib/newfile && echo FILEOK",
+            ])
+            .env("PATH", ALPINE_PATH)
+            .with_image_layers(layers)
+            .with_bind_mount_ro(&source_file, "/lib/newfile")
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: unsafe { libc::getuid() },
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: unsafe { libc::getgid() },
+                count: 1,
+            }])
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("rootless multi-layer overlay spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "container should succeed (#522 regression if it doesn't); stdout={out}, stderr={err}"
+        );
+        assert!(
+            out.contains("usr/lib"),
+            "/lib should still resolve as a symlink to usr/lib, got: {out}"
+        );
+        assert!(
+            out.contains("LINKOK") && out.contains("FILEOK"),
+            "expected both markers, got: {out}"
+        );
+    }
 }
 
 // ── Build instruction tests (ENTRYPOINT, LABEL, USER, cache) ────────────────
