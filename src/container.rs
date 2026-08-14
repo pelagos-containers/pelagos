@@ -4083,6 +4083,47 @@ impl Command {
             None
         };
 
+        // #522: under rootless native-overlay+userxattr (even with a full
+        // subordinate uid/gid range), the kernel's copy-up of a lower-layer
+        // directory that has not yet been materialized into the upper dir can
+        // fail with EOVERFLOW on `mkdirat`/`openat` inside pre_exec (root
+        // cause not fully understood on the kernel/overlayfs side — see #522).
+        // The /etc/hosts and /etc/resolv.conf pre-seeding above already
+        // sidesteps this by writing directly into the upper dir on the host
+        // filesystem before the overlay is even mounted (originally to work
+        // around a DIFFERENT bug — EINVAL bind-mounting a tmpfs file onto
+        // overlayfs — but it happens to avoid the copy-up path entirely,
+        // which is how this fix was found). Apply the same technique to every
+        // bind-mount target: pre-create the needed parent directory (and, for
+        // file-target binds, an empty placeholder file) directly in the upper
+        // dir before fork, so the kernel never has to copy up that path.
+        if is_rootless {
+            if let Some(ref ov) = self.overlay {
+                let lower_base: Option<&std::path::Path> = ov
+                    .lower_dirs
+                    .first()
+                    .map(|p| p.as_path())
+                    .or(self.chroot_dir.as_deref());
+                if let Some(lower_base) = lower_base {
+                    for bm in &bind_mounts {
+                        let resolved_target = resolve_mount_target_in_root(lower_base, &bm.target);
+                        let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
+                            continue;
+                        };
+                        let upper_target = ov.upper_dir.join(rel);
+                        let source_is_dir = !bm.source.exists() || bm.source.is_dir();
+                        if source_is_dir {
+                            let _ = std::fs::create_dir_all(&upper_target);
+                        } else if let Some(parent) = upper_target.parent() {
+                            if std::fs::create_dir_all(parent).is_ok() && !upper_target.exists() {
+                                let _ = std::fs::File::create(&upper_target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         // (ready_w, done_r) go into the child closure; (ready_r, done_w) stay for the parent thread.
         let (idmap_ready_w, idmap_done_r, idmap_ready_r, idmap_done_w) =
@@ -7451,6 +7492,37 @@ impl Command {
         } else {
             None
         };
+
+        // #522: see the matching block in spawn() for the full explanation —
+        // pre-create bind-mount targets directly in the overlay upper dir
+        // before fork, to avoid a kernel copy-up EOVERFLOW under rootless
+        // native-overlay+userxattr.
+        if is_rootless {
+            if let Some(ref ov) = self.overlay {
+                let lower_base: Option<&std::path::Path> = ov
+                    .lower_dirs
+                    .first()
+                    .map(|p| p.as_path())
+                    .or(self.chroot_dir.as_deref());
+                if let Some(lower_base) = lower_base {
+                    for bm in &bind_mounts {
+                        let resolved_target = resolve_mount_target_in_root(lower_base, &bm.target);
+                        let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
+                            continue;
+                        };
+                        let upper_target = ov.upper_dir.join(rel);
+                        let source_is_dir = !bm.source.exists() || bm.source.is_dir();
+                        if source_is_dir {
+                            let _ = std::fs::create_dir_all(&upper_target);
+                        } else if let Some(parent) = upper_target.parent() {
+                            if std::fs::create_dir_all(parent).is_ok() && !upper_target.exists() {
+                                let _ = std::fs::File::create(&upper_target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Create idmap sync pipes before the pre_exec closure so it can capture the FDs.
         let (idmap_ready_w_i, idmap_done_r_i, idmap_ready_r_i, idmap_done_w_i) =
