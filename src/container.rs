@@ -4121,7 +4121,20 @@ impl Command {
                     .map(|p| p.as_path())
                     .or(self.chroot_dir.as_deref());
                 if let Some(lower_base) = lower_base {
-                    for bm in &bind_mounts {
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let _ = writeln!(f, "[{}] CHILD: reached bind_mounts_loop_start count={}", std::process::id(), bind_mounts.len());
+                        }
+                    }
+                    for (bm_idx522, bm) in bind_mounts.iter().enumerate() {
+                        {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                                let _ = writeln!(f, "[{}] CHILD: bind_mounts[{}] source={:?} target={:?}", std::process::id(), bm_idx522, bm.source, bm.target);
+                            }
+                        }
+
                         let resolved_target = resolve_mount_target_in_root(lower_base, &bm.target);
                         let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
                             continue;
@@ -4933,6 +4946,12 @@ impl Command {
                         .map(|m| std::path::Path::new(m.to_str().unwrap()))
                         .unwrap_or(dir.as_path());
 
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let _ = writeln!(f, "[{}] CHILD: reached dns_start", std::process::id());
+                        }
+                    }
                     // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
                     // Done here (before chroot) using the host-side effective_root path.
                     // Because Namespace::MOUNT is required, the bind mount is scoped to this
@@ -4971,6 +4990,12 @@ impl Command {
                         }
                     }
 
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let _ = writeln!(f, "[{}] CHILD: reached ca_start", std::process::id());
+                        }
+                    }
                     // CA certs: bind-mount host trust store read-only for pasta containers.
                     // Alpine/scratch images lack ca-certificates; this lets wget/curl verify TLS.
                     //
@@ -5018,6 +5043,12 @@ impl Command {
                         }
                     }
 
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let _ = writeln!(f, "[{}] CHILD: reached hosts_start", std::process::id());
+                        }
+                    }
                     // Hosts: bind-mount the per-container hosts file over /etc/hosts.
                     // Same mechanism as DNS — scoped to this container's mount namespace.
                     if let Some(ref hosts_src) = hosts_temp_file_cstring {
@@ -5307,6 +5338,12 @@ impl Command {
                         }
                     }
 
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let _ = writeln!(f, "[{}] CHILD: reached devbind_start", std::process::id());
+                        }
+                    }
                     // Pre-chroot device bind-mounts for USER namespace containers.
                     // mknod(2) for character/block devices requires CAP_MKNOD in the
                     // initial user namespace — it always fails with EPERM inside a user
