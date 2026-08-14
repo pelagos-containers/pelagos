@@ -4110,7 +4110,7 @@ impl Command {
         {
             use std::io::Write as _;
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                let _ = writeln!(f, "PARENT: preseed loop start, bind_mounts.len()={} is_rootless={} overlay_some={}", bind_mounts.len(), is_rootless, self.overlay.is_some());
+                let _ = writeln!(f, "PARENT[pid={}]: preseed loop start, bind_mounts.len()={} is_rootless={} overlay_some={}", std::process::id(), bind_mounts.len(), is_rootless, self.overlay.is_some());
             }
         }
         if is_rootless {
@@ -4155,7 +4155,7 @@ impl Command {
         {
             use std::io::Write as _;
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                let _ = writeln!(f, "PARENT: preseed loop done");
+                let _ = writeln!(f, "PARENT[pid={}]: preseed loop done", std::process::id());
             }
         }
 
@@ -4311,7 +4311,7 @@ impl Command {
                 {
                     use std::io::Write as _;
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
-                        let _ = writeln!(f, "[{}] CHILD: pre_exec entered", std::process::id());
+                        let _ = writeln!(f, "[pid={} ppid={}] CHILD: pre_exec entered", std::process::id(), libc::getppid());
                     }
                 }
 
