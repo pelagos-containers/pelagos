@@ -1570,6 +1570,13 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+            let _ = writeln!(f, "[{}] do_pivot_root ENTERED", std::process::id());
+        }
+    }
+
     let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
 
     // pivot_root(2) requires new_root to be a mountpoint.  Overlay merged dirs
@@ -1581,6 +1588,12 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
         libc::MS_BIND | libc::MS_REC,
         std::ptr::null(),
     );
+    {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+            let _ = writeln!(f, "[{}] do_pivot_root self-bind rc={} errno={:?}", std::process::id(), bind_rc, io::Error::last_os_error().raw_os_error());
+        }
+    }
     // EINVAL usually means it is already a mountpoint — ignore.
     if bind_rc != 0 {
         let e = io::Error::last_os_error();
@@ -1595,7 +1608,14 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     // Create the put_old directory inside new_root to receive the old root.
     // The name was generated in the parent process and is unique per container.
     let put_old = new_root.join(put_old_name);
-    std::fs::create_dir_all(&put_old)?;
+    let mkdir_res = std::fs::create_dir_all(&put_old);
+    {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+            let _ = writeln!(f, "[{}] do_pivot_root create_dir_all(put_old) res={:?}", std::process::id(), mkdir_res.as_ref().map_err(|e| e.raw_os_error()));
+        }
+    }
+    mkdir_res?;
     let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
 
     #[cfg(target_arch = "x86_64")]
@@ -1604,6 +1624,12 @@ unsafe fn do_pivot_root(new_root: &std::path::Path, put_old_name: &str) -> io::R
     const SYS_PIVOT_ROOT: i64 = 41;
 
     let rc = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
+    {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+            let _ = writeln!(f, "[{}] do_pivot_root syscall rc={} errno={:?}", std::process::id(), rc, io::Error::last_os_error().raw_os_error());
+        }
+    }
     if rc != 0 {
         return Err(pre_exec_err(
             &format!("pivot_root({}, {})", new_root.display(), put_old.display()),
