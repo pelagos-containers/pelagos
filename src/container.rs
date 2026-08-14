@@ -3692,7 +3692,18 @@ impl Command {
         // None in all other cases.
         let fuse_overlay_opts_c: Option<std::ffi::CString>;
         if is_rootless && self.overlay.is_some() {
-            if native_rootless_overlay_supported() {
+            // #522: with only a single 1:1 uid/gid map (no subordinate range —
+            // `use_id_helpers` false), any lower-layer file NOT owned by our own
+            // uid/gid is unrepresentable in the user namespace. Native kernel
+            // overlayfs's copy-up path fails to preserve such unmapped ownership
+            // and returns EOVERFLOW (same mechanism already documented for the
+            // nested-build case, #432 — just triggered here by ordinary
+            // multi-owner image content, e.g. apt-installed files in real base
+            // images). fuse-overlayfs's squash_to_uid/gid=0 presents every
+            // lower-layer file as owned by 0, sidestepping the mapping problem
+            // entirely, so prefer it whenever we lack a real subordinate range.
+            let single_id_map = !use_id_helpers;
+            if !single_id_map && native_rootless_overlay_supported() {
                 log::debug!("rootless overlay: using native overlay+userxattr");
                 use_fuse_overlay = false;
                 fuse_overlay_opts_c = None;
@@ -3713,6 +3724,15 @@ impl Command {
                 } else {
                     fuse_overlay_opts_c = None;
                 }
+            } else if native_rootless_overlay_supported() {
+                log::warn!(
+                    "rootless overlay: no subordinate uid/gid range and fuse-overlayfs is \
+                     unavailable — falling back to native overlay+userxattr; files owned by \
+                     uids/gids other than ours in image layers may fail with EOVERFLOW on \
+                     copy-up (#522); install fuse-overlayfs for full compatibility"
+                );
+                use_fuse_overlay = false;
+                fuse_overlay_opts_c = None;
             } else {
                 return Err(Error::Io(io::Error::other(
                     "rootless overlay requires kernel 5.11+ or fuse-overlayfs; \
@@ -7091,7 +7111,18 @@ impl Command {
         // None in all other cases.
         let fuse_overlay_opts_c: Option<std::ffi::CString>;
         if is_rootless && self.overlay.is_some() {
-            if native_rootless_overlay_supported() {
+            // #522: with only a single 1:1 uid/gid map (no subordinate range —
+            // `use_id_helpers` false), any lower-layer file NOT owned by our own
+            // uid/gid is unrepresentable in the user namespace. Native kernel
+            // overlayfs's copy-up path fails to preserve such unmapped ownership
+            // and returns EOVERFLOW (same mechanism already documented for the
+            // nested-build case, #432 — just triggered here by ordinary
+            // multi-owner image content, e.g. apt-installed files in real base
+            // images). fuse-overlayfs's squash_to_uid/gid=0 presents every
+            // lower-layer file as owned by 0, sidestepping the mapping problem
+            // entirely, so prefer it whenever we lack a real subordinate range.
+            let single_id_map = !use_id_helpers;
+            if !single_id_map && native_rootless_overlay_supported() {
                 log::debug!("rootless overlay: using native overlay+userxattr");
                 use_fuse_overlay = false;
                 fuse_overlay_opts_c = None;
@@ -7112,6 +7143,15 @@ impl Command {
                 } else {
                     fuse_overlay_opts_c = None;
                 }
+            } else if native_rootless_overlay_supported() {
+                log::warn!(
+                    "rootless overlay: no subordinate uid/gid range and fuse-overlayfs is \
+                     unavailable — falling back to native overlay+userxattr; files owned by \
+                     uids/gids other than ours in image layers may fail with EOVERFLOW on \
+                     copy-up (#522); install fuse-overlayfs for full compatibility"
+                );
+                use_fuse_overlay = false;
+                fuse_overlay_opts_c = None;
             } else {
                 return Err(Error::Io(io::Error::other(
                     "rootless overlay requires kernel 5.11+ or fuse-overlayfs; \
