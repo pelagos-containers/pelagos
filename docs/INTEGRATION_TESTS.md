@@ -2057,6 +2057,23 @@ staging directories with mode=0 as a security measure, and overlayfs copy-up of
 those directories fails unless `fuse-overlayfs` has `CAP_DAC_OVERRIDE` (which it
 gets when running as uid 0 inside its user namespace).
 
+### `test_rootless_single_uid_overlay_copy_up_avoids_eoverflow`
+**Requires:** non-root + rootfs + `fuse-overlayfs` on PATH
+
+Regression test for #522. Spawns a rootless container with an explicit
+single-UID/GID map (no subordinate range — the plain-rootless fallback) over
+an overlay whose lower dir (the shared alpine-rootfs) contains root-owned
+content, and runs `chmod 644 /etc/passwd && echo ok` to force a copy-up of a
+file whose owner is unmapped in the container's user namespace. Asserts the
+container exits 0 and stdout contains `ok`.
+
+Failure indicates overlay backend selection is again picking native kernel
+overlayfs for the single-id-map case: native overlayfs's copy-up path cannot
+represent an unmapped owner and fails with EOVERFLOW, which is exactly what
+CDI GPU passthrough hit on real (non-subuid-delegated) rootless hosts running
+multi-owner base images. The fix prefers fuse-overlayfs (`squash_to_uid/gid=0`)
+whenever only a single-id map is available.
+
 Fixed across multiple commits (issue #195):
 - Removed a stale CVE-2023-0386 fast-path that incorrectly blocked native overlayfs
 - Pre-seeded `resolv.conf`/`/etc/hosts` into overlay upper dir to avoid bind-mount

@@ -12246,6 +12246,93 @@ mod rootless_idmap {
             out.trim()
         );
     }
+
+    /// test_rootless_single_uid_overlay_copy_up_avoids_eoverflow
+    ///
+    /// Rootless (non-root), requires `fuse-overlayfs` on PATH and the shared
+    /// alpine-rootfs.
+    ///
+    /// Regression test for #522: with only a single 1:1 uid/gid map (no
+    /// `/etc/subuid`/`/etc/subgid` delegation — the plain-rootless fallback,
+    /// same shape as `test_rootless_single_uid_fallback` above), writing
+    /// through an overlay to a lower-layer file NOT owned by our own uid/gid
+    /// (`/etc/passwd`, owned by root:root on the shared rootfs, almost always
+    /// different from the non-root uid running this test) forces a copy-up of
+    /// an unmapped owner. Before #522's fix, overlay backend selection only
+    /// considered kernel/btrfs support and would happily pick native
+    /// overlay+userxattr for this case, which fails the copy-up with
+    /// EOVERFLOW. The fix prefers fuse-overlayfs (squash_to_uid/gid=0) when
+    /// only a single-id map is available, so the copy-up (and hence the
+    /// container) now succeeds.
+    ///
+    /// Failure indicates the single-id-map / native-overlay EOVERFLOW
+    /// regression from #522 is back.
+    #[test]
+    fn test_rootless_single_uid_overlay_copy_up_avoids_eoverflow() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+        let fuse_available = std::process::Command::new("fuse-overlayfs")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok();
+        if !fuse_available {
+            eprintln!("Skipping: fuse-overlayfs not on PATH");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&upper).expect("mkdir upper");
+        std::fs::create_dir_all(&work).expect("mkdir work");
+
+        // Explicit single-UID map (bypassing subuid auto-config) over an
+        // overlay whose lower dir (the chroot rootfs) has root-owned content
+        // — forces a copy-up of a file with an unmapped owner.
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "chmod 644 /etc/passwd && echo ok"])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_overlay(&upper, &work)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_uid_maps(&[UidMap {
+                inside: 0,
+                outside: unsafe { libc::getuid() },
+                count: 1,
+            }])
+            .with_gid_maps(&[GidMap {
+                inside: 0,
+                outside: unsafe { libc::getgid() },
+                count: 1,
+            }])
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("rootless single-uid overlay spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "copy-up of unmapped-owner file failed under single-uid rootless overlay \
+             (#522 regression); stdout={out}, stderr={err}"
+        );
+        assert_eq!(
+            out.trim(),
+            "ok",
+            "expected 'ok' from chmod test, got: {}",
+            out.trim()
+        );
+    }
 }
 
 // ── Build instruction tests (ENTRYPOINT, LABEL, USER, cache) ────────────────
