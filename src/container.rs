@@ -6229,6 +6229,7 @@ impl Command {
                 // path, still available here before setuid).  NNP is deferred to
                 // step 8.7, after setuid + capset + ambient re-raise.
 
+                diag522w!("[{}] CHILD: reached step6_6", std::process::id());
                 // Step 6.6: PTY slave setup for OCI terminal mode.
                 // When the caller allocated a PTY (process.terminal = true), wire the
                 // slave fd as stdin/stdout/stderr and make it the controlling terminal.
@@ -6264,6 +6265,7 @@ impl Command {
                     crate::mac::write_mac_attr(selinux_attr_fd, label)?;
                 }
 
+                diag522w!("[{}] CHILD: reached step7", std::process::id());
                 // Step 7: Apply seccomp filter (no_new_privileges=true path only).
                 // When no_new_privileges=false, seccomp was applied at step 4.849 using
                 // CAP_SYS_ADMIN (before capability drops), so no action needed here.
@@ -6308,6 +6310,7 @@ impl Command {
                     libc::close(notif_child_sock);
                 }
 
+                diag522w!("[{}] CHILD: reached step8", std::process::id());
                 // Step 8: OCI create/start synchronization.
                 // Signals the parent that setup is complete (writes PID to ready_write_fd),
                 // then blocks on accept(listen_fd) until "pelagos start" connects.
@@ -6329,6 +6332,7 @@ impl Command {
                     libc::close(listen_fd);
                 }
 
+                diag522w!("[{}] CHILD: reached step8_5", std::process::id());
                 // Step 8.5: Set UID/GID after OCI sync.
                 // Placed AFTER the OCI sync so that "pelagos create" succeeds (container
                 // reaches "created" state) even when the target UID is not yet mapped in
@@ -6374,6 +6378,7 @@ impl Command {
                     }
                 }
 
+                diag522w!("[{}] CHILD: reached step8_6", std::process::id());
                 // Step 8.6: Apply capability set after setuid.
                 //
                 // capset() is placed here (not at step 4.86) so that setuid()
@@ -6437,6 +6442,7 @@ impl Command {
                     );
                 }
 
+                diag522w!("[{}] CHILD: reached step8_7", std::process::id());
                 // Step 8.7: Set no-new-privileges after all capability setup.
                 //
                 // Deferred from step 6.5 so that PR_CAP_AMBIENT_RAISE above
@@ -6453,6 +6459,7 @@ impl Command {
                     }
                 }
 
+                diag522w!("[{}] CHILD: pre_exec CLOSURE RETURNING Ok, about to execve", std::process::id());
                 Ok(())
             });
         }
