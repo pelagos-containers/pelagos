@@ -5706,6 +5706,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_5", std::process::id());
+                    }
+                }
                 // Step 4.5: Perform automatic mounts if requested.
                 // IMPORTANT: Use absolute paths for mount targets — cwd may not
                 // be "/" if the caller used with_cwd().
@@ -5923,6 +5929,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_65", std::process::id());
+                    }
+                }
                 // Step 4.65: Propagation-only remounts (MS_SHARED, MS_SLAVE, etc.)
                 // These must come after the initial mount; passing propagation flags
                 // in the initial mount(2) call returns EINVAL on Linux.
@@ -5943,6 +5955,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_7", std::process::id());
+                    }
+                }
                 // Step 4.7: Apply sysctl settings (write to /proc/sys/)
                 for (key, value) in &sysctl {
                     // Convert "net.ipv4.ip_forward" -> "/proc/sys/net/ipv4/ip_forward"
@@ -5961,6 +5979,12 @@ impl Command {
                     // Ignore errors — sysctl may not exist in this namespace
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_72", std::process::id());
+                    }
+                }
                 // Step 4.72: Create device nodes
                 if !devices.is_empty() {
                     // Clear umask so mknod creates devices with the exact mode
@@ -6004,6 +6028,12 @@ impl Command {
                     libc::umask(old_umask);
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_73", std::process::id());
+                    }
+                }
                 // Step 4.73: Create /dev symlinks (OCI default symlinks for fresh /dev tmpfs).
                 // symlink(target, linkpath) — ignore errors (may already exist).
                 for (link, target) in &dev_symlinks {
@@ -6015,6 +6045,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_8", std::process::id());
+                    }
+                }
                 // Step 4.8: Mask sensitive paths
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
@@ -6048,6 +6084,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_82", std::process::id());
+                    }
+                }
                 // Step 4.82: Make specific paths read-only (linux.readonlyPaths)
                 if !readonly_paths.is_empty() {
                     for path in &readonly_paths {
@@ -6078,6 +6120,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_85", std::process::id());
+                    }
+                }
                 // Step 4.85: Make rootfs read-only if requested.
                 // MUST come after all mounts (/proc, /sys, /dev, masked paths).
                 // The self-bind done before pivot_root made "/" a bind-mount,
@@ -6096,6 +6144,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_855", std::process::id());
+                    }
+                }
                 // Step 4.855: Join path-specified namespaces.
                 //
                 // MUST come before capability drop (step 4.86) because setns(2)
@@ -6114,6 +6168,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_9", std::process::id());
+                    }
+                }
                 // Step 4.9: Set resource limits BEFORE capability drops.
                 //
                 // MUST come before step 4.86 (capability drops) because raising a
@@ -6232,6 +6292,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step5", std::process::id());
+                    }
+                }
                 // Step 5: Run user-provided pre_exec callback
                 // MUST run before setuid — exec's callback does setns(CLONE_NEWNS)
                 // which requires CAP_SYS_ADMIN.
