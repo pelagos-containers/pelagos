@@ -1302,6 +1302,82 @@ fn resolve_mount_target_in_root(root: &std::path::Path, target: &std::path::Path
     root.join(resolved)
 }
 
+/// Like [`resolve_mount_target_in_root`], but checks a *stack* of layer
+/// roots (topmost first, matching overlayfs `lowerdir=A:B:C` priority —
+/// `A` wins) instead of a single root. Needed because a path component can
+/// be a symlink that only exists in a lower-priority (or even the very
+/// bottom) layer — checking only the topmost layer silently treats it as a
+/// literal directory name instead of following the redirect (#522: this
+/// caused `/lib` — a symlink to `usr/lib` present only in the base OS
+/// layer — to be mis-resolved as a literal path, and a real directory
+/// created there in the overlay upperdir then shadowed the symlink
+/// entirely, making `/lib` vanish from the merged view).
+fn resolve_mount_target_in_layers(roots: &[&std::path::Path], target: &std::path::Path) -> PathBuf {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let Some(&primary_root) = roots.first() else {
+        return target.to_path_buf();
+    };
+
+    let to_queue = |p: &std::path::Path| -> Vec<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let mut pending: VecDeque<OsString> = to_queue(target).into();
+    let mut resolved = PathBuf::new();
+    let mut link_budget = 40u32;
+
+    while let Some(comp) = pending.pop_front() {
+        if comp == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&comp);
+        // Check each layer, topmost first, for a symlink at this path —
+        // the first layer that has ANY entry there (symlink or not) wins,
+        // matching overlayfs's own top-layer-priority merge semantics.
+        let mut link_target: Option<PathBuf> = None;
+        let mut found_non_symlink = false;
+        for root in roots {
+            match std::fs::symlink_metadata(root.join(&candidate)) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    if let Ok(link) = std::fs::read_link(root.join(&candidate)) {
+                        link_target = Some(link);
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    found_non_symlink = true;
+                    break;
+                }
+                Err(_) => continue, // not present in this layer, check the next
+            }
+        }
+        if let (Some(link), true) = (link_target, link_budget > 0) {
+            link_budget -= 1;
+            if link.is_absolute() {
+                resolved = PathBuf::new();
+            }
+            for seg in to_queue(&link).into_iter().rev() {
+                pending.push_front(seg);
+            }
+        } else {
+            let _ = found_non_symlink;
+            resolved = candidate;
+        }
+    }
+
+    primary_root.join(resolved)
+}
+
 /// A tmpfs mount inside the container.
 #[derive(Debug, Clone)]
 pub struct TmpfsMount {
@@ -4125,16 +4201,17 @@ impl Command {
         // dir before fork, so the kernel never has to copy up that path.
         if is_rootless {
             if let Some(ref ov) = self.overlay {
-                let lower_base: Option<&std::path::Path> = ov
-                    .lower_dirs
-                    .first()
-                    .map(|p| p.as_path())
-                    .or(self.chroot_dir.as_deref());
+                let layer_roots: Vec<&std::path::Path> = if !ov.lower_dirs.is_empty() {
+                    ov.lower_dirs.iter().map(|p| p.as_path()).collect()
+                } else {
+                    self.chroot_dir.as_deref().into_iter().collect()
+                };
+                let lower_base: Option<&std::path::Path> = layer_roots.first().copied();
                 if let Some(lower_base) = lower_base {
                     for (bm_idx522, bm) in bind_mounts.iter().enumerate() {
                         let _ = bm_idx522;
 
-                        let resolved_target = resolve_mount_target_in_root(lower_base, &bm.target);
+                        let resolved_target = resolve_mount_target_in_layers(&layer_roots, &bm.target);
                         let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
                             continue;
                         };
@@ -7620,14 +7697,15 @@ impl Command {
         // native-overlay+userxattr.
         if is_rootless {
             if let Some(ref ov) = self.overlay {
-                let lower_base: Option<&std::path::Path> = ov
-                    .lower_dirs
-                    .first()
-                    .map(|p| p.as_path())
-                    .or(self.chroot_dir.as_deref());
+                let layer_roots: Vec<&std::path::Path> = if !ov.lower_dirs.is_empty() {
+                    ov.lower_dirs.iter().map(|p| p.as_path()).collect()
+                } else {
+                    self.chroot_dir.as_deref().into_iter().collect()
+                };
+                let lower_base: Option<&std::path::Path> = layer_roots.first().copied();
                 if let Some(lower_base) = lower_base {
                     for bm in &bind_mounts {
-                        let resolved_target = resolve_mount_target_in_root(lower_base, &bm.target);
+                        let resolved_target = resolve_mount_target_in_layers(&layer_roots, &bm.target);
                         let Ok(rel) = resolved_target.strip_prefix(lower_base) else {
                             continue;
                         };
