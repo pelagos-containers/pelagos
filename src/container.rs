@@ -5698,7 +5698,21 @@ impl Command {
                     }
 
                     let put_old_name = pivot_put_old_name.as_deref().unwrap_or(".pivot_root_old");
-                    do_pivot_root(effective_root, put_old_name)?;
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let put_old_full = effective_root.join(put_old_name);
+                            let _ = writeln!(f, "[{}] about to pivot_root, put_old_name={:?} exists_before={} effective_root={:?}", std::process::id(), put_old_name, put_old_full.exists(), effective_root);
+                        }
+                    }
+                    let pivot_result = do_pivot_root(effective_root, put_old_name);
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                            let _ = writeln!(f, "[{}] pivot_root result={:?}", std::process::id(), pivot_result.as_ref().map_err(|e| e.raw_os_error()));
+                        }
+                    }
+                    pivot_result?;
 
                     // Apply container working directory (defaults to /).
                     let cwd = container_cwd
