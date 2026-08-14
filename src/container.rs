@@ -6469,6 +6469,30 @@ impl Command {
                         p.exists(),
                         meta.as_ref().map(|m| (m.len(), m.is_file(), m.permissions().mode()))
                     );
+                    let proc_self_exe = std::fs::read_link("/proc/self/exe");
+                    diag522w!("[{}] /proc/self/exe -> {:?}", std::process::id(), proc_self_exe);
+                    let interp_check = std::fs::metadata("/lib/ld-linux-aarch64.so.1")
+                        .or_else(|_| std::fs::metadata("/lib64/ld-linux-x86-64.so.2"));
+                    diag522w!("[{}] dynamic linker present: {:?}", std::process::id(), interp_check.is_ok());
+                    // Manually attempt the execve ourselves to see its EXACT raw errno,
+                    // rather than relying on std's own (possibly-different) exec path.
+                    let prog_c = std::ffi::CString::new("/usr/bin/nvidia-smi").unwrap();
+                    let argv: [*const libc::c_char; 2] = [prog_c.as_ptr(), std::ptr::null()];
+                    let envp: [*const libc::c_char; 1] = [std::ptr::null()];
+                    // Fork a throwaway child just to test execve without disturbing our own return path.
+                    let test_pid = libc::fork();
+                    if test_pid == 0 {
+                        libc::execve(prog_c.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                        let err = *libc::__errno_location();
+                        libc::write(diag522_fd, b"MANUAL_EXECVE_FAILED\n".as_ptr() as *const libc::c_void, 21);
+                        let msg = format!("[{}] manual execve errno={}\n", std::process::id(), err);
+                        libc::write(diag522_fd, msg.as_ptr() as *const libc::c_void, msg.len());
+                        libc::_exit(1);
+                    } else if test_pid > 0 {
+                        let mut status: libc::c_int = 0;
+                        libc::waitpid(test_pid, &mut status, 0);
+                        diag522w!("[{}] manual execve test child status={}", std::process::id(), status);
+                    }
                 }
                 diag522w!("[{}] CHILD: pre_exec CLOSURE RETURNING Ok, about to execve", std::process::id());
                 Ok(())
