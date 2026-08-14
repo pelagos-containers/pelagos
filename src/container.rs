@@ -4329,6 +4329,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step1_unshare", std::process::id());
+                    }
+                }
                 // Step 1: Unshare namespaces.
                 if !namespaces.is_empty() {
                     if is_rootless && namespaces.contains(Namespace::USER) {
@@ -4524,6 +4530,12 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step1_65_pidns", std::process::id());
+                    }
+                }
                 // Step 1.65: PID namespace double-fork.
                 //
                 // Two cases handled here:
@@ -4695,6 +4707,12 @@ impl Command {
                     -1
                 };
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step2_idmap", std::process::id());
+                    }
+                }
                 // Step 2: UID/GID mapping for root-created user namespaces.
                 // Maps are written by the parent process (via needs_parent_idmap pipe),
                 // not by the child — the child loses CAP_SETUID in the parent user
@@ -4702,6 +4720,12 @@ impl Command {
                 // (Rootless maps were written early in Step 1 by the child itself, which
                 // is allowed because the child's own UID is in the mapped range.)
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step3_5_overlay", std::process::id());
+                    }
+                }
                 // Step 3.5: Mount overlayfs (if configured).
                 // The merged dir becomes the effective root for chroot and bind mounts.
                 let overlay_merged: Option<&std::ffi::CString> =
@@ -4890,6 +4914,12 @@ impl Command {
                 let mut deferred_sys_mounts: Vec<(PathBuf, BindMount)> = Vec::new();
                 let mut sys_stash_idx: usize = 0;
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                        let _ = writeln!(f, "[{}] CHILD: reached step4_chroot", std::process::id());
+                    }
+                }
                 // Step 4: Change root if specified
                 if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
