@@ -6459,6 +6459,17 @@ impl Command {
                     }
                 }
 
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let p = std::path::Path::new("/usr/bin/nvidia-smi");
+                    let meta = std::fs::symlink_metadata(p);
+                    diag522w!(
+                        "[{}] check /usr/bin/nvidia-smi (post-pivot, in-container view): exists={} meta={:?}",
+                        std::process::id(),
+                        p.exists(),
+                        meta.as_ref().map(|m| (m.len(), m.is_file(), m.permissions().mode()))
+                    );
+                }
                 diag522w!("[{}] CHILD: pre_exec CLOSURE RETURNING Ok, about to execve", std::process::id());
                 Ok(())
             });
