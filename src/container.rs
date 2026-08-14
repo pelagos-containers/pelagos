@@ -5402,7 +5402,13 @@ impl Command {
                     // /dev/** (e.g. /dev/termination-log) land in the tmpfs rather than
                     // being covered by it.  Source paths are still host paths here
                     // (chroot has not happened yet).
-                    for bm in &bind_mounts {
+                    for (real_bm_idx, bm) in bind_mounts.iter().enumerate() {
+                        {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/diag522c.txt") {
+                                let _ = writeln!(f, "[{}] REALLOOP[{}] source={:?} target={:?}", std::process::id(), real_bm_idx, bm.source, bm.target);
+                            }
+                        }
                         use std::os::unix::ffi::OsStrExt as _;
                         // Target inside the effective root on the host side, with any
                         // symlinked parent dirs in the image rootfs resolved (e.g.
