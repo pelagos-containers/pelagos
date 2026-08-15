@@ -158,6 +158,31 @@ This is a hard requirement, not optional cleanup.
 3. Present the plan to the user (from the issue body)
 4. Quietly implement — no step-by-step narration
 5. Create integration tests and run them to success locally
+5.5. **If the fix targets specific hardware — the DGX Spark aarch64 GPU
+   host (`spark-0d93`) or the ipc x86_64 k3s cluster — build and smoke-test
+   directly on that hardware BEFORE opening the PR.** CI validates generic
+   logic on GitHub-hosted runners; it cannot catch host-specific kernel,
+   driver, or overlay-filesystem behavior (the #522/#526/#529 GPU-passthrough
+   fixes all needed real hardware to actually prove correct — CI alone
+   would have missed the #525 iteration-1 bug, which broke the dynamic
+   linker only on a real multi-layer image on real hardware).
+   - **Spark (aarch64):** SSH in, build with `cargo build --release -p
+     pelagos --bin pelagos` directly on the box (rustup + a repo clone are
+     already set up there from prior sessions), and run the real repro
+     against `target/release/pelagos` directly — no need to install it
+     anywhere first. Do NOT wait for the GitHub Actions release pipeline
+     just to get a testable aarch64 binary — that costs ~15-20 min per
+     iteration for something an SSH build does in ~10s.
+   - **ipc cluster (x86_64):** use the in-cluster build infra
+     (`cluster-build.sh` / `docs/k8s-build/`) rather than waiting on CI.
+   - This step applies identically whether a human session or the
+     autonomous watcher (`pelagos-watch-coordinator.service`,
+     `scripts/watch-coordinator.sh`) is running the cycle — an unattended
+     cycle is not an exemption from validating on real hardware before
+     shipping a hardware-specific fix.
+   - The full CI/release pipeline (steps 6-7 below) still happens after —
+     this step is about confirming the fix *works* before investing in the
+     official release, not a replacement for it.
 6. Commit, push, open a PR
 7. **Immediately launch the CI-merge-release workflow in the background:**
    ```

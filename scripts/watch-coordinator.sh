@@ -113,6 +113,14 @@ autonomously, with these adjustments to that macro (per explicit user direction,
   auto-merge without waiting for further human review.
 - If multiple issues are filed, batch them into one release cycle where it
   makes sense (one version bump covering all fixes), same as recent releases.
+- CLAUDE.md's macro step 5.5 (build+smoke-test directly on target hardware
+  before opening the PR, for spark-0d93/aarch64 or the ipc x86_64 cluster
+  issues) applies to you exactly as it does to an interactive session — you
+  are not exempt from it just because this cycle is unattended. SSH access
+  to spark-0d93 and the in-cluster build infra are both already available;
+  use them. Do not treat a green GitHub Actions CI run as sufficient proof
+  a hardware-specific fix actually works — CI runs on generic GitHub-hosted
+  runners and cannot see host-specific kernel/driver/overlay-fs behavior.
 
 Do NOT touch agent-coordinator or pelagos.json yourself — the watcher script
 handles the post-release coordinator-board write deterministically after this
