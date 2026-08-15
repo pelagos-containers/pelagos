@@ -468,6 +468,25 @@ cross-test artifact collisions on the shared, non-ephemeral `alpine-rootfs`. Fai
 indicates `create_symlinks_pairs()` regressed back to checking `path` / the invoking
 binary's name instead of the `args` shape alone.
 
+### `test_cli_device_flag_cdi_update_ldcache_hook`
+**Requires:** root, rootfs
+
+Regression test for #529. The same real-world CDI spec shape as
+`test_cli_device_flag_cdi_create_symlinks_hook` ships a *second* `createContainer`
+hook right alongside `create-symlinks`: `update-ldcache --folder DIR`, which refreshes
+the dynamic linker cache so libraries placed by `create-symlinks` are visible to
+dlopen-based resolution (Triton, PyTorch's inductor backend) rather than just a
+hardcoded search path (which is why `nvidia-smi` worked but `vllm serve` didn't).
+Before this fix, `pelagos run` recognized `create-symlinks` but silently skipped
+`update-ldcache` (logged a warning) — libraries were correctly placed and symlinked
+but never registered in `/etc/ld.so.cache`. Since the test rootfs has no real
+`ldconfig` (musl/Alpine's dynamic linker doesn't use an ld.so.cache), this
+bind-mounts a fake `ldconfig` shell script to `/sbin/ldconfig` that records its
+invocation args to a host-visible marker file, and asserts it was invoked with
+exactly the hook's `--folder` directory. Failure indicates
+`CdiHook::update_ldcache_folder()` in `cdi.rs` is not parsing the `--folder` arg, or
+`with_ldconfig_folder()` / `add_cdi_device()` are not wiring it through to pre_exec.
+
 ### `test_bind_mount_into_dev`
 **Requires:** root, rootfs
 

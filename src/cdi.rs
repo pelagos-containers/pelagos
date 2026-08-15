@@ -154,6 +154,31 @@ impl CdiHook {
         }
         Some(pairs)
     }
+
+    /// If this hook's `args` invoke an `update-ldcache` subcommand with a
+    /// `--folder DIR` argument — the convention `nvidia-ctk cdi generate`
+    /// embeds to refresh the dynamic linker cache for a directory of driver
+    /// libraries dropped in alongside the `create-symlinks` hook above — return
+    /// that directory. See #529: without this, libraries resolved via the
+    /// ldconfig cache (Triton, PyTorch's inductor backend) aren't found even
+    /// though `create-symlinks` placed them correctly on disk.
+    ///
+    /// Same rationale as `create_symlinks_pairs()` for not checking `path`/the
+    /// invoking binary's name, and for being handled as a native built-in
+    /// (`ldconfig <folder>`, run inside the container's own mount namespace)
+    /// rather than executing the host's hook binary.
+    pub fn update_ldcache_folder(&self) -> Option<String> {
+        if !self.args.iter().any(|a| a == "update-ldcache") {
+            return None;
+        }
+        let mut iter = self.args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == "--folder" {
+                return iter.next().cloned();
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -497,5 +522,51 @@ devices:
             env: vec![],
         };
         assert!(hook.create_symlinks_pairs().is_none());
+    }
+
+    #[test]
+    fn update_ldcache_parses_folder_arg() {
+        // Regression test for #529: the CDI spec's second createContainer hook,
+        // alongside create-symlinks, must also be recognized natively.
+        let hook = CdiHook {
+            hook_name: "createContainer".to_string(),
+            path: "/usr/bin/nvidia-cdi-hook".to_string(),
+            args: vec![
+                "nvidia-cdi-hook".to_string(),
+                "update-ldcache".to_string(),
+                "--folder".to_string(),
+                "/usr/lib/aarch64-linux-gnu".to_string(),
+            ],
+            env: vec![],
+        };
+        assert_eq!(
+            hook.update_ldcache_folder(),
+            Some("/usr/lib/aarch64-linux-gnu".to_string())
+        );
+    }
+
+    #[test]
+    fn update_ldcache_ignores_other_hooks() {
+        let hook = CdiHook {
+            hook_name: "createContainer".to_string(),
+            path: "/usr/bin/nvidia-cdi-hook".to_string(),
+            args: vec![
+                "nvidia-cdi-hook".to_string(),
+                "disable-device-node-modification".to_string(),
+            ],
+            env: vec![],
+        };
+        assert!(hook.update_ldcache_folder().is_none());
+    }
+
+    #[test]
+    fn update_ldcache_missing_folder_arg_returns_none() {
+        let hook = CdiHook {
+            hook_name: "createContainer".to_string(),
+            path: "/usr/bin/nvidia-cdi-hook".to_string(),
+            args: vec!["nvidia-cdi-hook".to_string(), "update-ldcache".to_string()],
+            env: vec![],
+        };
+        assert!(hook.update_ldcache_folder().is_none());
     }
 }

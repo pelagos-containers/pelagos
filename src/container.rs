@@ -1583,6 +1583,8 @@ pub struct Command {
     // Symlinks to create inside /dev when it is a fresh tmpfs.
     // Each entry is (link_path, target) — created via symlink(2) in pre_exec.
     dev_symlinks: Vec<(PathBuf, PathBuf)>,
+    // Directories to run `ldconfig` against in pre_exec (CDI update-ldcache hook).
+    ldconfig_folders: Vec<PathBuf>,
     // Ambient capability numbers (0–40) to raise via PR_CAP_AMBIENT_RAISE in pre_exec.
     ambient_cap_numbers: Vec<u8>,
     // OOM score adjustment to write to /proc/self/oom_score_adj in pre_exec.
@@ -1735,6 +1737,7 @@ impl Command {
             additional_networks: Vec::new(),
             propagation_mounts: Vec::new(),
             dev_symlinks: Vec::new(),
+            ldconfig_folders: Vec::new(),
             ambient_cap_numbers: Vec::new(),
             oom_score_adj: None,
             additional_gids: Vec::new(),
@@ -3020,6 +3023,20 @@ impl Command {
         self
     }
 
+    /// Run `ldconfig <folder>` inside the container's mount namespace in pre_exec,
+    /// after chroot/pivot_root but before the user command execs.
+    ///
+    /// Mirrors the CDI `update-ldcache` hook (see `CdiHook::update_ldcache_folder()`):
+    /// driver libraries dropped into `folder` (e.g. by `create-symlinks`) are not
+    /// picked up by dlopen-based resolution — Triton, PyTorch's inductor backend,
+    /// and anything else that resolves via the ldconfig cache rather than a
+    /// hardcoded path — until `/etc/ld.so.cache` is regenerated to include them.
+    /// `ldconfig` is resolved from the container's own rootfs, not the host's.
+    pub fn with_ldconfig_folder(mut self, folder: impl Into<PathBuf>) -> Self {
+        self.ldconfig_folders.push(folder.into());
+        self
+    }
+
     /// Raise a capability in the ambient set (PR_CAP_AMBIENT_RAISE).
     ///
     /// `cap_num` is the kernel capability number (0 = CAP_CHOWN, 1 = CAP_DAC_OVERRIDE, …).
@@ -3535,6 +3552,7 @@ impl Command {
         let sysctl = self.sysctl.clone();
         let devices = self.devices.clone();
         let dev_symlinks = self.dev_symlinks.clone();
+        let ldconfig_folders = self.ldconfig_folders.clone();
         let ambient_cap_numbers = self.ambient_cap_numbers.clone();
         let oom_score_adj = self.oom_score_adj;
         let additional_gids = self.additional_gids.clone();
@@ -6049,6 +6067,38 @@ impl Command {
                     }
                 }
 
+                // Step 4.74: Refresh the dynamic linker cache for directories named by
+                // the CDI update-ldcache hook (see CdiHook::update_ldcache_folder()).
+                // Libraries dropped in by create-symlinks above are otherwise invisible
+                // to dlopen-based resolution (Triton, PyTorch's inductor backend, etc.)
+                // until /etc/ld.so.cache is regenerated — see #529. Runs the container's
+                // own ldconfig (tried at its common install paths), not the host's.
+                // Best-effort: a missing ldconfig binary is not fatal.
+                for folder in &ldconfig_folders {
+                    if let Ok(folder_c) = CString::new(folder.as_os_str().as_encoded_bytes()) {
+                        for candidate in [
+                            "/sbin/ldconfig",
+                            "/usr/sbin/ldconfig",
+                            "/bin/ldconfig",
+                            "/usr/bin/ldconfig",
+                        ] {
+                            let prog_c = CString::new(candidate).unwrap();
+                            let argv = [prog_c.as_ptr(), folder_c.as_ptr(), ptr::null()];
+                            let pid = libc::fork();
+                            if pid == 0 {
+                                libc::execv(prog_c.as_ptr(), argv.as_ptr());
+                                libc::_exit(127);
+                            } else if pid > 0 {
+                                let mut status: libc::c_int = 0;
+                                libc::waitpid(pid, &mut status, 0);
+                                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Step 4.8: Mask sensitive paths
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
@@ -7158,6 +7208,7 @@ impl Command {
         let sysctl = self.sysctl.clone();
         let devices = self.devices.clone();
         let dev_symlinks = self.dev_symlinks.clone();
+        let ldconfig_folders = self.ldconfig_folders.clone();
         let ambient_cap_numbers = self.ambient_cap_numbers.clone();
         let oom_score_adj = self.oom_score_adj;
         let additional_gids = self.additional_gids.clone();
@@ -9121,6 +9172,38 @@ impl Command {
                         CString::new(target.as_os_str().as_encoded_bytes()),
                     ) {
                         libc::symlink(tgt_c.as_ptr(), link_c.as_ptr());
+                    }
+                }
+
+                // Step 4.74: Refresh the dynamic linker cache for directories named by
+                // the CDI update-ldcache hook (see CdiHook::update_ldcache_folder()).
+                // Libraries dropped in by create-symlinks above are otherwise invisible
+                // to dlopen-based resolution (Triton, PyTorch's inductor backend, etc.)
+                // until /etc/ld.so.cache is regenerated — see #529. Runs the container's
+                // own ldconfig (tried at its common install paths), not the host's.
+                // Best-effort: a missing ldconfig binary is not fatal.
+                for folder in &ldconfig_folders {
+                    if let Ok(folder_c) = CString::new(folder.as_os_str().as_encoded_bytes()) {
+                        for candidate in [
+                            "/sbin/ldconfig",
+                            "/usr/sbin/ldconfig",
+                            "/bin/ldconfig",
+                            "/usr/bin/ldconfig",
+                        ] {
+                            let prog_c = CString::new(candidate).unwrap();
+                            let argv = [prog_c.as_ptr(), folder_c.as_ptr(), ptr::null()];
+                            let pid = libc::fork();
+                            if pid == 0 {
+                                libc::execv(prog_c.as_ptr(), argv.as_ptr());
+                                libc::_exit(127);
+                            } else if pid > 0 {
+                                let mut status: libc::c_int = 0;
+                                libc::waitpid(pid, &mut status, 0);
+                                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
 
