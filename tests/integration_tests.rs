@@ -2462,6 +2462,110 @@ devices:
         );
     }
 
+    /// test_cli_device_flag_cdi_update_ldcache_hook
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Regression test for #529: the CDI spec's `update-ldcache` createContainer
+    /// hook (which sits alongside `create-symlinks` in the same spec — see
+    /// `test_cli_device_flag_cdi_create_symlinks_hook`) was silently skipped,
+    /// leaving driver libraries invisible to dlopen-based resolution (Triton,
+    /// PyTorch's inductor backend) even though `create-symlinks` had placed
+    /// them correctly on disk. Since the test rootfs may not ship a real
+    /// `ldconfig` (musl/Alpine doesn't use an ld.so.cache), this bind-mounts a
+    /// fake `ldconfig` shell script to `/sbin/ldconfig` that records its
+    /// invocation args to a host-visible marker file, and asserts it was
+    /// invoked with exactly the `--folder` directory named in the hook.
+    ///
+    /// Failure indicates `CdiHook::update_ldcache_folder()` in `cdi.rs` is not
+    /// parsing the `--folder` arg, or `with_ldconfig_folder()` /
+    /// `add_cdi_device()` are not wiring it through to pre_exec.
+    #[test]
+    #[serial(cdi_rootfs)]
+    fn test_cli_device_flag_cdi_update_ldcache_hook() {
+        if !is_root() {
+            eprintln!("Skipping test_cli_device_flag_cdi_update_ldcache_hook: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_cli_device_flag_cdi_update_ldcache_hook: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let cdi_dir = tempfile::tempdir().expect("tempdir");
+        let marker_dir = tempfile::tempdir().expect("tempdir");
+        let fake_ldconfig_dir = tempfile::tempdir().expect("tempdir");
+        let fake_ldconfig_path = fake_ldconfig_dir.path().join("ldconfig");
+        std::fs::write(
+            &fake_ldconfig_path,
+            "#!/bin/sh\necho \"LDCONFIG_CALLED:$1\" >> /marker/output\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_ldconfig_path)
+            .unwrap()
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake_ldconfig_path, perms).unwrap();
+
+        let spec = format!(
+            r#"
+cdiVersion: "0.6.0"
+kind: "test.pelagos.dev/gpu"
+devices:
+  - name: "0"
+    containerEdits:
+      mounts:
+        - hostPath: "{fake_ldconfig}"
+          containerPath: "/sbin/ldconfig"
+          options: ["bind"]
+        - hostPath: "{marker_dir}"
+          containerPath: "/marker"
+          options: ["bind"]
+      hooks:
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - update-ldcache
+            - --folder
+            - /usr/lib/cditest
+"#,
+            fake_ldconfig = fake_ldconfig_path.display(),
+            marker_dir = marker_dir.path().display(),
+        );
+        std::fs::write(cdi_dir.path().join("vendor.yaml"), spec).unwrap();
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .env("PELAGOS_CDI_SPEC_DIRS", cdi_dir.path())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "--device",
+                "test.pelagos.dev/gpu=0",
+                "/bin/sh",
+                "-c",
+                "true",
+            ])
+            .output()
+            .expect("pelagos run --device <cdi with update-ldcache hook>");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        let marker_contents =
+            std::fs::read_to_string(marker_dir.path().join("output")).unwrap_or_default();
+        assert!(
+            marker_contents.contains("LDCONFIG_CALLED:/usr/lib/cditest"),
+            "fake ldconfig was not invoked with the hook's --folder directory — \
+             update-ldcache hook was not executed natively. marker contents:\n{}\nstderr:\n{}",
+            marker_contents,
+            stderr
+        );
+    }
+
     /// test_bind_mount_into_dev
     ///
     /// Requires: root, rootfs.

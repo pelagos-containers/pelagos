@@ -1390,11 +1390,15 @@ fn add_cdi_device(
         }
     }
     for hook in &edits.hooks {
-        match hook.create_symlinks_pairs() {
-            Some(pairs) => {
-                for (target, link_path) in pairs {
-                    cmd = cmd.with_dev_symlink(link_path, target);
-                }
+        if let Some(pairs) = hook.create_symlinks_pairs() {
+            for (target, link_path) in pairs {
+                cmd = cmd.with_dev_symlink(link_path, target);
+            }
+            continue;
+        }
+        match hook.update_ldcache_folder() {
+            Some(folder) => {
+                cmd = cmd.with_ldconfig_folder(folder);
             }
             None => {
                 // Pelagos does not execute arbitrary CDI hook binaries on the CLI
