@@ -34,20 +34,39 @@ agents commit/push to it directly).
     "affected_node": null
   },
   "signals_out": {
-    "to_pelagos": "new-cluster-bugs",    // or "cluster-bug-fix-confirmed" or null
-    "new_issue_numbers": [501, 502]      // only meaningful when to_pelagos == "new-cluster-bugs"
+    "to_pelagos": "new-cluster-bugs",    // closed set — see below
+    "new_issue_numbers": [501, 502],     // issue(s) to act on — required for all actionable signals
+    "note": null                          // required context for priority-request; optional elsewhere
   },
   "updated_by": "k3s-agent",
   "updated_at": "2026-08-05T14:28:30Z"
 }
 ```
 
-`signals_out.to_pelagos` values:
-- `"new-cluster-bugs"` — new GitHub issues filed against pelagos, listed in
-  `new_issue_numbers`. Only this value triggers a pelagos-side work cycle.
-- `"cluster-bug-fix-confirmed"` — a prior fix was validated on the cluster.
-  Currently a no-op on the pelagos side (see Non-goals below).
-- `null` — nothing pending.
+`signals_out.to_pelagos` values — **closed set, exactly these five. Do not
+send anything else.**
+
+| Value | Meaning | Triggers a pelagos-side cycle? |
+|---|---|---|
+| `null` | Nothing pending. | No. |
+| `"new-cluster-bugs"` | New GitHub issues filed against pelagos, listed in `new_issue_numbers`. | Yes. |
+| `"retest-failed"` | A previously-released fix did not hold when retested. `new_issue_numbers` should reference the issue(s) to revisit. | Yes — same cycle as `new-cluster-bugs`. |
+| `"priority-request"` | Urgent, out-of-band attention needed regardless of category (e.g. blocking a time-sensitive cluster operation). `note` **must** explain why it's urgent; set `new_issue_numbers` if a specific issue is driving it. | Yes — same cycle, with the urgency context passed through. |
+| `"cluster-bug-fix-confirmed"` | FYI only — a prior fix was validated on the cluster. Use `note` to say what was confirmed. | No — acknowledged and cleared, but no work cycle (see Non-goals below). |
+
+**Why this is a closed set, not "whatever string makes sense at the time":**
+`retest-failed` and `priority-request` were both used informally for weeks
+before being written down here — the watcher's signal check was (and still
+is, structurally) a single exact-string match, so both were silently
+ignored the entire time, indistinguishable in the logs from genuine idle
+state (`watch.log` showed `signal='priority-request' (nothing to do)` next
+to real idle ticks, with no way to tell them apart without reading the
+literal string). If a new kind of signal is genuinely needed, add it to
+this table **and** to `scripts/watch-coordinator.sh`'s handling in the same
+change — never just start sending a new string and assume the other side
+understands it. The watcher now logs anything outside this closed set as a
+loud, distinct warning rather than silently treating it the same as `null`,
+specifically so future drift like this is visible instead of invisible.
 
 ### `pelagos.json` — pelagos-agent writes, k3s-agent reads
 
@@ -62,6 +81,12 @@ agents commit/push to it directly).
     "target_version": "0.65.74",
     "issues_to_validate": [494]
   },
+  "watcher_status": {
+    "active": false,                     // true while a headless cycle is running
+    "issues": [],                        // issues the current/last cycle is working
+    "signal": null,                      // which signal triggered it
+    "started_at": null
+  },
   "updated_by": "pelagos-agent",
   "updated_at": "2026-08-05T13:56:58Z"
 }
@@ -69,6 +94,13 @@ agents commit/push to it directly).
 
 `signals_out.to_k3s == "upgrade-and-test"` tells the k3s-agent a new release
 is ready at `target_version`, fixing `issues_to_validate`.
+
+`watcher_status` exists so "who is working what right now" is a one-glance
+read of the blackboard instead of checking `git log`, a running process, or
+a worktree directory by hand. Written the moment the watcher claims a
+signal (`active: true`), cleared to `active: false` when the cycle finishes
+— it does not distinguish success/failure (that's `release_status` and the
+issue tracker's job), it only answers "is something in flight."
 
 ## How writes happen — `bin/write-state.sh`, mandatory for both sides
 
@@ -138,10 +170,18 @@ Follow-ups below.
   writes a temp file and renames it into place — `close_write` fires on the
   temp path, not the target, so a watch using only `close_write` never
   triggers on git-committed files.
-- On `cluster.json`'s `signals_out.to_pelagos == "new-cluster-bugs"`:
-  1. Claims the issues — clears the signal, commits agent-coordinator
-     immediately (so concurrent filings land in the *next* signal instead of
-     racing). No push — see "no remote" note above.
+- On `cluster.json`'s `signals_out.to_pelagos` matching one of the three
+  actionable values (`new-cluster-bugs`, `retest-failed`,
+  `priority-request` — see the closed set above; `cluster-bug-fix-confirmed`
+  is acknowledged and cleared but does not reach this flow, and anything
+  outside the closed set is logged loudly and left untouched rather than
+  silently ignored):
+  1. Claims the issues — clears the signal via `write-state.sh` (so this
+     goes through the same cross-agent lock as every other blackboard
+     write, not a raw `jq`+`git commit`), and writes `pelagos.json`'s
+     `watcher_status = {active: true, issues, signal, started_at}` in the
+     same step, so an interactive session can see a cycle just started
+     without needing to check for a running process or worktree.
   2. Records the current latest GitHub release tag (`gh release list`), then
      creates an **isolated git worktree** under
      `~/.local/state/pelagos-watch/worktrees/` from a fresh `origin/main`,
@@ -161,6 +201,9 @@ Follow-ups below.
      `createdAt` — the draft is created before the gate finishes), and
      commits agent-coordinator. If nothing appears after 20 minutes, logs
      that no release was detected rather than writing a stale/fake entry.
+     Either way, `watcher_status.active` is set back to `false` at this
+     point — the cycle is "done" (successfully or not) once this step
+     finishes, whether or not a release resulted.
   4. The headless invocation runs with `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`
      — without it, the harness kills any background task the headless agent
      starts (including its own `ci-merge-release` Workflow poll) after a
@@ -235,10 +278,11 @@ k3s-agent finds a bug
   → commit + push agent-coordinator
 
 pelagos-watch-coordinator.service (inotify fires on moved_to)
-  → claims issues, clears to_pelagos, commit + push
+  → claims issues via write-state.sh: clears to_pelagos, sets watcher_status.active = true
   → headless claude -p: implement fix(es), test, PR, auto-merge, release
-  → writes pelagos.json: signals_out.to_k3s = "upgrade-and-test", target_version, issues_to_validate
-  → commit + push agent-coordinator
+  → writes pelagos.json: signals_out.to_k3s = "upgrade-and-test", target_version, issues_to_validate,
+    watcher_status.active = false
+  → commit agent-coordinator
 
 k3s-agent (if a session is watching, or on next startup check)
   → clears to_k3s
@@ -270,7 +314,8 @@ test after editing the script):
 | Symptom | Check |
 |---------|-------|
 | Service not running | `systemctl --user status pelagos-watch-coordinator.service`; if `enabled` but not `active`, check `journalctl --user -u pelagos-watch-coordinator.service` |
-| Signal set but nothing happened | `tail ~/.local/state/pelagos-watch/watch.log` — look for `skip: another cycle already running` (stale lock) or the signal being logged as ignored |
+| Signal set but nothing happened | `tail ~/.local/state/pelagos-watch/watch.log` — look for `skip: another cycle already running` (stale lock) or a `WARNING: signal='...' is not in the closed set` line (protocol drift — the sender used a value outside the five documented above; fix at the sending side, don't just clear the signal by hand) |
+| Can't tell who's working what right now | Read `pelagos.json`'s `watcher_status` field directly — `active: true` plus `issues`/`started_at` means a headless cycle is in flight; no need to check for a running process or worktree by hand |
 | Watcher missed the write entirely | Confirm the write actually used `moved_to` (a `git commit`/rename) not an in-place edit inside the watched dir — `close_write,moved_to` is set as a belt-and-suspenders, but a plain unlink+recreate outside git may not fire either |
 | Stuck lock | `rm ~/.local/state/pelagos-watch/watch.lock` if a prior headless run crashed mid-cycle without releasing it (check the log first to see why it crashed) |
 | Headless `claude -p` cycle failing | Check `~/.local/state/pelagos-watch/watch.log` for its full transcript output; confirm `pelagos/.claude/settings.local.json` still grants the tool access the cycle needs (Bash, Edit, Write, Workflow) |
