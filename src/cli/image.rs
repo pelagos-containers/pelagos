@@ -537,17 +537,32 @@ async fn pull_image(
         let is_wasm = pelagos::wasm::is_wasm_media_type(media_type);
 
         if layer_exists(layer_digest) {
-            cached += 1;
-            println!(
-                "  Layer {}/{}: {} (cached{})",
-                i + 1,
-                manifest.layers.len(),
-                &layer_digest[7..19.min(layer_digest.len())],
-                if is_wasm { ", wasm" } else { "" }
+            if image::layer_verify_integrity(layer_digest) {
+                cached += 1;
+                println!(
+                    "  Layer {}/{}: {} (cached{})",
+                    i + 1,
+                    manifest.layers.len(),
+                    &layer_digest[7..19.min(layer_digest.len())],
+                    if is_wasm { ", wasm" } else { "" }
+                );
+                layer_digests.push(layer_digest.clone());
+                layer_types.push(media_type.to_string());
+                continue;
+            }
+            // layer_exists() only proves the sentinel is present; it does not
+            // prove the directory still matches what was extracted (#534: this
+            // per-layer skip is reached on every pull, mutable tag or not,
+            // regardless of whether the whole-image "Already present" fast
+            // path above ever ran). extract_layer() itself also short-circuits
+            // on sentinel presence alone, so it would silently no-op on a
+            // corrupted-but-marked layer too — discard first so the download
+            // path below genuinely re-extracts.
+            log::warn!(
+                "layer {} failed integrity check on reuse; discarding for re-download",
+                layer_digest.get(..19).unwrap_or(layer_digest)
             );
-            layer_digests.push(layer_digest.clone());
-            layer_types.push(media_type.to_string());
-            continue;
+            let _ = image::discard_layer(layer_digest);
         }
 
         println!(

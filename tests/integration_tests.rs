@@ -8979,6 +8979,40 @@ mod images {
         }
     }
 
+    impl MockOciRegistry {
+        /// Spawn a single-arch registry whose layer contains one file with the
+        /// given content, rather than the empty-tar layer every other
+        /// `spawn()`/`spawn_nested()` caller shares. Needed for tests that
+        /// mutate the extracted layer directory on disk (corruption
+        /// simulation): the empty-tar layer's digest — and therefore its
+        /// on-disk content-addressable directory — is identical across every
+        /// test using the shared builder, so mutating it races any other
+        /// test running concurrently against the same digest.
+        fn spawn_with_content(image_name: &str, file_name: &str, content: &[u8]) -> Self {
+            let routes = build_routes_with_content(image_name, file_name, content);
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock registry");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown2 = Arc::clone(&shutdown);
+
+            std::thread::spawn(move || {
+                while !shutdown2.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_request(stream, &routes),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            MockOciRegistry { port, shutdown }
+        }
+    }
+
     impl Drop for MockOciRegistry {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::Relaxed);
@@ -8994,16 +9028,43 @@ mod images {
     }
 
     fn build_routes(image_name: &str, multi_arch: bool) -> Routes {
-        use flate2::{write::GzEncoder, Compression};
-        use tar::Builder;
-
         // Empty tar layer (two 512-byte EOF blocks).
         let mut tar_raw: Vec<u8> = Vec::new();
         {
-            let mut b = Builder::new(&mut tar_raw);
+            let mut b = tar::Builder::new(&mut tar_raw);
             b.finish().unwrap();
         }
         let diff_id = sha256_of(&tar_raw);
+
+        build_routes_from_tar(image_name, multi_arch, tar_raw, diff_id)
+    }
+
+    /// Single-arch registry whose layer tar contains one named file — gives a
+    /// digest (and therefore on-disk layer directory) unique to the content,
+    /// unlike `build_routes`'s always-identical empty-tar layer.
+    fn build_routes_with_content(image_name: &str, file_name: &str, content: &[u8]) -> Routes {
+        let mut tar_raw: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_raw);
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(content.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            b.append_data(&mut hdr, file_name, content).unwrap();
+            b.finish().unwrap();
+        }
+        let diff_id = sha256_of(&tar_raw);
+
+        build_routes_from_tar(image_name, false, tar_raw, diff_id)
+    }
+
+    fn build_routes_from_tar(
+        image_name: &str,
+        multi_arch: bool,
+        tar_raw: Vec<u8>,
+        diff_id: String,
+    ) -> Routes {
+        use flate2::{write::GzEncoder, Compression};
 
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         gz.write_all(&tar_raw).unwrap();
@@ -10674,6 +10735,110 @@ mod images {
         assert!(
             pelagos::image::layer_exists(&manifest.layers[0]),
             "layer dir missing after nested-index pull"
+        );
+
+        // Cleanup.
+        let _ = pelagos::image::remove_image(reference);
+    }
+
+    /// test_pull_self_heals_legacy_marker_layer
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Reproduces the actual gap the k3s-agent found in the first #534 fix
+    /// attempt (v0.65.92): `layer_verify_integrity()` originally trusted an
+    /// empty sentinel ("legacy format, can't verify, assume OK") for backward
+    /// compatibility — which made the check a complete no-op for exactly the
+    /// layers already corrupted in the field *before* the check existed. A
+    /// cluster's independent re-run of the SIGKILL-mid-extraction repro on
+    /// v0.65.92 still failed with "Already present" because the corrupted
+    /// layer from the original incident had exactly this kind of legacy
+    /// marker, so the new integrity check silently waved it through.
+    ///
+    /// Simulates that exact state directly (extract a real layer via the mock
+    /// registry, then truncate its sentinel to empty to look pre-#534, then
+    /// delete a file from it to actually corrupt it) and asserts that the
+    /// NEXT `pelagos image pull` — via both the whole-image "Already present"
+    /// fast path and the per-layer cache-skip inside the download loop —
+    /// detects it and re-extracts rather than reporting "Already present".
+    ///
+    /// Failure indicates the legacy-marker-trusts-blindly regression is back.
+    #[test]
+    fn test_pull_self_heals_legacy_marker_layer() {
+        if !is_root() {
+            eprintln!("Skipping test_pull_self_heals_legacy_marker_layer: requires root");
+            return;
+        }
+
+        let image_name = "library/pelagos-mock-legacy-marker";
+        let registry = MockOciRegistry::spawn_with_content(
+            image_name,
+            "legacy-marker-victim.txt",
+            b"unique layer content for test_pull_self_heals_legacy_marker_layer",
+        );
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            format!("[mirrors]\n\"docker.io\" = [\"{}\"]\n", registry.endpoint()),
+        )
+        .expect("write registries.toml");
+
+        let reference = "docker.io/library/pelagos-mock-legacy-marker:latest";
+        let _ = pelagos::image::remove_image(reference);
+
+        // Real first pull — proper (non-empty, entry-count) marker.
+        pull_via_binary(reference, tmp.path()).expect("initial pull should succeed");
+        let manifest =
+            pelagos::image::load_image(reference).expect("manifest should exist after pull");
+        assert_eq!(manifest.layers.len(), 1);
+        let digest = &manifest.layers[0];
+        let layer_dir = pelagos::image::layer_dir(digest);
+
+        // Downgrade the sentinel to the pre-#534 empty format, then actually
+        // corrupt the directory content underneath it — this is the state a
+        // node upgraded from before this fix, with pre-existing corruption,
+        // would be in.
+        std::fs::write(layer_dir.join(".pelagos_complete"), "").expect("truncate sentinel");
+        let victim = std::fs::read_dir(&layer_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name() != ".pelagos_complete")
+            .map(|e| e.path());
+        if let Some(victim) = victim {
+            let _ = std::fs::remove_file(&victim);
+        }
+
+        // Re-pull without `image rm` — must not report "Already present" over
+        // the corrupted-but-legacy-marked layer.
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
+            .args(["image", "pull", "--insecure", reference])
+            .env("PELAGOS_REGISTRIES", tmp.path())
+            .output()
+            .expect("spawn pelagos");
+        assert!(
+            out.status.success(),
+            "re-pull over legacy-marked corrupted layer should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("Already present"),
+            "re-pull must not silently trust a legacy-marked corrupted layer, got: {}",
+            stdout
+        );
+
+        // Sentinel should now carry a real recorded count, and integrity
+        // should pass — proving the layer was actually re-extracted, not
+        // just re-marked.
+        let recorded = std::fs::read_to_string(layer_dir.join(".pelagos_complete")).unwrap();
+        assert!(
+            !recorded.trim().is_empty(),
+            "sentinel should carry a real entry count after self-healing re-extraction"
+        );
+        assert!(
+            pelagos::image::layer_verify_integrity(digest),
+            "layer should pass integrity after self-healing re-extraction"
         );
 
         // Cleanup.
