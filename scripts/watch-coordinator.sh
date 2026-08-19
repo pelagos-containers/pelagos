@@ -190,7 +190,18 @@ reliably happen, so it's no longer this agent's responsibility).
 
 Do not touch cluster.json beyond what was already cleared. Do not act on
 cluster state beyond filing/releasing (no kubectl, no cluster SSH) — that
-remains the k3s agent's job."
+remains the k3s agent's job.
+
+CRITICAL: this is a single-shot invocation with no way to be resumed after
+your turn ends. If you background a test/build/verification command (or start
+a Workflow/Monitor and expect a completion notification) and then end your
+turn saying something like \"I'll wait for it to finish\", THIS PROCESS EXITS
+RIGHT THERE — there is no notification delivery outside an interactive
+session, and no branch/PR will exist for the issue even though the blackboard
+already shows it as claimed. Run every test/build/verification step
+synchronously in the foreground within this same turn (or poll it to
+completion yourself before ending your turn) — never end your turn waiting on
+an async notification you cannot receive."
 
   log "invoking headless claude for issues=$issues"
   (
@@ -260,7 +271,10 @@ remains the k3s agent's job."
        | .signals_out.to_k3s = \"upgrade-and-test\"
        | .signals_out.target_version = \"$version\"
        | .signals_out.issues_to_validate = $issues
-       | .watcher_status.active = false" \
+       | .watcher_status.active = false
+       | .watcher_status.last_cycle_outcome = \"shipped\"
+       | .watcher_status.last_cycle_issues = $issues
+       | .watcher_status.last_cycle_finished_at = \"$published_at\"" \
       "chore: pelagos-agent post-release state update $release_after (issues $issues)" >>"$LOG_FILE" 2>&1
     then
       log "deterministically wrote coordinator board for $release_after (issues=$issues)"
@@ -268,9 +282,20 @@ remains the k3s agent's job."
       log "warning: failed to write post-release coordinator board for $release_after (issues=$issues) — the release itself already succeeded, only this board write failed; recover manually per docs/AGENT_COORDINATION.md"
     fi
   else
-    "$COORD_DIR/bin/write-state.sh" pelagos.json '.watcher_status.active = false' \
+    # Visible on the board, not just in the local watch.log — a cycle that
+    # claims issues and then produces nothing shippable must be as visible
+    # as one that succeeds, or it silently reads as "handled" from the
+    # blackboard's point of view (issue #537: this happened when a headless
+    # turn backgrounded a wait and was never resumed).
+    local now_finished
+    now_finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    "$COORD_DIR/bin/write-state.sh" pelagos.json \
+      ".watcher_status.active = false
+       | .watcher_status.last_cycle_outcome = \"no_fix_shipped\"
+       | .watcher_status.last_cycle_issues = $issues
+       | .watcher_status.last_cycle_finished_at = \"$now_finished\"" \
       "chore: pelagos-agent watcher status: cycle finished, no release detected (issues $issues)" >>"$LOG_FILE" 2>&1 \
-      || log "warning: failed to clear watcher_status.active for issues=$issues (non-fatal)"
+      || log "warning: failed to write watcher_status for no-release outcome, issues=$issues (non-fatal)"
     log "no new release detected after 20min of polling for issues=$issues — NOT writing coordinator board (check watch.log for the cycle's own output; CI may have failed or nothing shippable was found)"
   fi
 }
