@@ -5867,6 +5867,41 @@ reference must preserve the image repository (`library/pelagos-mock-multi`) when
 the child manifest's digest, not mangle it into `library/sha256` (which would cause a 404
 on every multi-arch mirror pull).
 
+## `images::test_image_pull_mock_registry_nested_index`
+**Requires root** (writes to `/var/lib/pelagos/`). Same hermetic mock registry pattern, but
+the top-level index's per-platform entry is itself another index (two levels of nesting)
+rather than a direct manifest — the shape buildx commonly produces (real manifest +
+attestation grouped under one per-platform sub-index) and the exact repro from #533
+(`ghcr.io/goauthentik/server:2026.8.0`). Verifies `pelagos image pull` recurses through
+nested indices until it finds a direct manifest. **Why it matters:** before the fix, any
+index-of-indices failed outright with "nested image index not supported", permanently
+blocking pulls of any image published this way regardless of registry or mirror.
+
+## `images::test_concurrent_extract_layer_same_digest_no_corruption`
+**Requires root** (writes to `/var/lib/pelagos/layers/`). Spawns 4 threads calling
+`extract_layer` concurrently for the *same* digest, then asserts the layer exists and
+`layer_verify_integrity()` passes. **Why it matters:** `extract_layer` used to extract into
+a fixed `dest.with_extension("partial")` path shared by every caller for the same digest —
+two concurrent extractions of the same layer (plausible under CRI, where multiple
+pods/containers can trigger a pull around the same time) could delete each other's
+in-progress work or race on the final rename, producing ENOENT or a torn layer directory
+that still ends up with a valid-looking completion marker. This is the most likely root
+cause of #534's "sentinel present, contents corrupt" symptom. Fails if the shared-partial-path
+regression is reintroduced.
+
+## `images::test_layer_corruption_after_extraction_detected_on_reuse`
+**Requires root** (writes to `/var/lib/pelagos/layers/`). Extracts a layer, then deletes one
+extracted file *without* touching the `.pelagos_complete` sentinel — simulating #534's actual
+symptom, where the sentinel survives corruption that happens after extraction completes.
+Asserts: `layer_exists()` still returns `true` (the sentinel alone can't see this — expected,
+not a bug), `layer_verify_integrity()` returns `false` (the recorded entry count no longer
+matches), `discard_layer()` removes the corrupt directory, and a subsequent `extract_layer()`
+succeeds and passes integrity again. **Why it matters:** this is the exact gap #534 reported —
+`pelagos image pull` on an already-corrupted-but-marked-complete image reported "Already
+present" and exited 0 without fixing anything, so the standard "just re-pull to recover"
+instinct silently no-opped and only `image rm` + re-pull actually worked. This test fails if
+the entry-count integrity check regresses or its wiring into the pull fast path is removed.
+
 ## `image_layer_atomicity::test_save_blob_atomic_partial_then_rename`
 **Requires root** (writes to `/var/lib/pelagos/blobs/`). Calls `save_blob` with synthetic
 data for a test digest, then asserts that the final blob file exists, is intact, and no
