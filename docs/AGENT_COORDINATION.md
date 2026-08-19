@@ -85,7 +85,10 @@ specifically so future drift like this is visible instead of invisible.
     "active": false,                     // true while a headless cycle is running
     "issues": [],                        // issues the current/last cycle is working
     "signal": null,                      // which signal triggered it
-    "started_at": null
+    "started_at": null,
+    "last_cycle_outcome": "shipped",     // "shipped" | "no_fix_shipped", written when the cycle ends
+    "last_cycle_issues": [494],          // issues the last-finished cycle covered
+    "last_cycle_finished_at": "2026-08-05T04:54:24Z"
   },
   "updated_by": "pelagos-agent",
   "updated_at": "2026-08-05T13:56:58Z"
@@ -98,9 +101,18 @@ is ready at `target_version`, fixing `issues_to_validate`.
 `watcher_status` exists so "who is working what right now" is a one-glance
 read of the blackboard instead of checking `git log`, a running process, or
 a worktree directory by hand. Written the moment the watcher claims a
-signal (`active: true`), cleared to `active: false` when the cycle finishes
-— it does not distinguish success/failure (that's `release_status` and the
-issue tracker's job), it only answers "is something in flight."
+signal (`active: true`), cleared to `active: false` when the cycle finishes.
+`last_cycle_outcome` answers a narrower, harder question: did the cycle that
+just finished actually ship a fix, or did it end without one? This exists
+because a headless `claude -p` cycle can silently produce nothing — issue
+#537: a cycle backgrounded a test run and ended its turn saying "I'll wait
+for the notification," but a single-shot invocation has no way to be resumed
+after that, so it just exited with no branch/PR while the blackboard already
+showed the issues as claimed. `last_cycle_outcome` is written deterministically
+by the script itself (same principle as the release-tag recheck below), not
+self-reported by the headless agent, so a silently-abandoned cycle is visible
+on the board instead of indistinguishable from one still in progress or one
+that succeeded.
 
 ## How writes happen — `bin/write-state.sh`, mandatory for both sides
 
@@ -322,6 +334,7 @@ test after editing the script):
 | k3s side never picks up `to_k3s` | No persistent watcher exists on that side yet (see Follow-ups) — manually run `/watch-pelagos-release` in a k3s-experiments session, or start a new session (it checks on startup per that repo's CLAUDE.md) |
 | Coordinator board not updated despite a release shipping | Check `watch.log` for `"no new release detected after 20min of polling"` — the write is a deterministic, script-owned 20-minute retry loop against `gh release list`/`gh release view`, not delegated to the headless agent's self-report. If this fires despite a real release existing, either the release took longer than 20 minutes (rare — the gate is normally ~15min) or something's wrong with the retry loop itself; recover manually the same way as any other coordinator-write gap (write `pelagos.json` by hand using `gh release view <tag> --json publishedAt`). |
 | Stale worktree left behind | `git -C ~/Projects/pelagos worktree list` — a crashed cycle can leave one under `~/.local/state/pelagos-watch/worktrees/`; remove with `git -C ~/Projects/pelagos worktree remove <path> --force` |
+| Issue claimed but no branch/PR ever appeared | Read `pelagos.json`'s `watcher_status.last_cycle_outcome` — `"no_fix_shipped"` means the cycle ended without a release, most likely because the headless turn backgrounded a wait and was never resumed (issue #537). Check `watch.log` for the cycle's actual final text to confirm, then manually re-drive the issue (re-run `scripts/watch-coordinator.sh run_once` after re-raising the signal, or work it directly) — the watcher does not auto-retry a dropped cycle. |
 
 ## Explicit non-goals / scope boundaries
 
