@@ -302,24 +302,31 @@ fn count_entries_inner(dir: &Path, is_top_level: bool) -> io::Result<u64> {
 /// `layer_exists()` only proves the sentinel was written; it does not prove the
 /// directory still matches what was written. This walks the directory and
 /// compares its current entry count against the count recorded in the sentinel
-/// at extraction time. Layers extracted before this check existed have an empty
-/// sentinel (no recorded count) and are trusted as-is — this is a best-effort
-/// check for future corruption, not a retroactive audit of the existing store.
+/// at extraction time.
 ///
-/// Returns `false` only when a count was recorded AND it no longer matches;
-/// returns `true` for a missing layer, a missing/empty sentinel, or an I/O
-/// error walking the directory (fail open — an unreadable directory is a
-/// separate problem this check should not mask as "corrupt").
+/// A legacy sentinel (empty — written by any pre-#534 build) or an unparseable
+/// one is treated as a FAILURE, not trusted as-is: an earlier version of this
+/// check trusted empty sentinels for backward compatibility, which made it a
+/// complete no-op for exactly the layers already corrupted in the field before
+/// this check existed — precisely the ones #534 needs caught. Every legacy
+/// layer now gets re-extracted exactly once (self-healing the on-disk cache on
+/// first pull after upgrade); after that its sentinel carries a real count and
+/// this check is fully effective for it.
+///
+/// Returns `false` when a count was recorded and no longer matches, or when
+/// the sentinel is legacy/unparseable. Returns `true` only for a missing layer
+/// or an I/O error walking the directory (fail open — an unreadable directory
+/// is a separate problem this check should not mask as "corrupt").
 pub fn layer_verify_integrity(digest: &str) -> bool {
     let dir = layer_dir(digest);
     let marker = dir.join(LAYER_COMPLETE_MARKER);
     let recorded = match std::fs::read_to_string(&marker) {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => return true,
+        Ok(s) => s,
+        Err(_) => return true,
     };
     let expected: u64 = match recorded.trim().parse() {
         Ok(n) => n,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     match count_entries(&dir) {
         Ok(actual) => actual == expected,

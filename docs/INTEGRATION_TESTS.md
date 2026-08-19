@@ -5877,6 +5877,20 @@ nested indices until it finds a direct manifest. **Why it matters:** before the 
 index-of-indices failed outright with "nested image index not supported", permanently
 blocking pulls of any image published this way regardless of registry or mirror.
 
+## `images::test_pull_self_heals_legacy_marker_layer`
+**Requires root** (writes to `/var/lib/pelagos/`). Reproduces the actual gap the k3s-agent
+found in the first #534 fix attempt (v0.65.92): pulls a real image via a mock registry, then
+truncates its layer's `.pelagos_complete` sentinel to empty (the format every pre-#534 build
+wrote) and deletes a file from the layer directory — simulating a node upgraded from before
+this fix, with pre-existing corruption from the original incident still on disk. Asserts the
+next `pelagos image pull` (without `image rm`) does NOT report "Already present", the sentinel
+carries a real entry count afterward, and `layer_verify_integrity()` passes. **Why it
+matters:** the first #534 fix (v0.65.92) trusted an empty/legacy sentinel as "can't verify,
+assume OK" for backward compatibility, which made the integrity check a complete no-op for
+exactly the layers already corrupted in the field before the check existed — the cluster's
+independent re-run of the SIGKILL-mid-extraction repro on v0.65.92 still failed with "Already
+present" for precisely this reason. Fails if legacy sentinels are ever trusted again.
+
 ## `images::test_concurrent_extract_layer_same_digest_no_corruption`
 **Requires root** (writes to `/var/lib/pelagos/layers/`). Spawns 4 threads calling
 `extract_layer` concurrently for the *same* digest, then asserts the layer exists and
