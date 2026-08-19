@@ -48,11 +48,22 @@ if (!pr) {
 }
 
 const REPO = '/home/cb/Projects/pelagos'
-const MAX_POLLS = 300  // 300 × 90s ≈ 7.5 hours
+const POLL_INTERVAL_S = 120
+const MAX_POLLS = 150  // 150 × 120s = 5 hours
 
 // ── Poll CI ────────────────────────────────────────────────────────────────────
+// One agent call per iteration, not two: the check and the wait-before-next-check
+// both happen inside the SAME call (the agent runs `gh pr checks`, and if still
+// pending, sleeps via its own Bash tool before returning "pending"). An earlier
+// version spawned a second, separate agent() call whose entire job was `sleep 90`
+// — using a full LLM agent invocation as a sleep timer is pure waste, and on a
+// CI run that hangs (a wedged GitHub Actions runner, not a real failure) it burns
+// hundreds of agent calls and millions of tokens for what should cost a handful
+// of cheap status checks. See pelagos#(ci-merge-release token waste, 2026-08-19):
+// a hung e2e-tests runner drove this loop through all 300 iterations under the
+// old design, costing 600 agent calls / ~23.7M tokens before timing out.
 phase('Poll CI')
-log(`Polling CI for PR #${pr} (max ${MAX_POLLS} attempts, 90s apart)`)
+log(`Polling CI for PR #${pr} (max ${MAX_POLLS} attempts, ${POLL_INTERVAL_S}s apart, 1 agent call/attempt)`)
 
 let passed = false
 for (let i = 1; i <= MAX_POLLS; i++) {
@@ -66,6 +77,11 @@ Classify the output:
 - ANY check is "fail"                → status="fail", failed=[list of failing check names]
 - ANY check is "pending"/"in_progress" (and none failed) → status="pending", failed=[]
 
+If (and only if) the classification is "pending", run \`sleep ${POLL_INTERVAL_S}\` yourself
+(via your Bash tool) BEFORE returning, so the next poll is naturally spaced out — do not
+skip this, and do not spawn any other agent/task to do it. If "pass" or "fail", return
+immediately without sleeping.
+
 Return JSON.`,
     { schema: STATUS_SCHEMA, label: `poll #${i}` }
   )
@@ -78,13 +94,12 @@ Return JSON.`,
     log(`CI failed on attempt #${i}: ${result.failed.join(', ')}`)
     return { error: 'CI checks failed', failed: result.failed, pr }
   } else {
-    log(`Attempt #${i}: pending — sleeping 90s`)
-    await agent(`Run exactly: sleep 90 && echo done`, { label: 'sleep 90s' })
+    log(`Attempt #${i}: pending (agent slept ${POLL_INTERVAL_S}s before returning)`)
   }
 }
 
 if (!passed) {
-  return { error: `Timed out after ${MAX_POLLS} polls (≈7.5h)`, pr }
+  return { error: `Timed out after ${MAX_POLLS} polls (≈${(MAX_POLLS * POLL_INTERVAL_S / 3600).toFixed(1)}h) — check whether CI is genuinely still running or a runner is hung`, pr }
 }
 
 // ── Merge ──────────────────────────────────────────────────────────────────────
