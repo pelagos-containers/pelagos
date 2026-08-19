@@ -263,6 +263,82 @@ pub fn layer_exists(digest: &str) -> bool {
     dir.is_dir() && dir.join(LAYER_COMPLETE_MARKER).exists()
 }
 
+/// Recursively count filesystem entries (files, dirs, symlinks, devices) under
+/// `dir`, not counting `dir` itself. Used to record an extracted layer's entry
+/// count at extraction time and cheaply re-check it later without re-reading
+/// file contents.
+///
+/// Always excludes `LAYER_COMPLETE_MARKER` at the top level: extraction
+/// records the count before the sentinel is written (so it's naturally
+/// excluded there), but a later re-check walks a directory where the
+/// sentinel already exists — excluding it here keeps both counts comparable
+/// regardless of which side of sentinel-creation they're taken from.
+fn count_entries(dir: &Path) -> io::Result<u64> {
+    count_entries_inner(dir, true)
+}
+
+fn count_entries_inner(dir: &Path, is_top_level: bool) -> io::Result<u64> {
+    let mut count = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if is_top_level && entry.file_name() == std::ffi::OsStr::new(LAYER_COMPLETE_MARKER) {
+            continue;
+        }
+        count += 1;
+        // symlink_metadata so a symlink to a directory is counted as a leaf,
+        // not recursed into (matches tar semantics: a symlink entry is one item).
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            count += count_entries_inner(&entry.path(), false)?;
+        }
+    }
+    Ok(count)
+}
+
+/// Cheaply re-check a layer that already passed `layer_exists()` for signs of
+/// post-extraction corruption (e.g. files disappearing from a shared
+/// content-addressable layer directory after extraction completed).
+///
+/// `layer_exists()` only proves the sentinel was written; it does not prove the
+/// directory still matches what was written. This walks the directory and
+/// compares its current entry count against the count recorded in the sentinel
+/// at extraction time. Layers extracted before this check existed have an empty
+/// sentinel (no recorded count) and are trusted as-is — this is a best-effort
+/// check for future corruption, not a retroactive audit of the existing store.
+///
+/// Returns `false` only when a count was recorded AND it no longer matches;
+/// returns `true` for a missing layer, a missing/empty sentinel, or an I/O
+/// error walking the directory (fail open — an unreadable directory is a
+/// separate problem this check should not mask as "corrupt").
+pub fn layer_verify_integrity(digest: &str) -> bool {
+    let dir = layer_dir(digest);
+    let marker = dir.join(LAYER_COMPLETE_MARKER);
+    let recorded = match std::fs::read_to_string(&marker) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return true,
+    };
+    let expected: u64 = match recorded.trim().parse() {
+        Ok(n) => n,
+        Err(_) => return true,
+    };
+    match count_entries(&dir) {
+        Ok(actual) => actual == expected,
+        Err(_) => true,
+    }
+}
+
+/// Remove a layer directory so the next pull re-downloads and re-extracts it.
+/// Used to discard a layer that `layer_verify_integrity()` found corrupted.
+pub fn discard_layer(digest: &str) -> io::Result<()> {
+    let dir = layer_dir(digest);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    let rootless_marker = dir.with_extension("rootless");
+    let _ = std::fs::remove_file(&rootless_marker);
+    Ok(())
+}
+
 /// Return the raw blob path for the given digest.
 pub fn blob_path(digest: &str) -> std::path::PathBuf {
     crate::paths::blob_path(digest)
@@ -403,12 +479,24 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
         }
     }
 
-    // Extract to a temporary sibling, then rename atomically.
-    let partial = dest.with_extension("partial");
-    if partial.exists() {
-        std::fs::remove_dir_all(&partial)?;
-    }
-    std::fs::create_dir_all(&partial)?;
+    // Extract to a uniquely-named temporary sibling, then rename atomically.
+    //
+    // MUST be unique per call, not a fixed `dest.with_extension("partial")` —
+    // two concurrent extract_layer() calls for the same digest (e.g. the same
+    // image pulled by multiple containers/pods around the same time) used to
+    // share one fixed partial path, so one caller's `remove_dir_all` could
+    // delete the directory the other was mid-write into, producing ENOENT and,
+    // worse, a silently torn extraction if the deletion raced with the
+    // rename instead of the write loop (#534's most likely root cause — a
+    // layer whose sentinel says "complete" but whose contents don't match).
+    std::fs::create_dir_all(dest.parent().unwrap())?;
+    // Detach from TempDir's auto-cleanup-on-drop: on the happy path this
+    // directory is renamed into `dest` before this function returns, and on
+    // the lost-the-race path below it's removed explicitly.
+    let partial = tempfile::Builder::new()
+        .prefix(".partial-")
+        .tempdir_in(dest.parent().unwrap())?
+        .keep();
 
     let file = std::fs::File::open(tar_path)?;
 
@@ -492,16 +580,31 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
         }
     }
 
-    // Ensure parent dir exists and rename partial → final.
-    std::fs::create_dir_all(dest.parent().unwrap())?;
-    std::fs::rename(&partial, &dest)?;
+    // Rename partial → final. If a concurrent extract_layer() for the same
+    // digest already won this race, dest now exists (non-empty) and this
+    // rename fails (Linux `rename(2)` onto a non-empty directory) — that's
+    // not our error to report, the layer is already there. Only treat it as
+    // a real failure if dest doesn't already have a valid completion marker.
+    if let Err(e) = std::fs::rename(&partial, &dest) {
+        let _ = std::fs::remove_dir_all(&partial);
+        if dest.join(LAYER_COMPLETE_MARKER).exists() {
+            return Ok(dest);
+        }
+        return Err(e);
+    }
 
     // Write the completion sentinel and fsync it so that it survives a power
     // cut. Without this, the directory rename can be journaled while the file
     // data (and the sentinel itself) are still in the page cache — leaving a
-    // directory that looks valid but is empty or corrupt.
+    // directory that looks valid but is empty or corrupt. The sentinel's
+    // content is the extracted entry count, so a later reuse of this "already
+    // present" layer can cheaply detect post-extraction corruption via
+    // layer_verify_integrity() (#534) rather than trusting presence alone.
     {
-        let f = std::fs::File::create(dest.join(LAYER_COMPLETE_MARKER))?;
+        use std::io::Write as _;
+        let entry_count = count_entries(&dest).unwrap_or(0);
+        let mut f = std::fs::File::create(dest.join(LAYER_COMPLETE_MARKER))?;
+        write!(f, "{}", entry_count)?;
         f.sync_all()?;
     }
 

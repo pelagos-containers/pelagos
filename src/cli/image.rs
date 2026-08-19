@@ -377,8 +377,34 @@ async fn pull_image(
         if let Ok(existing) = load_image(canonical) {
             let all_cached = existing.layers.iter().all(|d| layer_exists(d));
             if all_cached {
-                println!("Already present: {}", canonical);
-                return Ok(());
+                // layer_exists() only proves each layer's sentinel is present, not
+                // that the directory still matches what was extracted — a layer can
+                // become corrupted after extraction while the sentinel survives
+                // (#534: this made "Already present" silently reuse a broken cache
+                // with no way to recover short of a manual `image rm`). Cheaply
+                // re-verify each layer's recorded entry count before trusting the
+                // cache; discard and fall through to a real re-pull for any layer
+                // that fails, so `pelagos image pull` alone is a reliable recovery
+                // path again.
+                let mut all_valid = true;
+                for d in &existing.layers {
+                    if !image::layer_verify_integrity(d) {
+                        log::warn!(
+                            "layer {} failed integrity check on reuse; discarding for re-extraction",
+                            d.get(..19).unwrap_or(d)
+                        );
+                        let _ = image::discard_layer(d);
+                        all_valid = false;
+                    }
+                }
+                if all_valid {
+                    println!("Already present: {}", canonical);
+                    return Ok(());
+                }
+                println!(
+                    "Detected corrupted cached layer(s) for {}; re-pulling...",
+                    canonical
+                );
             }
         }
     }
@@ -436,23 +462,48 @@ async fn pull_image(
     // The child reference is built with clone_with_digest on oci_ref so the
     // mirror host + repository (`library/alpine`, not `library/sha256`) are
     // preserved in every subsequent request. (#407)
+    //
+    // An index's per-platform entry MAY itself be another index rather than a
+    // direct manifest (valid per the OCI image-spec; buildx commonly wraps the
+    // real per-platform manifest alongside a provenance/attestation manifest
+    // this way — #533). Recurse until a direct manifest is found, matching
+    // containerd/Docker behavior, with a depth cap as a guard against a
+    // pathological or malicious registry looping indices forever.
+    const MAX_INDEX_DEPTH: u32 = 8;
     let (manifest, resolved_ref, digest) = match top_manifest {
         OciManifest::Image(m) => (m, oci_ref.clone(), top_digest),
         OciManifest::ImageIndex(idx) => {
-            let platform_digest = current_platform_resolver(&idx.manifests)
-                .ok_or("image index contains no manifest for the current platform")?;
-            let child_ref = oci_ref.clone_with_digest(platform_digest.clone());
-            log::debug!(
-                "pull: multi-arch index resolved to platform digest {}",
-                platform_digest
-            );
-            let (child_manifest, child_digest) = client
-                .pull_manifest(&child_ref, &auth)
-                .await
-                .map_err(|e| format!("failed to pull platform manifest: {}", e))?;
-            match child_manifest {
-                OciManifest::Image(m) => (m, child_ref, child_digest),
-                OciManifest::ImageIndex(_) => return Err("nested image index not supported".into()),
+            let mut current_idx = idx;
+            let mut current_ref = oci_ref.clone();
+            let mut depth = 0u32;
+            loop {
+                let platform_digest = current_platform_resolver(&current_idx.manifests)
+                    .ok_or("image index contains no manifest for the current platform")?;
+                let child_ref = current_ref.clone_with_digest(platform_digest.clone());
+                log::debug!(
+                    "pull: image index (depth {}) resolved to platform digest {}",
+                    depth,
+                    platform_digest
+                );
+                let (child_manifest, child_digest) = client
+                    .pull_manifest(&child_ref, &auth)
+                    .await
+                    .map_err(|e| format!("failed to pull platform manifest: {}", e))?;
+                match child_manifest {
+                    OciManifest::Image(m) => break (m, child_ref, child_digest),
+                    OciManifest::ImageIndex(nested) => {
+                        depth += 1;
+                        if depth >= MAX_INDEX_DEPTH {
+                            return Err(format!(
+                                "image index nesting exceeds {} levels; giving up",
+                                MAX_INDEX_DEPTH
+                            )
+                            .into());
+                        }
+                        current_idx = nested;
+                        current_ref = child_ref;
+                    }
+                }
             }
         }
     };

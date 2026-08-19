@@ -8946,6 +8946,34 @@ mod images {
             MockOciRegistry { port, shutdown }
         }
 
+        /// Spawn a registry whose top-level index's per-platform entry is
+        /// itself another index (not a direct manifest) — the shape buildx
+        /// commonly produces (real manifest + attestation, both listed under
+        /// one per-platform sub-index). Regression coverage for #533.
+        fn spawn_nested(image_name: &str) -> Self {
+            let routes = build_routes_nested(image_name);
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock registry");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown2 = Arc::clone(&shutdown);
+
+            std::thread::spawn(move || {
+                while !shutdown2.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_request(stream, &routes),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            MockOciRegistry { port, shutdown }
+        }
+
         fn endpoint(&self) -> String {
             format!("http://127.0.0.1:{}", self.port)
         }
@@ -9058,6 +9086,115 @@ mod images {
         );
 
         // Layer blob.
+        r.insert(
+            format!("/v2/{}/blobs/{}", image_name, layer_digest),
+            (
+                "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                layer_digest,
+                layer_bytes,
+            ),
+        );
+
+        r
+    }
+
+    /// Two-level index: top-level index -> per-platform index -> real manifest.
+    /// Mirrors #533's actual repro shape (ghcr.io/goauthentik/server:2026.8.0).
+    fn build_routes_nested(image_name: &str) -> Routes {
+        use flate2::{write::GzEncoder, Compression};
+        use tar::Builder;
+
+        let mut tar_raw: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut tar_raw);
+            b.finish().unwrap();
+        }
+        let diff_id = sha256_of(&tar_raw);
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_raw).unwrap();
+        let layer_bytes = gz.finish().unwrap();
+        let layer_digest = sha256_of(&layer_bytes);
+
+        let config_json = format!(
+            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["{}"]}},"config":{{}}}}"#,
+            diff_id
+        );
+        let config_bytes = config_json.into_bytes();
+        let config_digest = sha256_of(&config_bytes);
+
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","size":{},"digest":"{}"}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","size":{},"digest":"{}"}}]}}"#,
+            config_bytes.len(),
+            config_digest,
+            layer_bytes.len(),
+            layer_digest
+        );
+        let manifest_bytes = manifest_json.into_bytes();
+        let manifest_digest = sha256_of(&manifest_bytes);
+
+        // Per-platform sub-index wrapping the real manifest (standing in for
+        // the real-world shape's manifest + attestation pair — one entry is
+        // enough to prove recursion works).
+        let child_index_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":{},"digest":"{}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+            manifest_bytes.len(),
+            manifest_digest
+        );
+        let child_index_bytes = child_index_json.into_bytes();
+        let child_index_digest = sha256_of(&child_index_bytes);
+
+        // Top-level index: per-platform entry points at the sub-index above,
+        // not directly at a manifest.
+        let top_index_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.index.v1+json","size":{},"digest":"{}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+            child_index_bytes.len(),
+            child_index_digest
+        );
+        let top_index_bytes = top_index_json.into_bytes();
+
+        let mut r: Routes = HashMap::new();
+
+        r.insert(
+            "/v2/".to_string(),
+            (
+                "application/json".to_string(),
+                String::new(),
+                b"{}".to_vec(),
+            ),
+        );
+        r.insert(
+            format!("/v2/{}/manifests/latest", image_name),
+            (
+                "application/vnd.oci.image.index.v1+json".to_string(),
+                sha256_of(&top_index_bytes),
+                top_index_bytes,
+            ),
+        );
+        r.insert(
+            format!("/v2/{}/manifests/{}", image_name, child_index_digest),
+            (
+                "application/vnd.oci.image.index.v1+json".to_string(),
+                child_index_digest,
+                child_index_bytes,
+            ),
+        );
+        r.insert(
+            format!("/v2/{}/manifests/{}", image_name, manifest_digest),
+            (
+                "application/vnd.oci.image.manifest.v1+json".to_string(),
+                manifest_digest,
+                manifest_bytes,
+            ),
+        );
+        r.insert(
+            format!("/v2/{}/blobs/{}", image_name, config_digest),
+            (
+                "application/vnd.oci.image.config.v1+json".to_string(),
+                config_digest,
+                config_bytes,
+            ),
+        );
         r.insert(
             format!("/v2/{}/blobs/{}", image_name, layer_digest),
             (
@@ -10486,6 +10623,240 @@ mod images {
 
         // Cleanup.
         let _ = pelagos::image::remove_image(reference);
+    }
+
+    /// test_image_pull_mock_registry_nested_index
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Pulls an image whose top-level index's per-platform entry is itself
+    /// another index rather than a direct manifest — the shape buildx commonly
+    /// produces and the exact repro from #533
+    /// (ghcr.io/goauthentik/server:2026.8.0). Before the fix this failed with
+    /// "nested image index not supported"; the fix recurses through nested
+    /// indices until a direct manifest is found.
+    ///
+    /// Failure indicates a regression in the nested-index recursion added for #533.
+    #[test]
+    fn test_image_pull_mock_registry_nested_index() {
+        if !is_root() {
+            eprintln!("Skipping test_image_pull_mock_registry_nested_index: requires root");
+            return;
+        }
+
+        let image_name = "library/pelagos-mock-nested";
+        let registry = MockOciRegistry::spawn_nested(image_name);
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            format!("[mirrors]\n\"docker.io\" = [\"{}\"]\n", registry.endpoint()),
+        )
+        .expect("write registries.toml");
+
+        let reference = "docker.io/library/pelagos-mock-nested:latest";
+        let _ = pelagos::image::remove_image(reference);
+
+        let result = pull_via_binary(reference, tmp.path());
+        assert!(
+            result.is_ok(),
+            "nested-index pull failed (#533 regression?): {:?}",
+            result.err()
+        );
+
+        let manifest = pelagos::image::load_image(reference)
+            .expect("image manifest not stored after nested-index pull");
+        assert_eq!(
+            manifest.layers.len(),
+            1,
+            "expected 1 layer after nested-index resolution"
+        );
+        assert!(
+            pelagos::image::layer_exists(&manifest.layers[0]),
+            "layer dir missing after nested-index pull"
+        );
+
+        // Cleanup.
+        let _ = pelagos::image::remove_image(reference);
+    }
+
+    /// test_concurrent_extract_layer_same_digest_no_corruption
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Extracts the same layer digest from two threads concurrently and
+    /// asserts the resulting layer directory still has a matching entry count
+    /// per `layer_verify_integrity()` (#534). Guards against the corruption
+    /// class the integrity check was added to catch — a torn write from two
+    /// extractions racing on the same content-addressable digest — even
+    /// though the original cluster incident's exact trigger was never
+    /// reproduced outside the cluster.
+    #[test]
+    #[serial]
+    fn test_concurrent_extract_layer_same_digest_no_corruption() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_concurrent_extract_layer_same_digest_no_corruption: requires root"
+            );
+            return;
+        }
+
+        use pelagos::image;
+
+        let mut tar_raw: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_raw);
+            for i in 0..20 {
+                let data = format!("payload-{i}").into_bytes();
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_size(data.len() as u64);
+                hdr.set_mode(0o644);
+                hdr.set_cksum();
+                b.append_data(&mut hdr, format!("file-{i}.txt"), &data[..])
+                    .unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&tar_raw).unwrap();
+            e.finish().unwrap()
+        };
+
+        let digest = "sha256:test_concurrent_extract_no_corruption_deadbeef";
+        let layer_path = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&layer_path);
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let gz = gz.clone();
+                let digest = digest.to_string();
+                std::thread::spawn(move || {
+                    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+                    tmp.write_all(&gz).unwrap();
+                    tmp.flush().unwrap();
+                    image::extract_layer(
+                        &digest,
+                        tmp.path(),
+                        "application/vnd.oci.image.layer.v1.tar+gzip",
+                    )
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().expect("concurrent extract_layer");
+        }
+
+        assert!(
+            image::layer_exists(digest),
+            "layer should exist after concurrent extraction"
+        );
+        assert!(
+            image::layer_verify_integrity(digest),
+            "layer entry count should match after concurrent extraction (no torn write)"
+        );
+
+        let _ = std::fs::remove_dir_all(&layer_path);
+    }
+
+    /// test_layer_missing_marker_causes_re_extraction (integrity variant)
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Extracts a real layer, then deletes files from the extracted directory
+    /// WITHOUT touching the completion sentinel — simulating #534's actual
+    /// symptom (a layer whose sentinel survives but whose contents no longer
+    /// match what was recorded, so `pelagos image pull` silently reported
+    /// "Already present" over a broken cache). Asserts:
+    ///   - `layer_exists()` still returns true (sentinel alone can't detect this)
+    ///   - `layer_verify_integrity()` returns false (the entry-count check catches it)
+    ///   - `discard_layer()` removes it so a subsequent extract_layer() succeeds
+    ///
+    /// Failure indicates the #534 corruption-on-reuse fix has regressed.
+    #[test]
+    #[serial]
+    fn test_layer_corruption_after_extraction_detected_on_reuse() {
+        if !is_root() {
+            eprintln!(
+                "Skipping test_layer_corruption_after_extraction_detected_on_reuse: requires root"
+            );
+            return;
+        }
+
+        use pelagos::image;
+
+        let mut tar_raw: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_raw);
+            for i in 0..5 {
+                let data = format!("payload-{i}").into_bytes();
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_size(data.len() as u64);
+                hdr.set_mode(0o644);
+                hdr.set_cksum();
+                b.append_data(&mut hdr, format!("file-{i}.txt"), &data[..])
+                    .unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&tar_raw).unwrap();
+            e.finish().unwrap()
+        };
+
+        let digest = "sha256:test_corruption_after_extraction_facefeed";
+        let layer_path = image::layer_dir(digest);
+        let _ = std::fs::remove_dir_all(&layer_path);
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&gz).unwrap();
+        tmp.flush().unwrap();
+        image::extract_layer(
+            digest,
+            tmp.path(),
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("extract_layer");
+
+        assert!(image::layer_exists(digest), "layer should exist");
+        assert!(
+            image::layer_verify_integrity(digest),
+            "freshly extracted layer should pass integrity check"
+        );
+
+        // Simulate post-extraction corruption: delete a file, leave the sentinel.
+        std::fs::remove_file(layer_path.join("file-0.txt")).expect("remove file to corrupt");
+
+        assert!(
+            image::layer_exists(digest),
+            "layer_exists() cannot detect post-extraction corruption (sentinel untouched) — this is expected, not a bug"
+        );
+        assert!(
+            !image::layer_verify_integrity(digest),
+            "layer_verify_integrity() should detect the missing file"
+        );
+
+        image::discard_layer(digest).expect("discard_layer");
+        assert!(
+            !image::layer_exists(digest),
+            "layer should be gone after discard_layer()"
+        );
+
+        // Re-extraction should succeed and pass integrity again.
+        image::extract_layer(
+            digest,
+            tmp.path(),
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+        .expect("re-extract after discard");
+        assert!(
+            image::layer_verify_integrity(digest),
+            "re-extracted layer should pass integrity"
+        );
+
+        let _ = std::fs::remove_dir_all(&layer_path);
     }
 }
 
