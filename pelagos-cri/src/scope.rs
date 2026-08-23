@@ -120,7 +120,12 @@ pub fn sandbox_unit(sandbox_id: &str) -> String {
 /// `--setenv=` — see `setenv_args` for why. Order is `--setenv=...` flags first,
 /// then `--`, then the wrapped command, matching `systemd-run`'s own option
 /// convention of flags-before-`--`.
-pub fn build_scope_argv(unit: &str, bin: &str, args: &[&str], envs: &[(String, String)]) -> Vec<String> {
+pub fn build_scope_argv(
+    unit: &str,
+    bin: &str,
+    args: &[&str],
+    envs: &[(String, String)],
+) -> Vec<String> {
     let mut v = vec![
         "systemd-run".to_string(),
         "--scope".to_string(),
