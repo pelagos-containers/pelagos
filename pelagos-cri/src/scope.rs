@@ -31,21 +31,30 @@ use std::sync::OnceLock;
 /// first referenced; an optional shipped `pelagos.slice` may set properties.
 pub const SLICE: &str = "pelagos.slice";
 
-/// Escape a string for use as a systemd ExecStart argument.
+/// Whether a given systemd handles `$VAR` / `${VAR}` references inside a transient
+/// unit's (pre-split, D-Bus-supplied) ExecStart argv is **version-dependent, not a
+/// constant** — confirmed live on two real hosts: systemd 259 expands them against
+/// the scope's own environment (undeclared vars become an empty string); systemd 255
+/// does not touch the argv at all. #483 originally "fixed" this by escaping every `$`
+/// as `$$` (systemd's own literal-dollar escape), on the assumption that expansion
+/// always happens. On a systemd that does *not* expand, that escape is never undone:
+/// the container process (bash) receives a literal `$$` in its argv, which bash
+/// itself then interprets as *its own PID* (a container's init process is PID 1 in
+/// its own PID namespace) — corrupting `${BIN_PATH}` into `1{BIN_PATH}` (#543).
 ///
-/// systemd performs `$VAR` / `${VAR}` expansion on every token of an ExecStart line,
-/// including the arguments of a transient unit created by `systemd-run`. If a
-/// container's command or environment value contains a `$` reference (e.g. bash
-/// scripts that use `${BIN_PATH}`), systemd expands it against the *scope*
-/// environment — where the variable is unset — replacing it with an empty string
-/// before the container process ever runs.
-///
-/// The fix is to escape every `$` as `$$`. systemd interprets `$$` as a literal `$`
-/// and passes it through unchanged, so the container process (bash in this case)
-/// receives the original `${BIN_PATH}` and expands it correctly using the env vars
-/// set by pelagos via `Command::env()`.
-fn escape_systemd_arg(s: &str) -> String {
-    s.replace('$', "$$")
+/// The version-independent fix is to never rely on which behavior a given systemd
+/// has: pass the container's declared env vars to `systemd-run` itself via
+/// `--setenv=KEY=VALUE`, mirroring the `--env` values pelagos-cri already passes to
+/// `pelagos run`. If systemd *does* expand `$VAR` references in the argv, they now
+/// resolve to the same value the container's own process would produce (a harmless,
+/// idempotent no-op substitution). If it does not, the raw text passes through
+/// unmodified and bash performs its own correct expansion, exactly as it always did
+/// outside the systemd-run wrapper. Either way the result is correct, and the
+/// container's actual command text is never rewritten.
+fn setenv_args(envs: &[(String, String)]) -> Vec<String> {
+    envs.iter()
+        .map(|(k, v)| format!("--setenv={}={}", k, v))
+        .collect()
 }
 
 /// Whether this host is running under systemd and `systemd-run` is usable.
@@ -105,7 +114,13 @@ pub fn sandbox_unit(sandbox_id: &str) -> String {
 /// Build the `systemd-run --scope` argv that wraps a quick-returning command
 /// whose forked descendants must outlive the runtime (the `pelagos run --detach`
 /// watcher). Returns the full argv beginning with `systemd-run`.
-pub fn build_scope_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
+///
+/// `envs` are the container's declared environment variables (the same pairs
+/// passed to `pelagos run` as `--env`), mirrored onto the wrapper via
+/// `--setenv=` — see `setenv_args` for why. Order is `--setenv=...` flags first,
+/// then `--`, then the wrapped command, matching `systemd-run`'s own option
+/// convention of flags-before-`--`.
+pub fn build_scope_argv(unit: &str, bin: &str, args: &[&str], envs: &[(String, String)]) -> Vec<String> {
     let mut v = vec![
         "systemd-run".to_string(),
         "--scope".to_string(),
@@ -113,10 +128,11 @@ pub fn build_scope_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
         format!("--slice={}", SLICE),
         format!("--unit={}", unit),
         "--quiet".to_string(),
-        "--".to_string(),
-        escape_systemd_arg(bin),
     ];
-    v.extend(args.iter().map(|s| escape_systemd_arg(s)));
+    v.extend(setenv_args(envs));
+    v.push("--".to_string());
+    v.push(bin.to_string());
+    v.extend(args.iter().map(|s| s.to_string()));
     v
 }
 
@@ -126,6 +142,9 @@ pub fn build_scope_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
 ///
 /// `KillMode=mixed` so that stopping the unit signals the main process directly,
 /// and `--collect` so a failed unit is garbage-collected rather than lingering.
+/// The pause process's argv is entirely pelagos-internal (no user-supplied
+/// command or env references), so unlike `build_scope_argv` it needs no
+/// `--setenv` mirroring.
 pub fn build_service_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
     let mut v = vec![
         "systemd-run".to_string(),
@@ -135,9 +154,9 @@ pub fn build_service_argv(unit: &str, bin: &str, args: &[&str]) -> Vec<String> {
         "--property=KillMode=mixed".to_string(),
         "--quiet".to_string(),
         "--".to_string(),
-        escape_systemd_arg(bin),
+        bin.to_string(),
     ];
-    v.extend(args.iter().map(|s| escape_systemd_arg(s)));
+    v.extend(args.iter().map(|s| s.to_string()));
     v
 }
 
@@ -179,6 +198,7 @@ mod tests {
             "pelagos-ctr-pcri-abc123.scope",
             "/usr/local/bin/pelagos",
             &["run", "--detach", "--name", "pcri-abc123"],
+            &[],
         );
         assert_eq!(argv[0], "systemd-run");
         assert!(argv.contains(&"--scope".to_string()));
@@ -211,10 +231,16 @@ mod tests {
     }
 
     #[test]
-    fn dollar_signs_in_args_are_escaped_for_systemd() {
-        // systemd expands $VAR / ${VAR} in ExecStart args; we must escape $ → $$
-        // so container bash scripts that reference env vars like ${BIN_PATH} are
-        // not expanded prematurely by systemd before the container runs.
+    fn dollar_refs_in_args_are_passed_through_unmodified() {
+        // #543: whether systemd expands $VAR / ${VAR} references inside a transient
+        // unit's argv is version-dependent (confirmed live: systemd 259 does, 255
+        // does not) — a prior fix (#483) escaped every `$` as `$$` assuming
+        // expansion always happens. On a systemd that does NOT expand, that escape
+        // is never undone, so the container's bash process receives a literal `$$`
+        // and interprets it as *its own PID* (1, as a container's PID-1 init),
+        // corrupting `${BIN_PATH}` into `1{BIN_PATH}` — exactly the reported bug.
+        // The fix must never rewrite the command text; the env mirroring below is
+        // what makes systemd's expansion (when it happens) harmless instead.
         let script = "bash -ec 'nsenter \"${BIN_PATH}/tool\"'";
         let argv = build_scope_argv(
             "pelagos-ctr-pcri-abc.scope",
@@ -229,12 +255,38 @@ mod tests {
                 "-ec",
                 script,
             ],
+            &[("BIN_PATH".to_string(), "/k3s/bin".to_string())],
         );
-        let escaped_script = argv.last().unwrap();
-        assert_eq!(escaped_script, "bash -ec 'nsenter \"$${BIN_PATH}/tool\"'");
-        // args without $ are unchanged
+        assert_eq!(argv.last().unwrap(), script);
         assert!(argv.contains(&"--env".to_string()));
         assert!(argv.contains(&"BIN_PATH=/k3s/bin".to_string()));
+    }
+
+    #[test]
+    fn scope_argv_mirrors_container_envs_via_setenv() {
+        // The container's declared env vars are mirrored onto systemd-run itself
+        // via --setenv, so that IF the local systemd expands $VAR references in
+        // the wrapped argv, they resolve to the same value the container process
+        // would produce anyway — an idempotent no-op rather than data loss.
+        let argv = build_scope_argv(
+            "pelagos-ctr-pcri-abc.scope",
+            "/usr/local/bin/pelagos",
+            &["run", "--detach"],
+            &[
+                ("BIN_PATH".to_string(), "/k3s/bin".to_string()),
+                ("FOO".to_string(), "bar".to_string()),
+            ],
+        );
+        assert!(argv.contains(&"--setenv=BIN_PATH=/k3s/bin".to_string()));
+        assert!(argv.contains(&"--setenv=FOO=bar".to_string()));
+        // --setenv flags must precede the `--` separator (they configure
+        // systemd-run itself, not the wrapped command).
+        let sep = argv.iter().position(|s| s == "--").unwrap();
+        let setenv_pos = argv
+            .iter()
+            .position(|s| s == "--setenv=BIN_PATH=/k3s/bin")
+            .unwrap();
+        assert!(setenv_pos < sep);
     }
 
     #[test]
