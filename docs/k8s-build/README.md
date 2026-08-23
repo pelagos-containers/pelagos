@@ -1,5 +1,14 @@
 # Building pelagos in a Kubernetes / k3s cluster
 
+> **If you're building on the actual home k3s cluster** (not just using this as
+> a reference), the real, working automation — with the actual node names, LAN
+> IPs, and internal registry address — lives in the **private**
+> `skeptomai/home-monitoring` repo under `pelagos-build/README.md`, not here.
+> This directory is intentionally a genericized, placeholder-driven template;
+> `pelagos` is a public repo, so home-lab topology can't live in it. See that
+> repo's README for the current node classes, the build/deploy/test flow, and
+> the "guinea pig" node.
+
 An example of building pelagos **inside the cluster** — useful when your dev
 machine is remote/slow and the cluster nodes have fast disks + uplinks. A `Job`
 compiles `pelagos` + `pelagos-cri` on a build node; you then install the binaries
