@@ -2199,7 +2199,7 @@ impl RuntimeService for RuntimeSvc {
         let out = if scope::systemd_available() {
             let unit = scope::container_unit(&container.pelagos_name);
             scope::stop_unit(&unit).await; // clear any stale unit for this name
-            let argv = scope::build_scope_argv(&unit, &bin, &args_ref);
+            let argv = scope::build_scope_argv(&unit, &bin, &args_ref, &container.envs);
             let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
             run_pelagos(argv_ref[0], &argv_ref[1..])
                 .await
