@@ -1870,7 +1870,11 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
         let dest = image::layer_dir(&digest_str);
         let tmp_path = tmp_dest.path().to_path_buf();
         if std::fs::rename(&tmp_path, &dest).is_err() {
-            // Cross-filesystem or rename failed — copy and set group permissions.
+            // Cross-filesystem, or dest already exists (content-addressed: same
+            // digest means same bytes, so an existing dest is already correct —
+            // e.g. re-deriving a build layer whose blob was lost but whose
+            // directory is still the canonical copy for this digest, #547).
+            // Either way, copying our content on top is safe and idempotent.
             image::create_store_dir(&dest)?;
             copy_dir_recursive(&tmp_path, &dest)?;
         } else {
@@ -1878,6 +1882,7 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o775));
         }
+        image::mark_layer_complete(&dest)?;
 
         log::debug!("created layer {}", &hex[..12]);
         return Ok(digest_str);
@@ -1929,10 +1934,36 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     }
     image::create_store_dir(&partial)?;
     copy_dir_recursive(source_dir, &partial)?;
-    std::fs::rename(&partial, &dest)?;
+    rename_into_layer_store(&partial, &dest)?;
+    image::mark_layer_complete(&dest)?;
 
     log::debug!("created layer {}", &hex[..12]);
     Ok(digest)
+}
+
+/// Rename a staged `partial` layer directory into its final content-addressed
+/// `dest` path, treating "`dest` already exists as a directory" as success
+/// rather than an error.
+///
+/// The layer store is content-addressed: a `dest` that already exists at this
+/// exact digest path already has the same bytes this rename would have
+/// produced, so a colliding `dest` is a benign race or reuse, not a real
+/// failure — this mirrors `image::extract_layer()`'s handling of the same
+/// class of collision. The common trigger is `ensure_blob()` re-deriving a
+/// build layer whose compressed blob was lost but whose extracted directory
+/// (the `source_dir` passed to `create_layer_from_dir`) is itself already the
+/// canonical copy for this digest, i.e. `dest == source_dir` — `rename` onto
+/// a non-empty directory always fails with `ENOTEMPTY` in that case (#547).
+/// Only a `dest` that doesn't exist at all after the failed rename indicates
+/// a genuine error (permission denied, disk full, etc.), which is propagated.
+fn rename_into_layer_store(partial: &Path, dest: &Path) -> io::Result<()> {
+    if let Err(e) = std::fs::rename(partial, dest) {
+        let _ = std::fs::remove_dir_all(partial);
+        if !dest.is_dir() {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3378,5 +3409,56 @@ FROM ${NEXT} AS stage1\n";
             }
             _ => panic!("expected FROM instruction"),
         }
+    }
+
+    /// #547: renaming a staged `partial` onto a `dest` that already exists as
+    /// a non-empty directory must succeed, not propagate the raw `ENOTEMPTY`
+    /// io error — this is the exact collision `create_layer_from_dir` hits
+    /// when re-deriving a build layer whose blob was lost but whose extracted
+    /// directory is already the canonical copy for that digest.
+    #[test]
+    fn rename_into_layer_store_accepts_existing_nonempty_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let partial = tmp.path().join("partial");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("file.txt"), b"content").unwrap();
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("file.txt"), b"content").unwrap();
+
+        rename_into_layer_store(&partial, &dest).unwrap();
+
+        // Original dest content survives untouched; partial is cleaned up.
+        assert!(dest.join("file.txt").exists());
+        assert!(!partial.exists());
+    }
+
+    /// A genuine failure (dest never ends up existing) must still be reported,
+    /// not silently swallowed.
+    #[test]
+    fn rename_into_layer_store_propagates_real_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join("nonexistent-partial");
+        let dest = tmp.path().join("no-such-parent-dir").join("dest");
+
+        let result = rename_into_layer_store(&partial, &dest);
+        assert!(result.is_err());
+    }
+
+    /// Renaming onto a genuinely empty existing `dest` directory (the normal,
+    /// non-colliding case) still succeeds via the real rename, not the
+    /// fallback branch.
+    #[test]
+    fn rename_into_layer_store_normal_rename_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let partial = tmp.path().join("partial");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("file.txt"), b"content").unwrap();
+
+        rename_into_layer_store(&partial, &dest).unwrap();
+
+        assert!(dest.join("file.txt").exists());
+        assert!(!partial.exists());
     }
 }

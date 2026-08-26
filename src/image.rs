@@ -263,6 +263,30 @@ pub fn layer_exists(digest: &str) -> bool {
     dir.is_dir() && dir.join(LAYER_COMPLETE_MARKER).exists()
 }
 
+/// Write the `LAYER_COMPLETE_MARKER` sentinel into an already-populated layer
+/// directory, fsync'd so it survives a power cut (same durability contract as
+/// `extract_layer()`'s own sentinel write).
+///
+/// `create_layer_from_dir()` (build.rs) builds layers from a container's
+/// overlay upper dir rather than a pulled registry blob, and previously never
+/// wrote this marker at all — so `layer_exists()` was permanently `false` for
+/// every layer created by `pelagos build`, even when the directory was
+/// complete and correct. That made a later re-derivation (`ensure_blob()`,
+/// used by `image push`/`image save` when a layer's compressed blob is
+/// missing) always retry from scratch instead of recognizing the directory as
+/// already done — and when the recomputed digest happened to equal the
+/// source directory's own digest (the common case: identical content hashes
+/// identically), the resulting `rename(partial, dest)` collided with `dest`
+/// being `source_dir` itself, a non-empty directory, failing with
+/// `ENOTEMPTY` (#547).
+pub(crate) fn mark_layer_complete(dest: &std::path::Path) -> io::Result<()> {
+    use std::io::Write as _;
+    let entry_count = count_entries(dest).unwrap_or(0);
+    let mut f = std::fs::File::create(dest.join(LAYER_COMPLETE_MARKER))?;
+    write!(f, "{}", entry_count)?;
+    f.sync_all()
+}
+
 /// Recursively count filesystem entries (files, dirs, symlinks, devices) under
 /// `dir`, not counting `dir` itself. Used to record an extracted layer's entry
 /// count at extraction time and cheaply re-check it later without re-reading
@@ -1178,5 +1202,25 @@ mod tests {
         // Top-first for overlayfs lowerdir
         assert_eq!(dirs[0], crate::paths::layers_dir().join("top"));
         assert_eq!(dirs[1], crate::paths::layers_dir().join("bottom"));
+    }
+
+    /// #547: `create_layer_from_dir()` (build.rs) never wrote the completion
+    /// marker for layers it created, so `layer_exists()` was permanently
+    /// false for every build-created layer. `mark_layer_complete()` closes
+    /// that gap — verify it writes a readable, non-empty sentinel file that
+    /// `layer_exists()`'s own check (`dir.join(LAYER_COMPLETE_MARKER).exists()`)
+    /// would find. Uses a plain tempdir, not the real layer store — the
+    /// function only touches the path it's given.
+    #[test]
+    fn mark_layer_complete_writes_readable_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("somefile"), b"content").unwrap();
+
+        mark_layer_complete(tmp.path()).unwrap();
+
+        let marker = tmp.path().join(LAYER_COMPLETE_MARKER);
+        assert!(marker.exists());
+        let contents = std::fs::read_to_string(&marker).unwrap();
+        assert!(!contents.is_empty(), "marker should record an entry count");
     }
 }
