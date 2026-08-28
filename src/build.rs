@@ -1995,7 +1995,8 @@ fn append_dir_all_no_follow<W: io::Write>(
         // re-derivation that re-tars an already-marked directory (ensure_blob()
         // re-deriving a lost blob from its own prior output) would otherwise
         // bake this internal sentinel into the published layer content.
-        if prefix == Path::new(".") && entry.file_name() == std::ffi::OsStr::new(image::LAYER_COMPLETE_MARKER)
+        if prefix == Path::new(".")
+            && entry.file_name() == std::ffi::OsStr::new(image::LAYER_COMPLETE_MARKER)
         {
             continue;
         }
