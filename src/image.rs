@@ -250,7 +250,7 @@ pub fn layer_dir(digest: &str) -> PathBuf {
 /// directory rename completes). A directory that lacks the sentinel was left by
 /// an interrupted extraction (e.g. a power cut after `rename(2)` but before
 /// the write-back completed) and must be treated as corrupt.
-const LAYER_COMPLETE_MARKER: &str = ".pelagos_complete";
+pub(crate) const LAYER_COMPLETE_MARKER: &str = ".pelagos_complete";
 
 /// Check whether a layer has already been fully extracted.
 ///

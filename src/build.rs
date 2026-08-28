@@ -1120,10 +1120,19 @@ fn find_sole_wasm_file(layer_dir: &std::path::Path) -> Option<std::path::PathBuf
 }
 
 /// Recursively collect all regular files under `dir`.
+///
+/// Excludes `image::LAYER_COMPLETE_MARKER` — `create_layer_from_dir()` writes
+/// that sentinel into every layer dir it creates (#547), which would
+/// otherwise count as a second file and break `find_sole_wasm_file()`'s
+/// "exactly one file" check for a Wasm module `COPY`'d into a layer on its
+/// own (#548's regression, caught before merge).
 fn collect_layer_files(dir: &std::path::Path) -> io::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(image::LAYER_COMPLETE_MARKER) {
+            continue;
+        }
         let path = entry.path();
         if path.is_dir() {
             files.extend(collect_layer_files(&path)?);
@@ -1981,6 +1990,15 @@ fn append_dir_all_no_follow<W: io::Write>(
 ) -> Result<(), io::Error> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        // Exclude image::LAYER_COMPLETE_MARKER at the layer dir's root (#547):
+        // create_layer_from_dir() writes it into every layer it creates, so a
+        // re-derivation that re-tars an already-marked directory (ensure_blob()
+        // re-deriving a lost blob from its own prior output) would otherwise
+        // bake this internal sentinel into the published layer content.
+        if prefix == Path::new(".") && entry.file_name() == std::ffi::OsStr::new(image::LAYER_COMPLETE_MARKER)
+        {
+            continue;
+        }
         let ft = entry.file_type()?; // does NOT follow symlinks
         let name = prefix.join(entry.file_name());
         let path = entry.path();
@@ -3460,5 +3478,24 @@ FROM ${NEXT} AS stage1\n";
 
         assert!(dest.join("file.txt").exists());
         assert!(!partial.exists());
+    }
+
+    /// Regression for the #547 fix itself: `create_layer_from_dir()` now
+    /// writes `image::LAYER_COMPLETE_MARKER` into every layer dir it creates.
+    /// A Wasm module `COPY`'d into a layer on its own must still be detected
+    /// as a sole-file Wasm layer — the marker must not count as a second file.
+    #[test]
+    fn collect_layer_files_excludes_completion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("module.wasm"), b"fake wasm bytes").unwrap();
+        std::fs::write(tmp.path().join(image::LAYER_COMPLETE_MARKER), b"1").unwrap();
+
+        let files = collect_layer_files(tmp.path()).unwrap();
+
+        assert_eq!(
+            files,
+            vec![tmp.path().join("module.wasm")],
+            "the completion marker must not be counted as layer content"
+        );
     }
 }
