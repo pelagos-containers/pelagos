@@ -1120,10 +1120,19 @@ fn find_sole_wasm_file(layer_dir: &std::path::Path) -> Option<std::path::PathBuf
 }
 
 /// Recursively collect all regular files under `dir`.
+///
+/// Excludes `image::LAYER_COMPLETE_MARKER` — `create_layer_from_dir()` writes
+/// that sentinel into every layer dir it creates (#547), which would
+/// otherwise count as a second file and break `find_sole_wasm_file()`'s
+/// "exactly one file" check for a Wasm module `COPY`'d into a layer on its
+/// own (#548's regression, caught before merge).
 fn collect_layer_files(dir: &std::path::Path) -> io::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(image::LAYER_COMPLETE_MARKER) {
+            continue;
+        }
         let path = entry.path();
         if path.is_dir() {
             files.extend(collect_layer_files(&path)?);
@@ -1870,7 +1879,11 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
         let dest = image::layer_dir(&digest_str);
         let tmp_path = tmp_dest.path().to_path_buf();
         if std::fs::rename(&tmp_path, &dest).is_err() {
-            // Cross-filesystem or rename failed — copy and set group permissions.
+            // Cross-filesystem, or dest already exists (content-addressed: same
+            // digest means same bytes, so an existing dest is already correct —
+            // e.g. re-deriving a build layer whose blob was lost but whose
+            // directory is still the canonical copy for this digest, #547).
+            // Either way, copying our content on top is safe and idempotent.
             image::create_store_dir(&dest)?;
             copy_dir_recursive(&tmp_path, &dest)?;
         } else {
@@ -1878,6 +1891,7 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o775));
         }
+        image::mark_layer_complete(&dest)?;
 
         log::debug!("created layer {}", &hex[..12]);
         return Ok(digest_str);
@@ -1929,10 +1943,36 @@ pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     }
     image::create_store_dir(&partial)?;
     copy_dir_recursive(source_dir, &partial)?;
-    std::fs::rename(&partial, &dest)?;
+    rename_into_layer_store(&partial, &dest)?;
+    image::mark_layer_complete(&dest)?;
 
     log::debug!("created layer {}", &hex[..12]);
     Ok(digest)
+}
+
+/// Rename a staged `partial` layer directory into its final content-addressed
+/// `dest` path, treating "`dest` already exists as a directory" as success
+/// rather than an error.
+///
+/// The layer store is content-addressed: a `dest` that already exists at this
+/// exact digest path already has the same bytes this rename would have
+/// produced, so a colliding `dest` is a benign race or reuse, not a real
+/// failure — this mirrors `image::extract_layer()`'s handling of the same
+/// class of collision. The common trigger is `ensure_blob()` re-deriving a
+/// build layer whose compressed blob was lost but whose extracted directory
+/// (the `source_dir` passed to `create_layer_from_dir`) is itself already the
+/// canonical copy for this digest, i.e. `dest == source_dir` — `rename` onto
+/// a non-empty directory always fails with `ENOTEMPTY` in that case (#547).
+/// Only a `dest` that doesn't exist at all after the failed rename indicates
+/// a genuine error (permission denied, disk full, etc.), which is propagated.
+fn rename_into_layer_store(partial: &Path, dest: &Path) -> io::Result<()> {
+    if let Err(e) = std::fs::rename(partial, dest) {
+        let _ = std::fs::remove_dir_all(partial);
+        if !dest.is_dir() {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1950,6 +1990,16 @@ fn append_dir_all_no_follow<W: io::Write>(
 ) -> Result<(), io::Error> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        // Exclude image::LAYER_COMPLETE_MARKER at the layer dir's root (#547):
+        // create_layer_from_dir() writes it into every layer it creates, so a
+        // re-derivation that re-tars an already-marked directory (ensure_blob()
+        // re-deriving a lost blob from its own prior output) would otherwise
+        // bake this internal sentinel into the published layer content.
+        if prefix == Path::new(".")
+            && entry.file_name() == std::ffi::OsStr::new(image::LAYER_COMPLETE_MARKER)
+        {
+            continue;
+        }
         let ft = entry.file_type()?; // does NOT follow symlinks
         let name = prefix.join(entry.file_name());
         let path = entry.path();
@@ -3378,5 +3428,75 @@ FROM ${NEXT} AS stage1\n";
             }
             _ => panic!("expected FROM instruction"),
         }
+    }
+
+    /// #547: renaming a staged `partial` onto a `dest` that already exists as
+    /// a non-empty directory must succeed, not propagate the raw `ENOTEMPTY`
+    /// io error — this is the exact collision `create_layer_from_dir` hits
+    /// when re-deriving a build layer whose blob was lost but whose extracted
+    /// directory is already the canonical copy for that digest.
+    #[test]
+    fn rename_into_layer_store_accepts_existing_nonempty_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let partial = tmp.path().join("partial");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("file.txt"), b"content").unwrap();
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("file.txt"), b"content").unwrap();
+
+        rename_into_layer_store(&partial, &dest).unwrap();
+
+        // Original dest content survives untouched; partial is cleaned up.
+        assert!(dest.join("file.txt").exists());
+        assert!(!partial.exists());
+    }
+
+    /// A genuine failure (dest never ends up existing) must still be reported,
+    /// not silently swallowed.
+    #[test]
+    fn rename_into_layer_store_propagates_real_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join("nonexistent-partial");
+        let dest = tmp.path().join("no-such-parent-dir").join("dest");
+
+        let result = rename_into_layer_store(&partial, &dest);
+        assert!(result.is_err());
+    }
+
+    /// Renaming onto a genuinely empty existing `dest` directory (the normal,
+    /// non-colliding case) still succeeds via the real rename, not the
+    /// fallback branch.
+    #[test]
+    fn rename_into_layer_store_normal_rename_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let partial = tmp.path().join("partial");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("file.txt"), b"content").unwrap();
+
+        rename_into_layer_store(&partial, &dest).unwrap();
+
+        assert!(dest.join("file.txt").exists());
+        assert!(!partial.exists());
+    }
+
+    /// Regression for the #547 fix itself: `create_layer_from_dir()` now
+    /// writes `image::LAYER_COMPLETE_MARKER` into every layer dir it creates.
+    /// A Wasm module `COPY`'d into a layer on its own must still be detected
+    /// as a sole-file Wasm layer — the marker must not count as a second file.
+    #[test]
+    fn collect_layer_files_excludes_completion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("module.wasm"), b"fake wasm bytes").unwrap();
+        std::fs::write(tmp.path().join(image::LAYER_COMPLETE_MARKER), b"1").unwrap();
+
+        let files = collect_layer_files(tmp.path()).unwrap();
+
+        assert_eq!(
+            files,
+            vec![tmp.path().join("module.wasm")],
+            "the completion marker must not be counted as layer content"
+        );
     }
 }
