@@ -308,6 +308,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         apparmor_profile: None,
         selinux_label: None,
         stop_grace_period: None,
+        dns: Vec::new(),
     };
 
     for arg in &args[1..] {

@@ -780,10 +780,7 @@ mod tests {
         // error or panic — ServiceSpec derives Default, and dns must behave
         // like the other Vec<String> fields (cap_add, networks) in this regard.
         let mut i = interp();
-        eval_ok(
-            &mut i,
-            r#"(define-service svc "app" :image "app:latest")"#,
-        );
+        eval_ok(&mut i, r#"(define-service svc "app" :image "app:latest")"#);
         let v = eval_ok(&mut i, "svc");
         match v {
             Value::ServiceSpec(s) => {
