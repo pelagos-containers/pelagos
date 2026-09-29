@@ -150,6 +150,11 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_state = AppState::new(args.pelagos_bin.clone());
 
+    // Expose in-memory sandbox/container bookkeeping as gauges so internal
+    // state drift (#351/#347's root cause class) is visible as a metric
+    // instead of only manifesting downstream as a crash loop (#554).
+    app_state.start_tracked_state_gauge_sampler();
+
     // Periodically reap dead-pause ("phantom") sandboxes so we never keep
     // presenting the kubelet an orphaned, un-operable sandbox to garbage-collect
     // — the path that deleted the host /bin (#347). Without this, a phantom
