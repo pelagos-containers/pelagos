@@ -754,6 +754,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_define_service_dns_keyword() {
+        // issue #550: :dns takes one or more atom values under one keyword,
+        // same shape as :cap-add — confirms parsing lands in spec.dns.
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "app"
+                 :image "app:latest"
+                 :dns   "100.100.100.100" "1.1.1.1")"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.dns, vec!["100.100.100.100", "1.1.1.1"]);
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_no_dns_defaults_empty() {
+        // A service with no :dns option must default to an empty list, not
+        // error or panic — ServiceSpec derives Default, and dns must behave
+        // like the other Vec<String> fields (cap_add, networks) in this regard.
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "app" :image "app:latest")"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert!(s.dns.is_empty());
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
     // ── define-service: dotted-pair env values with complex expressions (issue #159) ──
 
     #[test]

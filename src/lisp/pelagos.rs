@@ -66,6 +66,7 @@ pub fn register_pelagos_builtins(
                     user: None,
                     cap_add: Vec::new(),
                     cap_drop: Vec::new(),
+                    dns: Vec::new(),
                     apparmor_profile: None,
                     selinux_label: None,
                     stop_grace_period: None,
@@ -423,6 +424,11 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
         "cap-add" => {
             for v in vals {
                 spec.cap_add.push(str_or_sym("cap-add", v)?);
+            }
+        }
+        "dns" => {
+            for v in vals {
+                spec.dns.push(str_or_sym("dns", v)?);
             }
         }
         "cap-drop" => {

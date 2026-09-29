@@ -1,0 +1,18 @@
+;;; Fixture for test_compose_dns_keyword (issue #550).
+;;;
+;;; One service declaring an explicit :dns resolver — confirms the compose
+;;; `:dns` keyword actually lands in the container's /etc/resolv.conf,
+;;; overriding the runtime's normal auto-injected bridge-network default.
+;;;
+;;; Usage (tests supply a unique -p project name):
+;;;   sudo pelagos compose up -f stack.reml -p <project>
+
+(compose-up
+  (compose
+    (network "dns-kw-net" '(subnet "10.92.0.0/24"))
+
+    (service "app"
+      '(image "alpine:3.21")
+      '(network "dns-kw-net")
+      '(dns "9.9.9.9")
+      '(command "/bin/sh" "-c" "sleep 300"))))

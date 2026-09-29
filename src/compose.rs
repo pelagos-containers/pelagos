@@ -56,6 +56,10 @@ pub struct ServiceSpec {
     pub selinux_label: Option<String>,
     /// Seconds to wait for graceful shutdown before SIGKILL (default: 10).
     pub stop_grace_period: Option<u64>,
+    /// Extra DNS resolvers for this service, e.g. `:dns ("100.100.100.100")`.
+    /// Explicit `:dns` wins over the runtime's auto-injected bridge-network
+    /// default (mirrors `pelagos run --dns`'s "explicit --dns always wins").
+    pub dns: Vec<String>,
 }
 
 /// A volume mount: `name:path` inside the container.
