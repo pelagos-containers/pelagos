@@ -626,7 +626,12 @@ fn spawn_service(
     }
 
     // Note: DNS nameservers (gateway IPs) are auto-injected by the container
-    // runtime's spawn() — no explicit with_dns() needed here.
+    // runtime's spawn() — no explicit with_dns() needed here, UNLESS the
+    // service declares its own (:dns ...) resolvers, which take priority
+    // (mirrors `pelagos run --dns`'s "explicit --dns always wins").
+    if !svc.dns.is_empty() {
+        cmd = cmd.with_dns(&svc.dns);
+    }
 
     // Volumes.
     for vol in &svc.volumes {

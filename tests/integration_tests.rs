@@ -21321,6 +21321,93 @@ mod tutorial_e2e_p4 {
 }
 
 // ============================================================================
+// Compose :dns keyword (issue #550): explicit per-service DNS resolvers
+// ============================================================================
+//
+// A service's :dns option should land in the spawned container's
+// /etc/resolv.conf, taking priority over the runtime's normal
+// auto-injected bridge-network default (mirrors `pelagos run --dns`'s
+// "explicit --dns always wins" precedent — see src/cli/run.rs).
+
+/// Verify that a compose service with `:dns ("9.9.9.9")` gets that resolver
+/// in its /etc/resolv.conf, via a real `pelagos compose up` + `pelagos exec`
+/// round trip (not just the ServiceSpec parsing layer).
+#[test]
+#[serial_test::serial(nat)]
+fn test_compose_dns_keyword() {
+    if !is_root() {
+        eprintln!("SKIP test_compose_dns_keyword: requires root");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_pelagos");
+    let stack_file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/tutorial-e2e/dns-keyword-stack/stack.reml"
+    );
+
+    let ls = std::process::Command::new(bin)
+        .args(["image", "ls"])
+        .output()
+        .expect("pelagos image ls");
+    if !String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+        let status = std::process::Command::new(bin)
+            .args(["image", "pull", "alpine:3.21"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull failed");
+    }
+
+    let project = "dns-kw-test";
+    let down = |bin: &str, stack_file: &str, project: &str| {
+        let _ = std::process::Command::new(bin)
+            .args(["compose", "down", "-f", stack_file, "-p", project])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    down(bin, stack_file, project); // pre-clean
+
+    let up_status = std::process::Command::new(bin)
+        .args(["compose", "up", "-f", stack_file, "-p", project])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("compose up (dns keyword test)");
+    assert!(up_status.success(), "compose up should exit 0");
+
+    let app_name = format!("{}-app", project);
+
+    // Poll for the container to be running before exec'ing into it.
+    let ps_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut running = false;
+    while std::time::Instant::now() < ps_deadline {
+        if let Ok(out) = std::process::Command::new(bin).args(["ps"]).output() {
+            if String::from_utf8_lossy(&out.stdout).contains(&app_name) {
+                running = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    assert!(running, "app service should be running before dns check");
+
+    let exec_out = std::process::Command::new(bin)
+        .args(["exec", &app_name, "/bin/sh", "-c", "cat /etc/resolv.conf"])
+        .output()
+        .expect("pelagos exec cat resolv.conf");
+    let stdout = String::from_utf8_lossy(&exec_out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&exec_out.stderr).into_owned();
+
+    down(bin, stack_file, project);
+
+    assert!(
+        stdout.contains("9.9.9.9"),
+        "expected the compose :dns resolver 9.9.9.9 in /etc/resolv.conf; \
+         stdout='{}' stderr='{}'",
+        stdout.trim(),
+        stderr.trim()
+    );
+}
+
+// ============================================================================
 // Compose cap-add: verify capability restoration in compose services
 // ============================================================================
 //
