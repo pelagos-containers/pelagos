@@ -536,6 +536,48 @@ impl AppState {
             log::info!("startup: removing stale sandbox {sid} (pause process gone)");
         }
 
+        // Re-materialize the pelagos-native sandbox state (#553) for every
+        // sandbox that survived re-adoption above.
+        //
+        // Re-adoption only restores the CRI-facing records under
+        // /run/pelagos-cri/ (this struct). It does NOT restore the separate,
+        // pelagos-native `SandboxState` file at
+        // /run/pelagos/sandboxes/<id>/state.json, which `pelagos run --sandbox
+        // <id>` (i.e. every CreateContainer/StartContainer in this sandbox)
+        // depends on via `Command::with_sandbox()`. That file is normally
+        // written exactly once, by `run_pod_sandbox()` — nothing regenerates
+        // it on restart. If it's missing when re-adoption completes (the
+        // runtime dir was cleared by an install/upgrade, a prior partial
+        // failure, etc.), any subsequent container start in that sandbox
+        // fails permanently with "sandbox not found", because RunPodSandbox
+        // is never re-invoked for a re-adopted sandbox to repair it.
+        //
+        // hostNetwork pods hit this deterministically: the #457 fix below
+        // unconditionally kills and restarts their container on every
+        // pelagos-cri restart to free host ports, guaranteeing an immediate
+        // new StartContainer call against the (possibly state-less)
+        // re-adopted sandbox. Rewriting the native state here — from the
+        // same CriSandbox fields `run_pod_sandbox()` used to write it the
+        // first time — makes re-adoption fully self-healing regardless of
+        // why the file went missing.
+        for sandbox in inner.sandboxes.values() {
+            if let Err(e) = write_pelagos_sandbox_state(
+                &sandbox.id,
+                Some(&sandbox.name),
+                sandbox.pause_pid,
+                &sandbox.netns,
+                &sandbox.ip,
+                sandbox.namespaces,
+            ) {
+                log::warn!(
+                    "startup: failed to re-materialize pelagos-native state for \
+                     re-adopted sandbox {}: {e} — container starts in this sandbox \
+                     will fail until it is recreated",
+                    sandbox.id
+                );
+            }
+        }
+
         // #457 — hostNetwork container processes hold ports in the HOST network
         // namespace.  A CRI restart re-adopts the sandbox (pause still alive,
         // network namespace preserved) but leaves the container process running
@@ -897,6 +939,39 @@ mod tests {
             stale,
             vec!["running-dead".to_string()],
             "only the Running sandbox with a dead pause must be reaped"
+        );
+    }
+
+    /// #553 regression: `AppState::new()` re-materializes the pelagos-native
+    /// sandbox state (`write_pelagos_sandbox_state`) for exactly the sandboxes
+    /// that survive `reap_stale_sandboxes` — i.e. every re-adopted sandbox, and
+    /// none of the reaped ones. This is the set the new re-materialization loop
+    /// in `AppState::new()` iterates: proving it's exactly {alive-pause sandboxes}
+    /// (mixed with a native, pause-less sandbox and a stale one) is what makes
+    /// that loop safe — it must never try to write state for a sandbox that was
+    /// just purged, and must always cover every sandbox a hostNetwork container
+    /// restart (#457) could subsequently target.
+    #[test]
+    fn readoption_set_is_exactly_the_surviving_sandboxes() {
+        let mut inner = StateInner {
+            sandboxes: map(vec![
+                sandbox("readopted", 1001), // pause alive → survives, needs rewrite
+                sandbox("phantom", 1002),   // pause dead → reaped, must be skipped
+                sandbox("native", 0),       // no pause to check → survives
+            ]),
+            containers: HashMap::new(),
+            pelagos_bin: String::new(),
+        };
+
+        let (reaped, _to_kill) = inner.reap_stale_sandboxes(|pid| pid == 1001);
+        assert_eq!(reaped, vec!["phantom".to_string()]);
+
+        let mut surviving: Vec<&str> = inner.sandboxes.keys().map(|s| s.as_str()).collect();
+        surviving.sort();
+        assert_eq!(
+            surviving,
+            vec!["native", "readopted"],
+            "re-materialization must run for every surviving sandbox, and only those"
         );
     }
 
