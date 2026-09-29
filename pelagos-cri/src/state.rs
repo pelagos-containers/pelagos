@@ -1,5 +1,6 @@
 //! In-memory CRI state backed by disk at `/run/pelagos-cri/`.
 
+use metrics::{describe_gauge, gauge};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -682,6 +683,116 @@ impl AppState {
             log::info!("reconcile: removed stale sandbox {sid} (pause process gone)");
         }
     }
+
+    /// Spawns a periodic sampler exposing `pelagos_cri_tracked_sandboxes` and
+    /// `pelagos_cri_tracked_containers` gauges — internal bookkeeping state
+    /// made directly observable (#554), rather than only visible downstream
+    /// as a crash loop or, in #347's case, host filesystem damage. `phantom`
+    /// (a `Running` sandbox whose pause process died without an explicit
+    /// `StopPodSandbox`) is the same condition `reconcile_stale_sandboxes`
+    /// reaps every 30s (#347/#351's root cause class); this gauge should
+    /// read 0 outside the brief window before the next reap.
+    pub fn start_tracked_state_gauge_sampler(&self) {
+        describe_gauge!(
+            "pelagos_cri_tracked_sandboxes",
+            "Pod sandboxes pelagos-cri currently tracks in memory, labeled by state: \
+             ready (Running, pause alive or pause-less native sandbox), notready \
+             (explicitly stopped via StopPodSandbox, awaiting RemovePodSandbox), or \
+             phantom (Running, pause process unexpectedly dead — internal bookkeeping \
+             drift, the #351/#347 bug class; reaped within 30s by reconcile_stale_sandboxes)"
+        );
+        describe_gauge!(
+            "pelagos_cri_tracked_containers",
+            "Containers pelagos-cri currently tracks in memory, labeled by state: \
+             created, running, exited, or unknown"
+        );
+
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let (sandboxes, containers) = {
+                    let st = state.inner.lock().await;
+                    let sandboxes = sandbox_state_counts(&st.sandboxes, |pid| {
+                        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+                    });
+                    let containers = container_state_counts(&st.containers);
+                    (sandboxes, containers)
+                };
+
+                gauge!("pelagos_cri_tracked_sandboxes", "state" => "ready")
+                    .set(sandboxes.ready as f64);
+                gauge!("pelagos_cri_tracked_sandboxes", "state" => "notready")
+                    .set(sandboxes.notready as f64);
+                gauge!("pelagos_cri_tracked_sandboxes", "state" => "phantom")
+                    .set(sandboxes.phantom as f64);
+
+                gauge!("pelagos_cri_tracked_containers", "state" => "created")
+                    .set(containers.created as f64);
+                gauge!("pelagos_cri_tracked_containers", "state" => "running")
+                    .set(containers.running as f64);
+                gauge!("pelagos_cri_tracked_containers", "state" => "exited")
+                    .set(containers.exited as f64);
+                gauge!("pelagos_cri_tracked_containers", "state" => "unknown")
+                    .set(containers.unknown as f64);
+            }
+        });
+    }
+}
+
+/// Sandbox counts by tracked state, for `pelagos_cri_tracked_sandboxes` (#554).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SandboxStateCounts {
+    pub ready: u64,
+    pub notready: u64,
+    pub phantom: u64,
+}
+
+/// Classifies every tracked sandbox the same way `stale_sandbox_ids` does
+/// (see its doc comment for the invariants), so the gauge and the reaper can
+/// never disagree about what counts as a phantom. Pulled out as a pure
+/// function, `is_alive` injected, for the same testability reason as
+/// `stale_sandbox_ids` (#336).
+pub(crate) fn sandbox_state_counts<F: Fn(i32) -> bool>(
+    sandboxes: &HashMap<String, CriSandbox>,
+    is_alive: F,
+) -> SandboxStateCounts {
+    let mut counts = SandboxStateCounts::default();
+    for s in sandboxes.values() {
+        if s.is_explicitly_stopped() {
+            counts.notready += 1;
+        } else if s.pause_pid > 0 && !is_alive(s.pause_pid) {
+            counts.phantom += 1;
+        } else {
+            counts.ready += 1;
+        }
+    }
+    counts
+}
+
+/// Container counts by `ContainerState`, for `pelagos_cri_tracked_containers` (#554).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContainerStateCounts {
+    pub created: u64,
+    pub running: u64,
+    pub exited: u64,
+    pub unknown: u64,
+}
+
+pub(crate) fn container_state_counts(
+    containers: &HashMap<String, CriContainer>,
+) -> ContainerStateCounts {
+    let mut counts = ContainerStateCounts::default();
+    for c in containers.values() {
+        match c.state {
+            ContainerState::Created => counts.created += 1,
+            ContainerState::Running => counts.running += 1,
+            ContainerState::Exited => counts.exited += 1,
+            ContainerState::Unknown => counts.unknown += 1,
+        }
+    }
+    counts
 }
 
 /// Identify sandboxes whose supervisor (pause process) is gone and must be purged
@@ -1059,6 +1170,75 @@ mod tests {
             to_kill,
             vec!["pcri-running".to_string()],
             "only the Running container must appear in to_kill"
+        );
+    }
+
+    // ── #554: tracked-state gauges ──────────────────────────────────────────
+
+    /// `sandbox_state_counts` must classify every sandbox exactly the way
+    /// `stale_sandbox_ids` does (ready/notready/phantom), covering the same
+    /// mix of cases as `only_running_sandboxes_with_dead_pause_are_reaped`
+    /// plus a pause-less native sandbox (which is never a phantom).
+    #[test]
+    fn test_sandbox_state_counts_classifies_ready_notready_and_phantom() {
+        let sandboxes = map(vec![
+            sandbox("running-live", 1001),         // Running, pause alive → ready
+            sandbox("running-dead", 1002),         // Running, pause dead → phantom
+            stopped_sandbox("stopped-dead", 1003), // NotReady, pause dead → notready
+            sandbox("native", 0),                  // no pause to check → ready
+        ]);
+        let counts = sandbox_state_counts(&sandboxes, |pid| pid == 1001);
+        assert_eq!(
+            counts,
+            SandboxStateCounts {
+                ready: 2,
+                notready: 1,
+                phantom: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_sandbox_state_counts_empty_map_is_all_zero() {
+        let sandboxes: HashMap<String, CriSandbox> = HashMap::new();
+        assert_eq!(
+            sandbox_state_counts(&sandboxes, |_pid| true),
+            SandboxStateCounts::default()
+        );
+    }
+
+    #[test]
+    fn test_container_state_counts_tallies_each_state() {
+        fn container_with_state(id: &str, state: &str) -> CriContainer {
+            let json = format!(
+                r#"{{"id":"{id}","sandbox_id":"s","pelagos_name":"pcri-{id}",
+                     "name":"c","image":"img","entrypoint":[],"args":[],"envs":[],
+                     "working_dir":"","mounts":[],"labels":{{}},"annotations":{{}},
+                     "created_at_ns":0,"started_at_ns":0,"finished_at_ns":0,
+                     "state":"{state}","exit_code":0}}"#
+            );
+            serde_json::from_str(&json).expect("valid container json")
+        }
+
+        let containers: HashMap<String, CriContainer> = vec![
+            container_with_state("c1", "Created"),
+            container_with_state("c2", "Running"),
+            container_with_state("c3", "Running"),
+            container_with_state("c4", "Exited"),
+            container_with_state("c5", "Unknown"),
+        ]
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+
+        assert_eq!(
+            container_state_counts(&containers),
+            ContainerStateCounts {
+                created: 1,
+                running: 2,
+                exited: 1,
+                unknown: 1,
+            }
         );
     }
 }
