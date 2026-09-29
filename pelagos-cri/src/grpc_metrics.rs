@@ -230,13 +230,15 @@ fn grpc_method_label(path: &str) -> &'static str {
 /// response body to inspect its closing trailer frame, which is a larger
 /// change left as a follow-up if/when such an RPC is actually implemented.
 fn grpc_status_label(headers: &http::HeaderMap) -> &'static str {
-    match headers
-        .get(tonic::Status::GRPC_STATUS)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i32>().ok())
-    {
-        None => "OK",
+    // No header at all is the success case (see the doc comment above) — that
+    // is distinct from a header being present but unparsable, which must NOT
+    // also fall through to "OK".
+    let Some(value) = headers.get(tonic::Status::GRPC_STATUS) else {
+        return "OK";
+    };
+    match value.to_str().ok().and_then(|s| s.parse::<i32>().ok()) {
         Some(code) => grpc_code_name(code),
+        None => "UNKNOWN_CODE",
     }
 }
 
