@@ -640,8 +640,7 @@ impl AppState {
 
             // Mark Exited in CRI state so kubelet schedules a replacement.
             if let Some(c) = inner.containers.get_mut(cid) {
-                c.state = ContainerState::Exited;
-                c.finished_at_ns = finished_at_ns;
+                mark_container_killed_for_restart(c, finished_at_ns);
                 let _ = save_container(c);
             }
         }
@@ -817,6 +816,24 @@ pub(crate) fn stale_sandbox_ids<F: Fn(i32) -> bool>(
         .filter(|s| !s.is_explicitly_stopped() && s.pause_pid > 0 && !is_alive(s.pause_pid))
         .map(|s| s.id.clone())
         .collect()
+}
+
+/// Record a hostNetwork container's forced SIGKILL (#457 port-release-on-restart)
+/// in CRI state as an actual termination, not a silent reset. Pulled out as a pure
+/// function so the exit_code/state bookkeeping can be unit-tested without shelling
+/// out to `pelagos stop` (#557).
+///
+/// exit_code 137 (128+SIGKILL) matches the convention `container_status()` already
+/// documents for OOM kills — `pelagos stop --time 0` (the path that runs just
+/// before this is called) goes straight to cgroup kill / SIGKILL, so this is the
+/// container's real termination signal, not a default. Leaving exit_code at its
+/// pre-exit value of 0 would make this forced kill indistinguishable from a clean
+/// exit in ContainerStatus/lastState, which is exactly what left kubelet unable to
+/// tell the container had been killed at all.
+pub(crate) fn mark_container_killed_for_restart(c: &mut CriContainer, finished_at_ns: i64) {
+    c.state = ContainerState::Exited;
+    c.finished_at_ns = finished_at_ns;
+    c.exit_code = 137;
 }
 
 // ── Disk helpers ─────────────────────────────────────────────────────────────
@@ -1170,6 +1187,28 @@ mod tests {
             to_kill,
             vec!["pcri-running".to_string()],
             "only the Running container must appear in to_kill"
+        );
+    }
+
+    /// #557 regression: when a hostNetwork container is force-killed on CRI
+    /// restart to release its port binding (#457), the resulting CriContainer
+    /// must show a real termination (exit_code 137, state Exited) — not the
+    /// container's pre-exit default of exit_code 0, which is indistinguishable
+    /// from a clean exit and left kubelet unable to compute lastState/reason at
+    /// all for the generation being retired.
+    #[test]
+    fn hostnet_restart_kill_records_sigkill_not_clean_exit() {
+        let mut c = container("hostnet1", "sbx1");
+        assert_eq!(c.state, ContainerState::Running);
+        assert_eq!(c.exit_code, 0);
+
+        mark_container_killed_for_restart(&mut c, 123_456_789);
+
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.finished_at_ns, 123_456_789);
+        assert_eq!(
+            c.exit_code, 137,
+            "a forced SIGKILL must not be reported as a clean (0) exit"
         );
     }
 
