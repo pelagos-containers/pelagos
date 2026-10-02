@@ -2002,6 +2002,51 @@ subdirectories for PTY allocation and shared memory.
 
 ---
 
+## /run tmpfs Tests (`run_mount` module, #559)
+
+Pelagos never mounted a fresh tmpfs over `/run` inside CRI containers, so `/run`
+showed whatever the image's own build-time layer content happened to be —
+frozen at build time and, on a setgid `root:pelagos` layer store, potentially
+owned by the host's own `pelagos` service GID. This broke `sshd` outright
+("/run/sshd must be owned by root and not group or world-writable").
+
+### `test_run_mount_explicit_opt_in`
+**Requires:** root + rootfs
+
+Spawns a container with the new `with_run_mount()` setter (parity with
+`with_dev_mount()`/`with_proc_mount()`/`with_sys_mount()`) on a plain
+`with_chroot()` container (no image layers). Asserts `/run` is `root:root`,
+mode `755`, and empty.
+
+Failure indicates the explicit `with_run_mount()` opt-in path is not mounting
+a fresh tmpfs, or is getting the mode/ownership wrong.
+
+### `test_run_mount_masks_stale_image_content`
+**Requires:** root + rootfs
+
+The real #559 repro: bakes a marker file into `/run` in a synthetic image
+layer (simulating stale build-time content like a leftover `/run/sshd`), then
+spawns a container via `with_image_layers()` (which enables `mount_run`
+automatically) and asserts the marker is NOT visible inside the container.
+
+Failure means the regression is back: image-layer `/run` content is leaking
+into running containers instead of being masked by a fresh tmpfs.
+
+### `test_run_mount_ordering_with_bind_mount`
+**Requires:** root + rootfs
+
+Verifies mount ordering: with `with_run_mount()` active, a bind mount
+targeting a deeply nested path under `/run/secrets/kubernetes.io/serviceaccount/`
+(simulating a Kubernetes service-account-token projected volume) still
+resolves and reads back the correct content. This is the real-workload check
+(spire-agent/spire-server/promtail-style mounts under `/run/**`) called out
+alongside the sshd repro — not just the symptom case.
+
+Failure would indicate the `/run` tmpfs is mounted AFTER the bind-mount loop
+instead of before it, masking legitimate bind mounts under `/run/**`.
+
+---
+
 ## Rootless Cgroups
 
 These tests exercise cgroup v2 delegation for non-root users. They skip

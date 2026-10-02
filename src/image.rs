@@ -22,6 +22,48 @@ fn pelagos_group_gid() -> Option<libc::gid_t> {
     }
 }
 
+/// Like `std::fs::create_dir_all`, but also resets any directory components
+/// it had to create to root:root ownership (#559) rather than letting them
+/// inherit the setgid `pelagos` group from the layer-store filesystem.
+fn create_dir_all_root_owned(path: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if p.as_os_str().is_empty() || p.exists() {
+            break;
+        }
+        missing.push(p.to_path_buf());
+        cur = p.parent();
+    }
+    std::fs::create_dir_all(path)?;
+    for p in missing.iter().rev() {
+        if let Err(e) = lchown_root(p) {
+            log::debug!(
+                "failed to reset ownership of implicit parent dir {}: {}",
+                p.display(),
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reset a path's ownership to root:root (0,0) via `lchown(2)`.
+///
+/// Uses `lchown` (not `chown`) so a symlink target is never followed — this is
+/// only ever called on directories created implicitly by tar extraction, but
+/// `lchown` is the safe default regardless (#559).
+fn lchown_root(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let r = unsafe { libc::lchown(c_path.as_ptr(), 0, 0) };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Ensure the image store directories exist with correct ownership and mode.
 ///
 /// If the `pelagos` system group exists (created by `scripts/setup.sh`):
@@ -567,7 +609,7 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: mark parent as opaque for overlayfs.
             let parent = partial.join(raw_path.parent().unwrap_or(Path::new("")));
-            std::fs::create_dir_all(&parent)?;
+            create_dir_all_root_owned(&parent)?;
             if rootless {
                 let _ = set_opaque_xattr_userxattr(&parent);
             } else {
@@ -578,7 +620,7 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
 
         if let Some(target_name) = file_name.strip_prefix(".wh.") {
             let parent = partial.join(raw_path.parent().unwrap_or(Path::new("")));
-            std::fs::create_dir_all(&parent)?;
+            create_dir_all_root_owned(&parent)?;
             let whiteout_path = parent.join(target_name);
             if rootless {
                 create_whiteout_userxattr(&whiteout_path)?;
@@ -588,8 +630,50 @@ pub fn extract_layer(digest: &str, tar_path: &Path, media_type: &str) -> io::Res
             continue;
         }
 
+        // #559: `/var/lib/pelagos/layers/` is setgid root:pelagos (mode 2775) so
+        // that extracted layer content is group-readable by the `pelagos` group.
+        // When this tar entry's path has ancestor directories that don't exist
+        // in `partial` yet, `unpack_in` below creates them implicitly (e.g. a
+        // `run/sshd` entry with no preceding explicit `run/` directory entry in
+        // the tar stream). Those implicitly-created directories inherit GID from
+        // the setgid layer-store filesystem instead of being root:root like the
+        // image build almost certainly intended. Record which ancestors are
+        // missing *before* unpacking so we can force them back to root:root
+        // immediately after — a real tar entry for one of these paths (explicit
+        // ownership from the tar header) processed later still wins, since its
+        // own `unpack_in` call resets ownership for that specific path.
+        let missing_ancestors: Vec<PathBuf> = {
+            let mut missing = Vec::new();
+            let mut cur = raw_path.parent();
+            while let Some(p) = cur {
+                if p.as_os_str().is_empty() {
+                    break;
+                }
+                if !partial.join(p).exists() {
+                    missing.push(p.to_path_buf());
+                }
+                cur = p.parent();
+            }
+            missing
+        };
+
         // Normal file — unpack.
         entry.unpack_in(&partial)?;
+
+        // Outermost-first so a nested implicit dir's own lchown isn't undone by
+        // chowning its (already-correct) parent afterward — order doesn't
+        // actually matter for lchown itself, but iterating top-down matches the
+        // order the directories were created in.
+        for rel in missing_ancestors.iter().rev() {
+            let full = partial.join(rel);
+            if let Err(e) = lchown_root(&full) {
+                log::debug!(
+                    "failed to reset ownership of implicit parent dir {}: {}",
+                    full.display(),
+                    e
+                );
+            }
+        }
 
         // Ensure regular files are world-readable after extraction (#452).
         // Image layer directories are owned root:pelagos (setgid), so extracted
@@ -1222,5 +1306,181 @@ mod tests {
         assert!(marker.exists());
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert!(!contents.is_empty(), "marker should record an entry count");
+    }
+
+    /// #559: `lchown_root()` is the primitive the `extract_layer()` GID-leak fix
+    /// uses to reset an implicitly-created directory's ownership. Verify it
+    /// actually changes both uid and gid to 0 regardless of what they were set
+    /// to beforehand. Requires root (chown to an arbitrary uid/gid needs
+    /// CAP_CHOWN) — uses a plain tempdir, not the real layer store.
+    #[test]
+    fn test_lchown_root_resets_uid_and_gid() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("skipping test_lchown_root_resets_uid_and_gid: requires root");
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("implicit-parent");
+        std::fs::create_dir(&dir).unwrap();
+
+        // Simulate inheriting a non-root GID (e.g. from a setgid layer-store
+        // directory) by chowning to an arbitrary non-root uid/gid pair first.
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap_or_default();
+        let r = unsafe { libc::lchown(c_path.as_ptr(), 1, 983) };
+        assert_eq!(r, 0, "setup chown failed: {}", io::Error::last_os_error());
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(meta.uid(), 1);
+        assert_eq!(meta.gid(), 983);
+
+        lchown_root(&dir).expect("lchown_root should succeed");
+
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(meta.uid(), 0, "lchown_root should reset uid to 0");
+        assert_eq!(meta.gid(), 0, "lchown_root should reset gid to 0");
+    }
+
+    /// #559: `create_dir_all_root_owned()` must force newly-created directory
+    /// components to root:root, but must NOT touch a directory that already
+    /// existed (e.g. one with legitimate non-root ownership from an earlier,
+    /// explicit tar entry). Uses a plain tempdir, not the real layer store.
+    #[test]
+    fn test_create_dir_all_root_owned_only_fixes_new_dirs() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("skipping test_create_dir_all_root_owned_only_fixes_new_dirs: requires root");
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Pre-existing ancestor with deliberate non-root ownership — must survive
+        // untouched (this models a directory that DID have its own explicit tar
+        // entry, which legitimately set non-root ownership).
+        let existing = tmp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let existing_c =
+            std::ffi::CString::new(existing.as_os_str().as_bytes()).unwrap_or_default();
+        assert_eq!(unsafe { libc::lchown(existing_c.as_ptr(), 0, 983) }, 0);
+
+        // Two missing levels under the pre-existing dir — both implicit.
+        let target = existing.join("missing-a").join("missing-b");
+        create_dir_all_root_owned(&target).expect("create_dir_all_root_owned");
+
+        let existing_meta = std::fs::metadata(&existing).unwrap();
+        assert_eq!(
+            existing_meta.gid(),
+            983,
+            "pre-existing ancestor ownership must be left alone"
+        );
+
+        let a_meta = std::fs::metadata(existing.join("missing-a")).unwrap();
+        assert_eq!(a_meta.uid(), 0);
+        assert_eq!(a_meta.gid(), 0, "newly-created ancestor must be root:root");
+
+        let b_meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(b_meta.uid(), 0);
+        assert_eq!(b_meta.gid(), 0, "newly-created leaf dir must be root:root");
+    }
+
+    /// #559 end-to-end: a tar entry whose parent directory has no explicit tar
+    /// entry of its own (only a nested file, e.g. `run/sshd` with no `run/`
+    /// entry) must not leave `run/` owned by whatever GID the layer-store
+    /// filesystem's setgid bit would otherwise hand it. Simulates the setgid
+    /// layer store by making the *real* layer-store parent directory setgid
+    /// with a test GID for the duration of the test, restoring it afterward —
+    /// `extract_layer()` always extracts into `paths::layers_dir()`, so this is
+    /// the only way to exercise the real code path end-to-end. Requires root.
+    #[test]
+    #[serial]
+    fn test_extract_layer_implicit_parent_is_root_owned() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("skipping test_extract_layer_implicit_parent_is_root_owned: requires root");
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        ensure_image_dirs().expect("ensure_image_dirs");
+        let layers_root = crate::paths::layers_dir();
+        std::fs::create_dir_all(&layers_root).expect("layers_dir");
+
+        // Save + restore the layer store dir's own mode/gid so this test
+        // doesn't permanently alter host state.
+        let orig_meta = std::fs::metadata(&layers_root).expect("stat layers_dir");
+        let orig_mode = orig_meta.permissions().mode();
+        let orig_gid = orig_meta.gid();
+
+        let test_gid: libc::gid_t = 59832; // arbitrary, unlikely to collide
+        let layers_root_c =
+            std::ffi::CString::new(layers_root.as_os_str().as_bytes()).unwrap_or_default();
+        let r = unsafe { libc::chown(layers_root_c.as_ptr(), u32::MAX, test_gid) };
+        assert_eq!(
+            r,
+            0,
+            "failed to set test gid on layers_dir: {}",
+            io::Error::last_os_error()
+        );
+        let _ = std::fs::set_permissions(
+            &layers_root,
+            std::fs::Permissions::from_mode(0o2775), // setgid
+        );
+
+        let restore = || {
+            let _ = unsafe { libc::chown(layers_root_c.as_ptr(), u32::MAX, orig_gid) };
+            let _ =
+                std::fs::set_permissions(&layers_root, std::fs::Permissions::from_mode(orig_mode));
+        };
+
+        let result = (|| -> io::Result<()> {
+            // Build a tiny tar with a single file entry `run/sshd` and NO
+            // explicit `run/` directory entry — exactly the shape the
+            // investigation found in real registry layers.
+            let tmp = tempfile::tempdir()?;
+            let tar_path = tmp.path().join("layer.tar");
+            {
+                let file = std::fs::File::create(&tar_path)?;
+                let mut builder = tar::Builder::new(file);
+                let data: &[u8] = b"#!/bin/sh\n";
+                let mut header = tar::Header::new_gnu();
+                header.set_path("run/sshd")?;
+                header.set_size(data.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder.append(&header, data)?;
+                builder.finish()?;
+            }
+
+            let digest = format!("sha256:test559{:x}", std::process::id());
+            let dest = extract_layer(&digest, &tar_path, "application/vnd.oci.image.layer.v1.tar")?;
+
+            let run_dir_meta = std::fs::metadata(dest.join("run"))?;
+            assert_eq!(
+                run_dir_meta.uid(),
+                0,
+                "implicit parent dir 'run' should be root-owned"
+            );
+            assert_eq!(
+                run_dir_meta.gid(),
+                0,
+                "implicit parent dir 'run' should NOT inherit the setgid test GID ({})",
+                test_gid
+            );
+            assert_ne!(
+                run_dir_meta.gid(),
+                test_gid,
+                "regression check: must not match the simulated leaked GID"
+            );
+
+            let _ = std::fs::remove_dir_all(&dest);
+            Ok(())
+        })();
+
+        restore();
+        result.expect("extract_layer GID-leak regression check failed");
     }
 }
