@@ -813,6 +813,7 @@ fn build_command(
         .with_proc_mount()
         .with_sys_mount()
         .with_dev_mount()
+        .with_run_mount()
         // Rootfs-based runs have no image config; inject the OCI default PATH
         // so executables in standard locations are always findable.
         .env(

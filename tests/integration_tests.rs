@@ -12175,6 +12175,214 @@ mod dev {
     }
 }
 
+/// #559: Pelagos never mounted a fresh tmpfs over `/run` inside CRI containers,
+/// so `/run` showed whatever the image's own build-time layer content happened
+/// to be — frozen at build time and, on a setgid `root:pelagos` layer store,
+/// potentially owned by the host's own `pelagos` service GID. This surfaced as
+/// `sshd` refusing to start ("/run/sshd must be owned by root") whenever a
+/// node's layer cache for that image had picked up the leaked GID.
+mod run_mount {
+    use super::*;
+
+    /// test_run_mount_explicit_opt_in
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Mirrors `dev::test_dev_pts_exists` — `.with_run_mount()` (the new
+    /// setter, parity with `.with_dev_mount()`/`.with_proc_mount()`/
+    /// `.with_sys_mount()`) must produce a real, empty, root-owned `/run`
+    /// even on a plain `with_chroot()` container that never set up image
+    /// layers.
+    #[test]
+    #[serial]
+    fn test_run_mount_explicit_opt_in() {
+        if !is_root() {
+            eprintln!("Skipping test_run_mount_explicit_opt_in: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_run_mount_explicit_opt_in: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "stat -c '%U:%G %a' /run && ls -A /run | wc -l"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_dev_mount()
+            .with_run_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, stderr_bytes) =
+            child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        assert!(status.success(), "stat /run failed: {} {}", stdout, stderr);
+        assert!(
+            stdout.contains("root:root"),
+            "/run should be root:root, got: {}",
+            stdout
+        );
+        // Mode: dir bit (4) is always set for a directory listing; just check
+        // the tmpfs mode we asked for (0755) shows up verbatim.
+        assert!(
+            stdout.contains("755"),
+            "/run should be mode 755, got: {}",
+            stdout
+        );
+        assert!(
+            stdout.trim_end().ends_with('0'),
+            "fresh /run should be empty, got entry count in: {}",
+            stdout
+        );
+    }
+
+    /// test_run_mount_masks_stale_image_content
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// This is the real #559 repro: bakes a file into `/run` at "image build
+    /// time" (i.e. present in the layer dir before the container ever starts —
+    /// exactly what a published image's `/run/sshd` directory looks like) and
+    /// verifies a container using `with_image_layers()` (which enables
+    /// `mount_run` automatically, see `Command::with_image_layers`) does NOT
+    /// see it — the fresh tmpfs must mask it, not let the overlay's view of
+    /// the lower layer show through.
+    ///
+    /// Failure here means the regression is back: image-layer `/run` content
+    /// leaking into a running container, which is exactly what broke sshd.
+    #[test]
+    #[serial]
+    fn test_run_mount_masks_stale_image_content() {
+        if !is_root() {
+            eprintln!("Skipping test_run_mount_masks_stale_image_content: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_run_mount_masks_stale_image_content: alpine-rootfs not found");
+            return;
+        };
+
+        let layer = tempfile::tempdir().expect("layer dir");
+        // Same approach as images::copy_rootfs (private to that module): rsync
+        // the rootfs in, excluding pseudo-filesystems that can't be copied
+        // from a live mount, then re-create their empty mount-point dirs.
+        let status = std::process::Command::new("rsync")
+            .args(["-a", "--exclude=/sys", "--exclude=/proc", "--exclude=/dev"])
+            .arg(rootfs.to_str().unwrap().to_string() + "/")
+            .arg(layer.path().to_str().unwrap().to_string() + "/")
+            .status()
+            .expect("rsync rootfs to layer (is rsync installed?)");
+        assert!(status.success(), "rsync should succeed");
+        std::fs::create_dir_all(layer.path().join("proc")).unwrap();
+        std::fs::create_dir_all(layer.path().join("sys")).unwrap();
+        std::fs::create_dir_all(layer.path().join("dev")).unwrap();
+
+        // Simulate image-build-time content baked into /run (e.g. a stale
+        // /run/sshd left over from an RUN step during `pelagos build`).
+        let stale_run = layer.path().join("run");
+        std::fs::create_dir_all(&stale_run).expect("mkdir run");
+        std::fs::write(stale_run.join("stale-marker"), b"baked-at-build-time")
+            .expect("write stale marker");
+
+        let layers = vec![layer.path().to_path_buf()];
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "ls /run/ 2>&1; echo RC=$?"])
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn with image layers");
+
+        let (status, stdout_bytes, stderr_bytes) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout_bytes);
+        let err = String::from_utf8_lossy(&stderr_bytes);
+        assert!(status.success(), "container should exit 0, stderr: {}", err);
+        assert!(
+            !out.contains("stale-marker"),
+            "fresh /run tmpfs should mask image-layer content, but saw it: {}",
+            out
+        );
+    }
+
+    /// test_run_mount_ordering_with_bind_mount
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// The fix note in #559 explicitly calls out mount ordering: the `/run`
+    /// tmpfs must be mounted BEFORE the later bind-mount loop that creates
+    /// directories under paths like `/run/secrets/kubernetes.io/serviceaccount`
+    /// (the Kubernetes service-account-token mount), or those bind targets
+    /// would be masked by a tmpfs mounted afterward. Verify a bind mount
+    /// targeting a nested `/run/**` path still resolves correctly with
+    /// `with_run_mount()` active — this is the spire-agent/spire-server/
+    /// promtail-style real-workload check called out in the issue, not just
+    /// the sshd repro.
+    #[test]
+    #[serial]
+    fn test_run_mount_ordering_with_bind_mount() {
+        if !is_root() {
+            eprintln!("Skipping test_run_mount_ordering_with_bind_mount: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_run_mount_ordering_with_bind_mount: alpine-rootfs not found");
+            return;
+        };
+
+        // Simulates a projected service-account-token volume: a host file
+        // bind-mounted to a deeply nested path under /run that the runtime
+        // itself must create directories for.
+        let token_src = tempfile::NamedTempFile::new().expect("token file");
+        std::fs::write(token_src.path(), b"fake-service-account-token").expect("write token");
+
+        let mut child = Command::new("/bin/cat")
+            .args(["/run/secrets/kubernetes.io/serviceaccount/token"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_run_mount()
+            .with_bind_mount_ro(
+                token_src.path(),
+                "/run/secrets/kubernetes.io/serviceaccount/token",
+            )
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, stderr_bytes) =
+            child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        assert!(
+            status.success(),
+            "cat of bind-mounted token under /run failed: {} {}",
+            stdout,
+            stderr
+        );
+        assert_eq!(
+            stdout.trim(),
+            "fake-service-account-token",
+            "bind mount under /run/** should resolve correctly with the /run \
+             tmpfs active (mount-ordering regression), got: {}",
+            stdout
+        );
+    }
+}
+
 mod rootless_cgroups {
     use super::*;
 

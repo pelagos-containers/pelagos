@@ -1516,6 +1516,7 @@ pub struct Command {
     mount_proc: bool,
     mount_sys: bool,
     mount_dev: bool,
+    mount_run: bool,
     // Security configuration
     capabilities: Option<Capability>, // None = keep all, Some = keep only these
     seccomp_profile: Option<SeccompProfile>, // None = no seccomp, Some = apply profile
@@ -1704,6 +1705,7 @@ impl Command {
             mount_proc: false,
             mount_sys: false,
             mount_dev: false,
+            mount_run: false,
             capabilities: None,
             seccomp_profile: None,
             no_new_privileges: false,
@@ -2059,6 +2061,29 @@ impl Command {
     /// ```
     pub fn with_dev_mount(mut self) -> Self {
         self.mount_dev = true;
+        self
+    }
+
+    /// Automatically mount a fresh tmpfs over `/run` after chroot.
+    ///
+    /// This masks any image-layer content baked into `/run` at build time with
+    /// an empty, root-owned tmpfs, matching the conventional guarantee that
+    /// `/run` is fresh and writable at container start (systemd's `/run`
+    /// contract). Without this, software that expects to create runtime state
+    /// under `/run` (e.g. sshd's `/run/sshd`) can see stale or incorrectly
+    /// owned content left over from the image build (#559).
+    ///
+    /// Requires `Namespace::MOUNT` to be set.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_namespaces(Namespace::MOUNT)
+    ///    .with_chroot("/path/to/rootfs")
+    ///    .with_run_mount();
+    /// ```
+    pub fn with_run_mount(mut self) -> Self {
+        self.mount_run = true;
         self
     }
 
@@ -2633,6 +2658,7 @@ impl Command {
         self.mount_proc = true;
         self.mount_sys = true;
         self.mount_dev = true;
+        self.mount_run = true;
         self
     }
 
@@ -3543,6 +3569,7 @@ impl Command {
         let mount_proc = self.mount_proc;
         let mount_sys = self.mount_sys;
         let mount_dev = self.mount_dev;
+        let mount_run = self.mount_run;
         let capabilities = self.capabilities;
         let rlimits = self.rlimits.clone();
         let no_new_privileges = self.no_new_privileges;
@@ -5402,6 +5429,40 @@ impl Command {
                         }
                     }
 
+                    // Fresh tmpfs over /run BEFORE chroot — must happen before the
+                    // later bind-mount loop that creates directories under /run/**
+                    // (e.g. the Kubernetes service-account-token mount under
+                    // /run/secrets/kubernetes.io/serviceaccount) so those bind
+                    // targets land inside this tmpfs instead of being masked by a
+                    // tmpfs mounted afterward. Without this, /run shows the image's
+                    // own build-time layer content un-shadowed, which can carry
+                    // stale files and leaked host GIDs from the layer store (#559).
+                    if mount_run {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let run_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/run"),
+                        );
+                        std::fs::create_dir_all(&run_host)
+                            .map_err(|e| pre_exec_err("mkdir /run", e))?;
+                        let run_host_c = CString::new(run_host.as_os_str().as_bytes()).unwrap();
+                        let tmpfs_type = CString::new("tmpfs").unwrap();
+                        let run_opts = CString::new("mode=755,size=65536k").unwrap();
+                        let r = libc::mount(
+                            tmpfs_type.as_ptr(),
+                            run_host_c.as_ptr(),
+                            tmpfs_type.as_ptr(),
+                            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME,
+                            run_opts.as_ptr() as *const libc::c_void,
+                        );
+                        if r != 0 {
+                            let e = io::Error::last_os_error();
+                            if !is_rootless {
+                                return Err(pre_exec_err("mount tmpfs /run", e));
+                            }
+                        }
+                    }
+
                     // Pre-chroot device bind-mounts for USER namespace containers.
                     // mknod(2) for character/block devices requires CAP_MKNOD in the
                     // initial user namespace — it always fails with EPERM inside a user
@@ -7199,6 +7260,7 @@ impl Command {
         let mount_proc = self.mount_proc;
         let mount_sys = self.mount_sys;
         let mount_dev = self.mount_dev;
+        let mount_run = self.mount_run;
         let capabilities = self.capabilities;
         let rlimits = self.rlimits.clone();
         let no_new_privileges = self.no_new_privileges;
@@ -8705,6 +8767,35 @@ impl Command {
                                     }
                                 }
                                 bind_host_devs_i(std::path::Path::new("/dev"), &dev_host);
+                            }
+                        }
+                    }
+
+                    // Fresh tmpfs over /run BEFORE chroot — see the same block in
+                    // spawn() for rationale (#559); must happen before the bind-mount
+                    // loop below that creates directories under /run/**.
+                    if mount_run {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let run_host = resolve_mount_target_in_root(
+                            effective_root,
+                            std::path::Path::new("/run"),
+                        );
+                        std::fs::create_dir_all(&run_host)
+                            .map_err(|e| pre_exec_err("mkdir /run", e))?;
+                        let run_host_c = CString::new(run_host.as_os_str().as_bytes()).unwrap();
+                        let tmpfs_type = CString::new("tmpfs").unwrap();
+                        let run_opts = CString::new("mode=755,size=65536k").unwrap();
+                        let r = libc::mount(
+                            tmpfs_type.as_ptr(),
+                            run_host_c.as_ptr(),
+                            tmpfs_type.as_ptr(),
+                            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME,
+                            run_opts.as_ptr() as *const libc::c_void,
+                        );
+                        if r != 0 {
+                            let e = io::Error::last_os_error();
+                            if !is_rootless {
+                                return Err(pre_exec_err("mount tmpfs /run", e));
                             }
                         }
                     }
