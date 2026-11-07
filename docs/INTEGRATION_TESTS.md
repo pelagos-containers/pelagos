@@ -5782,6 +5782,17 @@ in the same lock acquisition it reads from, before any teardown step runs, and t
 dead. **Why it matters:** proves the race window `stop_pod_sandbox` now closes by marking
 `NotReady` first instead of last.
 
+**#565 fix:** the assertion originally checked the entire `stale_sandbox_ids` result was
+empty, but `AppState::new()` loads real on-disk sandbox state from
+`/run/pelagos-cri/sandboxes` — on a live cluster node (not a clean/empty environment),
+every genuine already-running sandbox gets pulled into the same map, and this test's
+`|_pid| false` closure claims all of THOSE are dead-paused too, so they legitimately show
+up in `stale`. Confirmed via `cargo test -p pelagos-cri` run directly on ipc7, a real
+cluster node with actual running pods — the first time this suite had been run anywhere
+but a clean dev box or an empty build-job container. Narrowed to assert only that the
+test's own `"churning"` sandbox is absent from `stale`, not that the list is globally
+empty; other entries are expected noise from the host's own state, not a test failure.
+
 ## `image::tests::run_timed_gives_up_rather_than_block_past_its_timeout` (pelagos-cri unit test)
 **No root required.** Defensive-bound test for #561's Image-service wedge theory:
 `ListImages`/`ImageFsInfo` call `du` via `dir_disk_usage`/`count_inodes`, with no timeout
