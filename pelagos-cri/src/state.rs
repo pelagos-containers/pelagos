@@ -1131,9 +1131,16 @@ mod tests {
 
         // Even though pid 9999 is now reported dead (teardown killed the pause),
         // the #438 reaper must not touch it — this is the race #561 closes.
+        //
+        // Assert only that OUR sandbox is absent, not that the whole list is
+        // empty: `AppState::new()` loads real on-disk sandbox state, so on a
+        // live cluster node `sandboxes` also contains every genuine sandbox
+        // already running there, and `|_pid| false` claims all of THOSE are
+        // dead too — real entries showing up in `stale` is expected noise
+        // from the host's own state, not a failure of this test (#565).
         let stale = stale_sandbox_ids(&sandboxes, |_pid| false);
         assert!(
-            stale.is_empty(),
+            !stale.contains(&"churning".to_string()),
             "a sandbox already marked NotReady by begin_stop_pod_sandbox must never \
              be reaped as a phantom, even with its pause reported dead: {stale:?}"
         );
