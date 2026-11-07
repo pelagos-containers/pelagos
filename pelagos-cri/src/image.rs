@@ -142,6 +142,58 @@ async fn cached_layer_size(digest: &str) -> u64 {
     size
 }
 
+/// Same caching as `layer_size_cache`, for per-layer inode counts.
+fn layer_inode_cache() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Inode count of the layer at `digest`, served from `layer_inode_cache()`
+/// after the first real `du`.
+async fn cached_layer_inodes(digest: &str) -> u64 {
+    if let Some(&n) = layer_inode_cache().lock().await.get(digest) {
+        return n;
+    }
+    let n = count_inodes(&format!("{LAYERS_DIR}/{digest}")).await;
+    layer_inode_cache()
+        .lock()
+        .await
+        .insert(digest.to_string(), n);
+    n
+}
+
+/// Total on-disk size and inode count of every layer under `LAYERS_DIR`,
+/// built from a single shallow `read_dir` (not a recursive `du`) plus the
+/// same per-layer caches `list_images` populates.
+///
+/// `image_fs_info` used to run `du -sb`/`du --inodes -s` over the ENTIRE
+/// `LAYERS_DIR` tree on every call — measured live at 1.7s + 1.65s (809k
+/// inodes, 22GB) on a real cluster node, which is what `crictl`'s startup
+/// "validate CRI v1 image API" preflight actually calls and what was really
+/// producing the reported permanent `DeadlineExceeded` (#561) — the
+/// per-image `layers_size` cache above doesn't touch this path at all, since
+/// it's one aggregate query over the whole tree rather than per-image. Since
+/// `LAYERS_DIR` contains nothing but per-digest layer directories, this total
+/// equals the sum of each layer's own cached size/inode count — recomputed
+/// from a real `du` only for digests neither this nor `list_images` has seen
+/// before.
+async fn layers_dir_usage(dir: &str) -> (u64, u64) {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return (0, 0);
+    };
+    let mut used = 0u64;
+    let mut inodes = 0u64;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Some(digest) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        used += cached_layer_size(&digest).await;
+        inodes += cached_layer_inodes(&digest).await;
+    }
+    (used, inodes)
+}
+
 /// Current time in nanoseconds since the Unix epoch (for CRI timestamps).
 fn now_ns() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -464,16 +516,14 @@ impl ImageService for ImageSvc {
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
         use crate::cri::{FilesystemIdentifier, FilesystemUsage, UInt64Value};
         // Report real usage of the layer store so the kubelet's image GC works.
-        let used = dir_disk_usage(LAYERS_DIR).await;
+        let (used, inodes) = layers_dir_usage(LAYERS_DIR).await;
         let usage = FilesystemUsage {
             timestamp: now_ns(),
             fs_id: Some(FilesystemIdentifier {
                 mountpoint: LAYERS_DIR.to_string(),
             }),
             used_bytes: Some(UInt64Value { value: used }),
-            inodes_used: Some(UInt64Value {
-                value: count_inodes(LAYERS_DIR).await,
-            }),
+            inodes_used: Some(UInt64Value { value: inodes }),
         };
         Ok(Response::new(ImageFsInfoResponse {
             image_filesystems: vec![usage],
@@ -540,6 +590,40 @@ mod tests {
             "a layer's size must be cached after the first lookup, even when `du` \
              reports 0 for it, so repeat ListImages calls never re-run `du` for \
              the same digest (#561)"
+        );
+    }
+
+    /// #561 regression, part 2: `image_fs_info` used to run `du -sb`/`du
+    /// --inodes -s` over the ENTIRE layers tree on every call — measured live
+    /// at 1.7s + 1.65s (809k inodes, 22GB) on a real cluster node. This path,
+    /// not `list_images`'s per-image loop, is what `crictl`'s "validate CRI
+    /// v1 image API" preflight actually calls, so it alone was enough to keep
+    /// reproducing the reported permanent `DeadlineExceeded` even after
+    /// caching `list_images`'s per-image loop. `layers_dir_usage` must read
+    /// the directory's entries and serve each from the SAME per-layer caches
+    /// `list_images` populates, rather than re-walking the whole tree.
+    /// Proven here by pre-populating the caches with values a real `du`
+    /// could never produce for these (empty) directories, then asserting
+    /// those exact values come back — which only happens on a cache hit.
+    #[tokio::test]
+    async fn layers_dir_usage_sums_cached_sizes_without_rerunning_du() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let digests = ["fakedigest561-a", "fakedigest561-b"];
+        for d in digests {
+            std::fs::create_dir(dir.path().join(d)).expect("mkdir");
+            layer_size_cache().lock().await.insert(d.to_string(), 1000);
+            layer_inode_cache().lock().await.insert(d.to_string(), 7);
+        }
+
+        let (used, inodes) = layers_dir_usage(dir.path().to_str().unwrap()).await;
+
+        assert_eq!(
+            used, 2000,
+            "must sum the CACHED per-layer sizes, not re-run du over the whole tree (#561)"
+        );
+        assert_eq!(
+            inodes, 14,
+            "must sum the cached per-layer inode counts the same way"
         );
     }
 

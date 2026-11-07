@@ -5814,9 +5814,31 @@ present in `layer_size_cache()` immediately after its first lookup — even when
 reports 0 for a path that doesn't exist — so a later lookup for the same digest never
 re-runs `du` at all. **Why it matters:** collapses `ListImages`'s cost from O(images x
 layers) real subprocess spawns on every call to O(unique layers) ever, then pure
-in-memory lookups — the fix that actually resolves the reported permanent
-`DeadlineExceeded`, not just a defensive bound against a hang that live testing showed
-was not, in fact, what was happening on the reporting node.
+in-memory lookups. One half of the #561 fix — see
+`layers_dir_usage_sums_cached_sizes_without_rerunning_du` below for the other, more
+directly implicated half.
+
+## `image::tests::layers_dir_usage_sums_cached_sizes_without_rerunning_du` (pelagos-cri unit test)
+**No root required.** The other half of #561's real fix: `image_fs_info` ran `du -sb`/`du
+--inodes -s` over the ENTIRE `LAYERS_DIR` tree on every single call — a path the per-image
+`cached_layer_size` fix above doesn't touch at all, since it's one aggregate query over
+the whole tree rather than per-image. Measured live on the same cluster node: 1.7s +
+1.65s (809k inodes, 22GB). `crictl`'s startup "validate CRI v1 image API" preflight calls
+this RPC specifically (not `ListImages`), so this alone was enough to keep reproducing the
+reported permanent `DeadlineExceeded` even after the `ListImages` fix landed — confirmed
+live: `crictl images` dropped from unusable to a consistent ~3.4s (still over `crictl`'s 2s
+default deadline) with only the `ListImages` fix in place, exactly matching the measured
+cost of these two whole-tree `du` calls. `layers_dir_usage` replaces them with a single
+shallow `read_dir` over `LAYERS_DIR` plus the same per-layer caches `list_images`
+populates, since the directory holds nothing but per-digest layer directories and the
+total is exactly the sum of each layer's own cached size/inode count. The test
+pre-populates the caches with values no real `du` could produce for the (empty) test
+directories, then asserts those exact values come back — proof the cached path, not a
+fresh scan, served the result. **Why it matters:** this, combined with the `ListImages`
+cache, is what actually resolves the reported permanent `DeadlineExceeded` — live
+reproduction disproved the original wedged-mount theory outright (no stuck process,
+instant recovery with a longer client timeout) in favor of plain unbounded, uncached
+O(layers) work that only gets worse as a node's image count grows over its lifetime.
 
 ## `issue_451_host_visible_overlay::test_host_visible_overlay_in_mountinfo`
 **Requires root.** Spawns a container with a native overlayfs (`with_overlay()`) and reads
