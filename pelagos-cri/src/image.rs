@@ -46,100 +46,106 @@ struct ImageConfig {
     user: String,
 }
 
-/// Bound on how long a `du` invocation may run before we give up on it.
-const DU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Recursively compute the apparent (logical byte) size and inode count of
+/// everything under `path`, in one filesystem walk — natively, with no `du`
+/// subprocess (#563/#564).
+///
+/// Matches `du`'s actual semantics:
+/// - `lstat`-equivalent metadata — does NOT follow symlinks (a symlink counts
+///   as itself, not its target, same as `du`'s default).
+/// - Deduplicates hard-linked files by `(dev, ino)`, so a file linked
+///   multiple times within the scanned tree is only counted once (toward
+///   both size and inodes) — matching `du`'s real accounting.
+/// - Directories count toward the inode total but NOT the size total — only
+///   regular files'/symlinks' own apparent size contributes to `size`.
+///   Confirmed by live cross-check against real `du` on a production layer:
+///   an earlier version of this function that also summed each directory's
+///   own (non-trivial, filesystem-block-dependent) `st_size` overcounted by
+///   exactly the sum of every directory's raw size in the tree.
+///
+/// A dangling/partially torn-down overlay or FUSE mount left by an aborted
+/// layer extraction could in principle make a real `du` binary wedge in
+/// kernel D-state indefinitely (#561's original theory, since disproven by
+/// live reproduction — the actual #561 cause was uncached repeated `du` work,
+/// not a wedge). A plain synchronous walk has the same exposure in principle
+/// (a hung read on a wedged mount blocks this call same as it would `du`),
+/// but carries none of the subprocess-spawn overhead, binary/flag dependency,
+/// or stdout-parsing fragility that motivated replacing it; run on the
+/// blocking thread pool via `tokio::task::spawn_blocking` so a slow walk
+/// never stalls the async runtime's worker threads.
+fn walk_dir_usage(path: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let mut size = 0u64;
+    let mut inodes = 0u64;
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
 
-/// Run `cmd` with `args`, bounded by `timeout`; best-effort SIGKILL the child
-/// and give up rather than hang the caller if it doesn't finish in time.
-/// Generic over the command so the timeout/kill behavior can be exercised in
-/// a test without depending on `du` ever actually wedging.
-async fn run_timed(cmd: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
-    let child = tokio::process::Command::new(cmd)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let pid = child.id().map(|p| p as i32);
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(o)) if o.status.success() => std::str::from_utf8(&o.stdout).ok().map(str::to_string),
-        Ok(_) => None,
-        Err(_) => {
-            log::warn!("{cmd} {args:?} timed out after {timeout:?}; killing and giving up (#561)");
-            if let Some(pid) = pid {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
+    // GNU `du --apparent-size` counts directories toward the inode total but
+    // NOT toward the size total — only regular files'/symlinks' own apparent
+    // size contributes. Confirmed by live cross-check against real `du` on a
+    // production layer: a naive walk that also summed each directory's own
+    // (non-trivial, ext4-block-dependent) stat size overcounted by exactly
+    // the sum of every directory's raw `st_size` in the tree.
+    let mut count = |meta: &std::fs::Metadata| {
+        if seen.insert((meta.dev(), meta.ino())) {
+            if !meta.is_dir() {
+                size += meta.len();
             }
-            None
+            inodes += 1;
+        }
+    };
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        count(&meta);
+    }
+
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // DirEntry::metadata() is lstat-equivalent — does not follow symlinks.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            count(&meta);
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
         }
     }
+    (size, inodes)
 }
 
-/// Run `du` against `path`, bounded by `DU_TIMEOUT`. A dangling/partially
-/// torn-down overlay or FUSE mount left by an aborted layer extraction or
-/// rootfs teardown can wedge `du` in kernel D-state indefinitely (#561) —
-/// unlike a Rust-level deadlock, that survives a `pelagos-cri` restart, since
-/// the stuck process is external to it and a fresh restart just re-runs `du`
-/// against the same wedged path. Bound it like every other subprocess wait in
-/// this codebase (streaming.rs, runtime.rs) so one bad layer can't wedge
-/// ListImages/ImageFsInfo forever.
-async fn run_du(path: &str, args: &[&str]) -> Option<String> {
-    let mut full_args: Vec<&str> = args.to_vec();
-    full_args.push(path);
-    run_timed("du", &full_args, DU_TIMEOUT).await
-}
-
-/// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
-async fn dir_disk_usage(path: &str) -> u64 {
-    run_du(path, &["--apparent-size", "-sb"])
+/// Async wrapper around [`walk_dir_usage`], off the async runtime's worker
+/// threads.
+async fn dir_usage(path: &str) -> (u64, u64) {
+    let path = std::path::PathBuf::from(path);
+    tokio::task::spawn_blocking(move || walk_dir_usage(&path))
         .await
-        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
-        .unwrap_or(0)
-}
-
-/// Count inodes (files + directories) under a path via `du --inodes -s`.
-async fn count_inodes(path: &str) -> u64 {
-    run_du(path, &["--inodes", "-s"])
-        .await
-        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
-        .unwrap_or(0)
+        .unwrap_or((0, 0))
 }
 
 /// In-memory cache of per-layer on-disk size, keyed by layer digest (without
 /// the `sha256:` prefix). Layer content is immutable and content-addressed —
-/// a given digest's `du` result can never change — so caching it for the life
-/// of the process is always safe, with no invalidation needed.
+/// a given digest's on-disk size/inode count can never change — so caching it
+/// for the life of the process is always safe, with no invalidation needed.
 ///
-/// Without this, `layers_size` reran `du` on every layer of every image on
-/// every single `ListImages` call: real, measured 5.9s for 73 images / 405
-/// layers on a cluster node that had simply been running for a while — comfortably
-/// past `crictl`'s 2s default client deadline. Since a node's accumulated
-/// image/layer count is exactly what a `pelagos-cri` restart does NOT reset,
-/// that cost only grows over a node's lifetime and, once it crosses the
-/// client's deadline, fails every call thereafter — which looks identical to,
-/// and was originally mistaken for, a stuck/wedged `du` (#561). Caching turns
-/// repeat `ListImages` calls into O(unique layers) real `du` spawns ever,
-/// then pure in-memory lookups — collapsing the common case (many images
-/// sharing base layers) to near-zero added latency.
+/// Without this, `layers_size` recomputed every layer of every image on every
+/// single `ListImages` call: real, measured 5.9s for 73 images / 405 layers
+/// (back when this walked via a `du` subprocess per layer) on a cluster node
+/// that had simply been running for a while — comfortably past `crictl`'s 2s
+/// default client deadline. Since a node's accumulated image/layer count is
+/// exactly what a `pelagos-cri` restart does NOT reset, that cost only grows
+/// over a node's lifetime and, once it crosses the client's deadline, fails
+/// every call thereafter (#561). Caching turns repeat `ListImages` calls into
+/// O(unique layers) real filesystem walks ever, then pure in-memory lookups —
+/// collapsing the common case (many images sharing base layers) to near-zero
+/// added latency.
 fn layer_size_cache() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
     static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, u64>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
-}
-
-/// On-disk size of the layer at `digest`, served from `layer_size_cache()`
-/// after the first real `du`.
-async fn cached_layer_size(digest: &str) -> u64 {
-    if let Some(&size) = layer_size_cache().lock().await.get(digest) {
-        return size;
-    }
-    let size = dir_disk_usage(&format!("{LAYERS_DIR}/{digest}")).await;
-    layer_size_cache()
-        .lock()
-        .await
-        .insert(digest.to_string(), size);
-    size
 }
 
 /// Same caching as `layer_size_cache`, for per-layer inode counts.
@@ -149,34 +155,49 @@ fn layer_inode_cache() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
     CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-/// Inode count of the layer at `digest`, served from `layer_inode_cache()`
-/// after the first real `du`.
-async fn cached_layer_inodes(digest: &str) -> u64 {
-    if let Some(&n) = layer_inode_cache().lock().await.get(digest) {
-        return n;
+/// On-disk size and inode count of the layer at `digest`, served from
+/// `layer_size_cache()`/`layer_inode_cache()` after the first real walk.
+/// Computes both from a single [`walk_dir_usage`] pass — not two — since
+/// `layers_dir_usage` below needs both for every digest it sees.
+async fn cached_layer_usage(digest: &str) -> (u64, u64) {
+    {
+        let sizes = layer_size_cache().lock().await;
+        let inodes = layer_inode_cache().lock().await;
+        if let (Some(&size), Some(&n)) = (sizes.get(digest), inodes.get(digest)) {
+            return (size, n);
+        }
     }
-    let n = count_inodes(&format!("{LAYERS_DIR}/{digest}")).await;
+    let (size, n) = dir_usage(&format!("{LAYERS_DIR}/{digest}")).await;
+    layer_size_cache()
+        .lock()
+        .await
+        .insert(digest.to_string(), size);
     layer_inode_cache()
         .lock()
         .await
         .insert(digest.to_string(), n);
-    n
+    (size, n)
+}
+
+/// On-disk size of the layer at `digest`. See [`cached_layer_usage`].
+async fn cached_layer_size(digest: &str) -> u64 {
+    cached_layer_usage(digest).await.0
 }
 
 /// Total on-disk size and inode count of every layer under `LAYERS_DIR`,
-/// built from a single shallow `read_dir` (not a recursive `du`) plus the
-/// same per-layer caches `list_images` populates.
+/// built from a single shallow `read_dir` (not a recursive walk of the whole
+/// tree) plus the same per-layer caches `list_images` populates.
 ///
-/// `image_fs_info` used to run `du -sb`/`du --inodes -s` over the ENTIRE
-/// `LAYERS_DIR` tree on every call — measured live at 1.7s + 1.65s (809k
-/// inodes, 22GB) on a real cluster node, which is what `crictl`'s startup
-/// "validate CRI v1 image API" preflight actually calls and what was really
-/// producing the reported permanent `DeadlineExceeded` (#561) — the
-/// per-image `layers_size` cache above doesn't touch this path at all, since
-/// it's one aggregate query over the whole tree rather than per-image. Since
+/// `image_fs_info` used to walk the ENTIRE `LAYERS_DIR` tree on every call via
+/// `du -sb`/`du --inodes -s` — measured live at 1.7s + 1.65s (809k inodes,
+/// 22GB) on a real cluster node, which is what `crictl`'s startup "validate
+/// CRI v1 image API" preflight actually calls and what was really producing
+/// the reported permanent `DeadlineExceeded` (#561) — the per-image
+/// `layers_size` cache above doesn't touch this path at all, since it's one
+/// aggregate query over the whole tree rather than per-image. Since
 /// `LAYERS_DIR` contains nothing but per-digest layer directories, this total
 /// equals the sum of each layer's own cached size/inode count — recomputed
-/// from a real `du` only for digests neither this nor `list_images` has seen
+/// from a real walk only for digests neither this nor `list_images` has seen
 /// before.
 async fn layers_dir_usage(dir: &str) -> (u64, u64) {
     let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
@@ -188,8 +209,9 @@ async fn layers_dir_usage(dir: &str) -> (u64, u64) {
         let Some(digest) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        used += cached_layer_size(&digest).await;
-        inodes += cached_layer_inodes(&digest).await;
+        let (size, n) = cached_layer_usage(&digest).await;
+        used += size;
+        inodes += n;
     }
     (used, inodes)
 }
@@ -547,28 +569,58 @@ impl ImageService for ImageSvc {
 mod tests {
     use super::*;
 
-    /// #561 regression: `ListImages`/`ImageFsInfo` call `du` on every request
-    /// with no bound, so a `du` wedged on a dangling/torn-down overlay or FUSE
-    /// mount hangs the image service forever — and survives a `pelagos-cri`
-    /// restart, since the wedge is in the kernel, external to the process.
-    /// `run_timed` must give up and return rather than block past its
-    /// timeout, regardless of how long the underlying command actually runs.
-    #[tokio::test]
-    async fn run_timed_gives_up_rather_than_block_past_its_timeout() {
-        let start = std::time::Instant::now();
-        let result = run_timed("sleep", &["5"], std::time::Duration::from_millis(100)).await;
-        assert!(
-            result.is_none(),
-            "a command still running past its timeout must report no output, not hang the caller"
+    /// #563/#564: `walk_dir_usage` must compute apparent size and inode count
+    /// matching `du -sb --apparent-size`/`du --inodes -s` semantics natively —
+    /// no `du` subprocess, no dependency on GNU-specific flags being present.
+    /// Builds a small real tree (two files, a subdirectory, a symlink, and a
+    /// hard link) and asserts: file sizes are summed exactly; directories
+    /// contribute to the inode count but NOT the size total (confirmed by a
+    /// live cross-check against real `du` on a production layer, where an
+    /// earlier version of this function overcounted by exactly the sum of
+    /// every directory's own raw size — `du`'s apparent-size total only
+    /// reflects actual file/symlink content, not directory metadata); the
+    /// symlink is counted as itself (its own size — the target path's byte
+    /// length), not traversed into its target, matching `du`'s default
+    /// `lstat`-based behavior; the hard link is NOT double-counted, matching
+    /// `du`'s real `(dev, ino)` dedup.
+    #[test]
+    fn walk_dir_usage_matches_du_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("a.txt"), b"hello").unwrap(); // 5 bytes
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"world!").unwrap(); // 6 bytes
+        std::fs::hard_link(root.join("a.txt"), root.join("sub/a-hardlink.txt")).unwrap();
+        let target = root.join("a.txt");
+        // A symlink's own apparent size (lstat) is the byte length of its
+        // target path string.
+        let symlink_size = target.as_os_str().len() as u64;
+        std::os::unix::fs::symlink(&target, root.join("link-to-a")).unwrap();
+
+        let (size, inodes) = walk_dir_usage(root);
+
+        // Entries: root dir, a.txt, sub dir, sub/b.txt, link-to-a (symlink
+        // itself, not traversed) = 5 inodes. a.txt's hardlink in sub/ shares
+        // the same (dev, ino) as a.txt, so it must NOT add a 6th.
+        assert_eq!(
+            inodes, 5,
+            "hard link to an already-counted file must not be double-counted"
         );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "must return promptly on timeout, not block for anywhere near the full \
-             underlying command duration (#561)"
+        // Size = ONLY the two real files' content (5 + 6) + the symlink's own
+        // size. The root and sub DIRECTORIES must contribute nothing to size
+        // (only to the inode count above) -- matching a live cross-check
+        // against real `du` on a production layer, where an earlier version
+        // of this function that also summed directories' own sizes
+        // overcounted by exactly the sum of every directory's raw size.
+        assert_eq!(
+            size,
+            5 + 6 + symlink_size,
+            "directories must not contribute to the size total, only to inodes: got {size}"
         );
     }
 
-    /// #561 regression: the actual reproduced root cause of the persistent
+    /// #563/#564: the other half of #561's real fix: the actual reproduced root cause
     /// `DeadlineExceeded` on `ListImages`/`crictl images` was not a wedged
     /// mount but plain O(images x layers) `du` re-execution on every call —
     /// measured at 5.9s for 73 images / 405 layers on a real cluster node,

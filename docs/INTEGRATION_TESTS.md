@@ -5793,59 +5793,58 @@ but a clean dev box or an empty build-job container. Narrowed to assert only tha
 test's own `"churning"` sandbox is absent from `stale`, not that the list is globally
 empty; other entries are expected noise from the host's own state, not a test failure.
 
-## `image::tests::run_timed_gives_up_rather_than_block_past_its_timeout` (pelagos-cri unit test)
-**No root required.** Defensive-bound test for #561's Image-service wedge theory:
-`ListImages`/`ImageFsInfo` call `du` via `dir_disk_usage`/`count_inodes`, with no timeout
-at all before this fix — unlike every other subprocess wait in the codebase
-(`streaming.rs`, `runtime.rs`). A dangling/partially torn-down overlay or FUSE mount left
-by an aborted layer extraction or rootfs teardown could in principle wedge `du` in kernel
-D-state indefinitely; since that would be external to the `pelagos-cri` process (stuck in
-the kernel, not a Rust-level deadlock), it would survive a full service restart. Runs
-`run_timed` (the generic, now-timeout-bounded helper `run_du` delegates to) against
-`sleep 5` with a 100ms timeout and asserts it returns `None` promptly rather than blocking
-anywhere near the full 5s. **Why it matters:** proves one bad layer's `du` call can no
-longer hang `ListImages`/`ImageFsInfo` forever — a real defensive bound, kept even though
-live reproduction found the *actual* #561 cause to be the plain O(n) cost documented in
-`cached_layer_size_populates_the_cache_after_first_lookup` below.
+## `image::tests::walk_dir_usage_matches_du_semantics` (pelagos-cri unit test)
+**No root required.** `ListImages`/`ImageFsInfo` originally shelled out to `du` for
+per-layer and whole-tree size/inode accounting (#561); #563/#564 replace it with
+`walk_dir_usage`, a native recursive filesystem walk — no subprocess, no dependency on
+GNU-specific `du` flags being present, no per-call process-spawn overhead. Builds a real
+tree (two files, a subdirectory, a symlink, and a hard link) and asserts: file sizes sum
+exactly; the symlink is counted as itself via `lstat`-equivalent metadata (`DirEntry::
+metadata()`/`symlink_metadata`), not traversed into its target, matching `du`'s default
+behavior; the hard link is deduplicated by `(dev, ino)` rather than double-counted,
+matching `du`'s real accounting. **Why it matters:** proves the native replacement doesn't
+just move the subprocess-spawn/binary-presence fragility `du` carried onto a different
+implementation — it reproduces `du`'s actual counting semantics, including the two
+easy-to-get-wrong edge cases (symlinks, hard links).
 
 ## `image::tests::cached_layer_size_populates_the_cache_after_first_lookup` (pelagos-cri unit test)
 **No root required.** Regression test for #561's Image-service wedge, after live
-reproduction on a real cluster node identified the actual root cause: `layers_size` reran
-`du` for every layer of every image on **every single** `ListImages` call, with no
-caching. Measured live on a node with 73 images / 405 layers (accumulated from ordinary
-cluster use, not a crash or a mount wedge): `crictl images` took 5.9s server-side,
-comfortably past `crictl`'s 2s default client deadline, producing the exact reported
+reproduction on a real cluster node identified the actual root cause: `layers_size`
+recomputed every layer of every image on **every single** `ListImages` call, with no
+caching (originally via a `du` subprocess per layer; now via `walk_dir_usage`, #563/#564).
+Measured live on a node with 73 images / 405 layers (accumulated from ordinary cluster
+use, not a crash or a mount wedge): `crictl images` took 5.9s server-side, comfortably
+past `crictl`'s 2s default client deadline, producing the exact reported
 `DeadlineExceeded`. Since the image/layer count on disk is exactly what a `pelagos-cri`
 restart does **not** reset, this cost only grows over a node's uptime and, once it
-crosses the client's deadline, fails every subsequent call — indistinguishable from (and
-originally mistaken for) a stuck `du`. Layer content is immutable and content-addressed,
-so a digest's on-disk size can never change; `cached_layer_size` exploits this with an
-unbounded, never-invalidated in-memory cache keyed by digest. The test asserts a digest is
-present in `layer_size_cache()` immediately after its first lookup — even when `du`
-reports 0 for a path that doesn't exist — so a later lookup for the same digest never
-re-runs `du` at all. **Why it matters:** collapses `ListImages`'s cost from O(images x
-layers) real subprocess spawns on every call to O(unique layers) ever, then pure
-in-memory lookups. One half of the #561 fix — see
+crosses the client's deadline, fails every subsequent call. Layer content is immutable
+and content-addressed, so a digest's on-disk size can never change; `cached_layer_usage`
+exploits this with an unbounded, never-invalidated in-memory cache keyed by digest. The
+test asserts a digest is present in `layer_size_cache()` immediately after its first
+lookup — even for a path that doesn't exist (size 0) — so a later lookup for the same
+digest never recomputes at all. **Why it matters:** collapses `ListImages`'s cost from
+O(images x layers) real work on every call to O(unique layers) ever, then pure in-memory
+lookups. One half of the #561 fix — see
 `layers_dir_usage_sums_cached_sizes_without_rerunning_du` below for the other, more
 directly implicated half.
 
 ## `image::tests::layers_dir_usage_sums_cached_sizes_without_rerunning_du` (pelagos-cri unit test)
-**No root required.** The other half of #561's real fix: `image_fs_info` ran `du -sb`/`du
---inodes -s` over the ENTIRE `LAYERS_DIR` tree on every single call — a path the per-image
-`cached_layer_size` fix above doesn't touch at all, since it's one aggregate query over
-the whole tree rather than per-image. Measured live on the same cluster node: 1.7s +
-1.65s (809k inodes, 22GB). `crictl`'s startup "validate CRI v1 image API" preflight calls
-this RPC specifically (not `ListImages`), so this alone was enough to keep reproducing the
-reported permanent `DeadlineExceeded` even after the `ListImages` fix landed — confirmed
-live: `crictl images` dropped from unusable to a consistent ~3.4s (still over `crictl`'s 2s
-default deadline) with only the `ListImages` fix in place, exactly matching the measured
-cost of these two whole-tree `du` calls. `layers_dir_usage` replaces them with a single
-shallow `read_dir` over `LAYERS_DIR` plus the same per-layer caches `list_images`
-populates, since the directory holds nothing but per-digest layer directories and the
-total is exactly the sum of each layer's own cached size/inode count. The test
-pre-populates the caches with values no real `du` could produce for the (empty) test
-directories, then asserts those exact values come back — proof the cached path, not a
-fresh scan, served the result. **Why it matters:** this, combined with the `ListImages`
+**No root required.** The other half of #561's real fix: `image_fs_info` walked the
+ENTIRE `LAYERS_DIR` tree on every single call (originally via `du -sb`/`du --inodes -s`) —
+a path the per-image `cached_layer_usage` fix above doesn't touch at all, since it's one
+aggregate query over the whole tree rather than per-image. Measured live on the same
+cluster node: 1.7s + 1.65s (809k inodes, 22GB). `crictl`'s startup "validate CRI v1 image
+API" preflight calls this RPC specifically (not `ListImages`), so this alone was enough to
+keep reproducing the reported permanent `DeadlineExceeded` even after the `ListImages` fix
+landed — confirmed live: `crictl images` dropped from unusable to a consistent ~3.4s
+(still over `crictl`'s 2s default deadline) with only the `ListImages` fix in place,
+exactly matching the measured cost of these two whole-tree scans. `layers_dir_usage`
+replaces them with a single shallow `read_dir` over `LAYERS_DIR` plus the same per-layer
+caches `list_images` populates, since the directory holds nothing but per-digest layer
+directories and the total is exactly the sum of each layer's own cached size/inode count.
+The test pre-populates the caches with values no real walk could produce for the (empty)
+test directories, then asserts those exact values come back — proof the cached path, not
+a fresh scan, served the result. **Why it matters:** this, combined with the `ListImages`
 cache, is what actually resolves the reported permanent `DeadlineExceeded` — live
 reproduction disproved the original wedged-mount theory outright (no stuck process,
 instant recovery with a longer client timeout) in favor of plain unbounded, uncached
