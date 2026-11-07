@@ -65,13 +65,18 @@ pub fn has_newgidmap() -> bool {
     which("newgidmap")
 }
 
+/// Search `$PATH` for an executable named `name` natively, rather than
+/// shelling out to `which` — which isn't guaranteed present on a minimal
+/// host either, which is the whole irony of using it for a presence check.
 fn which(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        std::fs::metadata(dir.join(name))
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
 }
 
 /// Get the current username and primary GID by looking up the real UID in `/etc/passwd`.
@@ -165,6 +170,51 @@ pub fn apply_gid_map(pid: u32, maps: &[GidMap]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #564: `which` must find an executable on `$PATH` natively (no `which`
+    /// binary involved), reject a same-named non-executable file, and reject
+    /// a name that exists nowhere on `$PATH` at all.
+    #[test]
+    fn which_finds_executables_on_path_natively() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-newuidmap-564");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let not_exe = dir.path().join("fake-not-executable-564");
+        std::fs::write(&not_exe, b"not a binary").unwrap();
+        std::fs::set_permissions(&not_exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let path_with_dir = format!("{}:{}", dir.path().display(), original_path);
+        // SAFETY: test-only mutation of this process's env, restored below;
+        // no other thread in this test binary depends on PATH concurrently.
+        unsafe {
+            std::env::set_var("PATH", &path_with_dir);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                which("fake-newuidmap-564"),
+                "must find an executable file placed on PATH"
+            );
+            assert!(
+                !which("fake-not-executable-564"),
+                "must reject a same-named file without the executable bit set"
+            );
+            assert!(
+                !which("fake-newuidmap-564-does-not-exist"),
+                "must return false for a name absent from every PATH entry"
+            );
+        });
+
+        unsafe {
+            std::env::set_var("PATH", &original_path);
+        }
+        result.unwrap();
+    }
 
     #[test]
     fn test_parse_subid_single_range() {

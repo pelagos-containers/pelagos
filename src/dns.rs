@@ -12,6 +12,19 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+/// Search `$PATH` for an executable named `name` natively, rather than
+/// shelling out to `which` — which isn't guaranteed present on a minimal
+/// host either, which is the whole irony of using it for a presence check.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var).find_map(|dir| {
+        let candidate = dir.join(name);
+        let meta = std::fs::metadata(&candidate).ok()?;
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
+    })
+}
+
 /// DNS backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsBackend {
@@ -415,16 +428,8 @@ fn find_dns_binary() -> io::Result<PathBuf> {
     }
 
     // Fall back to PATH lookup.
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("pelagos-dns")
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
-        }
+    if let Some(path) = find_on_path("pelagos-dns") {
+        return Ok(path);
     }
 
     Err(io::Error::other(
@@ -459,16 +464,8 @@ fn exec_dns_binary(bin: &std::path::Path, config_dir: &str) -> io::Error {
 
 /// Check if dnsmasq is available on PATH.
 fn find_dnsmasq() -> io::Result<PathBuf> {
-    let output = std::process::Command::new("which")
-        .arg("dnsmasq")
-        .output()
-        .map_err(|e| io::Error::other(format!("failed to search for dnsmasq: {}", e)))?;
-
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
+    if let Some(path) = find_on_path("dnsmasq") {
+        return Ok(path);
     }
 
     Err(io::Error::other(
@@ -681,5 +678,54 @@ fn flock_exclusive(file: &std::fs::File) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #564: `find_on_path` must find an executable on `$PATH` natively (no
+    /// `which` binary involved), reject a same-named non-executable file, and
+    /// return `None` for a name absent from every `$PATH` entry.
+    #[test]
+    fn find_on_path_finds_executables_natively() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-dnsmasq-564");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let not_exe = dir.path().join("fake-not-executable-564");
+        std::fs::write(&not_exe, b"not a binary").unwrap();
+        std::fs::set_permissions(&not_exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let path_with_dir = format!("{}:{}", dir.path().display(), original_path);
+        // SAFETY: test-only mutation of this process's env, restored below;
+        // no other thread in this test binary depends on PATH concurrently.
+        unsafe {
+            std::env::set_var("PATH", &path_with_dir);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            assert_eq!(find_on_path("fake-dnsmasq-564"), Some(exe.clone()));
+            assert_eq!(
+                find_on_path("fake-not-executable-564"),
+                None,
+                "must reject a same-named file without the executable bit set"
+            );
+            assert_eq!(
+                find_on_path("fake-dnsmasq-564-does-not-exist"),
+                None,
+                "must return None for a name absent from every PATH entry"
+            );
+        });
+
+        unsafe {
+            std::env::set_var("PATH", &original_path);
+        }
+        result.unwrap();
     }
 }

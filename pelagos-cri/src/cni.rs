@@ -68,26 +68,16 @@ pub fn find_cni_conf() -> Option<PathBuf> {
     None
 }
 
-/// Create a named network namespace via `ip netns add`.
-/// Returns the netns path (`/run/netns/<name>`) on success.
+/// Create a named network namespace. Returns the netns path
+/// (`/run/netns/<name>`) on success. See `netns_native::create_netns` (#564).
 pub fn create_netns(name: &str) -> Result<String, String> {
-    let out = Command::new("ip")
-        .args(["netns", "add", name])
-        .output()
-        .map_err(|e| format!("ip netns add: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ip netns add {} failed: {}",
-            name,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(format!("/run/netns/{}", name))
+    crate::netns_native::create_netns(name).map_err(|e| format!("netns create {}: {}", name, e))
 }
 
 /// Delete a named network namespace.  Best-effort; errors are ignored.
+/// See `netns_native::delete_netns` (#564).
 pub fn delete_netns(name: &str) {
-    let _ = Command::new("ip").args(["netns", "del", name]).output();
+    crate::netns_native::delete_netns(name);
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────

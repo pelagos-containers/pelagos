@@ -10,6 +10,7 @@ mod cri_metrics;
 mod grpc_metrics;
 mod image;
 mod invoke;
+mod netns_native;
 mod runtime;
 mod scope;
 mod state;

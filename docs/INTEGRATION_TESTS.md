@@ -5840,6 +5840,55 @@ reproduction disproved the original wedged-mount theory outright (no stuck proce
 instant recovery with a longer client timeout) in favor of plain unbounded, uncached
 O(layers) work that only gets worse as a node's image count grows over its lifetime.
 
+## `netns_native::tests::*` (pelagos-cri unit tests, issue #564)
+**No root required** (each test operates on `lo`/`/proc/self/ns/net`/a readable sysctl
+rather than creating a privileged namespace). Guards the native replacements for
+`pelagos-cri`'s `nsenter`/`ip netns` subprocess calls, found by an audit of every
+`Command::new` shell-out across the workspace. The prior code shelled to `nsenter` to
+bring a sandbox's loopback up, set an unprivileged-port sysctl, set the pod hostname, and
+apply pod-level sysctls across net/ipc/uts namespaces, and to `ip netns add`/`del` to
+manage the namespace itself — each paying real process-spawn overhead and depending on
+`nsenter`/`ip`/`sysctl`/`hostname` being present with expected flags. `netns_native`
+replaces all of them with direct `setns`/`unshare`/`ioctl`/`sethostname`/`mount` syscalls,
+following the exact thread-based pattern already proven in the main `pelagos` crate's
+`netlink::in_netns`/`netns_create`/`netns_del` (duplicated rather than shared, since
+`pelagos-cri` deliberately doesn't link the full `pelagos` crate).
+- `set_link_up_sets_iff_up_on_loopback` / `set_link_up_rejects_overlong_name`: the
+  `SIOCSIFFLAGS` `IFF_UP` toggle (replaces `nsenter ... -- ip link set lo up`) actually
+  flips the flag (verified via `/sys/class/net/lo/flags`) and rejects a name too long for
+  `IFNAMSIZ` before ever opening a socket.
+- `write_sysctl_translates_dots_to_proc_path`: the dotted-key-to-`/proc/sys/...`-path
+  translation (replaces `nsenter ... -- sysctl -w key=value`) matches what `sysctl -w`
+  does internally — dots become slashes, nothing else.
+- `in_net_ns_enters_and_runs_closure` / `in_net_ns_rejects_missing_path`: the
+  thread-spawn-and-`setns` plumbing (replaces `nsenter --net=<path>`) actually runs the
+  closure after entering (using the test process's own `/proc/self/ns/net`, needing no
+  new namespace), and a bad path fails on the calling thread before any thread is spawned.
+**Why it matters:** proves the native replacements behave identically to what the shelled
+commands did, without any of the four binaries, and without the subprocess-spawn
+overhead or binary-presence fragility that motivated #564 in the first place.
+
+## `idmap::tests::which_finds_executables_on_path_natively` (pelagos unit test)
+**No root required.** Companion fix from the same #564 audit, in the main `pelagos`
+crate: `has_newuidmap`/`has_newgidmap` shelled to `which` to probe for the `newuidmap`/
+`newgidmap` helpers — ironic, since `which` itself isn't guaranteed present on a minimal
+host either, which is exactly the kind of binary-presence fragility #564 is about.
+Replaces it with a manual `$PATH`-splitting + file-metadata check. The test places a real
+executable and a same-named-but-non-executable file in a temp dir prepended to `$PATH`
+(restored via `catch_unwind` + explicit reset even on assertion failure, since mutating
+process-global `$PATH` must not leak into other tests) and asserts the function finds the
+executable, rejects the non-executable file, and returns `false` for a name on neither.
+**Why it matters:** proves the native check has the same semantics as `which` (name
+findable AND executable), not just "a file with this name exists somewhere on PATH."
+
+## `dns::tests::find_on_path_finds_executables_natively` (pelagos unit test)
+**No root required.** The third #564 site: `find_dns_binary`'s PATH fallback and
+`find_dnsmasq` both shelled to `which`. Same native `$PATH`-search replacement and the
+same test shape as `idmap::tests::which_finds_executables_on_path_natively` above, applied
+to `find_on_path` (which additionally returns the matched `PathBuf`, not just a bool).
+**Why it matters:** same as above — proves the executable-bit check, not just existence,
+determines a match.
+
 ## `issue_451_host_visible_overlay::test_host_visible_overlay_in_mountinfo`
 **Requires root.** Spawns a container with a native overlayfs (`with_overlay()`) and reads
 `/proc/self/mountinfo` from the HOST process (not inside the container) while the container

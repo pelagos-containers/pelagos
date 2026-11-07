@@ -32,6 +32,7 @@ use crate::cri::{
     VersionRequest, VersionResponse,
 };
 use crate::invoke::run_pelagos;
+use crate::netns_native;
 use crate::scope;
 use crate::state::{
     self, AppState, ContainerState as MyContainerState, CriContainer, CriMount, CriSandbox,
@@ -952,50 +953,30 @@ impl RuntimeService for RuntimeSvc {
                 }
             };
 
-            let net_arg = format!("--net={}", netns_path);
-
-            // Bring the loopback interface up in the sandbox netns.  The CNI
-            // spec requires a loopback plugin in the chain, but k3s/Flannel
-            // omit it.  Without this, lo stays DOWN and all intra-pod 127.0.0.1
-            // traffic fails — breaking the sidecar pattern (issue #331).
-            match tokio::process::Command::new("nsenter")
-                .args([net_arg.as_str(), "--", "ip", "link", "set", "lo", "up"])
-                .output()
-                .await
-            {
-                Ok(out) if !out.status.success() => {
-                    log::warn!(
-                        "bring lo up in {}: {}",
-                        ns_name,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-                Err(e) => log::warn!("nsenter lo up in {}: {}", ns_name, e),
-                _ => {}
-            }
-
-            // Allow non-root container processes (e.g. coredns running as "nonroot") to
-            // bind privileged ports inside this netns.  This matches containerd's default.
-            match tokio::process::Command::new("nsenter")
-                .args([
-                    net_arg.as_str(),
-                    "--",
-                    "sysctl",
-                    "-w",
-                    "net.ipv4.ip_unprivileged_port_start=0",
-                ])
-                .output()
-                .await
-            {
-                Ok(out) if !out.status.success() => {
-                    log::warn!(
-                        "sysctl ip_unprivileged_port_start in {}: {}",
-                        ns_name,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-                Err(e) => log::warn!("nsenter sysctl in {}: {}", ns_name, e),
-                _ => {}
+            // Bring the loopback interface up and allow non-root container
+            // processes (e.g. coredns running as "nonroot") to bind privileged
+            // ports, both inside the sandbox's netns, natively (#564 — no
+            // `nsenter`/`ip`/`sysctl` subprocesses). The CNI spec requires a
+            // loopback plugin in the chain, but k3s/Flannel omit it — without
+            // bringing lo up, all intra-pod 127.0.0.1 traffic fails, breaking
+            // the sidecar pattern (issue #331). The unprivileged-port sysctl
+            // matches containerd's default.
+            let netns_path_for_setup = netns_path.clone();
+            let setup_result = tokio::task::spawn_blocking(move || {
+                netns_native::in_net_ns(&netns_path_for_setup, || {
+                    netns_native::set_link_up("lo")?;
+                    netns_native::write_sysctl("net.ipv4.ip_unprivileged_port_start", "0")
+                })
+            })
+            .await;
+            match setup_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!(
+                    "sandbox netns setup (lo up / unprivileged ports) in {}: {}",
+                    ns_name,
+                    e
+                ),
+                Err(e) => log::warn!("sandbox netns setup task join error in {}: {}", ns_name, e),
             }
 
             // Spawn pause process: joins the CNI-configured netns, unshares IPC+UTS.
@@ -1210,9 +1191,11 @@ impl RuntimeService for RuntimeSvc {
                         sandbox_id,
                         sb.pause_pid
                     );
-                    let _ = std::process::Command::new("kill")
-                        .args(["-TERM", &sb.pause_pid.to_string()])
-                        .output();
+                    // Native kill(2) (#564) — matches the liveness check just below,
+                    // which already calls libc::kill directly.
+                    unsafe {
+                        libc::kill(sb.pause_pid, libc::SIGTERM);
+                    }
                     pause_drained = false;
                     // Bounded drain (~5s): poll until the pause is gone (ESRCH).
                     for _ in 0..100 {
@@ -3196,41 +3179,39 @@ async fn wait_for_pause_ns_unshare(pause_pid: i32) -> bool {
 
 /// Set the pod hostname inside the pause's UTS namespace (which containers join),
 /// so `hostname` resolves to the pod name (#354 set-hostname). Best-effort; no-op
-/// when empty.
+/// when empty. Native `setns`+`sethostname` (#564 — no `nsenter`/`hostname` subprocess).
 async fn apply_pod_hostname(pause_pid: i32, hostname: &str) {
     if hostname.is_empty() {
         return;
     }
-    let uts = format!("--uts=/proc/{}/ns/uts", pause_pid);
-    match tokio::process::Command::new("nsenter")
-        .args([uts.as_str(), "--", "hostname", hostname])
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => log::info!("pod hostname set to {}", hostname),
-        Ok(out) => log::warn!(
-            "set pod hostname {}: {}",
-            hostname,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-        Err(e) => log::warn!("nsenter hostname {}: {}", hostname, e),
+    let uts_path = format!("/proc/{}/ns/uts", pause_pid);
+    let hostname_owned = hostname.to_string();
+    let hostname_log = hostname_owned.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        netns_native::in_uts_ns(&uts_path, move || {
+            netns_native::set_hostname(&hostname_owned)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => log::info!("pod hostname set to {}", hostname_log),
+        Ok(Err(e)) => log::warn!("set pod hostname {}: {}", hostname_log, e),
+        Err(e) => log::warn!("set pod hostname {} task join error: {}", hostname_log, e),
     }
 }
 
-/// Build the `nsenter` argv that applies one pod-level sysctl inside a sandbox's
-/// namespaces. `net.*` keys live in the network namespace; `kernel.*`/`fs.*` live
-/// in the IPC/UTS namespaces held by the pause — so we enter all three and let
-/// `sysctl -w` write to whichever `/proc/sys` the key belongs to.
-fn sandbox_sysctl_argv(netns_path: &str, pause_pid: i32, key: &str, value: &str) -> Vec<String> {
-    vec![
-        format!("--net={}", netns_path),
-        format!("--ipc=/proc/{}/ns/ipc", pause_pid),
-        format!("--uts=/proc/{}/ns/uts", pause_pid),
-        "--".to_string(),
-        "sysctl".to_string(),
-        "-w".to_string(),
-        format!("{}={}", key, value),
-    ]
+/// Derive the three namespace paths needed to apply a pod-level sysctl inside
+/// all of a sandbox's pod namespaces. `net.*` keys live in the network
+/// namespace; `kernel.*`/`fs.*` live in the IPC/UTS namespaces held by the
+/// pause — so every sysctl enters all three and lets `write_sysctl` land in
+/// whichever `/proc/sys` the key belongs to (#564 — no `nsenter`/`sysctl`
+/// subprocess; see `netns_native::in_pod_ns`/`write_sysctl`).
+fn pod_ns_paths(netns_path: &str, pause_pid: i32) -> (String, String, String) {
+    (
+        netns_path.to_string(),
+        format!("/proc/{}/ns/ipc", pause_pid),
+        format!("/proc/{}/ns/uts", pause_pid),
+    )
 }
 
 /// Apply the sandbox's configured sysctls (safe + unsafe; the kubelet has already
@@ -3240,23 +3221,20 @@ async fn apply_sandbox_sysctls(
     pause_pid: i32,
     sysctls: &HashMap<String, String>,
 ) {
+    let (net_path, ipc_path, uts_path) = pod_ns_paths(netns_path, pause_pid);
     for (key, value) in sysctls {
-        let argv = sandbox_sysctl_argv(netns_path, pause_pid, key, value);
-        match tokio::process::Command::new("nsenter")
-            .args(&argv)
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {
-                log::info!("sandbox sysctl {}={} applied", key, value)
-            }
-            Ok(out) => log::warn!(
-                "sandbox sysctl {}={}: {}",
-                key,
-                value,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(e) => log::warn!("nsenter sysctl {}={}: {}", key, value, e),
+        let (key_mv, value_mv) = (key.clone(), value.clone());
+        let (net_path, ipc_path, uts_path) = (net_path.clone(), ipc_path.clone(), uts_path.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            netns_native::in_pod_ns(&net_path, &ipc_path, &uts_path, move || {
+                netns_native::write_sysctl(&key_mv, &value_mv)
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => log::info!("sandbox sysctl {}={} applied", key, value),
+            Ok(Err(e)) => log::warn!("sandbox sysctl {}={}: {}", key, value, e),
+            Err(e) => log::warn!("sandbox sysctl {}={} task join error: {}", key, value, e),
         }
     }
 }
@@ -3681,27 +3659,18 @@ mod tests {
         );
     }
 
-    /// #355: a pod-level sysctl is applied inside ALL THREE pod namespaces — net
-    /// (net.*), ipc + uts (kernel.*/fs.*) — so `sysctl -w` lands in whichever
-    /// /proc/sys the key belongs to. Values with spaces survive as one argv element.
+    /// #355/#564: a pod-level sysctl is applied inside ALL THREE pod
+    /// namespaces — net (net.*), ipc + uts (kernel.*/fs.*) — so
+    /// `write_sysctl` lands in whichever `/proc/sys` the key belongs to.
     #[test]
-    fn test_sandbox_sysctl_argv() {
+    fn test_pod_ns_paths() {
         assert_eq!(
-            sandbox_sysctl_argv(
-                "/run/netns/pcri-abc",
-                4242,
-                "net.ipv4.ping_group_range",
-                "0 2147483647"
-            ),
-            vec![
-                "--net=/run/netns/pcri-abc",
-                "--ipc=/proc/4242/ns/ipc",
-                "--uts=/proc/4242/ns/uts",
-                "--",
-                "sysctl",
-                "-w",
-                "net.ipv4.ping_group_range=0 2147483647",
-            ]
+            pod_ns_paths("/run/netns/pcri-abc", 4242),
+            (
+                "/run/netns/pcri-abc".to_string(),
+                "/proc/4242/ns/ipc".to_string(),
+                "/proc/4242/ns/uts".to_string(),
+            )
         );
     }
 
