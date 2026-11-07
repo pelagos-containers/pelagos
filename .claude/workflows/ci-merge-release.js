@@ -47,7 +47,17 @@ if (!pr) {
   return { error: 'args.pr is required — call with Workflow({ name: "ci-merge-release", args: { pr: 123 } })' }
 }
 
-const REPO = '/home/cb/Projects/pelagos'
+// NOT a hardcoded absolute path: this workflow runs from whichever machine the
+// user is on (macOS dev box at /Users/<name>/Projects/pelagos, Linux cluster
+// boxes at /home/cb/Projects/pelagos, ...). A fixed path silently breaks on
+// every machine but the one it was written on — exactly what happened on
+// 2026-11-06 (#562's release step refused to run rather than guess). Each
+// spawned agent resolves its own working directory instead.
+const REPO_HINT = "~/Projects/pelagos (use the shell's own ~/$HOME expansion — " +
+  "do not hardcode a specific user's home directory). If that path doesn't " +
+  "exist or isn't the pelagos-containers/pelagos repo, locate the correct " +
+  'clone yourself (e.g. `find ~ -maxdepth 4 -type d -name pelagos 2>/dev/null` ' +
+  'then verify with `git -C <path> remote get-url origin`) before proceeding.'
 const MAX_POLLS = 300  // 300 × 90s ≈ 7.5 hours
 
 // ── Poll CI ────────────────────────────────────────────────────────────────────
@@ -57,7 +67,7 @@ log(`Polling CI for PR #${pr} (max ${MAX_POLLS} attempts, 90s apart)`)
 let passed = false
 for (let i = 1; i <= MAX_POLLS; i++) {
   const result = await agent(
-    `Check GitHub PR #${pr} CI status. Working directory: ${REPO}
+    `Check GitHub PR #${pr} CI status. Working directory: ${REPO_HINT}
 
 Run: gh pr checks ${pr}
 
@@ -91,7 +101,7 @@ if (!passed) {
 phase('Merge')
 const mergeResult = await agent(
   `Merge GitHub PR #${pr} with a merge commit (NOT squash, NOT rebase).
-Working directory: ${REPO}
+Working directory: ${REPO_HINT}
 
 Run: gh pr merge ${pr} --merge
 
@@ -110,7 +120,7 @@ log(`Merged PR #${pr} at ${mergeResult.sha}`)
 phase('Release')
 const releaseResult = await agent(
   `Bump Cargo.toml patch version and push a release tag.
-Working directory: ${REPO}
+Working directory: ${REPO_HINT}
 
 Steps (run exactly in this order):
 1. git checkout main
@@ -118,13 +128,17 @@ Steps (run exactly in this order):
 3. Read the current version: grep '^version' Cargo.toml | head -1
 4. Parse it as MAJOR.MINOR.PATCH and compute NEW_PATCH = PATCH + 1
 5. NEW_VERSION = MAJOR.MINOR.NEW_PATCH
-6. Apply: sed -i "s/^version = \\".*\\"/version = \\"$NEW_VERSION\\"/" Cargo.toml
-7. Verify: grep '^version' Cargo.toml
-8. git add Cargo.toml
-9. git commit -m "chore(release): v$NEW_VERSION"
-10. git tag v$NEW_VERSION
-11. git push origin main
-12. git push origin v$NEW_VERSION
+6. Apply to Cargo.toml: sed -i "s/^version = \\".*\\"/version = \\"$NEW_VERSION\\"/" Cargo.toml
+7. Apply the SAME bump to Cargo.lock's own "pelagos" package entry (only the
+   version line immediately following \`name = "pelagos"\`, not every version
+   string in the file):
+   awk -v v="$NEW_VERSION" '/^name = "pelagos"$/{print; getline; print "version = \\"" v "\\""; next} 1' Cargo.lock > Cargo.lock.new && mv Cargo.lock.new Cargo.lock
+8. Verify both: grep '^version' Cargo.toml && grep -A1 '^name = "pelagos"$' Cargo.lock | head -2
+9. git add Cargo.toml Cargo.lock
+10. git commit -m "chore(release): v$NEW_VERSION"
+11. git tag v$NEW_VERSION
+12. git push origin main
+13. git push origin v$NEW_VERSION
 
 Return JSON: { version: "MAJOR.MINOR.NEW_PATCH", tag: "vMAJOR.MINOR.NEW_PATCH", pushed: true/false, error: "..." }`,
   { schema: RELEASE_SCHEMA }
