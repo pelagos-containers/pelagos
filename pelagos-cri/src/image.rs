@@ -106,6 +106,42 @@ async fn count_inodes(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// In-memory cache of per-layer on-disk size, keyed by layer digest (without
+/// the `sha256:` prefix). Layer content is immutable and content-addressed —
+/// a given digest's `du` result can never change — so caching it for the life
+/// of the process is always safe, with no invalidation needed.
+///
+/// Without this, `layers_size` reran `du` on every layer of every image on
+/// every single `ListImages` call: real, measured 5.9s for 73 images / 405
+/// layers on a cluster node that had simply been running for a while — comfortably
+/// past `crictl`'s 2s default client deadline. Since a node's accumulated
+/// image/layer count is exactly what a `pelagos-cri` restart does NOT reset,
+/// that cost only grows over a node's lifetime and, once it crosses the
+/// client's deadline, fails every call thereafter — which looks identical to,
+/// and was originally mistaken for, a stuck/wedged `du` (#561). Caching turns
+/// repeat `ListImages` calls into O(unique layers) real `du` spawns ever,
+/// then pure in-memory lookups — collapsing the common case (many images
+/// sharing base layers) to near-zero added latency.
+fn layer_size_cache() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// On-disk size of the layer at `digest`, served from `layer_size_cache()`
+/// after the first real `du`.
+async fn cached_layer_size(digest: &str) -> u64 {
+    if let Some(&size) = layer_size_cache().lock().await.get(digest) {
+        return size;
+    }
+    let size = dir_disk_usage(&format!("{LAYERS_DIR}/{digest}")).await;
+    layer_size_cache()
+        .lock()
+        .await
+        .insert(digest.to_string(), size);
+    size
+}
+
 /// Current time in nanoseconds since the Unix epoch (for CRI timestamps).
 fn now_ns() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -212,7 +248,7 @@ impl ImageSvc {
         let mut total: u64 = 0;
         for layer in layers {
             let digest = layer.strip_prefix("sha256:").unwrap_or(layer.as_str());
-            total += dir_disk_usage(&format!("{}/{}", LAYERS_DIR, digest)).await;
+            total += cached_layer_size(digest).await;
         }
         // kubelet rejects images with Size_ == 0.
         total.max(1)
@@ -479,6 +515,31 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "must return promptly on timeout, not block for anywhere near the full \
              underlying command duration (#561)"
+        );
+    }
+
+    /// #561 regression: the actual reproduced root cause of the persistent
+    /// `DeadlineExceeded` on `ListImages`/`crictl images` was not a wedged
+    /// mount but plain O(images x layers) `du` re-execution on every call —
+    /// measured at 5.9s for 73 images / 405 layers on a real cluster node,
+    /// comfortably past `crictl`'s 2s default deadline, and only growing as a
+    /// node accumulates more images (exactly what a `pelagos-cri` restart
+    /// does not reset). `cached_layer_size` must populate the cache on first
+    /// lookup — even when `du` reports 0 for a nonexistent/inaccessible path
+    /// — so a later lookup for the same digest never re-runs `du` at all.
+    #[tokio::test]
+    async fn cached_layer_size_populates_the_cache_after_first_lookup() {
+        let digest = "deadbeef561testonly-does-not-exist";
+        assert!(
+            layer_size_cache().lock().await.get(digest).is_none(),
+            "test digest must not already be cached"
+        );
+        let _ = cached_layer_size(digest).await;
+        assert!(
+            layer_size_cache().lock().await.contains_key(digest),
+            "a layer's size must be cached after the first lookup, even when `du` \
+             reports 0 for it, so repeat ListImages calls never re-run `du` for \
+             the same digest (#561)"
         );
     }
 

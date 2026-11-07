@@ -5783,18 +5783,40 @@ dead. **Why it matters:** proves the race window `stop_pod_sandbox` now closes b
 `NotReady` first instead of last.
 
 ## `image::tests::run_timed_gives_up_rather_than_block_past_its_timeout` (pelagos-cri unit test)
-**No root required.** Regression test for #561's Image-service wedge: `ListImages`/
-`ImageFsInfo` call `du` on every request via `dir_disk_usage`/`count_inodes`, with no
-timeout at all before this fix — unlike every other subprocess wait in the codebase
+**No root required.** Defensive-bound test for #561's Image-service wedge theory:
+`ListImages`/`ImageFsInfo` call `du` via `dir_disk_usage`/`count_inodes`, with no timeout
+at all before this fix — unlike every other subprocess wait in the codebase
 (`streaming.rs`, `runtime.rs`). A dangling/partially torn-down overlay or FUSE mount left
-by an aborted layer extraction or rootfs teardown during pod-churn load can wedge `du` in
-kernel D-state indefinitely; because the wedge is external to the `pelagos-cri` process
-(stuck in the kernel, not a Rust-level deadlock), it survives a full service restart —
-exactly the reported symptom (`crictl ps`/`crictl images` permanently `DeadlineExceeded`,
-fresh PID, zero journal activity). Runs `run_timed` (the generic, now-timeout-bounded
-helper `run_du` delegates to) against `sleep 5` with a 100ms timeout and asserts it
-returns `None` promptly rather than blocking anywhere near the full 5s. **Why it matters:**
-proves one bad layer's `du` call can no longer hang `ListImages`/`ImageFsInfo` forever.
+by an aborted layer extraction or rootfs teardown could in principle wedge `du` in kernel
+D-state indefinitely; since that would be external to the `pelagos-cri` process (stuck in
+the kernel, not a Rust-level deadlock), it would survive a full service restart. Runs
+`run_timed` (the generic, now-timeout-bounded helper `run_du` delegates to) against
+`sleep 5` with a 100ms timeout and asserts it returns `None` promptly rather than blocking
+anywhere near the full 5s. **Why it matters:** proves one bad layer's `du` call can no
+longer hang `ListImages`/`ImageFsInfo` forever — a real defensive bound, kept even though
+live reproduction found the *actual* #561 cause to be the plain O(n) cost documented in
+`cached_layer_size_populates_the_cache_after_first_lookup` below.
+
+## `image::tests::cached_layer_size_populates_the_cache_after_first_lookup` (pelagos-cri unit test)
+**No root required.** Regression test for #561's Image-service wedge, after live
+reproduction on a real cluster node identified the actual root cause: `layers_size` reran
+`du` for every layer of every image on **every single** `ListImages` call, with no
+caching. Measured live on a node with 73 images / 405 layers (accumulated from ordinary
+cluster use, not a crash or a mount wedge): `crictl images` took 5.9s server-side,
+comfortably past `crictl`'s 2s default client deadline, producing the exact reported
+`DeadlineExceeded`. Since the image/layer count on disk is exactly what a `pelagos-cri`
+restart does **not** reset, this cost only grows over a node's uptime and, once it
+crosses the client's deadline, fails every subsequent call — indistinguishable from (and
+originally mistaken for) a stuck `du`. Layer content is immutable and content-addressed,
+so a digest's on-disk size can never change; `cached_layer_size` exploits this with an
+unbounded, never-invalidated in-memory cache keyed by digest. The test asserts a digest is
+present in `layer_size_cache()` immediately after its first lookup — even when `du`
+reports 0 for a path that doesn't exist — so a later lookup for the same digest never
+re-runs `du` at all. **Why it matters:** collapses `ListImages`'s cost from O(images x
+layers) real subprocess spawns on every call to O(unique layers) ever, then pure
+in-memory lookups — the fix that actually resolves the reported permanent
+`DeadlineExceeded`, not just a defensive bound against a hang that live testing showed
+was not, in fact, what was happening on the reporting node.
 
 ## `issue_451_host_visible_overlay::test_host_visible_overlay_in_mountinfo`
 **Requires root.** Spawns a container with a native overlayfs (`with_overlay()`) and reads
