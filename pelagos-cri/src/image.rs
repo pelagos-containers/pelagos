@@ -50,11 +50,18 @@ struct ImageConfig {
 /// everything under `path`, in one filesystem walk — natively, with no `du`
 /// subprocess (#563/#564).
 ///
-/// Matches `du`'s actual semantics: uses `lstat`-equivalent metadata (does
-/// NOT follow symlinks — a symlink counts as itself, not its target, same as
-/// `du`'s default), and deduplicates hard-linked files by `(dev, ino)` so a
-/// file linked multiple times within the scanned tree is only counted once —
-/// exactly what `du --inodes`/`du -sb` do internally.
+/// Matches `du`'s actual semantics:
+/// - `lstat`-equivalent metadata — does NOT follow symlinks (a symlink counts
+///   as itself, not its target, same as `du`'s default).
+/// - Deduplicates hard-linked files by `(dev, ino)`, so a file linked
+///   multiple times within the scanned tree is only counted once (toward
+///   both size and inodes) — matching `du`'s real accounting.
+/// - Directories count toward the inode total but NOT the size total — only
+///   regular files'/symlinks' own apparent size contributes to `size`.
+///   Confirmed by live cross-check against real `du` on a production layer:
+///   an earlier version of this function that also summed each directory's
+///   own (non-trivial, filesystem-block-dependent) `st_size` overcounted by
+///   exactly the sum of every directory's raw size in the tree.
 ///
 /// A dangling/partially torn-down overlay or FUSE mount left by an aborted
 /// layer extraction could in principle make a real `du` binary wedge in
@@ -72,9 +79,17 @@ fn walk_dir_usage(path: &std::path::Path) -> (u64, u64) {
     let mut inodes = 0u64;
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
 
+    // GNU `du --apparent-size` counts directories toward the inode total but
+    // NOT toward the size total — only regular files'/symlinks' own apparent
+    // size contributes. Confirmed by live cross-check against real `du` on a
+    // production layer: a naive walk that also summed each directory's own
+    // (non-trivial, ext4-block-dependent) stat size overcounted by exactly
+    // the sum of every directory's raw `st_size` in the tree.
     let mut count = |meta: &std::fs::Metadata| {
         if seen.insert((meta.dev(), meta.ino())) {
-            size += meta.len();
+            if !meta.is_dir() {
+                size += meta.len();
+            }
             inodes += 1;
         }
     };
@@ -557,11 +572,17 @@ mod tests {
     /// #563/#564: `walk_dir_usage` must compute apparent size and inode count
     /// matching `du -sb --apparent-size`/`du --inodes -s` semantics natively —
     /// no `du` subprocess, no dependency on GNU-specific flags being present.
-    /// Builds a small real tree (two files, a subdirectory, and a symlink)
-    /// and asserts: file sizes are summed exactly; the symlink is counted as
-    /// itself (its own small size), not traversed into its target, matching
-    /// `du`'s default `lstat`-based behavior; a hard link to an existing file
-    /// is NOT double-counted, matching `du`'s real `(dev, ino)` dedup.
+    /// Builds a small real tree (two files, a subdirectory, a symlink, and a
+    /// hard link) and asserts: file sizes are summed exactly; directories
+    /// contribute to the inode count but NOT the size total (confirmed by a
+    /// live cross-check against real `du` on a production layer, where an
+    /// earlier version of this function overcounted by exactly the sum of
+    /// every directory's own raw size — `du`'s apparent-size total only
+    /// reflects actual file/symlink content, not directory metadata); the
+    /// symlink is counted as itself (its own size — the target path's byte
+    /// length), not traversed into its target, matching `du`'s default
+    /// `lstat`-based behavior; the hard link is NOT double-counted, matching
+    /// `du`'s real `(dev, ino)` dedup.
     #[test]
     fn walk_dir_usage_matches_du_semantics() {
         let dir = tempfile::tempdir().unwrap();
@@ -571,8 +592,11 @@ mod tests {
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/b.txt"), b"world!").unwrap(); // 6 bytes
         std::fs::hard_link(root.join("a.txt"), root.join("sub/a-hardlink.txt")).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(root.join("a.txt"), root.join("link-to-a")).unwrap();
+        let target = root.join("a.txt");
+        // A symlink's own apparent size (lstat) is the byte length of its
+        // target path string.
+        let symlink_size = target.as_os_str().len() as u64;
+        std::os::unix::fs::symlink(&target, root.join("link-to-a")).unwrap();
 
         let (size, inodes) = walk_dir_usage(root);
 
@@ -583,12 +607,16 @@ mod tests {
             inodes, 5,
             "hard link to an already-counted file must not be double-counted"
         );
-        // Size = root dir entry + a.txt (5) + sub dir entry + sub/b.txt (6) +
-        // the symlink's own (small) size -- i.e. strictly more than just the
-        // two files' content, and the hardlink contributes nothing extra.
-        assert!(
-            size >= 11,
-            "must include at least the two real files' content bytes (5 + 6): got {size}"
+        // Size = ONLY the two real files' content (5 + 6) + the symlink's own
+        // size. The root and sub DIRECTORIES must contribute nothing to size
+        // (only to the inode count above) -- matching a live cross-check
+        // against real `du` on a production layer, where an earlier version
+        // of this function that also summed directories' own sizes
+        // overcounted by exactly the sum of every directory's raw size.
+        assert_eq!(
+            size,
+            5 + 6 + symlink_size,
+            "directories must not contribute to the size total, only to inodes: got {size}"
         );
     }
 
