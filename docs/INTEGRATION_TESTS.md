@@ -5766,6 +5766,36 @@ the fix is targeted — legitimate phantoms (pause died unexpectedly while the s
 still in Running state) are still reaped, while intentionally stopped sandboxes are not,
 preserving the #347 phantom-GC invariant.
 
+## `state::tests::begin_stop_pod_sandbox_marks_notready_before_teardown` (pelagos-cri unit test)
+**No root required.** Regression test for a reopened #438 (#561). `stop_pod_sandbox` only
+set a sandbox's state to `NotReady` *after* killing the pause, running CNI DEL, and deleting
+the netns — each of which can take real time under concurrent pod-churn load (CNI DEL
+especially, since #500's semaphore fail-fast only shortens one call's duration, not the
+overall window). Until that flip, the sandbox looked identical to a genuine #438 phantom
+(pause dead, state still `Running`) to a concurrent `ListPodSandbox` poll, and
+`stale_sandbox_ids` reaped it — deleting live containers out from under
+`ContainerStatus`/log lookups even though the pod was never actually crashed, reproducing
+#438's exact symptom (log file present and correct on disk, CRI retrieval fails anyway).
+Verifies `AppState::begin_stop_pod_sandbox` flips a sandbox to `NotReady` and persists it
+in the same lock acquisition it reads from, before any teardown step runs, and that
+`stale_sandbox_ids` never classifies the result as a phantom even with its pause reported
+dead. **Why it matters:** proves the race window `stop_pod_sandbox` now closes by marking
+`NotReady` first instead of last.
+
+## `image::tests::run_timed_gives_up_rather_than_block_past_its_timeout` (pelagos-cri unit test)
+**No root required.** Regression test for #561's Image-service wedge: `ListImages`/
+`ImageFsInfo` call `du` on every request via `dir_disk_usage`/`count_inodes`, with no
+timeout at all before this fix — unlike every other subprocess wait in the codebase
+(`streaming.rs`, `runtime.rs`). A dangling/partially torn-down overlay or FUSE mount left
+by an aborted layer extraction or rootfs teardown during pod-churn load can wedge `du` in
+kernel D-state indefinitely; because the wedge is external to the `pelagos-cri` process
+(stuck in the kernel, not a Rust-level deadlock), it survives a full service restart —
+exactly the reported symptom (`crictl ps`/`crictl images` permanently `DeadlineExceeded`,
+fresh PID, zero journal activity). Runs `run_timed` (the generic, now-timeout-bounded
+helper `run_du` delegates to) against `sleep 5` with a 100ms timeout and asserts it
+returns `None` promptly rather than blocking anywhere near the full 5s. **Why it matters:**
+proves one bad layer's `du` call can no longer hang `ListImages`/`ImageFsInfo` forever.
+
 ## `issue_451_host_visible_overlay::test_host_visible_overlay_in_mountinfo`
 **Requires root.** Spawns a container with a native overlayfs (`with_overlay()`) and reads
 `/proc/self/mountinfo` from the HOST process (not inside the container) while the container

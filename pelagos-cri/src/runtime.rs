@@ -1170,10 +1170,10 @@ impl RuntimeService for RuntimeSvc {
             }
         }
 
-        let sandbox = {
-            let st = self.state.inner.lock().await;
-            st.sandboxes.get(&sandbox_id).cloned()
-        };
+        // Mark NotReady *before* any teardown step runs (pause kill / CNI DEL /
+        // netns delete can each take seconds under load, #500's semaphore
+        // fail-fast included) — see `AppState::begin_stop_pod_sandbox` (#561).
+        let sandbox = self.state.begin_stop_pod_sandbox(&sandbox_id).await;
 
         if let Some(ref sb) = sandbox {
             if !sb.netns.is_empty() {
@@ -1281,11 +1281,6 @@ impl RuntimeService for RuntimeSvc {
             }
         }
 
-        let mut st = self.state.inner.lock().await;
-        if let Some(s) = st.sandboxes.get_mut(&sandbox_id) {
-            s.state = SandboxState::NotReady;
-            let _ = state::save_sandbox(s);
-        }
         log::debug!("StopPodSandbox {} END", sandbox_id);
 
         Ok(Response::new(StopPodSandboxResponse {}))

@@ -46,40 +46,64 @@ struct ImageConfig {
     user: String,
 }
 
-/// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
-async fn dir_disk_usage(path: &str) -> u64 {
-    let out = tokio::process::Command::new("du")
-        .args(["--apparent-size", "-sb", path])
-        .output()
-        .await;
-    if let Ok(o) = out {
-        if o.status.success() {
-            if let Ok(s) = std::str::from_utf8(&o.stdout) {
-                if let Some(n) = s.split_whitespace().next() {
-                    return n.parse::<u64>().unwrap_or(0);
+/// Bound on how long a `du` invocation may run before we give up on it.
+const DU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `cmd` with `args`, bounded by `timeout`; best-effort SIGKILL the child
+/// and give up rather than hang the caller if it doesn't finish in time.
+/// Generic over the command so the timeout/kill behavior can be exercised in
+/// a test without depending on `du` ever actually wedging.
+async fn run_timed(cmd: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    let child = tokio::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let pid = child.id().map(|p| p as i32);
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) if o.status.success() => std::str::from_utf8(&o.stdout).ok().map(str::to_string),
+        Ok(_) => None,
+        Err(_) => {
+            log::warn!("{cmd} {args:?} timed out after {timeout:?}; killing and giving up (#561)");
+            if let Some(pid) = pid {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
                 }
             }
+            None
         }
     }
-    0
+}
+
+/// Run `du` against `path`, bounded by `DU_TIMEOUT`. A dangling/partially
+/// torn-down overlay or FUSE mount left by an aborted layer extraction or
+/// rootfs teardown can wedge `du` in kernel D-state indefinitely (#561) —
+/// unlike a Rust-level deadlock, that survives a `pelagos-cri` restart, since
+/// the stuck process is external to it and a fresh restart just re-runs `du`
+/// against the same wedged path. Bound it like every other subprocess wait in
+/// this codebase (streaming.rs, runtime.rs) so one bad layer can't wedge
+/// ListImages/ImageFsInfo forever.
+async fn run_du(path: &str, args: &[&str]) -> Option<String> {
+    let mut full_args: Vec<&str> = args.to_vec();
+    full_args.push(path);
+    run_timed("du", &full_args, DU_TIMEOUT).await
+}
+
+/// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
+async fn dir_disk_usage(path: &str) -> u64 {
+    run_du(path, &["--apparent-size", "-sb"])
+        .await
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
 }
 
 /// Count inodes (files + directories) under a path via `du --inodes -s`.
 async fn count_inodes(path: &str) -> u64 {
-    let out = tokio::process::Command::new("du")
-        .args(["--inodes", "-s", path])
-        .output()
-        .await;
-    if let Ok(o) = out {
-        if o.status.success() {
-            if let Ok(s) = std::str::from_utf8(&o.stdout) {
-                if let Some(n) = s.split_whitespace().next() {
-                    return n.parse::<u64>().unwrap_or(0);
-                }
-            }
-        }
-    }
-    0
+    run_du(path, &["--inodes", "-s"])
+        .await
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
 }
 
 /// Current time in nanoseconds since the Unix epoch (for CRI timestamps).
@@ -436,6 +460,27 @@ impl ImageService for ImageSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #561 regression: `ListImages`/`ImageFsInfo` call `du` on every request
+    /// with no bound, so a `du` wedged on a dangling/torn-down overlay or FUSE
+    /// mount hangs the image service forever — and survives a `pelagos-cri`
+    /// restart, since the wedge is in the kernel, external to the process.
+    /// `run_timed` must give up and return rather than block past its
+    /// timeout, regardless of how long the underlying command actually runs.
+    #[tokio::test]
+    async fn run_timed_gives_up_rather_than_block_past_its_timeout() {
+        let start = std::time::Instant::now();
+        let result = run_timed("sleep", &["5"], std::time::Duration::from_millis(100)).await;
+        assert!(
+            result.is_none(),
+            "a command still running past its timeout must report no output, not hang the caller"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must return promptly on timeout, not block for anywhere near the full \
+             underlying command duration (#561)"
+        );
+    }
 
     fn stored(
         reference: &str,
