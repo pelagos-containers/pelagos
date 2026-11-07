@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: repro564-netns-native
+spec:
+  nodeName: ipc7
+  restartPolicy: Never
+  hostname: repro564-netns-native
+  securityContext:
+    sysctls:
+      - name: net.ipv4.ip_unprivileged_port_start
+        value: "0"
+  containers:
+  - name: repro
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        echo "== hostname =="
+        hostname
+        echo "== lo flags (bit 0 = IFF_UP) =="
+        cat /sys/class/net/lo/flags
+        echo "== ping self via lo =="
+        ping -c1 -W1 127.0.0.1
+        echo "== unprivileged port sysctl (expect 0) =="
+        cat /proc/sys/net/ipv4/ip_unprivileged_port_start
+        sleep 2
