@@ -683,6 +683,29 @@ impl AppState {
         }
     }
 
+    /// Marks a sandbox `NotReady` and persists it immediately, returning the
+    /// pre-mutation snapshot the caller needs to drive teardown (netns,
+    /// pause_pid, cni_conf, ...).
+    ///
+    /// Must be called as the very FIRST state mutation in `stop_pod_sandbox`,
+    /// before killing the pause, running CNI DEL, or deleting the netns — all
+    /// of which can take real time under load (#500's semaphore fail-fast
+    /// included). Until `state` flips to `NotReady`, a sandbox mid-teardown
+    /// (pause dead, `state` still `Running`) is indistinguishable from a
+    /// genuine #438 phantom to a concurrent `ListPodSandbox` poll, and
+    /// `stale_sandbox_ids` would reap it — deleting live containers out from
+    /// under `ContainerStatus`/log lookups even though the pod was never
+    /// actually crashed (#561).
+    pub async fn begin_stop_pod_sandbox(&self, sandbox_id: &str) -> Option<CriSandbox> {
+        let mut st = self.inner.lock().await;
+        let sb = st.sandboxes.get(sandbox_id).cloned();
+        if let Some(s) = st.sandboxes.get_mut(sandbox_id) {
+            s.state = SandboxState::NotReady;
+            let _ = save_sandbox(s);
+        }
+        sb
+    }
+
     /// Spawns a periodic sampler exposing `pelagos_cri_tracked_sandboxes` and
     /// `pelagos_cri_tracked_containers` gauges — internal bookkeeping state
     /// made directly observable (#554), rather than only visible downstream
@@ -1067,6 +1090,52 @@ mod tests {
             stale,
             vec!["running-dead".to_string()],
             "only the Running sandbox with a dead pause must be reaped"
+        );
+    }
+
+    /// #561 regression: `begin_stop_pod_sandbox` must flip a sandbox to
+    /// `NotReady` synchronously, in the same lock acquisition that reads it —
+    /// *before* `stop_pod_sandbox` does anything else (kill the pause, run
+    /// CNI DEL, delete the netns). That ordering is what closes the race with
+    /// the #438 phantom-reaper: without it, a sandbox whose pause has already
+    /// been killed but whose `state` hasn't flipped yet is indistinguishable
+    /// from a genuine crash to `stale_sandbox_ids`, and gets reaped — along
+    /// with its still-valid containers — mid-shutdown.
+    #[tokio::test]
+    async fn begin_stop_pod_sandbox_marks_notready_before_teardown() {
+        let app = AppState::new("pelagos".into());
+        {
+            let mut st = app.inner.lock().await;
+            st.sandboxes
+                .insert("churning".into(), sandbox("churning", 9999));
+        }
+
+        let snapshot = app
+            .begin_stop_pod_sandbox("churning")
+            .await
+            .expect("sandbox must exist");
+        assert_eq!(
+            snapshot.pause_pid, 9999,
+            "snapshot must carry the pre-mutation pause_pid for the caller to act on"
+        );
+
+        let sandboxes = {
+            let st = app.inner.lock().await;
+            let sb = st.sandboxes.get("churning").expect("sandbox still tracked");
+            assert!(
+                sb.is_explicitly_stopped(),
+                "state must already be NotReady before any teardown step runs"
+            );
+            st.sandboxes.clone()
+        };
+
+        // Even though pid 9999 is now reported dead (teardown killed the pause),
+        // the #438 reaper must not touch it — this is the race #561 closes.
+        let stale = stale_sandbox_ids(&sandboxes, |_pid| false);
+        assert!(
+            stale.is_empty(),
+            "a sandbox already marked NotReady by begin_stop_pod_sandbox must never \
+             be reaped as a phantom, even with its pause reported dead: {stale:?}"
         );
     }
 

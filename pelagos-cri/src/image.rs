@@ -46,40 +46,152 @@ struct ImageConfig {
     user: String,
 }
 
-/// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
-async fn dir_disk_usage(path: &str) -> u64 {
-    let out = tokio::process::Command::new("du")
-        .args(["--apparent-size", "-sb", path])
-        .output()
-        .await;
-    if let Ok(o) = out {
-        if o.status.success() {
-            if let Ok(s) = std::str::from_utf8(&o.stdout) {
-                if let Some(n) = s.split_whitespace().next() {
-                    return n.parse::<u64>().unwrap_or(0);
+/// Bound on how long a `du` invocation may run before we give up on it.
+const DU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `cmd` with `args`, bounded by `timeout`; best-effort SIGKILL the child
+/// and give up rather than hang the caller if it doesn't finish in time.
+/// Generic over the command so the timeout/kill behavior can be exercised in
+/// a test without depending on `du` ever actually wedging.
+async fn run_timed(cmd: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    let child = tokio::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let pid = child.id().map(|p| p as i32);
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) if o.status.success() => std::str::from_utf8(&o.stdout).ok().map(str::to_string),
+        Ok(_) => None,
+        Err(_) => {
+            log::warn!("{cmd} {args:?} timed out after {timeout:?}; killing and giving up (#561)");
+            if let Some(pid) = pid {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
                 }
             }
+            None
         }
     }
-    0
+}
+
+/// Run `du` against `path`, bounded by `DU_TIMEOUT`. A dangling/partially
+/// torn-down overlay or FUSE mount left by an aborted layer extraction or
+/// rootfs teardown can wedge `du` in kernel D-state indefinitely (#561) —
+/// unlike a Rust-level deadlock, that survives a `pelagos-cri` restart, since
+/// the stuck process is external to it and a fresh restart just re-runs `du`
+/// against the same wedged path. Bound it like every other subprocess wait in
+/// this codebase (streaming.rs, runtime.rs) so one bad layer can't wedge
+/// ListImages/ImageFsInfo forever.
+async fn run_du(path: &str, args: &[&str]) -> Option<String> {
+    let mut full_args: Vec<&str> = args.to_vec();
+    full_args.push(path);
+    run_timed("du", &full_args, DU_TIMEOUT).await
+}
+
+/// Recursively sum up apparent file sizes in a directory tree using `du -sb --apparent-size`.
+async fn dir_disk_usage(path: &str) -> u64 {
+    run_du(path, &["--apparent-size", "-sb"])
+        .await
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
 }
 
 /// Count inodes (files + directories) under a path via `du --inodes -s`.
 async fn count_inodes(path: &str) -> u64 {
-    let out = tokio::process::Command::new("du")
-        .args(["--inodes", "-s", path])
-        .output()
-        .await;
-    if let Ok(o) = out {
-        if o.status.success() {
-            if let Ok(s) = std::str::from_utf8(&o.stdout) {
-                if let Some(n) = s.split_whitespace().next() {
-                    return n.parse::<u64>().unwrap_or(0);
-                }
-            }
-        }
+    run_du(path, &["--inodes", "-s"])
+        .await
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// In-memory cache of per-layer on-disk size, keyed by layer digest (without
+/// the `sha256:` prefix). Layer content is immutable and content-addressed —
+/// a given digest's `du` result can never change — so caching it for the life
+/// of the process is always safe, with no invalidation needed.
+///
+/// Without this, `layers_size` reran `du` on every layer of every image on
+/// every single `ListImages` call: real, measured 5.9s for 73 images / 405
+/// layers on a cluster node that had simply been running for a while — comfortably
+/// past `crictl`'s 2s default client deadline. Since a node's accumulated
+/// image/layer count is exactly what a `pelagos-cri` restart does NOT reset,
+/// that cost only grows over a node's lifetime and, once it crosses the
+/// client's deadline, fails every call thereafter — which looks identical to,
+/// and was originally mistaken for, a stuck/wedged `du` (#561). Caching turns
+/// repeat `ListImages` calls into O(unique layers) real `du` spawns ever,
+/// then pure in-memory lookups — collapsing the common case (many images
+/// sharing base layers) to near-zero added latency.
+fn layer_size_cache() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// On-disk size of the layer at `digest`, served from `layer_size_cache()`
+/// after the first real `du`.
+async fn cached_layer_size(digest: &str) -> u64 {
+    if let Some(&size) = layer_size_cache().lock().await.get(digest) {
+        return size;
     }
-    0
+    let size = dir_disk_usage(&format!("{LAYERS_DIR}/{digest}")).await;
+    layer_size_cache()
+        .lock()
+        .await
+        .insert(digest.to_string(), size);
+    size
+}
+
+/// Same caching as `layer_size_cache`, for per-layer inode counts.
+fn layer_inode_cache() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Inode count of the layer at `digest`, served from `layer_inode_cache()`
+/// after the first real `du`.
+async fn cached_layer_inodes(digest: &str) -> u64 {
+    if let Some(&n) = layer_inode_cache().lock().await.get(digest) {
+        return n;
+    }
+    let n = count_inodes(&format!("{LAYERS_DIR}/{digest}")).await;
+    layer_inode_cache()
+        .lock()
+        .await
+        .insert(digest.to_string(), n);
+    n
+}
+
+/// Total on-disk size and inode count of every layer under `LAYERS_DIR`,
+/// built from a single shallow `read_dir` (not a recursive `du`) plus the
+/// same per-layer caches `list_images` populates.
+///
+/// `image_fs_info` used to run `du -sb`/`du --inodes -s` over the ENTIRE
+/// `LAYERS_DIR` tree on every call — measured live at 1.7s + 1.65s (809k
+/// inodes, 22GB) on a real cluster node, which is what `crictl`'s startup
+/// "validate CRI v1 image API" preflight actually calls and what was really
+/// producing the reported permanent `DeadlineExceeded` (#561) — the
+/// per-image `layers_size` cache above doesn't touch this path at all, since
+/// it's one aggregate query over the whole tree rather than per-image. Since
+/// `LAYERS_DIR` contains nothing but per-digest layer directories, this total
+/// equals the sum of each layer's own cached size/inode count — recomputed
+/// from a real `du` only for digests neither this nor `list_images` has seen
+/// before.
+async fn layers_dir_usage(dir: &str) -> (u64, u64) {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return (0, 0);
+    };
+    let mut used = 0u64;
+    let mut inodes = 0u64;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Some(digest) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        used += cached_layer_size(&digest).await;
+        inodes += cached_layer_inodes(&digest).await;
+    }
+    (used, inodes)
 }
 
 /// Current time in nanoseconds since the Unix epoch (for CRI timestamps).
@@ -188,7 +300,7 @@ impl ImageSvc {
         let mut total: u64 = 0;
         for layer in layers {
             let digest = layer.strip_prefix("sha256:").unwrap_or(layer.as_str());
-            total += dir_disk_usage(&format!("{}/{}", LAYERS_DIR, digest)).await;
+            total += cached_layer_size(digest).await;
         }
         // kubelet rejects images with Size_ == 0.
         total.max(1)
@@ -404,16 +516,14 @@ impl ImageService for ImageSvc {
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
         use crate::cri::{FilesystemIdentifier, FilesystemUsage, UInt64Value};
         // Report real usage of the layer store so the kubelet's image GC works.
-        let used = dir_disk_usage(LAYERS_DIR).await;
+        let (used, inodes) = layers_dir_usage(LAYERS_DIR).await;
         let usage = FilesystemUsage {
             timestamp: now_ns(),
             fs_id: Some(FilesystemIdentifier {
                 mountpoint: LAYERS_DIR.to_string(),
             }),
             used_bytes: Some(UInt64Value { value: used }),
-            inodes_used: Some(UInt64Value {
-                value: count_inodes(LAYERS_DIR).await,
-            }),
+            inodes_used: Some(UInt64Value { value: inodes }),
         };
         Ok(Response::new(ImageFsInfoResponse {
             image_filesystems: vec![usage],
@@ -436,6 +546,86 @@ impl ImageService for ImageSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #561 regression: `ListImages`/`ImageFsInfo` call `du` on every request
+    /// with no bound, so a `du` wedged on a dangling/torn-down overlay or FUSE
+    /// mount hangs the image service forever — and survives a `pelagos-cri`
+    /// restart, since the wedge is in the kernel, external to the process.
+    /// `run_timed` must give up and return rather than block past its
+    /// timeout, regardless of how long the underlying command actually runs.
+    #[tokio::test]
+    async fn run_timed_gives_up_rather_than_block_past_its_timeout() {
+        let start = std::time::Instant::now();
+        let result = run_timed("sleep", &["5"], std::time::Duration::from_millis(100)).await;
+        assert!(
+            result.is_none(),
+            "a command still running past its timeout must report no output, not hang the caller"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must return promptly on timeout, not block for anywhere near the full \
+             underlying command duration (#561)"
+        );
+    }
+
+    /// #561 regression: the actual reproduced root cause of the persistent
+    /// `DeadlineExceeded` on `ListImages`/`crictl images` was not a wedged
+    /// mount but plain O(images x layers) `du` re-execution on every call —
+    /// measured at 5.9s for 73 images / 405 layers on a real cluster node,
+    /// comfortably past `crictl`'s 2s default deadline, and only growing as a
+    /// node accumulates more images (exactly what a `pelagos-cri` restart
+    /// does not reset). `cached_layer_size` must populate the cache on first
+    /// lookup — even when `du` reports 0 for a nonexistent/inaccessible path
+    /// — so a later lookup for the same digest never re-runs `du` at all.
+    #[tokio::test]
+    async fn cached_layer_size_populates_the_cache_after_first_lookup() {
+        let digest = "deadbeef561testonly-does-not-exist";
+        assert!(
+            layer_size_cache().lock().await.get(digest).is_none(),
+            "test digest must not already be cached"
+        );
+        let _ = cached_layer_size(digest).await;
+        assert!(
+            layer_size_cache().lock().await.contains_key(digest),
+            "a layer's size must be cached after the first lookup, even when `du` \
+             reports 0 for it, so repeat ListImages calls never re-run `du` for \
+             the same digest (#561)"
+        );
+    }
+
+    /// #561 regression, part 2: `image_fs_info` used to run `du -sb`/`du
+    /// --inodes -s` over the ENTIRE layers tree on every call — measured live
+    /// at 1.7s + 1.65s (809k inodes, 22GB) on a real cluster node. This path,
+    /// not `list_images`'s per-image loop, is what `crictl`'s "validate CRI
+    /// v1 image API" preflight actually calls, so it alone was enough to keep
+    /// reproducing the reported permanent `DeadlineExceeded` even after
+    /// caching `list_images`'s per-image loop. `layers_dir_usage` must read
+    /// the directory's entries and serve each from the SAME per-layer caches
+    /// `list_images` populates, rather than re-walking the whole tree.
+    /// Proven here by pre-populating the caches with values a real `du`
+    /// could never produce for these (empty) directories, then asserting
+    /// those exact values come back — which only happens on a cache hit.
+    #[tokio::test]
+    async fn layers_dir_usage_sums_cached_sizes_without_rerunning_du() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let digests = ["fakedigest561-a", "fakedigest561-b"];
+        for d in digests {
+            std::fs::create_dir(dir.path().join(d)).expect("mkdir");
+            layer_size_cache().lock().await.insert(d.to_string(), 1000);
+            layer_inode_cache().lock().await.insert(d.to_string(), 7);
+        }
+
+        let (used, inodes) = layers_dir_usage(dir.path().to_str().unwrap()).await;
+
+        assert_eq!(
+            used, 2000,
+            "must sum the CACHED per-layer sizes, not re-run du over the whole tree (#561)"
+        );
+        assert_eq!(
+            inodes, 14,
+            "must sum the cached per-layer inode counts the same way"
+        );
+    }
 
     fn stored(
         reference: &str,
