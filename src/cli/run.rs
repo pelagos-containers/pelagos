@@ -561,6 +561,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         no_ipc_ns: args.no_ipc_ns,
         privileged: args.privileged,
         stop_signal: args.stop_signal.clone(),
+        masked_paths_default: args.masked_paths_default,
         cpuset_cpus: args.cpuset_cpus.clone(),
         cpuset_mems: args.cpuset_mems.clone(),
     }
