@@ -2,7 +2,7 @@
 
 use super::{
     check_liveness, container_dir, containers_dir, now_iso8601, write_state, ContainerState,
-    ContainerStatus, HealthStatus,
+    ContainerStatus, HealthStatus, SpawnConfig,
 };
 use pelagos::compose::{
     parse_compose, topo_sort, ComposeFile, Dependency, HealthCheck, ServiceSpec,
@@ -543,6 +543,118 @@ pub fn run_compose_with_hooks(
     Ok(())
 }
 
+/// Derive a [`SpawnConfig`] for a compose-managed container so that plain
+/// `pelagos restart`/`pelagos start` can bring it back up without requiring
+/// a full project teardown+recreate (#549). Mirrors the transformations
+/// `spawn_service` itself applies from `ServiceSpec` to its `Command`,
+/// translated into the generic `SpawnConfig`/`RunArgs` schema `cmd_run`
+/// already understands — not a new restart mechanism, just enough persisted
+/// state for the existing one to work on compose containers too.
+///
+/// Known, accepted fidelity gaps (pre-existing limitations of
+/// `pelagos start`'s `SpawnConfig`, not introduced here):
+/// - `apparmor_profile`/`selinux_label` have no `SpawnConfig` field at all
+///   today — a restarted service loses either if the compose file set them.
+/// - Image-config-derived fallbacks for workdir/user/env (used only when the
+///   service doesn't set them explicitly) are not reproduced; a restarted
+///   service uses only what the compose file itself specifies.
+#[allow(clippy::too_many_arguments)]
+fn build_compose_spawn_config(
+    project: &str,
+    svc: &ServiceSpec,
+    full_ref: &str,
+    exe_and_args: &[String],
+    network_names: &[String],
+    container_name: &str,
+    compose_dir: &std::path::Path,
+) -> SpawnConfig {
+    // Relative bind-mount host paths are resolved against the compose file's
+    // directory, matching the same resolution `spawn_service` already
+    // performed (successfully, or this function would never be reached) when
+    // it built the container's actual mounts.
+    let resolve_host_path = |host_path: &str| -> String {
+        if std::path::Path::new(host_path).is_relative() {
+            compose_dir
+                .join(host_path)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| host_path.to_string())
+        } else {
+            host_path.to_string()
+        }
+    };
+    let bind_ro: Vec<String> = svc
+        .bind_mounts
+        .iter()
+        .filter(|b| b.read_only)
+        .map(|b| format!("{}:{}", resolve_host_path(&b.host_path), b.container_path))
+        .collect();
+    let bind: Vec<String> = svc
+        .bind_mounts
+        .iter()
+        .filter(|b| !b.read_only)
+        .map(|b| format!("{}:{}", resolve_host_path(&b.host_path), b.container_path))
+        .collect();
+    let volume: Vec<String> = svc
+        .volumes
+        .iter()
+        .map(|v| format!("{}:{}", scoped_volume_name(project, &v.name), v.mount_path))
+        .collect();
+    let publish: Vec<String> = svc
+        .ports
+        .iter()
+        .map(|p| format!("{}:{}", p.host, p.container))
+        .collect();
+    let env: Vec<String> = svc
+        .env
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
+
+    SpawnConfig {
+        image: Some(full_ref.to_string()),
+        exe: exe_and_args.first().cloned().unwrap_or_default(),
+        args: exe_and_args.get(1..).unwrap_or(&[]).to_vec(),
+        env,
+        bind,
+        bind_ro,
+        volume,
+        network: network_names.to_vec(),
+        publish,
+        dns: svc.dns.clone(),
+        dns_search: vec![],
+        dns_options: vec![],
+        working_dir: svc.workdir.clone(),
+        user: svc.user.clone(),
+        hostname: Some(container_name.to_string()),
+        cap_drop: svc.cap_drop.clone(),
+        cap_add: svc.cap_add.clone(),
+        // seccomp + no-new-privileges are always-on hardening defaults
+        // `spawn_service` applies unconditionally (`.with_seccomp_default()`,
+        // `.with_no_new_privileges(true)`) -- represented here as the same
+        // --security-opt strings `pelagos run` would use, so cmd_run's
+        // existing handling re-applies them identically on restart.
+        security_opt: vec![
+            "seccomp=default".to_string(),
+            "no-new-privileges".to_string(),
+        ],
+        read_only: false,
+        rm: false,
+        nat: !network_names.is_empty(),
+        no_nat: false,
+        labels: vec![],
+        tmpfs: svc.tmpfs_mounts.clone(),
+        device: vec![],
+        no_pid_ns: false,
+        no_ipc_ns: false,
+        privileged: false,
+        stop_signal: None,
+        cpuset_cpus: None,
+        cpuset_mems: None,
+        masked_paths_default: true,
+    }
+}
+
 fn spawn_service(
     project: &str,
     svc: &ServiceSpec,
@@ -772,6 +884,16 @@ fn spawn_service(
         .map_err(|e| format!("spawn '{}' failed: {}", svc.name, e))?;
     let pid = child.pid();
 
+    let spawn_config = build_compose_spawn_config(
+        project,
+        svc,
+        &full_ref,
+        &exe_and_args,
+        &svc_network_names,
+        container_name,
+        compose_dir,
+    );
+
     // Write container state.
     let cstate = ContainerState {
         name: container_name.to_string(),
@@ -793,7 +915,7 @@ fn spawn_service(
             .collect(),
         health: None,
         health_config: None,
-        spawn_config: None,
+        spawn_config: Some(spawn_config),
         labels: std::collections::HashMap::new(),
         mnt_ns_inode: super::read_mnt_ns_inode(pid),
         upper_dir: None,

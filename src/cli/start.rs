@@ -48,8 +48,11 @@ fn start_one(
 
     let sc = state.spawn_config.ok_or_else(|| {
         format!(
-            "container '{}' has no spawn config — cannot restart \
-             (was it created with an older version of pelagos?)",
+            "container '{}' has no spawn config — cannot restart. \
+             This container has no saved parameters to restart from (either \
+             its state predates `pelagos start`, or it was created by a tool \
+             that doesn't populate one). Recreate it with its original \
+             `pelagos run`/`pelagos compose up` command instead.",
             name
         )
     })?;
@@ -163,5 +166,6 @@ fn spawn_config_to_run_args(
         upper_dir: None, // set by start_one after this call
         default_subnet: None,
         sandbox: None,
+        masked_paths_default: sc.masked_paths_default,
     }
 }

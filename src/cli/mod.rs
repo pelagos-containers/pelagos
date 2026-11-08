@@ -244,6 +244,14 @@ pub struct SpawnConfig {
     /// Memory nodes this container may use (cpuset, e.g. "0-1").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpuset_mems: Option<String>,
+    /// Whether the default masked-path set (`/proc/kcore`, `/sys/firmware`, ...)
+    /// should be applied on restart. `pelagos run` only masks paths when the
+    /// user passes an explicit `--masked-path`; `pelagos compose up` always
+    /// applies the default set unconditionally as part of its hardening
+    /// baseline, so compose-derived spawn configs set this to preserve that
+    /// baseline across `pelagos restart`/`start` (#549).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub masked_paths_default: bool,
 }
 
 /// Persisted state for a running or exited container.
