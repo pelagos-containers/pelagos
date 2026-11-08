@@ -34591,3 +34591,252 @@ mod issue_483_env_var_propagation {
         assert!(!decoded2.contains('\0'));
     }
 }
+
+/// Regression tests for issue #549: `pelagos restart` on a container with no
+/// saved `SpawnConfig` left it stopped with no way back, and EVERY
+/// `pelagos compose up`-created container had no `SpawnConfig` at all,
+/// regardless of pelagos version -- so `pelagos restart`/`start` could never
+/// work on any compose-managed container.
+mod issue_549_restart_spawn_config {
+    use std::process::{Command, Stdio};
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    const ALPINE_ECR: &str = "public.ecr.aws/docker/library/alpine:latest";
+
+    fn ensure_alpine() {
+        let ls = Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains(ALPINE_ECR) {
+            return;
+        }
+        for attempt in 1..=3u32 {
+            let status = Command::new(bin())
+                .args(["image", "pull", ALPINE_ECR])
+                .status()
+                .expect("pelagos image pull alpine");
+            if status.success() {
+                return;
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_secs(30 * attempt as u64));
+            }
+        }
+        panic!("pre-test alpine pull from ECR failed after 3 attempts");
+    }
+
+    fn compose_down_project(project: &str, compose_file: &str) {
+        let _ = Command::new(bin())
+            .args(["compose", "down", "-f", compose_file, "-p", project])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    fn read_state(name: &str) -> serde_json::Value {
+        let path = format!("/run/pelagos/containers/{}/state.json", name);
+        let data = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read state.json for '{}': {}", name, e));
+        serde_json::from_str(&data).expect("state.json must be valid JSON")
+    }
+
+    fn wait_for_status(name: &str, status: &str, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) =
+                std::fs::read_to_string(format!("/run/pelagos/containers/{}/state.json", name))
+            {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["status"].as_str() == Some(status) {
+                        return true;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// test_compose_container_has_spawn_config_and_restarts
+    ///
+    /// Requires root. Regression test for #549's actual root cause: EVERY
+    /// `pelagos compose up`-created container previously had
+    /// `spawn_config: null` in its `state.json` unconditionally, so
+    /// `pelagos restart`/`start` could never work on one -- not just "old"
+    /// containers, as the original bug report assumed. Reproduces the exact
+    /// repro from the issue (a compose-managed service, restarted directly
+    /// by container name) rather than requiring a full project teardown.
+    ///
+    /// Asserts: (1) `state.json` contains a non-null `spawn_config` right
+    /// after `compose up`; (2) `pelagos restart <container>` on it exits 0;
+    /// (3) the container is `running` again afterward (not left `exited`).
+    ///
+    /// Failure indicates `spawn_service` (src/cli/compose.rs) regressed back
+    /// to never populating `spawn_config`, or the derived config is wrong
+    /// enough that restart fails.
+    #[test]
+    #[serial_test::serial(nat)]
+    fn test_compose_container_has_spawn_config_and_restarts() {
+        if !is_root() {
+            eprintln!("SKIP test_compose_container_has_spawn_config_and_restarts: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let project = "issue549-restart";
+        let compose_content = format!(
+            r#"(compose-up
+  (compose
+    (network "issue549-net" '(subnet "10.201.9.0/24"))
+    (service "svc"
+      '(image "{}")
+      '(network "issue549-net")
+      '(command "sleep" "60"))))
+"#,
+            ALPINE_ECR
+        );
+        let compose_file = std::env::temp_dir().join("pelagos-issue549.reml");
+        std::fs::write(&compose_file, compose_content.as_bytes()).expect("write compose file");
+
+        compose_down_project(project, compose_file.to_str().unwrap());
+
+        let up_status = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("compose up");
+        assert!(up_status.success(), "compose up should exit 0");
+
+        let container = format!("{}-svc", project);
+        assert!(
+            wait_for_status(&container, "running", 5_000),
+            "container '{}' should be running after compose up",
+            container
+        );
+
+        // Core #549 assertion: spawn_config must be populated, not null.
+        let state = read_state(&container);
+        assert!(
+            !state["spawn_config"].is_null(),
+            "state.json must contain a non-null spawn_config for a compose-managed \
+             container (#549): {:?}",
+            state["spawn_config"]
+        );
+
+        // The actual repro: `pelagos restart <container>` directly, no project
+        // teardown, must succeed.
+        let restart_status = Command::new(bin())
+            .args(["restart", &container])
+            .status()
+            .expect("pelagos restart");
+
+        let restarted_running = wait_for_status(&container, "running", 5_000);
+
+        compose_down_project(project, compose_file.to_str().unwrap());
+        let _ = std::fs::remove_file(&compose_file);
+
+        assert!(
+            restart_status.success(),
+            "pelagos restart on a compose-managed container must succeed (#549)"
+        );
+        assert!(
+            restarted_running,
+            "container '{}' must be running again after restart (#549)",
+            container
+        );
+    }
+
+    /// test_restart_fails_fast_without_stopping_when_no_spawn_config
+    ///
+    /// Requires root. Regression test for #549's compounding problem: before
+    /// the fix, `cmd_restart` unconditionally stopped the container FIRST,
+    /// and only discovered the missing `spawn_config` on the start half --
+    /// leaving the container `exited` with no narrow recovery path even
+    /// though it had been perfectly healthy moments before.
+    ///
+    /// Simulates a container with no spawn_config (e.g. a pre-`pelagos
+    /// start` container format) by stripping the field from a real
+    /// container's `state.json` after `pelagos run`, then calls `pelagos
+    /// restart`. Asserts: the command fails (non-zero exit) AND the
+    /// container is still `running` afterward -- never touched.
+    ///
+    /// Failure (container left `exited`) indicates `cmd_restart` regressed
+    /// back to stopping before checking for a spawn_config.
+    #[test]
+    #[serial_test::serial(nat)]
+    fn test_restart_fails_fast_without_stopping_when_no_spawn_config() {
+        if !is_root() {
+            eprintln!(
+                "SKIP test_restart_fails_fast_without_stopping_when_no_spawn_config: requires root"
+            );
+            return;
+        }
+        ensure_alpine();
+
+        let name = "issue549-no-spawn-config";
+        let _ = Command::new(bin()).args(["rm", "-f", name]).output();
+
+        let run_status = Command::new(bin())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "-d",
+                "--name",
+                name,
+                ALPINE_ECR,
+                "sleep",
+                "60",
+            ])
+            .status()
+            .expect("pelagos run -d");
+        assert!(run_status.success(), "pelagos run -d failed");
+        assert!(
+            wait_for_status(name, "running", 5_000),
+            "container should be running after pelagos run -d"
+        );
+
+        // Strip spawn_config from state.json to simulate a container with no
+        // saved restart parameters.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        v["spawn_config"] = serde_json::Value::Null;
+        std::fs::write(&state_path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        let restart_status = Command::new(bin())
+            .args(["restart", name])
+            .status()
+            .expect("pelagos restart");
+
+        let still_running = wait_for_status(name, "running", 2_000);
+
+        let _ = Command::new(bin()).args(["rm", "-f", name]).output();
+
+        assert!(
+            !restart_status.success(),
+            "pelagos restart must fail (not exit 0) when there is no spawn_config to \
+             restart from (#549)"
+        );
+        assert!(
+            still_running,
+            "container '{}' must still be running -- a restart that cannot complete \
+             must not stop it first (#549)",
+            name
+        );
+    }
+}

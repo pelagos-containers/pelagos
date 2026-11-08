@@ -299,6 +299,13 @@ pub struct RunArgs {
     #[clap(skip)]
     pub upper_dir: Option<PathBuf>,
 
+    /// Apply the default masked-path set unconditionally. Not a CLI flag —
+    /// set programmatically by `pelagos start` from a compose-derived
+    /// `SpawnConfig` to preserve `pelagos compose up`'s always-on hardening
+    /// baseline across restart (#549).
+    #[clap(skip)]
+    pub masked_paths_default: bool,
+
     /// Override the subnet used when bootstrapping pelagos0 for the first time.
     /// Has no effect once pelagos0 already exists.  Use CIDR notation,
     /// e.g. `10.88.0.0/24`.
@@ -1227,6 +1234,9 @@ fn apply_cli_options(
     }
 
     // Masked paths
+    if args.masked_paths_default {
+        cmd = cmd.with_masked_paths_default();
+    }
     if !args.masked_path.is_empty() {
         let paths: Vec<&str> = args.masked_path.iter().map(|s| s.as_str()).collect();
         cmd = cmd.with_masked_paths(&paths);
