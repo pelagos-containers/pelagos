@@ -2054,6 +2054,28 @@ cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
 # 0 → unrestricted
 ```
 
+### `WARN rootless: newuidmap/newgidmap not found on PATH`
+
+**Symptom:** this warning appears (visible with `RUST_LOG=warn` or above) when
+running a rootless container, and files created inside the container can
+intermittently fail with a kernel `EOVERFLOW` on a fresh overlay mount.
+
+**Cause:** the `uidmap` package (providing `newuidmap`/`newgidmap`) isn't
+installed. Without it, pelagos falls back to a minimal single-UID mapping
+(no subordinate UID/GID range) — a legitimate but degraded rootless mode.
+Creating files under that mapping on a rootless native-overlay+userxattr
+mount can hit a flaky kernel-level `EOVERFLOW` when a layer's files are
+owned by a uid/gid outside the mapped range.
+
+**Fix:**
+
+```bash
+sudo apt install uidmap                              # Debian/Ubuntu
+sudo dnf install shadow-utils                         # Fedora/RHEL
+sudo usermod --add-subuids 100000-165535 "$USER"
+sudo usermod --add-subgids 100000-165535 "$USER"
+```
+
 ### Rootless overlay fails
 
 If you see an error about overlay mount failing:
