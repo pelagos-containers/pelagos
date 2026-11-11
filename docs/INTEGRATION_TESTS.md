@@ -4118,6 +4118,30 @@ Asserts the build succeeds and the file from stage 0 is visible in the resulting
 Failure indicates: `sub_vars` is not updated by ARG processing inside a stage's body, so
 inter-stage FROM substitution fails when the caller provides no `--build-arg` override.
 
+### `test_run_shell_vars_survive_arg_substitution`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Regression test for #546. Builds a Remfile with a declared `ARG GREETING=hello` and a RUN
+step that assigns and reads its own local shell variable (`LOCAL`, not declared anywhere).
+Asserts the resulting image's output contains both the ARG's value (now passed to RUN as a
+real environment variable, not textual substitution) and the script's own local variable
+intact.
+
+Failure indicates RUN's command text is being textually substituted again — before the fix,
+`LOCAL` (an undeclared variable) would have been silently emptied at parse time, before the
+shell ever ran the script.
+
+### `test_run_arg_name_collision_shell_var_wins`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Regression test for #546's "worse" case: a RUN script's own shell variable (`FOO`) whose name
+collides with a declared `ARG FOO=buildtime`. The script reassigns `FOO=runtime` before using
+it. Asserts the resulting image's output reflects the script's own runtime-assigned value,
+not the ARG's build-time value.
+
+Failure indicates RUN text is being substituted before the shell runs it — before the fix,
+the ARG's build-time value would silently clobber the script's own same-named variable.
+
 ### `test_copy_chown_flag_parsed`
 **Requires:** root, `docker.io/library/alpine:latest` pulled
 

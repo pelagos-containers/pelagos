@@ -19892,6 +19892,171 @@ CMD [\"cat\", \"/marker2\"]\n";
         result.unwrap();
     }
 
+    /// test_run_shell_vars_survive_arg_substitution
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for issue #546: `pelagos build`'s ARG/ENV substitution
+    /// was applied to the entire text of every RUN instruction, silently
+    /// emptying any `$VAR`/`${VAR}` reference that wasn't a declared Remfile
+    /// ARG — e.g. a RUN script's own shell variable.
+    ///
+    /// Builds a Remfile with a declared ARG (GREETING) AND a RUN step that
+    /// assigns and uses its own local shell variable (LOCAL) that is not
+    /// declared anywhere. Asserts both the declared ARG's value (now passed
+    /// to RUN as a real environment variable) and the script's own local
+    /// variable come through correctly — before the fix, LOCAL would have
+    /// been silently wiped to empty at parse time.
+    ///
+    /// Failure indicates RUN's command text is being textually substituted
+    /// again instead of left opaque to the shell.
+    #[test]
+    fn test_run_shell_vars_survive_arg_substitution() {
+        if !is_root() {
+            eprintln!("SKIP test_run_shell_vars_survive_arg_substitution: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_run_shell_vars_survive_arg_substitution: alpine not pulled \
+                 (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        let remfile = "\
+ARG GREETING=hello\n\
+FROM alpine\n\
+RUN LOCAL=world; echo \"arg=${GREETING} local=${LOCAL}\" > /marker\n\
+CMD [\"cat\", \"/marker\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-run-shell-vars-546:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+            None,
+        )
+        .expect("execute_build with RUN-local shell var should succeed (issue #546)");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("cat")
+                .args(["/marker"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn");
+
+            let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(
+                status.success(),
+                "container exited non-zero, stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(
+                out.trim(),
+                "arg=hello local=world",
+                "expected the declared ARG (via real env var) and the RUN script's own \
+                 local shell variable both intact; a RUN-text substitution regression \
+                 would blank 'local' to empty"
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
+    /// test_run_arg_name_collision_shell_var_wins
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for issue #546's "worse" case: a RUN script's own shell
+    /// variable whose name COLLIDES with a declared Remfile ARG. Before the
+    /// fix, RUN's text was substituted before the shell ever ran it, so the
+    /// script's own runtime assignment was silently overwritten by the ARG's
+    /// build-time value. After the fix, RUN text is untouched and the ARG's
+    /// value only reaches the shell as an inherited environment variable,
+    /// which the script's own local assignment correctly shadows.
+    ///
+    /// Asserts the script's own runtime-assigned value wins, not the ARG's.
+    #[test]
+    fn test_run_arg_name_collision_shell_var_wins() {
+        if !is_root() {
+            eprintln!("SKIP test_run_arg_name_collision_shell_var_wins: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_run_arg_name_collision_shell_var_wins: alpine not pulled \
+                 (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        let remfile = "\
+ARG FOO=buildtime\n\
+FROM alpine\n\
+RUN FOO=runtime; echo \"value: ${FOO}\" > /marker\n\
+CMD [\"cat\", \"/marker\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-run-arg-collision-546:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(),
+            None,
+        )
+        .expect("execute_build with colliding ARG/shell-var name should succeed (issue #546)");
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("cat")
+                .args(["/marker"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn");
+
+            let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(
+                status.success(),
+                "container exited non-zero, stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(
+                out.trim(),
+                "value: runtime",
+                "expected the RUN script's own runtime assignment to win over the \
+                 same-named ARG's build-time value — a pre-#546-fix regression would \
+                 silently produce 'value: buildtime' instead"
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
     /// test_copy_chown_flag_parsed
     ///
     /// Requires: root, alpine image pre-pulled

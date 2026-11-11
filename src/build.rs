@@ -655,7 +655,15 @@ fn substitute_instruction(instr: &Instruction, vars: &HashMap<String, String>) -
             image: substitute_vars(image, vars),
             alias: alias.clone(),
         },
-        Instruction::Run(cmd) => Instruction::Run(substitute_vars(cmd, vars)),
+        // RUN's command text is the shell's own script, not Remfile-level
+        // templating — the shell is the sole interpreter of its `$` syntax
+        // (mirrors Docker: ARG/ENV build-arg substitution never touches RUN's
+        // shell text). Substituting here silently emptied unrelated shell
+        // variables a RUN script assigned itself (e.g. via `case`/`read`), or
+        // clobbered them if the name collided with a declared ARG (#546).
+        // Declared ARG/ENV values are instead exported as real environment
+        // variables for the RUN step — see `execute_run`.
+        Instruction::Run(cmd) => Instruction::Run(cmd.clone()),
         Instruction::Copy {
             src,
             dest,
@@ -884,8 +892,21 @@ fn execute_stage(
                 );
             }
             Instruction::Run(ref cmd_text) => {
+                // RUN's text is no longer substituted (#546), so it alone doesn't
+                // reflect the ARG/ENV values the shell will actually see this step —
+                // fold the current var state into the cache key too, or a changed
+                // ARG would silently serve a stale cached layer.
                 let cache_key = if cache_active {
-                    Some(compute_cache_key(&layers, &format!("RUN {}", cmd_text)))
+                    let mut sorted_vars: Vec<(&String, &String)> = sub_vars.iter().collect();
+                    sorted_vars.sort_by(|a, b| a.0.cmp(b.0));
+                    let vars_repr: String = sorted_vars
+                        .iter()
+                        .map(|(k, v)| format!("{}={}\n", k, v))
+                        .collect();
+                    Some(compute_cache_key(
+                        &layers,
+                        &format!("RUN {}\n{}", cmd_text, vars_repr),
+                    ))
                 } else {
                     None
                 };
@@ -898,7 +919,8 @@ fn execute_stage(
                 }
                 cache_active = false;
                 eprintln!("Step {}/{}: RUN {}", step, total, cmd_text);
-                let new_digest = execute_run(cmd_text, &layers, &config, network_mode.clone())?;
+                let new_digest =
+                    execute_run(cmd_text, &layers, &config, network_mode.clone(), sub_vars)?;
                 if let Some(ref digest) = new_digest {
                     if let Some(ref key) = cache_key {
                         cache_store(key, digest);
@@ -1356,6 +1378,7 @@ fn execute_run(
     current_layers: &[String],
     config: &ImageConfig,
     network_mode: NetworkMode,
+    build_vars: &HashMap<String, String>,
 ) -> Result<Option<String>, BuildError> {
     // Deduplicate layer paths — overlayfs returns EINVAL if lowerdir contains
     // duplicate entries, which can happen when a base image (e.g. Debian/Python)
@@ -1402,6 +1425,23 @@ fn execute_run(
     // environment (e.g. a vsock daemon with a minimal or absent PATH).
     // This matches Docker/runc behaviour: container env = image config env only.
     cmd = cmd.env_clear();
+
+    // Declared ARG/ENV values as real shell environment variables for this RUN
+    // step — mirrors Docker's build-arg injection. RUN's command text is never
+    // textually substituted (see substitute_instruction, #546), so this is the
+    // only way a RUN script sees a Remfile ARG's value; a script's own shell
+    // variables of the same name correctly shadow these within the shell, and
+    // any variable the script assigns itself (not a declared ARG/ENV) is left
+    // completely alone.
+    log::debug!(
+        "build: execute_run applying {} build var(s): {:?}",
+        build_vars.len(),
+        build_vars
+    );
+    for (k, v) in build_vars {
+        cmd = cmd.env(k, v);
+    }
+
     log::debug!(
         "build: execute_run applying {} env vars: {:?}",
         config.env.len(),
@@ -2980,6 +3020,25 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         vars.insert("A".to_string(), "1".to_string());
         vars.insert("B".to_string(), "2".to_string());
         assert_eq!(substitute_vars("$A-${B}-$$", &vars), "1-2-$");
+    }
+
+    /// #546: `substitute_instruction` must leave `Instruction::Run`'s command
+    /// text completely untouched, even when it contains `$`/`${}` references
+    /// that match a declared var — RUN's shell text is opaque to the builder;
+    /// only the shell interprets its own `$` syntax (ARG/ENV values instead
+    /// reach RUN as real environment variables, see `execute_run`).
+    #[test]
+    fn test_substitute_instruction_leaves_run_untouched() {
+        let mut vars = HashMap::new();
+        vars.insert("ARCH".to_string(), "amd64".to_string());
+        let raw = Instruction::Run(
+            "case \"$(uname -m)\" in x86_64) ARCH=amd64 ;; esac; echo \"${ARCH}\"".to_string(),
+        );
+        let substituted = substitute_instruction(&raw, &vars);
+        assert_eq!(
+            substituted, raw,
+            "RUN text must be byte-for-byte unchanged regardless of declared vars"
+        );
     }
 
     // -- .pelagosignore tests --
