@@ -354,6 +354,10 @@ requires syscalls it would otherwise block.
 - `nft` (nftables) for NAT and port mapping (root only)
 - `ip` (iproute2) for bridge networking (root only)
 - `fuse-overlayfs` for rootless overlay on kernels < 5.11
+- `uidmap` (`newuidmap`/`newgidmap`) for full rootless support — without it,
+  rootless containers fall back to a minimal single-UID mapping (no
+  subordinate range), which can hit a kernel EOVERFLOW on overlayfs copy-up;
+  pelagos logs a `WARN` when it detects this (`RUST_LOG=warn`)
 
 ---
 

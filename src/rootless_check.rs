@@ -192,17 +192,54 @@ pub fn diagnose(s: &Signals) -> Option<RootlessSetupError> {
     }
 }
 
-/// Probe the host and return an error if rootless setup is predicted to fail.
-/// Honours `PELAGOS_SKIP_ROOTLESS_CHECK=1`.
+/// Follow-up to #522: `newuidmap`/`newgidmap` missing is only ever surfaced
+/// by `diagnose()` as part of the AppArmor-conjunction hard error above — on
+/// a host where AppArmor isn't restricting unprivileged userns at all (the
+/// common case), rootless setup silently falls back to a minimal single-UID
+/// mapping (no subordinate range) with no diagnostic whatsoever. That
+/// fallback is a legitimate degraded mode, but it has a real cost: creating
+/// files under it on a fresh rootless native-overlay+userxattr mount can hit
+/// a flaky kernel-level EOVERFLOW (#522) — previously only diagnosable via
+/// an extended strace investigation. Returns the warning text when the
+/// tools are missing, independent of the AppArmor state; `None` when
+/// they're present (regardless of whether subuid/subgid ranges are
+/// actually configured — that's a separate, already-silent fallback case
+/// not covered by this issue).
+pub fn missing_uidmap_warning(s: &Signals) -> Option<String> {
+    if s.has_newuidmap && s.has_newgidmap {
+        return None;
+    }
+    Some(
+        "rootless: newuidmap/newgidmap not found on PATH — falling back to a \
+         minimal single-UID mapping (no subordinate UID/GID range). This can \
+         cause a kernel EOVERFLOW during overlayfs copy-up if a container \
+         layer's files are owned by a uid/gid outside the mapped range (see \
+         https://github.com/pelagos-containers/pelagos/issues/522). Install \
+         the uidmap package for full rootless support (Debian/Ubuntu: `sudo \
+         apt install uidmap`; Fedora/RHEL: `sudo dnf install shadow-utils`), \
+         then configure a subordinate range: `sudo usermod \
+         --add-subuids/--add-subgids 100000-165535 $USER`."
+            .to_string(),
+    )
+}
+
+/// Probe the host and return an error if rootless setup is predicted to
+/// fail. Otherwise, logs a `WARN` if `newuidmap`/`newgidmap` are missing
+/// (see `missing_uidmap_warning`). Honours `PELAGOS_SKIP_ROOTLESS_CHECK=1`
+/// for both.
 pub fn check() -> Result<(), RootlessSetupError> {
     if std::env::var_os(SKIP_ENV).is_some() {
         log::debug!("rootless_check: bypassed via {}", SKIP_ENV);
         return Ok(());
     }
-    match diagnose(&Signals::probe()) {
-        None => Ok(()),
-        Some(e) => Err(e),
+    let signals = Signals::probe();
+    if let Some(e) = diagnose(&signals) {
+        return Err(e);
     }
+    if let Some(msg) = missing_uidmap_warning(&signals) {
+        log::warn!("{}", msg);
+    }
+    Ok(())
 }
 
 /// Read `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`. File absent
@@ -328,5 +365,46 @@ mod tests {
         let p3 = text.find("3. Run as root").expect("workaround 3");
         assert!(p1 < p2 && p2 < p3, "workarounds out of order");
         assert!(text.contains("PELAGOS_SKIP_ROOTLESS_CHECK"));
+    }
+
+    // #523: missing_uidmap_warning — fires independently of AppArmor state.
+
+    #[test]
+    fn missing_uidmap_warning_fires_without_apparmor() {
+        // No AppArmor restriction at all (the common case #523 is about) —
+        // diagnose() stays silent, but the warning must still fire.
+        let s = signals(false, false, false, true, 0, 0);
+        assert!(diagnose(&s).is_none());
+        let warning = missing_uidmap_warning(&s).expect("should warn");
+        assert!(warning.contains("newuidmap/newgidmap not found"));
+        assert!(warning.contains("uidmap"));
+        assert!(warning.contains("EOVERFLOW"));
+    }
+
+    #[test]
+    fn missing_uidmap_warning_fires_when_only_one_helper_present() {
+        // newuidmap present but newgidmap absent — still missing the pair.
+        let mut s = signals(false, true, false, true, 1, 1);
+        assert!(missing_uidmap_warning(&s).is_some());
+        s = signals(false, false, true, true, 1, 1);
+        assert!(missing_uidmap_warning(&s).is_some());
+    }
+
+    #[test]
+    fn missing_uidmap_warning_silent_when_both_helpers_present() {
+        // Helpers present — even with no subuid/subgid configured (a
+        // different, already-silent fallback case not covered by #523).
+        let s = signals(false, true, true, true, 0, 0);
+        assert!(missing_uidmap_warning(&s).is_none());
+    }
+
+    #[test]
+    fn missing_uidmap_warning_does_not_duplicate_apparmor_hard_error() {
+        // When AppArmor restriction + missing helpers both apply, diagnose()
+        // already returns a hard error — check() must not also emit the
+        // separate warning on top of it (see check()'s early return).
+        let s = signals(true, false, false, true, 1, 1);
+        assert!(diagnose(&s).is_some());
+        assert!(missing_uidmap_warning(&s).is_some());
     }
 }
