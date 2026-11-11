@@ -925,6 +925,16 @@ fn spawn_service(
     write_state(&cstate)?;
 
     // Register DNS with bare service name.
+    //
+    // Upstream for the embedded per-network proxy: a service's own (:dns ...)
+    // servers (if set) so unknown-name queries get forwarded there rather than
+    // only ever reaching the default public resolvers (#552) — dns_add_entry
+    // merges this into the network's shared upstream list.
+    let dns_upstream: Vec<String> = if svc.dns.is_empty() {
+        vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+    } else {
+        svc.dns.clone()
+    };
     let all_ips: Vec<(String, String)> = cstate
         .network_ips
         .iter()
@@ -940,13 +950,9 @@ fn spawn_service(
             Err(_) => continue,
         };
         // Register with the bare service name (not project-prefixed).
-        if let Err(e) = pelagos::dns::dns_add_entry(
-            net_name,
-            &svc.name,
-            ip,
-            net_def.gateway,
-            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
-        ) {
+        if let Err(e) =
+            pelagos::dns::dns_add_entry(net_name, &svc.name, ip, net_def.gateway, &dns_upstream)
+        {
             log::warn!(
                 "dns: failed to register '{}' on {}: {}",
                 svc.name,

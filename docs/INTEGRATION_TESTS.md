@@ -2555,6 +2555,24 @@ inside the container is capped at 10s with `timeout` to prevent hanging.
 Failure means the daemon can't forward queries to upstream DNS servers, or
 the nslookup inside the container can't reach the gateway.
 
+### `test_dns_upstream_merge_custom_server`
+**Requires:** root, rootfs (no external network access — uses an in-process fake
+upstream DNS server on 127.0.0.2:53)
+
+Regression test for #552. Registers a first container on a network with only
+the default upstream (8.8.8.8/1.1.1.1), creating the network's DNS config
+header. Registers a second container on the *same* network with a custom
+upstream (a fake local DNS-over-TCP server). Asserts the on-disk config header
+now contains both upstream lists merged, then resolves a name only the fake
+server knows from inside a container via the gateway and asserts the fake
+server's answer comes back.
+
+Failure means `dns_add_entry` is leaving an existing network's upstream header
+untouched when a later container joins with its own `:dns`/`--dns` servers —
+exactly the bug in #552, where a compose service's custom DNS resolver was
+silently dropped because another service had already created the network's
+DNS config with the public defaults.
+
 ### `test_dns_network_isolation`
 **Requires:** root, rootfs
 

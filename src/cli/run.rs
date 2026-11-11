@@ -378,6 +378,10 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let additional_networks: Vec<String> = args.network.iter().skip(1).cloned().collect();
 
+    // Resolved once here so register_dns (below) and with_dns() inside
+    // apply_cli_options use the same upstream list (#552).
+    let dns_upstream = effective_dns(&args, &network_mode);
+
     // Guard against an explicit --network bridge/--nat from a rootless user.
     // (The -p auto-bridge path above already handled the rootless+ports case.)
     if let Some(msg) =
@@ -486,6 +490,7 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             attach_stderr,
             upper_dir: persistent_upper,
             keep_stdin: args.stdin,
+            dns_upstream,
         })
     } else if args.interactive {
         run_interactive(
@@ -497,6 +502,7 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             Some(spawn_config),
             labels,
             persistent_upper,
+            dns_upstream,
         )
     } else {
         run_foreground(
@@ -508,6 +514,7 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             Some(spawn_config),
             labels,
             persistent_upper,
+            dns_upstream,
         )
     }
 }
@@ -850,6 +857,32 @@ fn build_command(
     Ok(cmd)
 }
 
+/// Resolve the DNS servers for this run: explicit `--dns` always wins; for bridge
+/// networks with no explicit `--dns`, fall back to the configured defaults so name
+/// resolution works without extra flags. Pasta and loopback are excluded from the
+/// fallback — pasta inherits host DNS via the user-mode network stack.
+///
+/// Used both for the container's `/etc/resolv.conf` (via `with_dns()`, above) and
+/// as the embedded per-network DNS proxy's upstream forwarding list (`register_dns`)
+/// so the two stay in sync — previously `register_dns` always hardcoded the public
+/// defaults regardless of `--dns`, so the proxy never forwarded unknown names to a
+/// custom upstream (#552).
+fn effective_dns(args: &RunArgs, network_mode: &NetworkMode) -> Vec<String> {
+    let is_bridge = matches!(
+        network_mode,
+        NetworkMode::Bridge | NetworkMode::BridgeNamed(_)
+    );
+    if !args.dns.is_empty() {
+        args.dns.clone()
+    } else if is_bridge {
+        pelagos::config::PelagosConfig::load()
+            .network
+            .effective_default_dns()
+    } else {
+        vec![]
+    }
+}
+
 /// Apply all CLI options (network, filesystem, env, security, etc.) to a Command.
 /// Shared between the rootfs path and the --image path.
 ///
@@ -925,21 +958,17 @@ fn apply_cli_options(
         if (is_bridge && !args.no_nat) || args.nat {
             cmd = cmd.with_nat();
         }
-        // Resolve effective DNS: explicit --dns always wins; for bridge networks
-        // with no explicit --dns, auto-inject the configured defaults so that
-        // name resolution works without extra flags.  Pasta and loopback are
-        // excluded — pasta inherits host DNS via the user-mode network stack.
-        let effective_dns: Vec<String> = if !args.dns.is_empty() {
-            args.dns.clone()
-        } else if is_bridge {
-            pelagos::config::PelagosConfig::load()
-                .network
-                .effective_default_dns()
-        } else {
-            vec![]
-        };
-        if !effective_dns.is_empty() {
-            cmd = cmd.with_dns(&effective_dns.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        // Resolve effective DNS (shared with register_dns, below, so the embedded
+        // per-network proxy's upstream forwarding list matches what's written to
+        // /etc/resolv.conf — see effective_dns() and #552).
+        let dns_for_resolv = effective_dns(args, &network_mode);
+        if !dns_for_resolv.is_empty() {
+            cmd = cmd.with_dns(
+                &dns_for_resolv
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            );
         }
     } // end of `else` block for non-sandbox networking
 
@@ -1484,6 +1513,7 @@ fn run_foreground(
     spawn_config: Option<SpawnConfig>,
     labels: std::collections::HashMap<String, String>,
     upper_dir: Option<PathBuf>,
+    dns_upstream: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Use Piped for stdout/stderr so we can write state with the real PID
     // before any container output reaches the caller (issue #124).
@@ -1539,7 +1569,7 @@ fn run_foreground(
     write_state(&state)?;
 
     // Register container with embedded DNS daemon for each bridge network.
-    register_dns(&name, &all_ips);
+    register_dns(&name, &all_ips, &dns_upstream);
 
     // Relay threads: pipe container stdout/stderr to our stdout/stderr.
     // Data only flows after write_state above, satisfying the ordering guarantee.
@@ -1611,6 +1641,7 @@ fn run_interactive(
     spawn_config: Option<SpawnConfig>,
     labels: std::collections::HashMap<String, String>,
     upper_dir: Option<PathBuf>,
+    dns_upstream: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create the state directory before spawning so that if anything fails
     // after spawn (state write, network info gathering) the container is not
@@ -1661,7 +1692,7 @@ fn run_interactive(
         cgroup_name,
     };
     write_state(&state)?;
-    register_dns(&name, &all_ips);
+    register_dns(&name, &all_ips, &dns_upstream);
 
     let result = session.run();
 
@@ -1705,6 +1736,7 @@ struct DetachedArgs {
     /// Wire the container's stdin to a persistent FIFO (`<dir>/stdin`) instead of
     /// /dev/null so a later `attach` can write to the running process.
     keep_stdin: bool,
+    dns_upstream: Vec<String>,
 }
 
 fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1720,6 +1752,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         attach_stderr,
         upper_dir,
         keep_stdin,
+        dns_upstream,
     } = a;
     // Create container directory before fork so parent and child both see it.
     std::fs::create_dir_all(containers_dir())?;
@@ -1936,7 +1969,7 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Register container with embedded DNS daemon.
-            register_dns(&name, &all_ips);
+            register_dns(&name, &all_ips, &dns_upstream);
 
             // Spawn health monitor thread (if the image has a HEALTHCHECK).
             let health_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2098,7 +2131,17 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 /// Register a container with the embedded DNS daemon for each bridge network.
-fn register_dns(container_name: &str, network_ips: &[(String, String)]) {
+///
+/// `dns_upstream`: the effective `--dns` servers (see `effective_dns()`) to merge
+/// into the network's upstream forwarding list; falls back to the public defaults
+/// when empty (#552).
+fn register_dns(container_name: &str, network_ips: &[(String, String)], dns_upstream: &[String]) {
+    let default_upstream = ["8.8.8.8".to_string(), "1.1.1.1".to_string()];
+    let upstream: &[String] = if dns_upstream.is_empty() {
+        &default_upstream
+    } else {
+        dns_upstream
+    };
     for (net_name, ip_str) in network_ips {
         let ip: std::net::Ipv4Addr = match ip_str.parse() {
             Ok(ip) => ip,
@@ -2108,13 +2151,9 @@ fn register_dns(container_name: &str, network_ips: &[(String, String)]) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        if let Err(e) = pelagos::dns::dns_add_entry(
-            net_name,
-            container_name,
-            ip,
-            net_def.gateway,
-            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
-        ) {
+        if let Err(e) =
+            pelagos::dns::dns_add_entry(net_name, container_name, ip, net_def.gateway, upstream)
+        {
             log::warn!(
                 "dns: failed to register '{}' on {}: {}",
                 container_name,
