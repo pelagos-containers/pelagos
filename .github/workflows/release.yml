@@ -35,6 +35,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nftables iproute2 passt
+      - name: Unconfine pasta/passt (AppArmor)
+        # See ci.yml's matching step: the Ubuntu runner image ships AppArmor
+        # profiles that block pasta/passt from opening a network namespace,
+        # breaking every pasta-networked test (pelagos's rootless default).
+        run: |
+          for p in pasta passt; do
+            f="/etc/apparmor.d/usr.bin.$p"
+            if [ -f "$f" ]; then
+              sudo apparmor_parser -R "$f" || true
+              sudo ln -sf "$f" /etc/apparmor.d/disable/
+            fi
+          done
       - name: Install protoc (>=23 for debug_redact support)
         run: |
           PROTOC_VERSION=25.3
@@ -268,6 +280,17 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y ./pelagos_*_${{ matrix.arch }}.deb
+      - name: Unconfine pasta/passt (AppArmor)
+        # See ci.yml's matching step — passt is pulled in as a .deb dependency
+        # here, so the AppArmor profile only exists after install.
+        run: |
+          for p in pasta passt; do
+            f="/etc/apparmor.d/usr.bin.$p"
+            if [ -f "$f" ]; then
+              sudo apparmor_parser -R "$f" || true
+              sudo ln -sf "$f" /etc/apparmor.d/disable/
+            fi
+          done
       - name: Verify installation
         run: |
           test "$(which pelagos)" = "/usr/bin/pelagos"

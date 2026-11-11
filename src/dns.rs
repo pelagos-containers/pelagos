@@ -197,18 +197,29 @@ pub fn dns_add_entry(
         };
         format!("{} {}\n{} {}\n", gateway, upstream_str, container_name, ip)
     } else {
-        // Append entry (remove old entry for same container name first).
-        let mut lines: Vec<String> = content
-            .lines()
-            .filter(|line| {
-                // Keep lines that don't start with this container name.
-                let first_word = line.split_whitespace().next().unwrap_or("");
-                first_word != container_name
-            })
-            .map(|s| s.to_string())
-            .collect();
-        lines.push(format!("{} {}", container_name, ip));
-        lines.join("\n") + "\n"
+        // Append entry (remove old entry for same container name first), merging
+        // `upstream` into the existing header rather than leaving it untouched.
+        // Without this, a later container's custom `:dns`/`--dns` servers were
+        // silently dropped whenever it joined a network another container had
+        // already created (#552) — the embedded proxy never learned about them
+        // and kept answering NXDOMAIN for names only the new upstream knew.
+        let mut lines = content.lines();
+        let header = lines.next().unwrap_or_default();
+        let existing_gateway = header.split_whitespace().next().unwrap_or_default();
+        let existing_upstream = header.split_whitespace().nth(1).unwrap_or_default();
+        let merged_upstream = merge_upstream(existing_upstream, upstream);
+
+        let mut out = format!("{} {}\n", existing_gateway, merged_upstream.join(","));
+        for line in lines.filter(|line| {
+            // Keep lines that don't start with this container name.
+            let first_word = line.split_whitespace().next().unwrap_or("");
+            first_word != container_name
+        }) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&format!("{} {}\n", container_name, ip));
+        out
     };
 
     std::fs::write(&config_file, new_content)?;
@@ -233,6 +244,27 @@ pub fn dns_add_entry(
     // Ensure daemon is running and signal reload.
     ensure_dns_daemon()?;
     signal_reload()
+}
+
+/// Union two comma-separated upstream DNS server lists, de-duped, preserving
+/// order with `existing` first. `existing` is the raw header field (may be
+/// empty); `new` is a list of server addresses (may be empty).
+fn merge_upstream(existing: &str, new: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = existing
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for server in new {
+        if !merged.iter().any(|s| s == server) {
+            merged.push(server.clone());
+        }
+    }
+    if merged.is_empty() {
+        merged = vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
+    }
+    merged
 }
 
 /// Remove a container entry from a network's DNS config file.
@@ -684,6 +716,37 @@ fn flock_exclusive(file: &std::fs::File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #552: a second container's custom upstream must be unioned into the
+    /// network's existing header, not dropped silently.
+    #[test]
+    fn merge_upstream_unions_new_servers() {
+        let merged = merge_upstream("8.8.8.8,1.1.1.1", &["100.100.100.100".to_string()]);
+        assert_eq!(merged, vec!["8.8.8.8", "1.1.1.1", "100.100.100.100"]);
+    }
+
+    /// Re-registering the same upstream (e.g. a container restart) must not
+    /// duplicate entries.
+    #[test]
+    fn merge_upstream_dedupes() {
+        let merged = merge_upstream("8.8.8.8,1.1.1.1", &["1.1.1.1".to_string()]);
+        assert_eq!(merged, vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    /// An empty existing header and empty new list both fall back to the
+    /// public defaults, matching the first-entry-creation path.
+    #[test]
+    fn merge_upstream_empty_falls_back_to_defaults() {
+        let merged = merge_upstream("", &[]);
+        assert_eq!(merged, vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    /// Whitespace/blank fields in the existing header are tolerated.
+    #[test]
+    fn merge_upstream_handles_blank_existing() {
+        let merged = merge_upstream("8.8.8.8,", &["9.9.9.9".to_string()]);
+        assert_eq!(merged, vec!["8.8.8.8", "9.9.9.9"]);
+    }
 
     /// #564: `find_on_path` must find an executable on `$PATH` natively (no
     /// `which` binary involved), reject a same-named non-executable file, and
