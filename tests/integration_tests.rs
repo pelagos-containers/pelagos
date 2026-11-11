@@ -8918,42 +8918,40 @@ mod images {
     }
 
     impl MockOciRegistry {
-        /// Spawn a registry serving `image_name` (e.g. `"library/mock-img"`).
-        /// `multi_arch = true` → top-level manifest is an OCI image index with
-        /// one linux/amd64 entry; `false` → single-arch manifest served directly.
-        fn spawn(image_name: &str, multi_arch: bool) -> Self {
-            let routes = build_routes(image_name, multi_arch);
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock registry");
-            let port = listener.local_addr().unwrap().port();
-            // Non-blocking so the serve loop can check the shutdown flag.
-            listener.set_nonblocking(true).unwrap();
-
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown2 = Arc::clone(&shutdown);
-
-            std::thread::spawn(move || {
-                while !shutdown2.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((stream, _)) => serve_request(stream, &routes),
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            MockOciRegistry { port, shutdown }
+        /// Spawn a registry whose layer contains one named file with the
+        /// given content. Every caller must supply content unique to itself
+        /// — the digest (and therefore on-disk content-addressable layer
+        /// directory) is a function of layer content, so two tests sharing
+        /// the same content race each other when run concurrently (the
+        /// default empty-tar layer every caller used to share, before #540).
+        /// `multi_arch = true` → top-level manifest is an OCI image index
+        /// with one linux/amd64 entry; `false` → single-arch manifest served
+        /// directly.
+        fn spawn_with_content(
+            image_name: &str,
+            multi_arch: bool,
+            file_name: &str,
+            content: &[u8],
+        ) -> Self {
+            Self::spawn_routes(build_routes_with_content(
+                image_name, multi_arch, file_name, content,
+            ))
         }
 
         /// Spawn a registry whose top-level index's per-platform entry is
         /// itself another index (not a direct manifest) — the shape buildx
         /// commonly produces (real manifest + attestation, both listed under
-        /// one per-platform sub-index). Regression coverage for #533.
-        fn spawn_nested(image_name: &str) -> Self {
-            let routes = build_routes_nested(image_name);
+        /// one per-platform sub-index). Regression coverage for #533. Layer
+        /// content is a named file unique to `content` — see
+        /// `spawn_with_content`'s doc comment for why (#540).
+        fn spawn_nested_with_content(image_name: &str, file_name: &str, content: &[u8]) -> Self {
+            Self::spawn_routes(build_routes_nested(image_name, Some((file_name, content))))
+        }
+
+        fn spawn_routes(routes: Routes) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock registry");
             let port = listener.local_addr().unwrap().port();
+            // Non-blocking so the serve loop can check the shutdown flag.
             listener.set_nonblocking(true).unwrap();
 
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -8979,40 +8977,6 @@ mod images {
         }
     }
 
-    impl MockOciRegistry {
-        /// Spawn a single-arch registry whose layer contains one file with the
-        /// given content, rather than the empty-tar layer every other
-        /// `spawn()`/`spawn_nested()` caller shares. Needed for tests that
-        /// mutate the extracted layer directory on disk (corruption
-        /// simulation): the empty-tar layer's digest — and therefore its
-        /// on-disk content-addressable directory — is identical across every
-        /// test using the shared builder, so mutating it races any other
-        /// test running concurrently against the same digest.
-        fn spawn_with_content(image_name: &str, file_name: &str, content: &[u8]) -> Self {
-            let routes = build_routes_with_content(image_name, file_name, content);
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock registry");
-            let port = listener.local_addr().unwrap().port();
-            listener.set_nonblocking(true).unwrap();
-
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown2 = Arc::clone(&shutdown);
-
-            std::thread::spawn(move || {
-                while !shutdown2.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((stream, _)) => serve_request(stream, &routes),
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            MockOciRegistry { port, shutdown }
-        }
-    }
-
     impl Drop for MockOciRegistry {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::Relaxed);
@@ -9027,35 +8991,40 @@ mod images {
         format!("sha256:{:x}", Sha256::digest(data))
     }
 
-    fn build_routes(image_name: &str, multi_arch: bool) -> Routes {
-        // Empty tar layer (two 512-byte EOF blocks).
+    /// Build a layer tar containing either nothing (empty tar — two 512-byte
+    /// EOF blocks, the default) or one named file, returning (raw tar bytes,
+    /// sha256 diff_id). Giving a test its own `content` gives its pull a
+    /// digest — and therefore on-disk layer directory — unique to that test,
+    /// isolating it from every other test sharing the always-identical
+    /// empty-tar default, which races when run concurrently (#540).
+    fn make_layer_tar(content: Option<(&str, &[u8])>) -> (Vec<u8>, String) {
         let mut tar_raw: Vec<u8> = Vec::new();
         {
             let mut b = tar::Builder::new(&mut tar_raw);
+            if let Some((file_name, data)) = content {
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_size(data.len() as u64);
+                hdr.set_mode(0o644);
+                hdr.set_cksum();
+                b.append_data(&mut hdr, file_name, data).unwrap();
+            }
             b.finish().unwrap();
         }
         let diff_id = sha256_of(&tar_raw);
-
-        build_routes_from_tar(image_name, multi_arch, tar_raw, diff_id)
+        (tar_raw, diff_id)
     }
 
-    /// Single-arch registry whose layer tar contains one named file — gives a
-    /// digest (and therefore on-disk layer directory) unique to the content,
-    /// unlike `build_routes`'s always-identical empty-tar layer.
-    fn build_routes_with_content(image_name: &str, file_name: &str, content: &[u8]) -> Routes {
-        let mut tar_raw: Vec<u8> = Vec::new();
-        {
-            let mut b = tar::Builder::new(&mut tar_raw);
-            let mut hdr = tar::Header::new_gnu();
-            hdr.set_size(content.len() as u64);
-            hdr.set_mode(0o644);
-            hdr.set_cksum();
-            b.append_data(&mut hdr, file_name, content).unwrap();
-            b.finish().unwrap();
-        }
-        let diff_id = sha256_of(&tar_raw);
-
-        build_routes_from_tar(image_name, false, tar_raw, diff_id)
+    /// Registry whose layer tar contains one named file — gives a digest (and
+    /// therefore on-disk layer directory) unique to the content, so two
+    /// tests calling this don't collide. See #540.
+    fn build_routes_with_content(
+        image_name: &str,
+        multi_arch: bool,
+        file_name: &str,
+        content: &[u8],
+    ) -> Routes {
+        let (tar_raw, diff_id) = make_layer_tar(Some((file_name, content)));
+        build_routes_from_tar(image_name, multi_arch, tar_raw, diff_id)
     }
 
     fn build_routes_from_tar(
@@ -9161,16 +9130,10 @@ mod images {
 
     /// Two-level index: top-level index -> per-platform index -> real manifest.
     /// Mirrors #533's actual repro shape (ghcr.io/goauthentik/server:2026.8.0).
-    fn build_routes_nested(image_name: &str) -> Routes {
+    fn build_routes_nested(image_name: &str, content: Option<(&str, &[u8])>) -> Routes {
         use flate2::{write::GzEncoder, Compression};
-        use tar::Builder;
 
-        let mut tar_raw: Vec<u8> = Vec::new();
-        {
-            let mut b = Builder::new(&mut tar_raw);
-            b.finish().unwrap();
-        }
-        let diff_id = sha256_of(&tar_raw);
+        let (tar_raw, diff_id) = make_layer_tar(content);
 
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         gz.write_all(&tar_raw).unwrap();
@@ -10596,7 +10559,12 @@ mod images {
         }
 
         let image_name = "library/pelagos-mock-single";
-        let registry = MockOciRegistry::spawn(image_name, false);
+        let registry = MockOciRegistry::spawn_with_content(
+            image_name,
+            false,
+            "single-arch-marker.txt",
+            b"unique layer content for test_image_pull_mock_registry_single_arch",
+        );
 
         // Point PELAGOS_REGISTRIES at the mock so `pelagos image pull
         // docker.io/library/pelagos-mock-single:latest` hits it instead.
@@ -10651,7 +10619,12 @@ mod images {
         }
 
         let image_name = "library/pelagos-mock-multi";
-        let registry = MockOciRegistry::spawn(image_name, true);
+        let registry = MockOciRegistry::spawn_with_content(
+            image_name,
+            true,
+            "multiarch-marker.txt",
+            b"unique layer content for test_image_pull_mock_registry_multiarch",
+        );
 
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(
@@ -10706,7 +10679,11 @@ mod images {
         }
 
         let image_name = "library/pelagos-mock-nested";
-        let registry = MockOciRegistry::spawn_nested(image_name);
+        let registry = MockOciRegistry::spawn_nested_with_content(
+            image_name,
+            "nested-index-marker.txt",
+            b"unique layer content for test_image_pull_mock_registry_nested_index",
+        );
 
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(
@@ -10773,6 +10750,7 @@ mod images {
         let image_name = "library/pelagos-mock-legacy-marker";
         let registry = MockOciRegistry::spawn_with_content(
             image_name,
+            false,
             "legacy-marker-victim.txt",
             b"unique layer content for test_pull_self_heals_legacy_marker_layer",
         );
