@@ -15403,7 +15403,9 @@ mod dns {
     /// that answers every query with an A record pointing at `answer_ip`.
     /// Stands in for a real custom `:dns`/`--dns` resolver (e.g. Tailscale's
     /// 100.100.100.100 in #552's original report) in tests, without depending
-    /// on external network access. Self-terminates after a few seconds.
+    /// on external network access. Self-terminates after ~30s — long enough to
+    /// outlast the caller's nslookup retry loop (up to ~10s) plus daemon
+    /// reload/setup time under CI/cluster scheduling jitter.
     fn spawn_fake_upstream_dns(bind_ip: &'static str, answer_ip: std::net::Ipv4Addr) {
         use std::net::TcpListener;
         let listener =
@@ -15411,7 +15413,7 @@ mod dns {
         listener.set_nonblocking(true).expect("set_nonblocking");
         std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -15524,13 +15526,18 @@ mod dns {
             header
         );
 
-        // Give the daemon a moment to reload after the second dns_add_entry's SIGHUP.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
         // Resolve a name only the custom (fake) upstream knows — the gateway proxy
-        // must forward to it, not just the original 8.8.8.8/1.1.1.1.
+        // must forward to it, not just the original 8.8.8.8/1.1.1.1. Retries instead
+        // of a fixed sleep: the daemon's SIGHUP reload after the second
+        // dns_add_entry is asynchronous, and a fixed delay flaked under CI/cluster
+        // scheduling jitter (observed: ~300ms was enough on real hardware but not
+        // on a loaded CI runner).
         let resolve_cmd = format!(
-            "timeout 10 nslookup custom-only.example {} 2>&1 || echo 'NSLOOKUP_FAILED'",
+            "i=0; while [ $i -lt 20 ]; do \
+               out=$(timeout 3 nslookup custom-only.example {} 2>&1); \
+               echo \"$out\" | grep -q 203.0.113.42 && {{ echo \"$out\"; exit 0; }}; \
+               i=$((i + 1)); sleep 0.5; \
+             done; echo \"$out\"; echo 'NSLOOKUP_FAILED'",
             net_def.gateway
         );
         let mut client = Command::new("/bin/sh")
