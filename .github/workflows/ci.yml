@@ -40,6 +40,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nftables iproute2 passt
+      - name: Unconfine pasta/passt (AppArmor)
+        # The Ubuntu runner image ships AppArmor profiles that block pasta/passt
+        # from opening a network namespace under /run/pelagos/pasta-ns/*, the same
+        # issue documented for bare-metal Ubuntu hosts in pelagos-build/README.md's
+        # guinea-pig setup — without this, every pasta-networked test (which is
+        # most of them, since pasta is pelagos's rootless default) fails with
+        # "pasta: Couldn't open network namespace ...: Permission denied".
+        # `|| true`/the existence check keep this a no-op if a future runner image
+        # removes or renames the profile.
+        run: |
+          for p in pasta passt; do
+            f="/etc/apparmor.d/usr.bin.$p"
+            if [ -f "$f" ]; then
+              sudo apparmor_parser -R "$f" || true
+              sudo ln -sf "$f" /etc/apparmor.d/disable/
+            fi
+          done
       - name: Install protoc (>=23 for debug_redact support)
         run: |
           PROTOC_VERSION=25.3
@@ -75,6 +92,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nftables iproute2 passt
+      - name: Unconfine pasta/passt (AppArmor)
+        # See the matching step in the integration-tests job above for why.
+        run: |
+          for p in pasta passt; do
+            f="/etc/apparmor.d/usr.bin.$p"
+            if [ -f "$f" ]; then
+              sudo apparmor_parser -R "$f" || true
+              sudo ln -sf "$f" /etc/apparmor.d/disable/
+            fi
+          done
       - name: Build rootfs
         run: sudo ./scripts/build-rootfs-tarball.sh
       - name: Set up pelagos system directories

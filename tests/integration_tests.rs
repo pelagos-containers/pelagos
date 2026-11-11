@@ -15378,6 +15378,189 @@ mod dns {
         cleanup_test_network(net_name);
     }
 
+    /// #552 regression: a second container's custom `:dns`/`--dns` upstream must
+    /// be merged into a network's embedded-DNS-proxy upstream list, even when it
+    /// joins a network another container already created — not silently dropped
+    /// (the pre-fix behaviour: `dns_add_entry` only ever wrote the upstream header
+    /// on first creation, so a later container's custom resolver never took
+    /// effect).
+    ///
+    /// Verifies the fix two ways: (1) the on-disk config header, read directly,
+    /// contains both upstream lists merged; (2) end-to-end, using only
+    /// already-proven infrastructure (no bespoke test-only DNS server, which
+    /// proved to be the flaky part of an earlier version of this test under CI
+    /// sandboxing — see git history): the FIRST container registers a
+    /// guaranteed-unreachable TEST-NET-3 address (RFC 5737) as its upstream, the
+    /// SECOND registers a real public resolver. `forward_upstream()` (unchanged,
+    /// pre-existing code also covered by `test_dns_upstream_forward`) tries
+    /// upstream servers in list order and falls through on failure — so
+    /// resolution only succeeds end-to-end if the merge actually landed in the
+    /// list the running daemon uses, not just on disk.
+    ///
+    /// Requires root + rootfs + host internet access to 8.8.8.8:53 (same
+    /// precondition as `test_dns_upstream_forward`, with the same skip-on-
+    /// unreachable guard).
+    #[test]
+    #[serial(nat)]
+    fn test_dns_upstream_merge_custom_server() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_upstream_merge_custom_server (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_upstream_merge_custom_server (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnstest552";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.3.0/24");
+
+        // Spawn a long-running holder container to create the bridge interface.
+        let mut holder = Command::new("/bin/sleep")
+            .args(["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder");
+
+        let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
+
+        // First container joins with a guaranteed-unreachable upstream (RFC 5737
+        // TEST-NET-3) — creates the network's DNS config header with ONLY that.
+        pelagos::dns::dns_add_entry(
+            net_name,
+            "dummy-default",
+            "10.90.3.98".parse().unwrap(),
+            net_def.gateway,
+            &["203.0.113.1".to_string()],
+        )
+        .expect("dns_add_entry (default)");
+
+        assert!(
+            wait_for_dns(net_def.gateway, 53, 2000),
+            "DNS daemon did not bind to {}:53 within 2s",
+            net_def.gateway
+        );
+
+        // Sanity-check 8.8.8.8 is reachable via DNS-over-TCP before relying on it —
+        // mirrors test_dns_upstream_forward's own pre-flight check.
+        let upstream_ok = {
+            use std::io::{Read as _, Write as _};
+            use std::net::TcpStream;
+            use std::time::Duration;
+            let query: &[u8] = &[
+                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x01,
+            ];
+            let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+            (|| -> std::io::Result<bool> {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let len = (query.len() as u16).to_be_bytes();
+                s.write_all(&len)?;
+                s.write_all(query)?;
+                let mut lbuf = [0u8; 2];
+                s.read_exact(&mut lbuf)?;
+                Ok(true)
+            })()
+            .unwrap_or(false)
+        };
+        if !upstream_ok {
+            eprintln!(
+                "Skipping test_dns_upstream_merge_custom_server: upstream 8.8.8.8:53 \
+                 not reachable via TCP from host"
+            );
+            pelagos::dns::dns_remove_entry(net_name, "dummy-default").ok();
+            unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+            let _ = holder.wait();
+            cleanup_dns();
+            cleanup_test_network(net_name);
+            return;
+        }
+
+        // Second container joins the SAME network with a real, working upstream —
+        // before the #552 fix, dns_add_entry left the existing header untouched
+        // and this server was silently dropped.
+        pelagos::dns::dns_add_entry(
+            net_name,
+            "dummy-custom",
+            "10.90.3.99".parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("dns_add_entry (custom)");
+
+        // Confirm the merge landed in the on-disk config before testing resolution.
+        let config_file = pelagos::paths::dns_network_file(net_name);
+        let content = std::fs::read_to_string(&config_file).expect("read dns config");
+        let header = content.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("203.0.113.1") && header.contains("8.8.8.8"),
+            "expected merged header to contain both the unreachable default and the \
+             custom upstream, got: {}",
+            header
+        );
+
+        // Resolve a real name. The daemon's forward_upstream() tries the merged
+        // list in order: 203.0.113.1 first (times out), then 8.8.8.8 (succeeds) —
+        // this only works end-to-end if the merge actually reached the daemon's
+        // in-memory upstream list, not just the on-disk file. A retry loop
+        // (rather than a fixed sleep) absorbs the daemon's asynchronous SIGHUP
+        // reload after the second dns_add_entry.
+        let resolve_cmd = format!(
+            "i=0; while [ $i -lt 15 ]; do \
+               out=$(timeout 8 nslookup example.com {} 2>&1); \
+               echo \"$out\" | grep -qE 'Address|Name' && {{ echo \"$out\"; exit 0; }}; \
+               i=$((i + 1)); sleep 0.5; \
+             done; echo \"$out\"; echo 'NSLOOKUP_FAILED'",
+            net_def.gateway
+        );
+        let mut client = Command::new("/bin/sh")
+            .args(["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, stderr_raw) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+        let stderr = String::from_utf8_lossy(&stderr_raw);
+
+        assert!(
+            !stdout.contains("NSLOOKUP_FAILED") && stdout.contains("Address"),
+            "expected example.com to resolve by falling through the merged upstream \
+             list (203.0.113.1 unreachable -> 8.8.8.8 works), stdout: {}, stderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        // Cleanup.
+        pelagos::dns::dns_remove_entry(net_name, "dummy-default").ok();
+        pelagos::dns::dns_remove_entry(net_name, "dummy-custom").ok();
+        unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+        let _ = holder.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+    }
+
     /// DNS respects network boundaries: container on net1 cannot resolve
     /// containers on net2.
     ///
