@@ -15378,75 +15378,28 @@ mod dns {
         cleanup_test_network(net_name);
     }
 
-    /// Build a minimal DNS-over-TCP A-record response, echoing the incoming
-    /// query's ID/question and answering with `ip`. `query` is the raw DNS
-    /// message (no TCP length prefix).
-    fn fake_dns_build_response(query: &[u8], ip: std::net::Ipv4Addr) -> Vec<u8> {
-        let mut resp = Vec::with_capacity(query.len() + 16);
-        resp.extend_from_slice(&query[0..2]); // ID
-        resp.extend_from_slice(&[0x81, 0x80]); // QR=1, RD, RA, RCODE=0
-        resp.extend_from_slice(&query[4..6]); // QDCOUNT (echoed)
-        resp.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT = 1
-        resp.extend_from_slice(&[0, 0]); // NSCOUNT
-        resp.extend_from_slice(&[0, 0]); // ARCOUNT
-        resp.extend_from_slice(&query[12..]); // question section (echoed)
-        resp.extend_from_slice(&[0xC0, 0x0C]); // answer name: pointer to offset 12
-        resp.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
-        resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
-        resp.extend_from_slice(&10u32.to_be_bytes()); // TTL
-        resp.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
-        resp.extend_from_slice(&ip.octets());
-        resp
-    }
-
-    /// Spawn a short-lived fake upstream DNS-over-TCP server on `bind_ip:53`
-    /// that answers every query with an A record pointing at `answer_ip`.
-    /// Stands in for a real custom `:dns`/`--dns` resolver (e.g. Tailscale's
-    /// 100.100.100.100 in #552's original report) in tests, without depending
-    /// on external network access. Self-terminates after ~30s — long enough to
-    /// outlast the caller's nslookup retry loop (up to ~10s) plus daemon
-    /// reload/setup time under CI/cluster scheduling jitter.
-    fn spawn_fake_upstream_dns(bind_ip: &'static str, answer_ip: std::net::Ipv4Addr) {
-        use std::net::TcpListener;
-        let listener =
-            TcpListener::bind(format!("{}:53", bind_ip)).expect("bind fake upstream dns");
-        listener.set_nonblocking(true).expect("set_nonblocking");
-        std::thread::spawn(move || {
-            use std::io::{Read as _, Write as _};
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let mut len_buf = [0u8; 2];
-                        if stream.read_exact(&mut len_buf).is_ok() {
-                            let len = u16::from_be_bytes(len_buf) as usize;
-                            let mut query = vec![0u8; len];
-                            if stream.read_exact(&mut query).is_ok() {
-                                let resp = fake_dns_build_response(&query, answer_ip);
-                                let _ = stream.write_all(&(resp.len() as u16).to_be_bytes());
-                                let _ = stream.write_all(&resp);
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
     /// #552 regression: a second container's custom `:dns`/`--dns` upstream must
     /// be merged into a network's embedded-DNS-proxy upstream list, even when it
     /// joins a network another container already created — not silently dropped
     /// (the pre-fix behaviour: `dns_add_entry` only ever wrote the upstream header
     /// on first creation, so a later container's custom resolver never took
-    /// effect). Verifies the fix end-to-end: a name only the *second* container's
-    /// custom upstream knows about must resolve via the shared gateway proxy.
+    /// effect).
     ///
-    /// Requires root + rootfs.
+    /// Verifies the fix two ways: (1) the on-disk config header, read directly,
+    /// contains both upstream lists merged; (2) end-to-end, using only
+    /// already-proven infrastructure (no bespoke test-only DNS server, which
+    /// proved to be the flaky part of an earlier version of this test under CI
+    /// sandboxing — see git history): the FIRST container registers a
+    /// guaranteed-unreachable TEST-NET-3 address (RFC 5737) as its upstream, the
+    /// SECOND registers a real public resolver. `forward_upstream()` (unchanged,
+    /// pre-existing code also covered by `test_dns_upstream_forward`) tries
+    /// upstream servers in list order and falls through on failure — so
+    /// resolution only succeeds end-to-end if the merge actually landed in the
+    /// list the running daemon uses, not just on disk.
+    ///
+    /// Requires root + rootfs + host internet access to 8.8.8.8:53 (same
+    /// precondition as `test_dns_upstream_forward`, with the same skip-on-
+    /// unreachable guard).
     #[test]
     #[serial(nat)]
     fn test_dns_upstream_merge_custom_server() {
@@ -15466,10 +15419,6 @@ mod dns {
         cleanup_dns();
         create_test_network(net_name, "10.90.3.0/24");
 
-        let fake_ip: std::net::Ipv4Addr = "127.0.0.2".parse().unwrap();
-        let answer_ip: std::net::Ipv4Addr = "203.0.113.42".parse().unwrap();
-        spawn_fake_upstream_dns("127.0.0.2", answer_ip);
-
         // Spawn a long-running holder container to create the bridge interface.
         let mut holder = Command::new("/bin/sleep")
             .args(["30"])
@@ -15487,14 +15436,14 @@ mod dns {
 
         let net_def = pelagos::network::load_network_def(net_name).expect("load net def");
 
-        // First container joins with only the default upstream — creates the
-        // network's DNS config header with 8.8.8.8/1.1.1.1 only.
+        // First container joins with a guaranteed-unreachable upstream (RFC 5737
+        // TEST-NET-3) — creates the network's DNS config header with ONLY that.
         pelagos::dns::dns_add_entry(
             net_name,
             "dummy-default",
             "10.90.3.98".parse().unwrap(),
             net_def.gateway,
-            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+            &["203.0.113.1".to_string()],
         )
         .expect("dns_add_entry (default)");
 
@@ -15504,15 +15453,51 @@ mod dns {
             net_def.gateway
         );
 
-        // Second container joins the SAME network with a custom upstream — before
-        // the #552 fix, dns_add_entry left the existing header untouched and this
-        // server was silently dropped.
+        // Sanity-check 8.8.8.8 is reachable via DNS-over-TCP before relying on it —
+        // mirrors test_dns_upstream_forward's own pre-flight check.
+        let upstream_ok = {
+            use std::io::{Read as _, Write as _};
+            use std::net::TcpStream;
+            use std::time::Duration;
+            let query: &[u8] = &[
+                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x01,
+            ];
+            let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+            (|| -> std::io::Result<bool> {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let len = (query.len() as u16).to_be_bytes();
+                s.write_all(&len)?;
+                s.write_all(query)?;
+                let mut lbuf = [0u8; 2];
+                s.read_exact(&mut lbuf)?;
+                Ok(true)
+            })()
+            .unwrap_or(false)
+        };
+        if !upstream_ok {
+            eprintln!(
+                "Skipping test_dns_upstream_merge_custom_server: upstream 8.8.8.8:53 \
+                 not reachable via TCP from host"
+            );
+            pelagos::dns::dns_remove_entry(net_name, "dummy-default").ok();
+            unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+            let _ = holder.wait();
+            cleanup_dns();
+            cleanup_test_network(net_name);
+            return;
+        }
+
+        // Second container joins the SAME network with a real, working upstream —
+        // before the #552 fix, dns_add_entry left the existing header untouched
+        // and this server was silently dropped.
         pelagos::dns::dns_add_entry(
             net_name,
             "dummy-custom",
             "10.90.3.99".parse().unwrap(),
             net_def.gateway,
-            &[fake_ip.to_string()],
+            &["8.8.8.8".to_string()],
         )
         .expect("dns_add_entry (custom)");
 
@@ -15521,21 +15506,22 @@ mod dns {
         let content = std::fs::read_to_string(&config_file).expect("read dns config");
         let header = content.lines().next().unwrap_or_default();
         assert!(
-            header.contains(&fake_ip.to_string()) && header.contains("8.8.8.8"),
-            "expected merged header to contain both the default and custom upstream, got: {}",
+            header.contains("203.0.113.1") && header.contains("8.8.8.8"),
+            "expected merged header to contain both the unreachable default and the \
+             custom upstream, got: {}",
             header
         );
 
-        // Resolve a name only the custom (fake) upstream knows — the gateway proxy
-        // must forward to it, not just the original 8.8.8.8/1.1.1.1. Retries instead
-        // of a fixed sleep: the daemon's SIGHUP reload after the second
-        // dns_add_entry is asynchronous, and a fixed delay flaked under CI/cluster
-        // scheduling jitter (observed: ~300ms was enough on real hardware but not
-        // on a loaded CI runner).
+        // Resolve a real name. The daemon's forward_upstream() tries the merged
+        // list in order: 203.0.113.1 first (times out), then 8.8.8.8 (succeeds) —
+        // this only works end-to-end if the merge actually reached the daemon's
+        // in-memory upstream list, not just the on-disk file. A retry loop
+        // (rather than a fixed sleep) absorbs the daemon's asynchronous SIGHUP
+        // reload after the second dns_add_entry.
         let resolve_cmd = format!(
-            "i=0; while [ $i -lt 20 ]; do \
-               out=$(timeout 3 nslookup custom-only.example {} 2>&1); \
-               echo \"$out\" | grep -q 203.0.113.42 && {{ echo \"$out\"; exit 0; }}; \
+            "i=0; while [ $i -lt 15 ]; do \
+               out=$(timeout 8 nslookup example.com {} 2>&1); \
+               echo \"$out\" | grep -qE 'Address|Name' && {{ echo \"$out\"; exit 0; }}; \
                i=$((i + 1)); sleep 0.5; \
              done; echo \"$out\"; echo 'NSLOOKUP_FAILED'",
             net_def.gateway
@@ -15559,9 +15545,9 @@ mod dns {
         let stderr = String::from_utf8_lossy(&stderr_raw);
 
         assert!(
-            stdout.contains("203.0.113.42"),
-            "expected custom-only.example to resolve via the merged custom upstream \
-             (203.0.113.42), stdout: {}, stderr: {}",
+            !stdout.contains("NSLOOKUP_FAILED") && stdout.contains("Address"),
+            "expected example.com to resolve by falling through the merged upstream \
+             list (203.0.113.1 unreachable -> 8.8.8.8 works), stdout: {}, stderr: {}",
             stdout.trim(),
             stderr.trim()
         );

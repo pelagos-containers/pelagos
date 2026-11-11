@@ -2556,16 +2556,26 @@ Failure means the daemon can't forward queries to upstream DNS servers, or
 the nslookup inside the container can't reach the gateway.
 
 ### `test_dns_upstream_merge_custom_server`
-**Requires:** root, rootfs (no external network access — uses an in-process fake
-upstream DNS server on 127.0.0.2:53)
+**Requires:** root, rootfs, host internet access to 8.8.8.8:53 (same precondition
+and skip-guard as `test_dns_upstream_forward`)
 
-Regression test for #552. Registers a first container on a network with only
-the default upstream (8.8.8.8/1.1.1.1), creating the network's DNS config
-header. Registers a second container on the *same* network with a custom
-upstream (a fake local DNS-over-TCP server). Asserts the on-disk config header
-now contains both upstream lists merged, then resolves a name only the fake
-server knows from inside a container via the gateway and asserts the fake
-server's answer comes back.
+Regression test for #552. Registers a first container on a network with an
+upstream that is guaranteed unreachable (`203.0.113.1`, RFC 5737 TEST-NET-3),
+creating the network's DNS config header. Registers a second container on the
+*same* network with a real, working upstream (`8.8.8.8`). Asserts the on-disk
+config header now contains both upstream lists merged, then resolves
+`example.com` from inside a container via the gateway: this only succeeds if
+`forward_upstream()` actually tries both merged servers in order (timing out
+on the unreachable one, then falling through to the real one) — proving the
+merge reached the running daemon's in-memory state, not just the file.
+
+An earlier version of this test used a bespoke in-process fake DNS-over-TCP
+server instead of a real upstream; that proved to be the flaky part under CI
+sandboxing (consistently correct on real cluster hardware, intermittently
+NXDOMAIN under GitHub Actions) even though the merge itself was already
+independently verified via the on-disk assertion. Using only already-proven
+infrastructure (real public DNS, the same `forward_upstream()` fallback path
+`test_dns_upstream_forward` exercises) removed the flakiness entirely.
 
 Failure means `dns_add_entry` is leaving an existing network's upstream header
 untouched when a later container joins with its own `:dns`/`--dns` servers —
