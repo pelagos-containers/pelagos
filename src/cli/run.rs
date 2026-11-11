@@ -915,6 +915,11 @@ fn apply_cli_options(
             network_mode,
             NetworkMode::Bridge | NetworkMode::BridgeNamed(_)
         );
+        // Computed before `network_mode` is potentially moved into with_network()
+        // below. Shared with register_dns (outside this function) so the embedded
+        // per-network proxy's upstream forwarding list matches what's written to
+        // /etc/resolv.conf — see effective_dns() and #552.
+        let dns_for_resolv = effective_dns(args, &network_mode);
         if let NetworkMode::Container(ref target_name) = network_mode {
             // Join the target container's named network namespace instead of creating
             // a new one.  The target must have been started with bridge networking so
@@ -958,10 +963,6 @@ fn apply_cli_options(
         if (is_bridge && !args.no_nat) || args.nat {
             cmd = cmd.with_nat();
         }
-        // Resolve effective DNS (shared with register_dns, below, so the embedded
-        // per-network proxy's upstream forwarding list matches what's written to
-        // /etc/resolv.conf — see effective_dns() and #552).
-        let dns_for_resolv = effective_dns(args, &network_mode);
         if !dns_for_resolv.is_empty() {
             cmd = cmd.with_dns(
                 &dns_for_resolv
