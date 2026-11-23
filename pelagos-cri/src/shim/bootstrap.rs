@@ -53,8 +53,14 @@ pub struct StartParams {
     pub binary: String,
     pub namespace: String,
     pub id: String,
-    /// Address of the containerd-compatible endpoint (events sink).
+    /// Value of the `-address` flag: the containerd-style endpoint address.
     pub address: String,
+    /// Events sink socket, exported to the shim as `TTRPC_ADDRESS`. Empty means
+    /// "do not set it" (the shim then only logs events). Distinct from
+    /// `address`: containerd serves its gRPC API at one path and the ttrpc
+    /// events service at another.
+    pub ttrpc_address: String,
+    /// Value of `-publish-binary`; must be non-empty (Kata validates it).
     pub publish_binary: String,
     /// Bundle directory; becomes the shim's cwd.
     pub bundle: PathBuf,
@@ -150,11 +156,15 @@ async fn run(
     timeout: Duration,
 ) -> Result<String, BootstrapError> {
     let mut cmd = Command::new(binary);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("TTRPC_ADDRESS", ttrpc_address)
-        .env("MAX_SHIM_VERSION", "2")
-        .stdin(std::process::Stdio::null())
+    cmd.args(args).current_dir(cwd).env("MAX_SHIM_VERSION", "2");
+    if ttrpc_address.is_empty() {
+        // Never leak an inherited value that would point the shim at some
+        // other client's sink.
+        cmd.env_remove("TTRPC_ADDRESS");
+    } else {
+        cmd.env("TTRPC_ADDRESS", ttrpc_address);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -174,14 +184,28 @@ async fn run(
 
 /// Run `start` and return the shim's address.
 pub async fn start(p: &StartParams, timeout: Duration) -> Result<ShimAddress, BootstrapError> {
-    let out = run(&p.binary, &start_args(p), &p.bundle, &p.address, timeout).await?;
+    let out = run(
+        &p.binary,
+        &start_args(p),
+        &p.bundle,
+        &p.ttrpc_address,
+        timeout,
+    )
+    .await?;
     parse_start_output(&out)
 }
 
 /// Run `delete` for an unreachable shim; returns its stdout (a `DeleteResponse`
 /// in some shims, ignored by callers).
 pub async fn delete(p: &StartParams, timeout: Duration) -> Result<String, BootstrapError> {
-    run(&p.binary, &delete_args(p), &p.bundle, &p.address, timeout).await
+    run(
+        &p.binary,
+        &delete_args(p),
+        &p.bundle,
+        &p.ttrpc_address,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -193,7 +217,8 @@ mod tests {
             binary: "containerd-shim-kata-v2".into(),
             namespace: "k8s.io".into(),
             id: "abc".into(),
-            address: "/run/pelagos-cri/ttrpc.sock".into(),
+            address: "/run/pelagos-cri/containerd.sock".into(),
+            ttrpc_address: "/run/pelagos-cri/events.sock".into(),
             publish_binary: "/usr/local/bin/pelagos-cri-publish".into(),
             bundle: PathBuf::from("/run/pelagos-cri/shim/k8s.io/abc"),
         }

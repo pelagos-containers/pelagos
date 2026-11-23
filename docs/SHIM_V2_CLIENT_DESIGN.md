@@ -122,17 +122,27 @@ sandbox, so this is an ordering and plumbing task.
 
 ## 7. Events
 
-Kata requires a non-empty `publish_binary` and builds an event publisher bound
-to the namespace and address. The containerd contract makes
-`TaskCreate/Start/Exit/Delete` (and exec equivalents) MUST-publish with strict
-ordering (Start before Exit).
+The containerd contract makes `TaskCreate/Start/Exit/Delete` (and exec
+equivalents) MUST-publish with strict ordering (Start before Exit).
 
-The client therefore needs an event sink. Proposed: host a ttrpc `Events`
-service on a unix socket owned by `pelagos-cri`, pass it as `TTRPC_ADDRESS` /
-`-address`, and ship a tiny publish binary (or subcommand) that forwards
-envelopes to it. `containerd-shim-protos` provides the `Events` types.
-**UNVERIFIED:** exact transport Kata's publisher uses (read
-`service/src/event.rs`); verify against a real shim before finalizing.
+**Verified against Kata runtime-rs 4.4.0 (`service/src/event.rs`, #585):** the
+shim does **not** exec `-publish-binary`. It reads `TTRPC_ADDRESS` from its
+environment, connects to that unix socket and calls
+`containerd.services.events.ttrpc.v1.Events/Forward` with an `Envelope`
+(topic, namespace, timestamp, `Any` event). If `TTRPC_ADDRESS` is unset or
+empty it only logs events. `-publish-binary` must still be non-empty
+(`Args::validate`), but is never run.
+
+So the client needs an **events sink**, implemented in
+`pelagos-cri/src/shim/events.rs`: a ttrpc `Events` server on a `0600` unix
+socket owned by `pelagos-cri`, exported to shims as `TTRPC_ADDRESS` (a plain
+path, as containerd passes it), delivering decoded events in arrival order over
+a channel. `-address` remains the separate containerd-style endpoint flag. The
+publish binary is a placeholder (the running `pelagos-cri` path).
+
+A real publish-binary subcommand is deferred: build it only if validation shows
+a shim (`runsc`, Kata's Go runtime) actually execs it. **UNVERIFIED** for those
+shims.
 
 ## 8. Stdio
 

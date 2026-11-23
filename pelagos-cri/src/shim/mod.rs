@@ -8,6 +8,7 @@
 //! - [`bootstrap`]: legacy `start` / `delete` subcommand protocol.
 //! - [`bundle`]: per-container bundle directory and persisted shim address.
 //! - [`client`]: ttrpc Task client wrapper.
+//! - [`events`]: ttrpc `Events` sink shims publish lifecycle events to.
 //!
 //! Nothing here is wired into the CRI request path yet; later epic items
 //! (OCI spec generation, events sink, re-adoption) consume it.
@@ -16,6 +17,7 @@
 pub mod bootstrap;
 pub mod bundle;
 pub mod client;
+pub mod events;
 
 /// Loopback integration: a fake shim `start` script prints the address of an
 /// in-process ttrpc Task server; we bootstrap it, persist the address, connect
@@ -154,7 +156,8 @@ mod roundtrip {
             binary: script.to_string_lossy().into_owned(),
             namespace: "k8s.io".into(),
             id: "ctr1".into(),
-            address: "/run/pelagos-cri/ttrpc.sock".into(),
+            address: "/run/pelagos-cri/containerd.sock".into(),
+            ttrpc_address: "/run/pelagos-cri/events.sock".into(),
             publish_binary: "/bin/true".into(),
             bundle: bundle.dir().to_path_buf(),
         };
@@ -202,6 +205,76 @@ mod roundtrip {
         server.shutdown().await.unwrap();
     }
 
+    /// #585: the shim must get the *sink* in `TTRPC_ADDRESS` while `-address`
+    /// stays the containerd-style endpoint, and the recorded path must be one a
+    /// shim can actually connect to and publish through.
+    #[tokio::test]
+    #[serial_test::serial(ttrpc_env)]
+    async fn bootstrap_exports_events_sink_as_ttrpc_address() {
+        use containerd_shim_protos::api::ForwardRequest;
+        use containerd_shim_protos::shim::event::Envelope;
+        use containerd_shim_protos::shim_async::{Client, EventsClient};
+        use containerd_shim_protos::ttrpc::context;
+
+        use super::events::{placeholder_publish_binary, EventsSink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut sink, mut rx) = EventsSink::start(&tmp.path().join("ev.sock"))
+            .await
+            .unwrap();
+
+        let script = tmp.path().join("containerd-shim-fake-v2");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"${TTRPC_ADDRESS-UNSET}\" > ./ttrpc.env\necho \"$@\" > ./args\necho unix:///x\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bundle = Bundle::create(&tmp.path().join("b"), "k8s.io", "c").unwrap();
+        let mut p = StartParams {
+            binary: script.to_string_lossy().into_owned(),
+            namespace: "k8s.io".into(),
+            id: "c".into(),
+            address: "/run/containerd.sock".into(),
+            ttrpc_address: sink.address(),
+            publish_binary: placeholder_publish_binary(),
+            bundle: bundle.dir().to_path_buf(),
+        };
+        bootstrap::start(&p, Duration::from_secs(10)).await.unwrap();
+
+        let env = std::fs::read_to_string(bundle.dir().join("ttrpc.env")).unwrap();
+        assert_eq!(env, sink.address(), "TTRPC_ADDRESS is the events sink");
+        let args = std::fs::read_to_string(bundle.dir().join("args")).unwrap();
+        assert!(args.contains("-address /run/containerd.sock"), "{args}");
+        assert!(
+            !args.contains("-publish-binary -"),
+            "publish binary non-empty: {args}"
+        );
+
+        // Publish through the exact path the shim was handed.
+        let c = EventsClient::new(Client::connect(&format!("unix://{env}")).await.unwrap());
+        let mut e = Envelope::new();
+        e.topic = "/tasks/exit".into();
+        e.namespace = "k8s.io".into();
+        let mut r = ForwardRequest::new();
+        r.envelope = Some(e).into();
+        c.forward(context::with_timeout(5_000_000_000), &r)
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().topic, "/tasks/exit");
+
+        // Empty ttrpc_address: never inherit someone else's sink.
+        std::env::set_var("TTRPC_ADDRESS", "/some/other/sink");
+        p.ttrpc_address = String::new();
+        bootstrap::start(&p, Duration::from_secs(10)).await.unwrap();
+        std::env::remove_var("TTRPC_ADDRESS");
+        assert_eq!(
+            std::fs::read_to_string(bundle.dir().join("ttrpc.env")).unwrap(),
+            "UNSET"
+        );
+        sink.shutdown().await;
+    }
+
     #[tokio::test]
     async fn failing_shim_reports_stderr() {
         let tmp = tempfile::tempdir().unwrap();
@@ -213,6 +286,7 @@ mod roundtrip {
             namespace: "k8s.io".into(),
             id: "x".into(),
             address: "a".into(),
+            ttrpc_address: String::new(),
             publish_binary: "p".into(),
             bundle: tmp.path().to_path_buf(),
         };

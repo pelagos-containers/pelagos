@@ -6344,3 +6344,13 @@ Only the detached watcher writes `status: exited` into `state.json`. If the cont
 
 **`scripts/test-cri.sh` (root + crictl):**
 - *vanished container reported CONTAINER_EXITED* and *reports exit code 137* — creates and starts a container, SIGKILLs both its pid and `watcher_pid` read from `state.json`, then polls `crictl inspect` (up to ~5s). Failure means the CRI trusts a stale `state.json` end to end.
+
+## `pelagos-cri` shim v2 events sink (issue #585)
+Part of epic #574. `pelagos-cri` unit/loopback tests (`cargo test -p pelagos-cri shim::`); none need root, KVM or a real shim. Kata runtime-rs 4.4.0 publishes events by calling ttrpc `Events/Forward` on the socket in `TTRPC_ADDRESS` (it never execs `-publish-binary`), so this sink is what a Kata shim needs.
+
+- `shim::events::tests::forwards_decoded_events_in_order` — three events sent through a real ttrpc `EventsClient` arrive decoded (topic, namespace, timestamp, type URL, payload) in send order. Failure of the ordering assertion would break containerd's MUST-order contract (Start before Exit), which the TaskExit item relies on.
+- `shim::events::tests::envelope_less_request_is_rejected_not_forwarded` — a `Forward` with no envelope is an error and nothing reaches subscribers, so a malformed shim cannot inject empty events.
+- `shim::events::tests::dropped_receiver_does_not_fail_the_shim` — if nobody is listening the sink still answers OK. Failing the RPC would make the shim retry forever.
+- `shim::events::tests::replaces_stale_socket_and_locks_down_permissions` — a stale socket file from a crashed run is replaced, the socket is `0600`, `address()` is the plain path, and `shutdown()` removes the file. Failure means a restart cannot rebind, or other local users could publish events.
+- `shim::events::tests::placeholder_publish_binary_is_never_empty` — Kata rejects an empty `-publish-binary`.
+- `shim::roundtrip::bootstrap_exports_events_sink_as_ttrpc_address` — a fake shim records its environment: `TTRPC_ADDRESS` equals the sink socket, `-address` keeps the containerd-style endpoint, the publish binary is non-empty, and an event forwarded through the recorded path reaches the receiver. With an empty `ttrpc_address` an inherited `TTRPC_ADDRESS` is removed so a shim can never publish into another client's sink. Failure means the two addresses were conflated again (the #579 bug) or the shim would publish nowhere.
