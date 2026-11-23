@@ -75,6 +75,11 @@ jobs:
         run: |
           sudo install -d /etc/pelagos
           sudo install -m 0644 ci/registries.toml /etc/pelagos/registries.toml
+      - name: Authenticate ECR Public pulls (avoid anonymous quota)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ECR_PUBLIC_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ECR_PUBLIC_AWS_SECRET_ACCESS_KEY }}
+        run: bash scripts/ci-ecr-public-auth.sh
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run integration tests
@@ -110,6 +115,11 @@ jobs:
         run: |
           sudo install -d /etc/pelagos
           sudo install -m 0644 ci/registries.toml /etc/pelagos/registries.toml
+      - name: Authenticate ECR Public pulls (avoid anonymous quota)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ECR_PUBLIC_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ECR_PUBLIC_AWS_SECRET_ACCESS_KEY }}
+        run: bash scripts/ci-ecr-public-auth.sh
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run e2e tests
