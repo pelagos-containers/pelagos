@@ -241,6 +241,27 @@ check_contains "crictl pods lists sandbox" "$OUT" "test-pod"
 OUT=$($CRICTL inspectp "$SANDBOX_ID" 2>&1)
 check_contains "crictl inspectp: state=SANDBOX_READY" "$OUT" "SANDBOX_READY"
 
+# ── RuntimeClass handler selection (#577) ─────────────────────────────────────
+# An unknown handler must be rejected up front (never silently run natively),
+# and the explicit native handler "pelagos" must work and be reported back.
+HANDLER_OUT=$($CRICTL runp --runtime=no-such-handler /tmp/test-pod.json 2>&1)
+if [ $? -ne 0 ] && echo "$HANDLER_OUT" | grep -q "unknown runtime handler"; then
+    pass "runp with unknown runtime handler is rejected (#577)"
+else
+    fail "unknown runtime handler was not rejected (#577): $(echo "$HANDLER_OUT" | head -2)"
+fi
+sed 's/test-pod/test-pod-native/; s/test-uid-12345/test-uid-native-577/' /tmp/test-pod.json > /tmp/test-pod-native.json
+NATIVE_SB=$(crictl_id runp --runtime=pelagos /tmp/test-pod-native.json)
+if [ -n "$NATIVE_SB" ]; then
+    pass "runp with runtime handler 'pelagos' succeeds (#577)"
+    OUT=$($CRICTL inspectp "$NATIVE_SB" 2>&1)
+    check_contains "inspectp reports runtimeHandler=pelagos (#577)" "$OUT" '"runtimeHandler": "pelagos"'
+    $CRICTL stopp "$NATIVE_SB" >/dev/null 2>&1
+    $CRICTL rmp "$NATIVE_SB" >/dev/null 2>&1
+else
+    fail "runp with runtime handler 'pelagos' failed (#577)"
+fi
+
 # ── Container lifecycle ───────────────────────────────────────────────────────
 
 step "C6: Container lifecycle"
