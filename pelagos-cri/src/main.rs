@@ -5,6 +5,7 @@ pub mod cri {
     tonic::include_proto!("runtime.v1");
 }
 
+mod backend;
 mod cni;
 mod cri_metrics;
 mod grpc_metrics;
@@ -175,6 +176,7 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         state: app_state.clone(),
         streaming_base_url: streaming_base_url.clone(),
         registry: registry.clone(),
+        backends: backend::BackendRegistry::new(args.pelagos_bin.clone()),
     };
     let image_svc = ImageSvc {
         state: app_state.clone(),
