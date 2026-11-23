@@ -3731,13 +3731,19 @@ mod tests {
                 .unwrap_or(false)
     }
 
-    fn find_one(pat: &str) -> Option<i32> {
+    /// Find a process whose argv is *exactly* `["sleep", dur]`. A substring match
+    /// on the cmdline would also hit the wrapper shells (whose `-c` script text
+    /// contains the same words) before the real `sleep` has forked, letting the
+    /// test kill too early and leak the sleep (#589).
+    fn find_sleep(dur: u32) -> Option<i32> {
+        let want = dur.to_string();
         for ent in std::fs::read_dir("/proc").ok()?.flatten() {
             let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
                 continue;
             };
             if let Ok(c) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-                if String::from_utf8_lossy(&c).replace('\0', " ").contains(pat) {
+                let argv: Vec<&[u8]> = c.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+                if argv.len() == 2 && argv[0].ends_with(b"sleep") && argv[1] == want.as_bytes() {
                     return Some(pid);
                 }
             }
@@ -3754,8 +3760,7 @@ mod tests {
         use std::process::Command;
         // A unique sleep DURATION acts as the sentinel (a marker *argument* would
         // make `sleep` fail with "invalid time interval").
-        let dur = 23000 + (std::process::id() % 5000);
-        let needle = format!("sleep {dur}");
+        let dur: u32 = 23000 + (std::process::id() % 5000);
         // wrapper -> `setsid` (new session leader) which forks the sentinel sleep
         // and then waits, so the sleep shares the new session.
         let mut wrapper = Command::new("/bin/sh")
@@ -3770,7 +3775,7 @@ mod tests {
         // Wait for the sentinel sleep (the session grandchild) to appear.
         let mut sleep_pid = None;
         for _ in 0..60 {
-            if let Some(p) = find_one(&needle) {
+            if let Some(p) = find_sleep(dur) {
                 sleep_pid = Some(p);
                 break;
             }

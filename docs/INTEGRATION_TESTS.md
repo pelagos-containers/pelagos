@@ -6373,3 +6373,6 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::exit ge
 - `runtime::tests::test_container_stopped_event_mapping` — an init exit maps to `CONTAINER_STOPPED_EVENT` with `created_at` in ns from the exit time; exec exits produce no CRI event.
 - `runtime::tests::test_get_container_events_unimplemented_without_shim` — with no shim backend the RPC stays `Unimplemented`. Streaming only shim exits would make an evented-PLEG kubelet miss every native container transition.
 - `runtime::tests::test_get_container_events_streams_shim_exits` — with a tracker wired, init exits stream in order and exec exits are filtered out.
+
+## `runtime::tests::test_kill_exec_wrapper_reaps_setsid_session` sentinel fix (issue #589)
+The sentinel `sleep` is now located by exact argv (`sleep <dur>`) via `find_sleep`, not by a cmdline substring. The old substring match could return the wrapper shell before the real `sleep` forked, so `kill_exec_wrapper` ran too early, orphaned the `sleep` (about 30% of runs under load), and the test still passed because it asserted on the dead shell's pid. The leaked `sleep` held the test's stdout/stderr pipe for ~6.7 hours, hanging any `| tail` style run. Failure of this test now means `kill_exec_wrapper` really left the setsid'd grandchild alive.
