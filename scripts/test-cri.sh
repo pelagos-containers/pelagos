@@ -399,6 +399,38 @@ step "C6: Container status"
 OUT=$($CRICTL inspect "$CONTAINER_ID" 2>&1)
 check_contains "crictl inspect: state=CONTAINER_RUNNING" "$OUT" "CONTAINER_RUNNING"
 
+# ── Vanished container (#581) ────────────────────────────────────────────────
+# Only the watcher writes `exited` into state.json. SIGKILL the container AND its
+# watcher so nothing records the exit: the CRI must notice the dead pids itself
+# and report Exited, not a phantom Running container that kubelet never retries.
+
+step "C6: Container and watcher vanish without recording exit (#581)"
+
+sed 's/test-container/vanish-container/g' /tmp/test-container.json > /tmp/vanish-container.json
+VANISH_ID=$(crictl_id create "$SANDBOX_ID" /tmp/vanish-container.json /tmp/test-pod.json)
+if [ -n "$VANISH_ID" ] && $CRICTL start "$VANISH_ID" >/dev/null 2>&1; then
+    sleep 1
+    VSTATE="/run/pelagos/containers/pcri-${VANISH_ID:0:12}/state.json"
+    VPID=$(grep -o '"pid": *[0-9]*' "$VSTATE" | grep -o '[0-9]*$')
+    VWATCH=$(grep -o '"watcher_pid": *[0-9]*' "$VSTATE" | grep -o '[0-9]*$')
+    if [ -n "$VPID" ] && [ "$VPID" -gt 0 ]; then
+        kill -9 $VWATCH $VPID 2>/dev/null
+        VOUT=""
+        for _ in $(seq 1 25); do
+            VOUT=$($CRICTL inspect "$VANISH_ID" 2>&1)
+            echo "$VOUT" | grep -q "CONTAINER_EXITED" && break
+            sleep 0.2
+        done
+        check_contains "vanished container reported CONTAINER_EXITED (#581)" "$VOUT" "CONTAINER_EXITED"
+        check_contains "vanished container reports exit code 137 (#581)" "$VOUT" '"exitCode": 137'
+    else
+        fail "could not read container pid from $VSTATE (#581)"
+    fi
+    $CRICTL rm -f "$VANISH_ID" >/dev/null 2>&1
+else
+    fail "could not create/start the vanish container (#581)"
+fi
+
 # ── Container stats ──────────────────────────────────────────────────────────
 
 step "C6: ListContainerStats / ContainerStats"

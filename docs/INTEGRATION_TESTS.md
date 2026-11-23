@@ -6328,3 +6328,17 @@ Part of epic #574. All are `pelagos-cri` unit tests (`cargo test -p pelagos-cri 
 - `shim::client::tests::address_normalisation` — bare socket paths get `unix://`; other schemes and trailing newlines are handled. Failure means the ttrpc connect gets an address it cannot parse.
 - `shim::roundtrip::bootstrap_connect_and_lifecycle` — end to end over a real unix ttrpc socket: bootstrap the fake shim (asserts cwd is the bundle dir and the standard flags are passed), persist and reload the address, reconnect from the persisted record, then Connect/Create/Start/State/Kill/Wait/Delete in order, with request fields reaching the server and a server-side error surfacing as `Err`. Failure indicates a break in the bootstrap contract, the generated-client wiring (including the `containerd-shim-protos` 0.12 bump), or call ordering.
 - `shim::roundtrip::failing_shim_reports_stderr` — a shim exiting non-zero yields `BootstrapError::Failed(code, stderr)` carrying the shim's own stderr, which is the only diagnostic an operator gets when Kata fails to boot.
+
+## Dead container + dead watcher reported as exited (issue #581)
+Only the detached watcher writes `status: exited` into `state.json`. If the container and its watcher are both killed, the file says `running` forever and the CRI used to report a phantom Running container that kubelet never retried (seen as a stuck `Init:0/1` pod on the test node).
+
+**Unit tests (`cargo test -p pelagos-cri`, no root), in `runtime::tests`:**
+- `dead_pid_and_watcher_reconcile_to_exited_137` — `running` with a dead pid and dead watcher becomes `exited` with exit code 137. Failure means the phantom-Running bug is back.
+- `live_watcher_keeps_running_authoritative` — a live watcher keeps the file authoritative (it is about to record the real status), so a normally exiting container is never given a synthetic 137.
+- `live_pid_stays_running` / `starting_container_with_no_pid_is_untouched` — a live process, and a container still starting with `pid` 0, are never marked exited.
+- `missing_watcher_pid_falls_back_to_pid_only` — older state files without `watcher_pid` are judged on the pid alone.
+- `recorded_exit_status_and_code_are_preserved` — an already-recorded `exited` status and a code already present (e.g. 3, 7) are never overwritten with 137.
+- `pid_alive_reports_self_and_not_garbage` — the liveness probe is true for this process and false for 0, negative and nonexistent pids.
+
+**`scripts/test-cri.sh` (root + crictl):**
+- *vanished container reported CONTAINER_EXITED* and *reports exit code 137* — creates and starts a container, SIGKILLs both its pid and `watcher_pid` read from `state.json`, then polls `crictl inspect` (up to ~5s). Failure means the CRI trusts a stale `state.json` end to end.

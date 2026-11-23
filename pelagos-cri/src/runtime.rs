@@ -67,7 +67,6 @@ struct PelagosSandboxState {
 
 #[derive(Deserialize)]
 struct PelagosContainerState {
-    #[allow(dead_code)]
     name: String,
     status: String,
     pid: i32,
@@ -75,7 +74,6 @@ struct PelagosContainerState {
     /// the startup orphan scan to detect containers whose watcher died without
     /// killing the container process (#472).
     #[serde(default)]
-    #[allow(dead_code)]
     watcher_pid: i32,
     #[allow(dead_code)]
     started_at: String,
@@ -513,7 +511,51 @@ fn apparmor_profile_loaded(name: &str) -> bool {
 fn read_pelagos_container_state(pelagos_name: &str) -> Option<PelagosContainerState> {
     let path = format!("{}/{}/state.json", PELAGOS_CONTAINERS_DIR, pelagos_name);
     let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let state: PelagosContainerState = serde_json::from_str(&data).ok()?;
+    Some(reconcile_dead_running(state, pid_alive))
+}
+
+/// True if `pid` exists (EPERM still means it exists).
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks for existence/permission.
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
+}
+
+/// Exit code reported for a container whose process vanished without the
+/// watcher recording an exit: 128 + SIGKILL, what the kubelet would see had
+/// the kernel or an operator killed it.
+const VANISHED_EXIT_CODE: i32 = 137;
+
+/// Only the detached watcher writes `status: exited` into `state.json`. If the
+/// container process *and* its watcher are both gone (SIGKILL, OOM of the whole
+/// scope, a test harness sweeping them) the file is left saying `running`
+/// forever and the CRI would report a phantom Running container that kubelet
+/// never retries (#581). Treat that combination as exited.
+///
+/// A live watcher keeps the file authoritative (it is about to write the real
+/// exit status), and `pid <= 0` means "still starting", so neither is touched.
+fn reconcile_dead_running(
+    mut state: PelagosContainerState,
+    alive: impl Fn(i32) -> bool,
+) -> PelagosContainerState {
+    if state.status == "running"
+        && state.pid > 0
+        && !alive(state.pid)
+        && (state.watcher_pid <= 0 || !alive(state.watcher_pid))
+    {
+        log::warn!(
+            "container {} marked running but pid {} and its watcher are gone; reporting exited ({})",
+            state.name,
+            state.pid,
+            VANISHED_EXIT_CODE
+        );
+        state.status = "exited".to_string();
+        state.exit_code.get_or_insert(VANISHED_EXIT_CODE);
+    }
+    state
 }
 
 fn cri_sandbox_state_val(s: &SandboxState) -> i32 {
@@ -3414,6 +3456,67 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
 
 #[cfg(test)]
 mod tests {
+    fn pstate(status: &str, pid: i32, watcher: i32, exit: Option<i32>) -> PelagosContainerState {
+        PelagosContainerState {
+            name: "c".into(),
+            status: status.into(),
+            pid,
+            watcher_pid: watcher,
+            started_at: String::new(),
+            exit_code: exit,
+            cgroup_name: None,
+            oom_killed: false,
+        }
+    }
+
+    #[test]
+    fn dead_pid_and_watcher_reconcile_to_exited_137() {
+        let s = reconcile_dead_running(pstate("running", 100, 99, None), |_| false);
+        assert_eq!(s.status, "exited");
+        assert_eq!(s.exit_code, Some(137));
+    }
+
+    #[test]
+    fn live_watcher_keeps_running_authoritative() {
+        // Container gone but the watcher is about to record the real status.
+        let s = reconcile_dead_running(pstate("running", 100, 99, None), |p| p == 99);
+        assert_eq!(s.status, "running");
+    }
+
+    #[test]
+    fn live_pid_stays_running() {
+        let s = reconcile_dead_running(pstate("running", 100, 99, None), |p| p == 100);
+        assert_eq!(s.status, "running");
+    }
+
+    #[test]
+    fn starting_container_with_no_pid_is_untouched() {
+        let s = reconcile_dead_running(pstate("running", 0, 0, None), |_| false);
+        assert_eq!(s.status, "running");
+    }
+
+    #[test]
+    fn missing_watcher_pid_falls_back_to_pid_only() {
+        let s = reconcile_dead_running(pstate("running", 100, 0, None), |_| false);
+        assert_eq!(s.status, "exited");
+    }
+
+    #[test]
+    fn recorded_exit_status_and_code_are_preserved() {
+        let s = reconcile_dead_running(pstate("exited", 100, 99, Some(3)), |_| false);
+        assert_eq!((s.status.as_str(), s.exit_code), ("exited", Some(3)));
+        let s = reconcile_dead_running(pstate("running", 100, 99, Some(7)), |_| false);
+        assert_eq!((s.status.as_str(), s.exit_code), ("exited", Some(7)));
+    }
+
+    #[test]
+    fn pid_alive_reports_self_and_not_garbage() {
+        assert!(pid_alive(std::process::id() as i32));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        assert!(!pid_alive(i32::MAX));
+    }
+
     use super::*;
     use tempfile::NamedTempFile;
 
