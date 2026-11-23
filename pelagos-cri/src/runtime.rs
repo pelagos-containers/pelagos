@@ -675,6 +675,10 @@ pub struct RuntimeSvc {
     pub streaming_base_url: String,
     pub registry: Registry,
     pub backends: BackendRegistry,
+    /// Exit tracker fed by the shim events sink (#587). `None` while no
+    /// shim-backed runtime handler is configured: `GetContainerEvents` then
+    /// stays unimplemented, exactly as before.
+    pub shim_exits: Option<crate::shim::exit::ExitTracker>,
 }
 
 impl RuntimeSvc {
@@ -3039,7 +3043,13 @@ impl RuntimeService for RuntimeSvc {
         &self,
         _request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        // Native containers do not emit events yet. Streaming only shim
+        // exits would make a kubelet with evented PLEG miss every native
+        // transition, so stay unimplemented until a shim backend is wired.
+        match &self.shim_exits {
+            Some(tracker) => Ok(Response::new(Box::pin(container_event_stream(tracker)))),
+            None => Err(Status::unimplemented("not implemented")),
+        }
     }
 
     type StreamPodSandboxMetricsStream = std::pin::Pin<
@@ -3054,6 +3064,64 @@ impl RuntimeService for RuntimeSvc {
     ) -> Result<Response<Self::StreamPodSandboxMetricsStream>, Status> {
         Err(Status::unimplemented("not implemented"))
     }
+}
+
+/// Map a shim init-process exit to a CRI `CONTAINER_STOPPED_EVENT`.
+///
+/// Only the identifying fields are filled; `pod_sandbox_status` and
+/// `containers_statuses` need the CRI-id mapping that arrives with the OCI
+/// spec generator (#574). Exec exits are not container events.
+pub(crate) fn container_stopped_event(
+    x: &crate::shim::exit::ContainerExit,
+) -> Option<ContainerEventResponse> {
+    if x.exec_id.is_some() {
+        return None;
+    }
+    let created_at = x
+        .exited_at
+        .map(|(s, n)| s.saturating_mul(1_000_000_000).saturating_add(n as i64))
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+                .unwrap_or(0)
+        });
+    Some(ContainerEventResponse {
+        container_id: x.container_id.clone(),
+        container_event_type: crate::cri::ContainerEventType::ContainerStoppedEvent as i32,
+        created_at,
+        pod_sandbox_status: None,
+        containers_statuses: Vec::new(),
+    })
+}
+
+/// A CRI event stream of shim container exits. The forwarding task ends when
+/// the client goes away; a subscriber that lags past the broadcast backlog
+/// skips the missed events with a warning rather than failing the stream.
+pub(crate) fn container_event_stream(
+    tracker: &crate::shim::exit::ExitTracker,
+) -> tokio_stream::wrappers::ReceiverStream<Result<ContainerEventResponse, Status>> {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut sub = tracker.subscribe();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(x) => {
+                    if let Some(ev) = container_stopped_event(&x) {
+                        if tx.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    log::warn!("container event stream lagged; {n} shim exit events skipped")
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
 /// Resolve the container's effective `(entrypoint, cmd)` from the CRI request and
@@ -3572,6 +3640,7 @@ mod tests {
             streaming_base_url: String::new(),
             registry: Default::default(),
             backends: BackendRegistry::new("pelagos".to_string()),
+            shim_exits: None,
         };
         {
             let mut st = svc.state.inner.lock().await;
@@ -4377,6 +4446,7 @@ mod tests {
             streaming_base_url: String::new(),
             registry: Default::default(),
             backends: BackendRegistry::new("pelagos".to_string()),
+            shim_exits: None,
         };
 
         // Insert a Running sidecar container (attempt 0) directly into state,
@@ -4465,6 +4535,7 @@ mod tests {
             streaming_base_url: String::new(),
             registry: Default::default(),
             backends: BackendRegistry::new("pelagos".to_string()),
+            shim_exits: None,
         }
     }
 
@@ -4579,5 +4650,78 @@ mod tests {
             svc.backend_for_sandbox("no-such-sandbox").await,
             Backend::Native(_)
         ));
+    }
+
+    // ── shim exit events → GetContainerEvents (#587) ────────────────────────
+
+    fn exit_of(id: &str, exec: Option<&str>, status: u32) -> crate::shim::exit::ContainerExit {
+        crate::shim::exit::ContainerExit {
+            container_id: id.into(),
+            exec_id: exec.map(Into::into),
+            pid: 10,
+            exit_status: status,
+            exited_at: Some((1_700_000_000, 5)),
+        }
+    }
+
+    #[test]
+    fn test_container_stopped_event_mapping() {
+        let ev = container_stopped_event(&exit_of("c1", None, 137)).unwrap();
+        assert_eq!(ev.container_id, "c1");
+        assert_eq!(
+            ev.container_event_type,
+            crate::cri::ContainerEventType::ContainerStoppedEvent as i32
+        );
+        assert_eq!(ev.created_at, 1_700_000_000_000_000_005);
+        // Exec exits are not container events.
+        assert!(container_stopped_event(&exit_of("c1", Some("e1"), 0)).is_none());
+    }
+
+    /// With no shim backend configured the RPC must stay unimplemented: a
+    /// stream that only carried shim exits would make an evented-PLEG kubelet
+    /// miss every native container transition.
+    #[tokio::test]
+    async fn test_get_container_events_unimplemented_without_shim() {
+        let svc = test_svc();
+        let r = svc
+            .get_container_events(Request::new(GetEventsRequest {}))
+            .await;
+        assert_eq!(r.err().unwrap().code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn test_get_container_events_streams_shim_exits() {
+        use tokio_stream::StreamExt;
+        let tracker = crate::shim::exit::ExitTracker::new();
+        let mut svc = test_svc();
+        svc.shim_exits = Some(tracker.clone());
+        let resp = svc
+            .get_container_events(Request::new(GetEventsRequest {}))
+            .await
+            .unwrap();
+        let mut stream = resp.into_inner();
+        // exec exit first: filtered; then two init exits, in order.
+        tracker.apply(crate::shim::exit::TaskEvent::Exit(exit_of(
+            "a",
+            Some("e"),
+            0,
+        )));
+        tracker.apply(crate::shim::exit::TaskEvent::Exit(exit_of("a", None, 1)));
+        tracker.apply(crate::shim::exit::TaskEvent::Exit(exit_of("b", None, 2)));
+        let t = std::time::Duration::from_secs(5);
+        let e1 = tokio::time::timeout(t, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let e2 = tokio::time::timeout(t, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (e1.container_id.as_str(), e2.container_id.as_str()),
+            ("a", "b")
+        );
     }
 }
