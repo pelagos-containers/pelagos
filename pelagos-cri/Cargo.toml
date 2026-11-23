@@ -33,6 +33,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 tower-layer = "0.3"
 tower-service = "0.3"
 percent-encoding = "2"
+async-trait = "0.1"
 containerd-shim-protos = { version = "0.12", features = ["async"] }
 ttrpc = { version = "0.10", features = ["async"] }
 protobuf = "3.7"
@@ -41,7 +42,6 @@ protobuf = "3.7"
 tempfile = "3"
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 serial_test = "3"
-async-trait = "0.1"
 
 [build-dependencies]
 tonic-build = "0.12"
