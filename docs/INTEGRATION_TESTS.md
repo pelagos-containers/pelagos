@@ -6334,6 +6334,8 @@ Only the detached watcher writes `status: exited` into `state.json`. If the cont
 
 **Unit tests (`cargo test -p pelagos-cri`, no root), in `runtime::tests`:**
 - `dead_pid_and_watcher_reconcile_to_exited_137` — `running` with a dead pid and dead watcher becomes `exited` with exit code 137. Failure means the phantom-Running bug is back.
+- `test_relay_terminates_when_container_and_watcher_vanish` — the log relay (`relay_logs_from_dir`) must drain, stop and return when `state.json` says `running` but the pid and watcher are dead, keeping output written before the vanish. This is the *root cause* of the status stall: the relay used to poll forever (one leaked task per vanished container) and never set `log_done`, so every `ContainerStatus` waited the full 2s, which is crictl's default deadline (seen as `DeadlineExceeded` in `scripts/test-cri.sh`).
+- `test_relay_keeps_running_while_watcher_alive` — with a live watcher the relay keeps waiting for the real exit status; a transiently missing container pid must not cut logging short.
 - `live_watcher_keeps_running_authoritative` — a live watcher keeps the file authoritative (it is about to record the real status), so a normally exiting container is never given a synthetic 137.
 - `live_pid_stays_running` / `starting_container_with_no_pid_is_untouched` — a live process, and a container still starting with `pid` 0, are never marked exited.
 - `missing_watcher_pid_falls_back_to_pid_only` — older state files without `watcher_pid` are judged on the pid alone.

@@ -541,11 +541,7 @@ fn reconcile_dead_running(
     mut state: PelagosContainerState,
     alive: impl Fn(i32) -> bool,
 ) -> PelagosContainerState {
-    if state.status == "running"
-        && state.pid > 0
-        && !alive(state.pid)
-        && (state.watcher_pid <= 0 || !alive(state.watcher_pid))
-    {
+    if is_vanished(&state.status, state.pid, state.watcher_pid, alive) {
         log::warn!(
             "container {} marked running but pid {} and its watcher are gone; reporting exited ({})",
             state.name,
@@ -556,6 +552,13 @@ fn reconcile_dead_running(
         state.exit_code.get_or_insert(VANISHED_EXIT_CODE);
     }
     state
+}
+
+/// `status: running` whose process and watcher are both gone (see
+/// [`reconcile_dead_running`]). Takes primitives so the log relay, which reads
+/// `state.json` as loose JSON, can share the exact same rule.
+fn is_vanished(status: &str, pid: i32, watcher_pid: i32, alive: impl Fn(i32) -> bool) -> bool {
+    status == "running" && pid > 0 && !alive(pid) && (watcher_pid <= 0 || !alive(watcher_pid))
 }
 
 fn cri_sandbox_state_val(s: &SandboxState) -> i32 {
@@ -3424,8 +3427,16 @@ async fn relay_logs_from_dir(container_dir: String, cri_log_path: String) {
         // Stop when the container exits.
         match tokio::fs::read_to_string(&state_file).await {
             Ok(data) => {
+                // Reconcile like every other reader: if the container and its
+                // watcher vanished without recording an exit, state.json says
+                // "running" forever and this loop (and the log_done flag
+                // container_status waits on) would never finish (#581).
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if v["status"].as_str() == Some("exited") {
+                    let status = v["status"].as_str().unwrap_or("");
+                    let int = |k: &str| v[k].as_i64().unwrap_or(0) as i32;
+                    if status == "exited"
+                        || is_vanished(status, int("pid"), int("watcher_pid"), pid_alive)
+                    {
                         // Final read to catch anything written between the last
                         // poll and the exit, then drain any partial line. (We break
                         // right after, so the offsets need not be updated.)
@@ -4026,6 +4037,79 @@ mod tests {
             std::path::Path::new(&cri_log_path).exists(),
             "CRI log file must exist even with no container output (#344)"
         );
+    }
+
+    /// #581: if the container and its watcher vanish without writing
+    /// `status: exited`, the relay must still drain, stop and return — otherwise
+    /// it polls forever and `log_done` never fires, stalling ContainerStatus.
+    #[tokio::test]
+    async fn test_relay_terminates_when_container_and_watcher_vanish() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // Dead pids; state.json never gets "exited".
+        std::fs::write(
+            dir.path().join("state.json"),
+            format!(
+                r#"{{"status":"running","pid":{},"watcher_pid":{}}}"#,
+                i32::MAX,
+                i32::MAX - 1
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("stdout.log"), "last words\n").unwrap();
+        let cri_log_dir = TempDir::new().unwrap();
+        let cri_log_path = cri_log_dir
+            .path()
+            .join("0.log")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            relay_logs_from_dir(
+                dir.path().to_str().unwrap().to_string(),
+                cri_log_path.clone(),
+            ),
+        )
+        .await
+        .expect("relay must stop for a vanished container (#581)");
+
+        let log = std::fs::read_to_string(&cri_log_path).unwrap();
+        assert!(
+            log.contains("last words"),
+            "output before vanishing is kept: {log}"
+        );
+    }
+
+    /// #581: a live watcher means the relay keeps waiting for the real status.
+    #[tokio::test]
+    async fn test_relay_keeps_running_while_watcher_alive() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let me = std::process::id() as i32;
+        std::fs::write(
+            dir.path().join("state.json"),
+            format!(
+                r#"{{"status":"running","pid":{},"watcher_pid":{}}}"#,
+                i32::MAX,
+                me
+            ),
+        )
+        .unwrap();
+        let cri_log_dir = TempDir::new().unwrap();
+        let cri_log_path = cri_log_dir
+            .path()
+            .join("0.log")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            relay_logs_from_dir(dir.path().to_str().unwrap().to_string(), cri_log_path),
+        )
+        .await;
+        assert!(r.is_err(), "relay must not stop while the watcher is alive");
     }
 
     /// Verify that DNS fields from CriSandbox round-trip through serde correctly,
