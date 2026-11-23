@@ -10,6 +10,7 @@
 //! - [`client`]: ttrpc Task client wrapper.
 //! - [`events`]: ttrpc `Events` sink shims publish lifecycle events to.
 //! - [`exit`]: decodes those events and tracks per-container exit state.
+//! - [`spec`]: CRI -> OCI `config.json` generation for shim bundles.
 //!
 //! Nothing here is wired into the CRI request path yet; later epic items
 //! (OCI spec generation, events sink, re-adoption) consume it.
@@ -20,6 +21,7 @@ pub mod bundle;
 pub mod client;
 pub mod events;
 pub mod exit;
+pub mod spec;
 
 /// Loopback integration: a fake shim `start` script prints the address of an
 /// in-process ttrpc Task server; we bootstrap it, persist the address, connect
@@ -39,6 +41,25 @@ mod roundtrip {
     use super::bootstrap::{self, StartParams};
     use super::bundle::Bundle;
     use super::client::ShimClient;
+
+    fn generated_config() -> Vec<u8> {
+        use super::spec::{build_sandbox_spec, to_config_json, SandboxSpecInput};
+        let sb: crate::state::CriSandbox = serde_json::from_value(serde_json::json!({
+            "id": "ctr1", "name": "pod", "namespace": "default", "uid": "u",
+            "attempt": 0, "labels": {}, "annotations": {}, "created_at_ns": 0,
+            "state": "Running",
+        }))
+        .unwrap();
+        let spec = build_sandbox_spec(&SandboxSpecInput {
+            sandbox: &sb,
+            netns_path: None,
+            resources: None,
+            hostname: None,
+            pause_args: &[],
+        })
+        .unwrap();
+        to_config_json(&spec).unwrap()
+    }
 
     #[derive(Default)]
     struct MockTask {
@@ -153,7 +174,9 @@ mod roundtrip {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let bundle = Bundle::create(&tmp.path().join("b"), "k8s.io", "ctr1").unwrap();
-        bundle.write_config(b"{}").unwrap();
+        // A real generated spec, not a stub, so the bundle the shim sees is the
+        // one the CRI would hand it.
+        bundle.write_config(&generated_config()).unwrap();
         let p = StartParams {
             binary: script.to_string_lossy().into_owned(),
             namespace: "k8s.io".into(),

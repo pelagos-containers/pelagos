@@ -2643,6 +2643,8 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
+ "oci-spec 0.10.0",
+ "pelagos",
  "percent-encoding",
  "prost",
  "protobuf",

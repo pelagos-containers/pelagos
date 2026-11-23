@@ -6376,3 +6376,42 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::exit ge
 
 ## `runtime::tests::test_kill_exec_wrapper_reaps_setsid_session` sentinel fix (issue #589)
 The sentinel `sleep` is now located by exact argv (`sleep <dur>`) via `find_sleep`, not by a cmdline substring. The old substring match could return the wrapper shell before the real `sleep` forked, so `kill_exec_wrapper` ran too early, orphaned the `sleep` (about 30% of runs under load), and the test still passed because it asserted on the dead shell's pid. The leaked `sleep` held the test's stdout/stderr pipe for ~6.7 hours, hanging any `| tail` style run. Failure of this test now means `kill_exec_wrapper` really left the setsid'd grandchild alive.
+
+## `pelagos-cri` CRI to OCI spec generator (issue #591)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::spec`; no root, KVM or real shim needed (the device test `stat`s `/dev/null`). The builders are pure, so every rule is asserted directly on the typed `oci_spec::runtime::Spec`.
+
+**Annotation invariants (what Kata keys on):**
+- `shim::spec::tests::container_always_typed_container_with_sandbox_id` — container specs carry `container-type=container`, `sandbox-id`, container/sandbox name, namespace and image name. A missing type makes Kata boot a VM per container.
+- `shim::spec::tests::sandbox_always_typed_sandbox` — the sandbox spec is typed `sandbox` and defaults to a `/pause` process.
+- `shim::spec::tests::user_annotations_cannot_override_reserved_keys` — pod annotations naming a reserved `io.kubernetes.cri.*` key are discarded for both containers and sandboxes. Failure means a pod could flip its container type or join another pod's VM.
+- `shim::spec::tests::sidecar_label_does_not_change_cri_container_type` — the kubelet's `sidecar_container` label is metadata only; the OCI type stays `container`.
+- `shim::spec::tests::sandbox_resources_become_annotations` — pod CPU/memory hints become `sandbox-cpu-*` / `sandbox-memory` annotations Kata sizes the VM from.
+
+**Process:**
+- `shim::spec::tests::argv_follows_cri_entrypoint_cmd_rules` — same rules as the native path (CRI command overrides entrypoint and drops image cmd; args replace only cmd).
+- `shim::spec::tests::empty_argv_is_an_error`, `env_merges_image_then_cri_overriding_by_key`, `cwd_prefers_cri_then_image_then_root` — empty command rejected; image env first with CRI overriding by key in stable order; cwd precedence CRI > image > `/`.
+- `shim::spec::tests::user_resolution` — image `uid[:gid]`, bare uid (gid = uid), CRI `runAsUser`/`runAsGroup` precedence, and merged/deduplicated supplemental groups.
+- `shim::spec::tests::usernames_are_rejected_not_guessed` — a username cannot be resolved before the rootfs is mounted, so it is an explicit error rather than silently uid 0.
+- `shim::spec::tests::capabilities_default_add_drop_all_privileged` — default set, add/drop (case and `CAP_` prefix insensitive), `drop: [ALL]` + `add: [X]` yields exactly `{X}` (drops apply before adds; this caught an ordering bug during development), privileged is every capability.
+- `shim::spec::tests::unknown_capability_is_an_error`, `every_listed_capability_parses` — typos fail loudly; every name in the built-in lists is a real `oci-spec` capability.
+- `shim::spec::tests::process_flags` — tty, no-new-privileges, `oomScoreAdj` (the `i32::MIN` unset sentinel is omitted), AppArmor localhost profile, SELinux label.
+
+**Root, mounts, namespaces, paths:**
+- `shim::spec::tests::root_is_relative_rootfs_and_honours_readonly` — root is `rootfs` (the shim mounts it) and carries read-only.
+- `shim::spec::tests::mounts_standard_set_then_cri_binds_in_order` — standard `/proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup` first, then CRI binds, then caller extras; options for private/`rslave`/`rshared` propagation and `ro`/`rro`.
+- `shim::spec::tests::pod_netns_joined_by_path_and_host_modes_omit_namespaces` — the pod netns is joined by path; host network/PID/IPC modes omit those namespaces.
+- `shim::spec::tests::masked_and_readonly_paths_default_explicit_and_privileged` — OCI default masked/readonly paths, an explicit list replaces them, privileged gets none (the builder's own default would otherwise leak them in).
+
+**Resources, seccomp, devices:**
+- `shim::spec::tests::resources_and_cgroup_path` — memory, swap, CPU shares/quota/period, cpuset, hugepages; cgroups path is `<sandbox cgroup parent>/<container id>`; nothing emitted when unset.
+- `shim::spec::tests::seccomp_only_emitted_for_localhost_and_never_when_privileged` — RuntimeDefault and Unconfined emit no profile, Localhost carries the loaded one, privileged ignores it.
+- `shim::spec::tests::seccomp_profile_loader_round_trips_json` — profile JSON loads; bad JSON and a missing file error.
+- `shim::spec::tests::devices_listed_and_allowed_in_cgroup` — `/dev/null` resolves to char 1:3, appears in `linux.devices` and as an allow rule; a non-device is rejected.
+
+**Round trips:**
+- `shim::spec::tests::image_defaults_from_manifest` — image config extraction from `manifest.json`, tolerant of missing fields and malformed env entries.
+- `shim::spec::tests::config_json_round_trips_and_is_written_to_a_bundle` — serialize then parse is lossless, key fields are present on disk, and `Bundle::write_config` stores identical bytes.
+- `shim::spec::tests::generated_spec_is_readable_by_pelagos_oci_parser` — pelagos's own `OciConfig` parser (used by `pelagos create`) accepts the generated spec.
+- `shim::roundtrip::bootstrap_connect_and_lifecycle` now writes a *generated* sandbox spec into the bundle instead of `{}`, so the loopback shim bootstrap runs against a real config.json.
+
+**Known gaps (tracked on #591/#574):** `linux.sysctl` is not emitted (`CriSandbox` does not record pod sysctls yet); usernames need the rootfs, so they wait for the rootfs Mount item; an explicit RuntimeDefault seccomp profile is not generated (the shim/guest default applies).

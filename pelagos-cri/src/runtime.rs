@@ -3138,7 +3138,7 @@ pub(crate) fn container_event_stream(
 /// CMD. The old code appended the image CMD whenever `args` was empty — even when
 /// `command` was set — producing e.g. `sleep 3600 sh` (image CMD `sh` appended),
 /// which exits immediately and breaks every verify-by-exec conformance spec.
-fn resolve_container_argv(
+pub(crate) fn resolve_container_argv(
     cri_command: &[String],
     cri_args: &[String],
     image_entrypoint: Vec<String>,
