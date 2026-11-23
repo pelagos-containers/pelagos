@@ -6354,3 +6354,22 @@ Part of epic #574. `pelagos-cri` unit/loopback tests (`cargo test -p pelagos-cri
 - `shim::events::tests::replaces_stale_socket_and_locks_down_permissions` — a stale socket file from a crashed run is replaced, the socket is `0600`, `address()` is the plain path, and `shutdown()` removes the file. Failure means a restart cannot rebind, or other local users could publish events.
 - `shim::events::tests::placeholder_publish_binary_is_never_empty` — Kata rejects an empty `-publish-binary`.
 - `shim::roundtrip::bootstrap_exports_events_sink_as_ttrpc_address` — a fake shim records its environment: `TTRPC_ADDRESS` equals the sink socket, `-address` keeps the containerd-style endpoint, the publish binary is non-empty, and an event forwarded through the recorded path reaches the receiver. With an empty `ttrpc_address` an inherited `TTRPC_ADDRESS` is removed so a shim can never publish into another client's sink. Failure means the two addresses were conflated again (the #579 bug) or the shim would publish nowhere.
+
+## `pelagos-cri` shim TaskExit tracking and `GetContainerEvents` (issue #587)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::exit get_container_events container_stopped`; none need root, KVM or a real shim (loopback ttrpc servers only).
+
+- `shim::exit::tests::decode_each_event_type` — every `Task*` event type decodes to its typed form, including host-prefixed type URLs; a `TaskExit` whose `id` equals the container id (or is empty) is the init process, any other id is an exec. Failure means exec exits would be mistaken for the container exiting (or vice versa).
+- `shim::exit::tests::unknown_type_preserved_and_malformed_skipped` — unknown event types decode to `Other` instead of being dropped; a malformed payload is skipped (never a panic, never an error to the shim).
+- `shim::exit::tests::exit_recorded_before_waiter_resolves_immediately` — `wait_exit` returns at once when the exit preceded the waiter. Failure is the classic lost-wakeup hang.
+- `shim::exit::tests::waiter_before_exit_is_woken` — a pending waiter is woken when the exit is recorded later.
+- `shim::exit::tests::duplicate_exit_is_idempotent_and_not_rebroadcast` — the first exit wins and is broadcast once. Failure means the event and the `Wait` fallback could report conflicting or repeated exits.
+- `shim::exit::tests::exec_exit_tracked_separately_from_init` — exec exits never populate the init exit slot.
+- `shim::exit::tests::exit_for_unknown_id_retained_and_forget_clears` — an exit for a never-seen container is kept (CRI restart case); `forget` and `TaskDelete` clear state so it cannot leak.
+- `shim::exit::tests::oldest_exited_entries_evicted_past_cap` — retained exits are bounded; the oldest exited entries go first.
+- `shim::exit::tests::end_to_end_through_the_events_sink` — real `EventsSink` + real ttrpc `Events` client + dispatcher: Start then Exit resolves the waiter with the right pid/status, an undecodable event in the middle does not stall later ones, and subscribers see exits in order.
+- `shim::exit::tests::fallback_wait_rpc_resolves_without_events` — with the sink silent, the shim's `Wait` RPC resolves the waiter and the exit becomes visible in state and the broadcast.
+- `shim::exit::tests::dead_shim_returns_shim_lost` — `Wait` fails and no event arrives: `ShimLost` after the grace period, not a hang.
+- `shim::exit::tests::failed_rpc_still_honours_late_event` — `Wait` fails but an event lands inside the grace window: the event wins.
+- `runtime::tests::test_container_stopped_event_mapping` — an init exit maps to `CONTAINER_STOPPED_EVENT` with `created_at` in ns from the exit time; exec exits produce no CRI event.
+- `runtime::tests::test_get_container_events_unimplemented_without_shim` — with no shim backend the RPC stays `Unimplemented`. Streaming only shim exits would make an evented-PLEG kubelet miss every native container transition.
+- `runtime::tests::test_get_container_events_streams_shim_exits` — with a tracker wired, init exits stream in order and exec exits are filtered out.

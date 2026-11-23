@@ -9,6 +9,7 @@
 //! - [`bundle`]: per-container bundle directory and persisted shim address.
 //! - [`client`]: ttrpc Task client wrapper.
 //! - [`events`]: ttrpc `Events` sink shims publish lifecycle events to.
+//! - [`exit`]: decodes those events and tracks per-container exit state.
 //!
 //! Nothing here is wired into the CRI request path yet; later epic items
 //! (OCI spec generation, events sink, re-adoption) consume it.
@@ -18,6 +19,7 @@ pub mod bootstrap;
 pub mod bundle;
 pub mod client;
 pub mod events;
+pub mod exit;
 
 /// Loopback integration: a fake shim `start` script prints the address of an
 /// in-process ttrpc Task server; we bootstrap it, persist the address, connect

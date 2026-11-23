@@ -178,6 +178,9 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         streaming_base_url: streaming_base_url.clone(),
         registry: registry.clone(),
         backends: backend::BackendRegistry::new(args.pelagos_bin.clone()),
+        // No shim-backed handler exists yet; the events sink + tracker are
+        // started here once one is configured (epic #574).
+        shim_exits: None,
     };
     let image_svc = ImageSvc {
         state: app_state.clone(),
