@@ -4286,6 +4286,10 @@ mod tests {
     #[tokio::test]
     async fn test_run_pod_sandbox_rejects_unknown_runtime_handler() {
         let svc = test_svc();
+        // AppState::new() loads persisted sandboxes from the host's CRI state
+        // dir, which is non-empty on a live node (e.g. when run as root on a
+        // cluster node), so compare counts rather than asserting emptiness.
+        let before = svc.state.inner.lock().await.sandboxes.len();
         let req = crate::cri::RunPodSandboxRequest {
             runtime_handler: "kata".to_string(),
             ..Default::default()
@@ -4297,7 +4301,7 @@ mod tests {
             "{}",
             err.message()
         );
-        assert!(svc.state.inner.lock().await.sandboxes.is_empty());
+        assert_eq!(svc.state.inner.lock().await.sandboxes.len(), before);
     }
 
     /// Both the default ("") and explicit "pelagos" handlers pass the handler

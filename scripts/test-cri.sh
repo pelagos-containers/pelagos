@@ -198,8 +198,11 @@ else
     fail "RemoveImage left other tags of the same image present (#340)"
 fi
 # Idempotent + concurrency-safe: simultaneous removes of a missing image must not error.
-$CRICTL rmi cri340b:two >/dev/null 2>&1 & $CRICTL rmi cri340b:two >/dev/null 2>&1 &
-wait
+# Wait on the two rmi jobs by PID: a bare `wait` also waits for the background
+# pelagos-cri this script started, which never exits, and hangs the suite forever.
+$CRICTL rmi cri340b:two >/dev/null 2>&1 & RMI_A=$!
+$CRICTL rmi cri340b:two >/dev/null 2>&1 & RMI_B=$!
+wait "$RMI_A" "$RMI_B"
 pass "simultaneous RemoveImage of a missing image does not error (#340)"
 # Restore alpine for the rest of the suite (the aggregated removal took it too).
 $CRICTL pull alpine >/dev/null 2>&1
