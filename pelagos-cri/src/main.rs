@@ -14,6 +14,7 @@ mod invoke;
 mod netns_native;
 mod runtime;
 mod scope;
+mod shim;
 mod state;
 mod streaming;
 

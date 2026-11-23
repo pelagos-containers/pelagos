@@ -6316,3 +6316,15 @@ Part of epic #574 (shim v2 / Kata support). Covered by `pelagos-cri` unit tests
 - *runp with unknown runtime handler is rejected* — real gRPC round trip: the kubelet-visible error contains "unknown runtime handler".
 - *runp with runtime handler 'pelagos' succeeds* and *inspectp reports runtimeHandler=pelagos* — the explicit native handler works end to end and is reported back.
 
+
+## `pelagos-cri` shim v2 client: bootstrap, bundle, Task client (issue #579)
+Part of epic #574. All are `pelagos-cri` unit tests (`cargo test -p pelagos-cri shim::`); **none require root, a rootfs, KVM or a real shim**. The loopback test stands in for a real shim with a fake `start` script plus an in-process ttrpc Task server; validation against `pelagos-shim-wasm`, `runsc` and Kata is a later epic item.
+
+- `shim::bootstrap::tests::runtime_type_to_binary` — `io.containerd.kata.v2` maps to `containerd-shim-kata-v2` and malformed runtime types are rejected. Failure means the wrong binary is exec'd, or a bad RuntimeClass handler is accepted.
+- `shim::bootstrap::tests::start_and_delete_args` — `start` and `delete` get `-namespace -id -address -publish-binary`, and `delete` also gets `-bundle`. Kata's `Args::validate` rejects empty id/namespace/publish-binary, so a dropped flag means the shim refuses to start.
+- `shim::bootstrap::tests::parse_plain_address` / `parse_json_address` / `parse_rejects_empty` — both reply forms of `start` (bare address, JSON `{"version","address","protocol"}`) parse, with defaults of version 2 and ttrpc. Empty or garbage output is an error rather than an empty address we would later try to connect to.
+- `shim::bundle::tests::create_persist_load_remove` — bundle dir layout, atomic `config.json`/`address`/`shim.json` writes, record round trip, `list_records` enumeration, idempotent removal. Failure would break re-adoption of live shims after a CRI restart.
+- `shim::bundle::tests::rejects_unsafe_ids` / `open_missing_is_not_found` — ids containing `/`, `.`, `..` or empty are refused (no path traversal out of the bundle root); opening a missing bundle is `NotFound`.
+- `shim::client::tests::address_normalisation` — bare socket paths get `unix://`; other schemes and trailing newlines are handled. Failure means the ttrpc connect gets an address it cannot parse.
+- `shim::roundtrip::bootstrap_connect_and_lifecycle` — end to end over a real unix ttrpc socket: bootstrap the fake shim (asserts cwd is the bundle dir and the standard flags are passed), persist and reload the address, reconnect from the persisted record, then Connect/Create/Start/State/Kill/Wait/Delete in order, with request fields reaching the server and a server-side error surfacing as `Err`. Failure indicates a break in the bootstrap contract, the generated-client wiring (including the `containerd-shim-protos` 0.12 bump), or call ordering.
+- `shim::roundtrip::failing_shim_reports_stderr` — a shim exiting non-zero yields `BootstrapError::Failed(code, stderr)` carrying the shim's own stderr, which is the only diagnostic an operator gets when Kata fails to boot.
