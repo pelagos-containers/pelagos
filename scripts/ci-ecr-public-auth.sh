@@ -19,11 +19,16 @@ if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
 fi
 
 # ECR Public's auth API only exists in us-east-1.
-token=$(AWS_DEFAULT_REGION=us-east-1 aws ecr-public get-login-password --region us-east-1 2>/dev/null) || token=""
+# Keep stderr: it carries the AWS error (e.g. AccessDenied), never the secret, and
+# swallowing it once hid a broken IAM policy behind a green anonymous run (#583).
+err=$(mktemp)
+token=$(AWS_DEFAULT_REGION=us-east-1 aws ecr-public get-login-password --region us-east-1 2>"$err") || token=""
 if [ -z "$token" ]; then
-    echo "::warning::could not mint an ECR Public token; pulling anonymously."
+    echo "::warning::could not mint an ECR Public token; pulling anonymously. aws said: $(head -c 400 "$err" | tr '\n' ' ')"
+    rm -f "$err"
     exit 0
 fi
+rm -f "$err"
 echo "::add-mask::$token"
 auth=$(printf 'AWS:%s' "$token" | base64 -w0)
 echo "::add-mask::$auth"
