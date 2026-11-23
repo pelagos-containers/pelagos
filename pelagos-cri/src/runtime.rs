@@ -1,5 +1,6 @@
 //! CRI RuntimeService implementation.
 
+use crate::backend::{Backend, BackendRegistry, RuntimeBackend};
 use crate::cni;
 use crate::cri::runtime_service_server::RuntimeService;
 use crate::cri::{
@@ -31,7 +32,6 @@ use crate::cri::{
     UpdatePodSandboxResourcesResponse, UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
     VersionRequest, VersionResponse,
 };
-use crate::invoke::run_pelagos;
 use crate::netns_native;
 use crate::scope;
 use crate::state::{
@@ -597,7 +597,7 @@ fn sandbox_to_proto(s: &CriSandbox) -> PodSandbox {
         created_at: s.created_at_ns,
         labels: s.labels.clone(),
         annotations: s.annotations.clone(),
-        runtime_handler: String::new(),
+        runtime_handler: s.runtime_handler.clone(),
     }
 }
 
@@ -629,9 +629,29 @@ pub struct RuntimeSvc {
     pub state: AppState,
     pub streaming_base_url: String,
     pub registry: Registry,
+    pub backends: BackendRegistry,
 }
 
 impl RuntimeSvc {
+    /// Backend for a sandbox, by its recorded runtime handler. Cleanup paths
+    /// must not fail, so an unknown handler or missing sandbox falls back to
+    /// the default (native) backend.
+    async fn backend_for_sandbox(&self, sandbox_id: &str) -> Backend {
+        let handler = self
+            .state
+            .inner
+            .lock()
+            .await
+            .sandboxes
+            .get(sandbox_id)
+            .map(|s| s.runtime_handler.clone())
+            .unwrap_or_default();
+        self.backends
+            .resolve(&handler)
+            .unwrap_or_else(|_| self.backends.default_backend())
+            .clone()
+    }
+
     async fn bin(&self) -> String {
         self.state.inner.lock().await.pelagos_bin.clone()
     }
@@ -795,13 +815,18 @@ impl RuntimeService for RuntimeSvc {
             info: HashMap::new(),
             // Advertise recursive read-only mount support (#356) on the default
             // handler so the kubelet/critest will request and exercise it.
-            runtime_handlers: vec![RuntimeHandler {
-                name: String::new(),
-                features: Some(RuntimeHandlerFeatures {
-                    recursive_read_only_mounts: true,
-                    ..Default::default()
-                }),
-            }],
+            runtime_handlers: self
+                .backends
+                .handler_names()
+                .into_iter()
+                .map(|name| RuntimeHandler {
+                    name,
+                    features: Some(RuntimeHandlerFeatures {
+                        recursive_read_only_mounts: true,
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
             features: None,
         }))
     }
@@ -811,6 +836,9 @@ impl RuntimeService for RuntimeSvc {
         request: Request<crate::cri::RunPodSandboxRequest>,
     ) -> Result<Response<crate::cri::RunPodSandboxResponse>, Status> {
         let req = request.into_inner();
+        // Reject an unknown RuntimeClass handler before any side effects.
+        let backend = self.backends.resolve(&req.runtime_handler)?.clone();
+        let runtime_handler = req.runtime_handler.clone();
         let config = req
             .config
             .ok_or_else(|| Status::invalid_argument("missing config"))?;
@@ -1045,7 +1073,8 @@ impl RuntimeService for RuntimeSvc {
         } else {
             // ── Pelagos native path ────────────────────────────────────────
             log::info!("no CNI config found — using pelagos native bridge networking");
-            let raw = run_pelagos(&bin, &["sandbox", "create", "--name", &uid])
+            let raw = backend
+                .create_sandbox(&uid)
                 .await
                 .map_err(|e| Status::internal(format!("exec error: {}", e)))?;
             if !raw.success {
@@ -1069,6 +1098,7 @@ impl RuntimeService for RuntimeSvc {
             annotations: config.annotations.clone(),
             created_at_ns: now_ns(),
             state: SandboxState::Running,
+            runtime_handler,
             netns,
             ip,
             cni_conf,
@@ -1121,7 +1151,7 @@ impl RuntimeService for RuntimeSvc {
         request: Request<StopPodSandboxRequest>,
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
         let sandbox_id = request.into_inner().pod_sandbox_id;
-        let bin = self.bin().await;
+        let backend = self.backend_for_sandbox(&sandbox_id).await;
         log::debug!("StopPodSandbox {} BEGIN", sandbox_id);
 
         let containers_to_stop: Vec<(String, MyContainerState)> = {
@@ -1142,7 +1172,7 @@ impl RuntimeService for RuntimeSvc {
                 );
                 // `pelagos stop` is the single kill path (#459): cgroup kill is
                 // primary, SIGKILL fallback, zombie-proof liveness wait.
-                let _ = run_pelagos(&bin, &["stop", pelagos_name]).await;
+                backend.kill_container(pelagos_name).await;
                 log::debug!(
                     "StopPodSandbox {} step=stop-container {} DONE",
                     sandbox_id,
@@ -1260,7 +1290,7 @@ impl RuntimeService for RuntimeSvc {
                 state::remove_pelagos_sandbox_state(&sandbox_id);
             } else {
                 // ── Pelagos native teardown ────────────────────────────────────
-                let _ = run_pelagos(&bin, &["sandbox", "rm", &sandbox_id]).await;
+                backend.remove_sandbox(&sandbox_id).await;
             }
         }
 
@@ -1348,7 +1378,7 @@ impl RuntimeService for RuntimeSvc {
             }),
             labels: sandbox.labels.clone(),
             annotations: sandbox.annotations.clone(),
-            runtime_handler: String::new(),
+            runtime_handler: sandbox.runtime_handler.clone(),
         };
 
         Ok(Response::new(PodSandboxStatusResponse {
@@ -1778,7 +1808,6 @@ impl RuntimeService for RuntimeSvc {
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
         let container_id = request.into_inner().container_id;
-        let bin = self.bin().await;
 
         let container = {
             let st = self.state.inner.lock().await;
@@ -2174,19 +2203,11 @@ impl RuntimeService for RuntimeSvc {
         // foreground `pelagos run` returns promptly after forking the watcher, so
         // the scope (kept alive by the watcher) outlives this call. Off systemd we
         // invoke pelagos directly, preserving prior behavior.
-        let out = if scope::systemd_available() {
-            let unit = scope::container_unit(&container.pelagos_name);
-            scope::stop_unit(&unit).await; // clear any stale unit for this name
-            let argv = scope::build_scope_argv(&unit, &bin, &args_ref, &container.envs);
-            let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-            run_pelagos(argv_ref[0], &argv_ref[1..])
-                .await
-                .map_err(|e| Status::internal(format!("exec error: {}", e)))?
-        } else {
-            run_pelagos(&bin, &args_ref)
-                .await
-                .map_err(|e| Status::internal(format!("exec error: {}", e)))?
-        };
+        let backend = self.backend_for_sandbox(&container.sandbox_id).await;
+        let out = backend
+            .start_container(&container.pelagos_name, &args_ref, &container.envs)
+            .await
+            .map_err(|e| Status::internal(format!("exec error: {}", e)))?;
 
         if !out.success {
             log::error!(
@@ -2267,14 +2288,15 @@ impl RuntimeService for RuntimeSvc {
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
         let container_id = request.into_inner().container_id;
-        let bin = self.bin().await;
 
-        let pelagos_name = {
+        let (pelagos_name, sandbox_id) = {
             let st = self.state.inner.lock().await;
-            st.containers
-                .get(&container_id)
-                .map(|c| c.pelagos_name.clone())
+            match st.containers.get(&container_id) {
+                Some(c) => (Some(c.pelagos_name.clone()), c.sandbox_id.clone()),
+                None => (None, String::new()),
+            }
         };
+        let backend = self.backend_for_sandbox(&sandbox_id).await;
         // StopContainer must be IDEMPOTENT: stopping a container the runtime no
         // longer knows about (already removed, or never existed) is a no-op
         // success, not an error — the kubelet relies on this (critest #342).
@@ -2284,12 +2306,7 @@ impl RuntimeService for RuntimeSvc {
 
         // `pelagos stop` is the single kill path (#459): cgroup kill is primary,
         // SIGKILL fallback, zombie-proof liveness wait.
-        let _ = run_pelagos(&bin, &["stop", &pelagos_name]).await;
-        // The watcher has exited, so the transient scope is now empty; --collect
-        // reaps it, but stop it explicitly for determinism (#336).
-        if scope::systemd_available() {
-            scope::stop_unit(&scope::container_unit(&pelagos_name)).await;
-        }
+        backend.stop_container(&pelagos_name).await;
 
         // Read the real exit state from state.json now that the process has been
         // stopped.  This is critical for native sidecars (#437): when the kubelet
@@ -2318,20 +2335,18 @@ impl RuntimeService for RuntimeSvc {
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
         let container_id = request.into_inner().container_id;
-        let bin = self.bin().await;
 
-        let pelagos_name = {
+        let (pelagos_name, sandbox_id) = {
             let st = self.state.inner.lock().await;
-            st.containers
-                .get(&container_id)
-                .map(|c| c.pelagos_name.clone())
+            match st.containers.get(&container_id) {
+                Some(c) => (Some(c.pelagos_name.clone()), c.sandbox_id.clone()),
+                None => (None, String::new()),
+            }
         };
+        let backend = self.backend_for_sandbox(&sandbox_id).await;
 
         if let Some(name) = pelagos_name {
-            let _ = run_pelagos(&bin, &["rm", &name]).await;
-            if scope::systemd_available() {
-                scope::stop_unit(&scope::container_unit(&name)).await;
-            }
+            backend.remove_container(&name).await;
             self.state.log_done.lock().await.remove(&name); // drop the #344 finalize flag
         }
 
@@ -3427,6 +3442,7 @@ mod tests {
             dns_options: vec![],
             namespaces,
             port_mappings: vec![],
+            runtime_handler: String::new(),
         }
     }
 
@@ -3441,6 +3457,7 @@ mod tests {
             state: AppState::new("pelagos".into()),
             streaming_base_url: String::new(),
             registry: Default::default(),
+            backends: BackendRegistry::new("pelagos".to_string()),
         };
         {
             let mut st = svc.state.inner.lock().await;
@@ -3934,6 +3951,7 @@ mod tests {
             dns_options: vec!["ndots:5".into()],
             namespaces: state::NamespaceModes::default(),
             port_mappings: vec![],
+            runtime_handler: String::new(),
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -3973,6 +3991,7 @@ mod tests {
             dns_options: vec![],
             namespaces: state::NamespaceModes::default(),
             port_mappings: vec![],
+            runtime_handler: String::new(),
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -4170,6 +4189,7 @@ mod tests {
             state: AppState::new("pelagos".into()),
             streaming_base_url: String::new(),
             registry: Default::default(),
+            backends: BackendRegistry::new("pelagos".to_string()),
         };
 
         // Insert a Running sidecar container (attempt 0) directly into state,
@@ -4248,5 +4268,129 @@ mod tests {
             assert!(c.is_sidecar, "is_sidecar must survive the restart cycle");
             assert_eq!(c.exit_code, 0, "new attempt starts with exit_code=0");
         }
+    }
+
+    // ── backend / runtime_handler selection (#577) ──────────────────────────
+
+    fn test_svc() -> RuntimeSvc {
+        RuntimeSvc {
+            state: AppState::new("pelagos".into()),
+            streaming_base_url: String::new(),
+            registry: Default::default(),
+            backends: BackendRegistry::new("pelagos".to_string()),
+        }
+    }
+
+    /// An unknown RuntimeClass handler must be rejected up front, before any
+    /// side effect — never silently run on the native backend.
+    #[tokio::test]
+    async fn test_run_pod_sandbox_rejects_unknown_runtime_handler() {
+        let svc = test_svc();
+        // AppState::new() loads persisted sandboxes from the host's CRI state
+        // dir, which is non-empty on a live node (e.g. when run as root on a
+        // cluster node), so compare counts rather than asserting emptiness.
+        let before = svc.state.inner.lock().await.sandboxes.len();
+        let req = crate::cri::RunPodSandboxRequest {
+            runtime_handler: "kata".to_string(),
+            ..Default::default()
+        };
+        let err = svc.run_pod_sandbox(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("unknown runtime handler"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(svc.state.inner.lock().await.sandboxes.len(), before);
+    }
+
+    /// Both the default ("") and explicit "pelagos" handlers pass the handler
+    /// gate; the request then fails on the (deliberately absent) config, which
+    /// proves the gate itself accepted the handler.
+    #[tokio::test]
+    async fn test_run_pod_sandbox_accepts_default_and_native_handlers() {
+        let svc = test_svc();
+        for handler in ["", "pelagos"] {
+            let req = crate::cri::RunPodSandboxRequest {
+                runtime_handler: handler.to_string(),
+                ..Default::default()
+            };
+            let err = svc.run_pod_sandbox(Request::new(req)).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(err.message(), "missing config", "handler {handler:?}");
+        }
+    }
+
+    /// `Status` advertises every registered handler, each with the
+    /// recursive-read-only-mounts feature (#356) the default handler had.
+    #[tokio::test]
+    async fn test_status_advertises_registered_handlers() {
+        let svc = test_svc();
+        let resp = svc
+            .status(Request::new(crate::cri::StatusRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        let names: Vec<&str> = resp
+            .runtime_handlers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["", "pelagos"]);
+        for h in &resp.runtime_handlers {
+            assert!(h.features.as_ref().unwrap().recursive_read_only_mounts);
+        }
+    }
+
+    /// The handler a sandbox was created with is reported back to the kubelet
+    /// (it was previously always empty).
+    #[tokio::test]
+    async fn test_sandbox_proto_reports_runtime_handler() {
+        let mut sb = sbx_with_namespaces("h1", state::NamespaceModes::default());
+        sb.runtime_handler = "pelagos".to_string();
+        assert_eq!(sandbox_to_proto(&sb).runtime_handler, "pelagos");
+
+        let svc = test_svc();
+        svc.state
+            .inner
+            .lock()
+            .await
+            .sandboxes
+            .insert("h1".into(), sb);
+        let st = svc
+            .pod_sandbox_status(Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "h1".into(),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .unwrap();
+        assert_eq!(st.runtime_handler, "pelagos");
+    }
+
+    /// Cleanup resolves through the sandbox's recorded handler but must never
+    /// fail: an unknown recorded handler or a vanished sandbox falls back to
+    /// the native backend.
+    #[tokio::test]
+    async fn test_backend_for_sandbox_falls_back_to_native() {
+        let svc = test_svc();
+        let mut sb = sbx_with_namespaces("gone-handler", state::NamespaceModes::default());
+        sb.runtime_handler = "removed-from-config".to_string();
+        svc.state
+            .inner
+            .lock()
+            .await
+            .sandboxes
+            .insert("gone-handler".into(), sb);
+        assert!(matches!(
+            svc.backend_for_sandbox("gone-handler").await,
+            Backend::Native(_)
+        ));
+        assert!(matches!(
+            svc.backend_for_sandbox("no-such-sandbox").await,
+            Backend::Native(_)
+        ));
     }
 }

@@ -175,6 +175,12 @@ pub struct CriSandbox {
     /// portmap plugin as capability args at ADD and (for cleanup) at DEL.
     #[serde(default)]
     pub port_mappings: Vec<CriPortMapping>,
+    /// CRI `runtime_handler` (Kubernetes `RuntimeClass` handler) this sandbox
+    /// was created with; selects the backend for the pod and its containers.
+    /// Empty = default (native). `serde(default)` keeps pre-existing on-disk
+    /// sandbox state loadable.
+    #[serde(default)]
+    pub runtime_handler: String,
 }
 
 /// A CRI `PortMapping` (host_port → container_port) persisted with the sandbox.
@@ -1355,5 +1361,22 @@ mod tests {
                 unknown: 1,
             }
         );
+    }
+
+    #[test]
+    fn sandbox_json_without_runtime_handler_loads_as_default() {
+        // On-disk sandbox state written before the field existed (the helper
+        // above builds exactly such JSON) must load with the default handler.
+        let sb = sandbox("legacy", 0);
+        assert_eq!(sb.runtime_handler, "");
+    }
+
+    #[test]
+    fn runtime_handler_survives_serde_roundtrip() {
+        let mut sb = sandbox("rt", 0);
+        sb.runtime_handler = "pelagos".to_string();
+        let json = serde_json::to_string(&sb).unwrap();
+        let back: CriSandbox = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.runtime_handler, "pelagos");
     }
 }

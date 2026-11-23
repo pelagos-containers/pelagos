@@ -6295,3 +6295,24 @@ sweep. This cleanup is called by `pelagos cleanup`.
 
 ## `issue_549_restart_spawn_config::test_restart_fails_fast_without_stopping_when_no_spawn_config`
 **Requires root.** Regression test for #549's compounding problem: `cmd_restart` (`src/cli/restart.rs`) used to stop the container unconditionally first, and only discover the missing `spawn_config` on the start half (inside `start_one`, `src/cli/start.rs`) — leaving a perfectly healthy container `exited` with no narrow recovery path (the issue's reported impact: a brief real Grafana outage that required restarting an entire 10-service monitoring stack to fix one container). Simulates a container with no spawn_config (e.g. a pre-`pelagos start` state format) by stripping the field from a real container's `state.json` after `pelagos run -d`, then calls `pelagos restart`. Asserts: the command fails (non-zero exit) AND the container is still `running` afterward — never touched. **Why it matters:** `cmd_restart` now checks `state.spawn_config.is_some()` *before* calling `cmd_stop`, so an unrestartable container fails loudly while still running instead of being torn down with no way back. If this check is ever moved back to after the stop (or removed), this test fails on the "still running" assertion even though the restart command itself still correctly reports an error.
+
+## `pelagos-cri` backend / RuntimeClass handler selection (issue #577)
+Part of epic #574 (shim v2 / Kata support). Covered by `pelagos-cri` unit tests
+(`cargo test -p pelagos-cri`, no root) and the `scripts/test-cri.sh` handler section (root + crictl).
+
+**Unit tests (no root):**
+- `backend::tests::default_and_native_handlers_resolve` — `""` and `"pelagos"` both resolve to the native backend. Failure means pods without a RuntimeClass (or with the explicit one) would be rejected.
+- `backend::tests::unknown_handler_is_invalid_argument` — an unknown handler yields `InvalidArgument` naming the handler. Failure means unknown handlers could silently run natively instead of failing.
+- `backend::tests::handler_names_advertise_default_and_native` — the registry's advertised handler list.
+- `backend::tests::start_invocation_direct_when_not_systemd` / `start_invocation_wraps_in_scope_under_systemd` — the `pelagos run --detach` command line is unchanged by the refactor: direct off systemd, wrapped in the #336 transient scope (unit name, `--` separator, wrapped argv intact and ordered) under systemd. Failure means containers could stop surviving a CRI restart (#336).
+- `runtime::tests::test_run_pod_sandbox_rejects_unknown_runtime_handler` — `RunPodSandbox` with an unknown handler fails with `InvalidArgument` and creates no sandbox state (the check happens before any side effect).
+- `runtime::tests::test_run_pod_sandbox_accepts_default_and_native_handlers` — both valid handlers pass the gate (request then fails later with "missing config", proving the gate accepted them).
+- `runtime::tests::test_status_advertises_registered_handlers` — `Status` lists `""` and `"pelagos"`, each keeping the `recursive_read_only_mounts` feature (#356).
+- `runtime::tests::test_sandbox_proto_reports_runtime_handler` — the recorded handler is returned in `PodSandbox` and `PodSandboxStatus` (it was previously always empty).
+- `runtime::tests::test_backend_for_sandbox_falls_back_to_native` — cleanup paths never fail: an unknown recorded handler or a vanished sandbox falls back to the native backend.
+- `state::tests::sandbox_json_without_runtime_handler_loads_as_default` / `runtime_handler_survives_serde_roundtrip` — on-disk sandbox state written before the field existed still loads (a CRI upgrade must re-adopt running pods, #336), and the field persists.
+
+**`scripts/test-cri.sh` (root + crictl):**
+- *runp with unknown runtime handler is rejected* — real gRPC round trip: the kubelet-visible error contains "unknown runtime handler".
+- *runp with runtime handler 'pelagos' succeeds* and *inspectp reports runtimeHandler=pelagos* — the explicit native handler works end to end and is reported back.
+
