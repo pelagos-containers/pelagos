@@ -49,8 +49,18 @@ pub struct ShimClient {
 
 /// True when a ttrpc error says the shim doesn't register the service we
 /// addressed (as opposed to the method failing).
+///
+/// Rust shims (Kata) answer INVALID_ARGUMENT "<svc> service does not exist";
+/// Go shims (runsc, containerd's own) answer UNIMPLEMENTED "service <svc>".
 fn is_service_missing(e: &containerd_shim_protos::ttrpc::Error) -> bool {
-    format!("{e:?}").contains("service does not exist")
+    use containerd_shim_protos::ttrpc::{Code, Error};
+    match e {
+        Error::RpcStatus(st) => {
+            st.message().contains("service does not exist")
+                || (st.code() == Code::UNIMPLEMENTED && st.message().starts_with("service "))
+        }
+        other => format!("{other:?}").contains("service does not exist"),
+    }
 }
 
 impl ShimClient {
@@ -315,6 +325,23 @@ mod tests {
         let (_t, c) = serve_as(TASK_V3).await;
         assert_eq!(c.connect_task("x").await.unwrap().task_pid, 22);
         assert_eq!(c.task_service(), TASK_V3);
+    }
+
+    #[test]
+    fn service_missing_matches_rust_and_go_shim_replies() {
+        use containerd_shim_protos::ttrpc::{get_status, Code, Error};
+        let rust = Error::RpcStatus(get_status(
+            Code::INVALID_ARGUMENT,
+            "containerd.task.v3.Task service does not exist",
+        ));
+        let go = Error::RpcStatus(get_status(
+            Code::UNIMPLEMENTED,
+            "service containerd.task.v3.Task",
+        ));
+        let method = Error::RpcStatus(get_status(Code::NOT_FOUND, "no such container"));
+        let unimpl_method = Error::RpcStatus(get_status(Code::UNIMPLEMENTED, "method Stats"));
+        assert!(is_service_missing(&rust) && is_service_missing(&go));
+        assert!(!is_service_missing(&method) && !is_service_missing(&unimpl_method));
     }
 
     #[test]

@@ -50,6 +50,11 @@ struct Args {
     /// binary; everything else stays native (#574).
     #[clap(long = "shim-handler", multiple_occurrences = true)]
     shim_handlers: Vec<String>,
+    /// Image whose rootfs the sandbox (pause) task of shim-backed pods runs
+    /// from. Must already be pulled into the local store
+    /// (`pelagos image pull`). Empty disables it (no sandbox rootfs).
+    #[clap(long, default_value = shimrt::DEFAULT_SANDBOX_IMAGE)]
+    shim_sandbox_image: String,
 }
 
 /// Parse `NAME=BINARY` pairs; rejects empty or reserved names.
@@ -215,7 +220,9 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         None
     } else {
         let names: Vec<String> = shim_handlers.keys().cloned().collect();
-        let rt = shimrt::ShimRuntime::start(shimrt::ShimConfig::system(shim_handlers)).await?;
+        let mut cfg = shimrt::ShimConfig::system(shim_handlers);
+        cfg.sandbox_image = Some(args.shim_sandbox_image.clone()).filter(|s| !s.is_empty());
+        let rt = shimrt::ShimRuntime::start(cfg).await?;
         log::info!("shim runtime handlers enabled: {names:?}");
         Some(std::sync::Arc::new(rt))
     };

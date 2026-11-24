@@ -8,6 +8,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,13 @@ pub struct ShimRecord {
     pub binary: String,
     pub address: String,
     pub version: u32,
+}
+
+/// Drain tasks for each bundle's `log` FIFO, aborted when the bundle goes.
+fn log_drains() -> &'static Mutex<std::collections::HashMap<PathBuf, tokio::task::JoinHandle<()>>> {
+    static D: OnceLock<Mutex<std::collections::HashMap<PathBuf, tokio::task::JoinHandle<()>>>> =
+        OnceLock::new();
+    D.get_or_init(Default::default)
 }
 
 #[derive(Debug, Clone)]
@@ -45,11 +53,56 @@ impl Bundle {
         }
         let dir = root.join(namespace).join(id);
         fs::create_dir_all(dir.join("rootfs"))?;
-        Ok(Self {
+        let b = Self {
             dir,
             namespace: namespace.into(),
             id: id.into(),
-        })
+        };
+        b.ensure_log_fifo()?;
+        Ok(b)
+    }
+
+    /// containerd gives every shim a `log` FIFO in its bundle dir and reads
+    /// it; Go shims such as gVisor's runsc exit at startup ("fifo error: stat
+    /// log") when it is missing (#609). Create it and forward what the shim
+    /// writes to our log. Opened read-write so it never sees EOF between
+    /// writers (shim restarts, our own re-adoption).
+    fn ensure_log_fifo(&self) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = self.dir.join("log");
+        if !path.exists() {
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // SAFETY: valid NUL-terminated path, plain syscall.
+            if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+            }
+        }
+        // Without a runtime (sync unit tests) the FIFO exists but is undrained.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return Ok(());
+        };
+        let mut drains = log_drains().lock().unwrap_or_else(|e| e.into_inner());
+        if drains.get(&path).is_some_and(|h| !h.is_finished()) {
+            return Ok(());
+        }
+        let _guard = rt.enter();
+        let rx = tokio::net::unix::pipe::OpenOptions::new()
+            .read_write(true)
+            .open_receiver(&path)?;
+        let tag = format!("{}/{}", self.namespace, self.id);
+        let handle = rt.spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(rx).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                log::info!(target: "shim", "[{tag}] {l}");
+            }
+        });
+        drains.insert(path, handle);
+        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
@@ -95,16 +148,28 @@ impl Bundle {
                 "bundle directory not found",
             ));
         }
-        Ok(Self {
+        let b = Self {
             dir,
             namespace: namespace.into(),
             id: id.into(),
-        })
+        };
+        // Re-adopted shims still hold the FIFO open as writers.
+        if b.dir.join("log").exists() {
+            let _ = b.ensure_log_fifo();
+        }
+        Ok(b)
     }
 
     /// Remove the bundle directory. Callers must have run the shim `delete`
     /// first so the shim has unmounted `rootfs/`.
     pub fn remove(&self) -> io::Result<()> {
+        if let Some(h) = log_drains()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.dir.join("log"))
+        {
+            h.abort();
+        }
         match fs::remove_dir_all(&self.dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             r => r,
@@ -149,6 +214,35 @@ mod tests {
             version: 3,
             protocol: "ttrpc".into(),
         }
+    }
+
+    /// #609: every bundle has a `log` FIFO (Go shims like runsc exit without
+    /// it); with a runtime a drain reads what the shim writes, and removing
+    /// the bundle stops the drain.
+    #[tokio::test]
+    async fn log_fifo_exists_and_is_drained() {
+        use std::io::Write;
+        use std::os::unix::fs::FileTypeExt;
+        let t = tempfile::tempdir().unwrap();
+        let b = Bundle::create(t.path(), "k8s.io", "fifo1").unwrap();
+        let log = b.dir().join("log");
+        assert!(fs::metadata(&log).unwrap().file_type().is_fifo());
+        // A shim-side writer must not block or fail: a reader (the drain) holds it open.
+        let mut w = fs::OpenOptions::new().write(true).open(&log).unwrap();
+        writeln!(w, "shim says hi").unwrap();
+        // Re-opening the bundle (re-adoption) keeps exactly one live drain.
+        let again = Bundle::open(t.path(), "k8s.io", "fifo1").unwrap();
+        let live = || {
+            log_drains()
+                .lock()
+                .unwrap()
+                .get(&log)
+                .is_some_and(|h| !h.is_finished())
+        };
+        assert!(live());
+        again.remove().unwrap();
+        tokio::task::yield_now().await;
+        assert!(!log_drains().lock().unwrap().contains_key(&log));
     }
 
     #[test]
