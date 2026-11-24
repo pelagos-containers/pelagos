@@ -61,6 +61,18 @@ jobs:
         run: sudo ./scripts/build-rootfs-tarball.sh
       - name: Initialise pelagos data directories
         run: sudo ./scripts/setup.sh --no-user
+      # Same registry setup as ci.yml's integration-tests job. Without it the
+      # release gate pulls anonymously and trips the shared-IP quota
+      # ("Data limit exceeded"), failing a release for reasons unrelated to the code.
+      - name: Configure registry mirror (ECR Public — avoid Docker Hub rate limits)
+        run: |
+          sudo install -d /etc/pelagos
+          sudo install -m 0644 ci/registries.toml /etc/pelagos/registries.toml
+      - name: Authenticate ECR Public pulls (avoid anonymous quota)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ECR_PUBLIC_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ECR_PUBLIC_AWS_SECRET_ACCESS_KEY }}
+        run: bash scripts/ci-ecr-public-auth.sh
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run integration tests
