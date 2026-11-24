@@ -41,6 +41,7 @@ fn build(c: &CriContainer, sb: &CriSandbox, img: &ImageDefaults) -> Result<Spec,
         devices: &[],
         seccomp: None,
         hostname: Some("pod-a"),
+        users: None,
     })
 }
 
@@ -245,36 +246,127 @@ fn cwd_prefers_cri_then_image_then_root() {
     );
 }
 
+/// In-memory image user database for the resolution rules.
+struct Db {
+    passwd: Vec<(&'static str, u32, u32)>,
+    group: Vec<(&'static str, u32)>,
+}
+
+impl UserDb for Db {
+    fn passwd_gid_by_uid(&self, uid: u32) -> Result<Option<u32>, String> {
+        Ok(self.passwd.iter().find(|p| p.1 == uid).map(|p| p.2))
+    }
+    fn passwd_by_name(&self, name: &str) -> Result<Option<(u32, u32)>, String> {
+        Ok(self.passwd.iter().find(|p| p.0 == name).map(|p| (p.1, p.2)))
+    }
+    fn gid_by_group_name(&self, name: &str) -> Result<Option<u32>, String> {
+        Ok(self.group.iter().find(|g| g.0 == name).map(|g| g.1))
+    }
+}
+
+fn db() -> Db {
+    Db {
+        passwd: vec![
+            ("root", 0, 0),
+            ("app", 1000, 2000),
+            ("nobody", 65534, 65534),
+        ],
+        group: vec![("staff", 50), ("app", 2000)],
+    }
+}
+
+/// containerd's `oci.WithUser` rules, including the one a naive reading gets
+/// wrong: a bare uid takes its gid from passwd and falls back to **0**, not to
+/// the uid.
 #[test]
-fn user_resolution() {
-    let uidgid = |c: &CriContainer, img: &ImageDefaults| {
-        let s = build(c, &sandbox(), img).unwrap();
+fn user_string_follows_containerd_rules() {
+    let d = db();
+    let r = |u: &str| resolve_user(u, Some(&d));
+    assert_eq!(r("").unwrap(), (0, 0));
+    assert_eq!(r("1000").unwrap(), (1000, 2000), "gid from passwd");
+    assert_eq!(r("4242").unwrap(), (4242, 0), "no passwd entry: gid 0");
+    assert_eq!(r("app").unwrap(), (1000, 2000), "name: both from passwd");
+    assert_eq!(r("1000:7").unwrap(), (1000, 7), "numeric pair as given");
+    assert_eq!(
+        r("app:staff").unwrap(),
+        (1000, 50),
+        "uid from name, gid from group"
+    );
+    assert_eq!(r("4242:staff").unwrap(), (4242, 50));
+    assert_eq!(r("app:77").unwrap(), (1000, 77));
+    assert!(matches!(r("ghost"), Err(SpecError::UserLookup(_))));
+    assert!(matches!(r("app:ghosts"), Err(SpecError::UserLookup(_))));
+    assert!(matches!(r("1:2:3"), Err(SpecError::UserLookup(_))));
+    assert!(matches!(r("99999999999"), Err(SpecError::UserLookup(_))));
+    // Without a database only all-numeric forms resolve; bare uid gets gid 0.
+    assert_eq!(resolve_user("1000", None).unwrap(), (1000, 0));
+    assert_eq!(resolve_user("1000:2000", None).unwrap(), (1000, 2000));
+    assert!(matches!(
+        resolve_user("app", None),
+        Err(SpecError::UnresolvedUser(_))
+    ));
+}
+
+#[test]
+fn user_resolution_in_spec() {
+    let uidgid = |c: &CriContainer, img: &ImageDefaults, users: Option<&dyn UserDb>| {
+        let s = build_container_spec(&ContainerSpecInput {
+            container: c,
+            sandbox: &sandbox(),
+            image: img,
+            netns_path: None,
+            extra_mounts: &[],
+            devices: &[],
+            seccomp: None,
+            hostname: None,
+            users,
+        })
+        .unwrap();
         let u = s.process().as_ref().unwrap().user().clone();
         (u.uid(), u.gid(), u.additional_gids().clone())
     };
-    assert_eq!(uidgid(&container(), &image()), (0, 0, None));
-    // Image numeric uid:gid.
+    let d = db();
+    assert_eq!(uidgid(&container(), &image(), Some(&d)), (0, 0, None));
+    // Image user.
     let mut img = image();
-    img.user = "1000:2000".into();
-    assert_eq!(uidgid(&container(), &img), (1000, 2000, None));
-    // Bare uid gets gid = uid.
-    img.user = "1000".into();
-    assert_eq!(uidgid(&container(), &img), (1000, 1000, None));
-    // CRI runAsUser/runAsGroup win over the image; groups merge + dedupe.
+    img.user = "app".into();
+    assert_eq!(uidgid(&container(), &img, Some(&d)), (1000, 2000, None));
+    // CRI runAsUser wins over the image user; its gid comes from passwd.
     let mut c = container();
-    c.run_as_user = Some(65534);
+    c.run_as_user = Some(1000);
+    assert_eq!(uidgid(&c, &img, Some(&d)), (1000, 2000, None));
+    // runAsUser + runAsGroup are taken as a numeric pair.
     c.run_as_group = Some(65533);
     c.supplemental_groups = vec![7, 8];
     let mut sb = sandbox();
     sb.supplemental_groups = vec![8, 9];
-    let s = build(&c, &sb, &img).unwrap();
+    let s = build_container_spec(&ContainerSpecInput {
+        container: &c,
+        sandbox: &sb,
+        image: &img,
+        netns_path: None,
+        extra_mounts: &[],
+        devices: &[],
+        seccomp: None,
+        hostname: None,
+        users: Some(&d),
+    })
+    .unwrap();
     let u = s.process().as_ref().unwrap().user().clone();
-    assert_eq!((u.uid(), u.gid()), (65534, 65533));
-    assert_eq!(u.additional_gids().clone(), Some(vec![8, 9, 7]));
+    assert_eq!((u.uid(), u.gid()), (1000, 65533));
+    assert_eq!(
+        u.additional_gids().clone(),
+        Some(vec![8, 9, 7]),
+        "merged, deduped"
+    );
+    // runAsUserName resolves through the database.
+    let mut c = container();
+    c.run_as_username = "nobody".into();
+    assert_eq!(uidgid(&c, &image(), Some(&d)), (65534, 65534, None));
 }
 
 #[test]
-fn usernames_are_rejected_not_guessed() {
+fn usernames_error_without_a_user_database() {
     let mut img = image();
     img.user = "nobody".into();
     assert!(matches!(
@@ -415,6 +507,7 @@ fn mounts_standard_set_then_cri_binds_in_order() {
         devices: &[],
         seccomp: None,
         hostname: None,
+        users: None,
     })
     .unwrap();
     let ms = s.mounts().as_ref().unwrap();
@@ -580,6 +673,7 @@ fn seccomp_only_emitted_for_localhost_and_never_when_privileged() {
             devices: &[],
             seccomp: Some(seccomp_profile()),
             hostname: None,
+            users: None,
         })
         .unwrap()
         .linux()
@@ -634,6 +728,7 @@ fn devices_listed_and_allowed_in_cgroup() {
         devices: std::slice::from_ref(&d),
         seccomp: None,
         hostname: None,
+        users: None,
     })
     .unwrap();
     let l = s.linux().clone().unwrap();

@@ -158,9 +158,10 @@ const DEFAULT_READONLY_PATHS: &[&str] = &[
 pub enum SpecError {
     /// Entrypoint and cmd are both empty after merging CRI and image values.
     EmptyArgs,
-    /// The image/CRI user is a name; resolving it needs the container rootfs
-    /// (`/etc/passwd`), which only exists once the shim has mounted it.
+    /// The user is (partly) a name but no [`UserDb`] was supplied to resolve it.
     UnresolvedUser(String),
+    /// Resolving the user against the image's passwd/group files failed.
+    UserLookup(String),
     InvalidCapability(String),
     Oci(OciSpecError),
 }
@@ -171,8 +172,9 @@ impl std::fmt::Display for SpecError {
             SpecError::EmptyArgs => write!(f, "container has no command (entrypoint and cmd empty)"),
             SpecError::UnresolvedUser(u) => write!(
                 f,
-                "user {u:?} is a name; it cannot be resolved before the rootfs is mounted (use a numeric uid[:gid])"
+                "user {u:?} names a user or group but no image user database was provided (use numeric uid:gid)"
             ),
+            SpecError::UserLookup(m) => write!(f, "user lookup failed: {m}"),
             SpecError::InvalidCapability(c) => write!(f, "unknown capability {c:?}"),
             SpecError::Oci(e) => write!(f, "invalid OCI spec: {e}"),
         }
@@ -311,6 +313,9 @@ pub struct ContainerSpecInput<'a> {
     /// Pre-loaded seccomp profile for `Localhost` mode (see [`load_seccomp_profile`]).
     pub seccomp: Option<LinuxSeccomp>,
     pub hostname: Option<&'a str>,
+    /// The image's user database, to resolve user *names* and passwd gids
+    /// (see [`resolve_user`]). `None` allows only all-numeric users.
+    pub users: Option<&'a dyn UserDb>,
 }
 
 pub struct SandboxSpecInput<'a> {
@@ -385,26 +390,96 @@ fn caps_to_oci(set: &BTreeSet<String>) -> Result<std::collections::HashSet<Capab
     set.iter().map(|c| cap(c)).collect()
 }
 
-/// `uid[:gid]` -> `(uid, gid)`. A bare uid gets gid = uid, matching
-/// containerd. Names are rejected.
-fn parse_user(u: &str) -> Result<(u32, u32), SpecError> {
-    if u.is_empty() {
+/// Read access to an image's user database (`/etc/passwd`, `/etc/group`).
+/// Methods return `Err` only for unreadable data, never for "not found".
+pub trait UserDb {
+    /// Primary gid of the first passwd entry with this uid.
+    fn passwd_gid_by_uid(&self, uid: u32) -> Result<Option<u32>, String>;
+    /// `(uid, gid)` of the passwd entry with this name.
+    fn passwd_by_name(&self, name: &str) -> Result<Option<(u32, u32)>, String>;
+    /// gid of the group with this name.
+    fn gid_by_group_name(&self, name: &str) -> Result<Option<u32>, String>;
+}
+
+const MAX_ID: u64 = i32::MAX as u64;
+
+fn numeric_id(s: &str) -> Option<Result<u32, ()>> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(match s.parse::<u64>() {
+        Ok(v) if v <= MAX_ID => Ok(v as u32),
+        _ => Err(()),
+    })
+}
+
+/// Resolve a user string to `(uid, gid)` with containerd's rules
+/// (`oci.WithUser`):
+///
+/// - `uid`: gid from the passwd entry with that uid; **gid 0 when there is no
+///   entry** (not an error);
+/// - `name`: both from the passwd entry; unknown name is an error;
+/// - `uid:gid` (both numeric): taken as given, no lookup;
+/// - `name:group` / `uid:group` / `name:gid`: the name comes from passwd (uid
+///   only), the group from `/etc/group`; unknown names are errors.
+///
+/// Without a `db`, only the all-numeric forms resolve (a bare uid gets gid 0,
+/// as containerd does for an empty passwd).
+pub fn resolve_user(user: &str, db: Option<&dyn UserDb>) -> Result<(u32, u32), SpecError> {
+    if user.is_empty() {
         return Ok((0, 0));
     }
-    let (a, b) = match u.split_once(':') {
-        Some((a, b)) => (a, Some(b)),
-        None => (u, None),
+    let bad = |what: &str| {
+        SpecError::UserLookup(format!("invalid USER value {user:?}: {what} out of range"))
     };
-    let uid: u32 = a
-        .parse()
-        .map_err(|_| SpecError::UnresolvedUser(u.to_string()))?;
-    let gid: u32 = match b {
-        Some(b) => b
-            .parse()
-            .map_err(|_| SpecError::UnresolvedUser(u.to_string()))?,
-        None => uid,
-    };
-    Ok((uid, gid))
+    let lookup = |e: String| SpecError::UserLookup(e);
+    let need_db = || db.ok_or_else(|| SpecError::UnresolvedUser(user.to_string()));
+    let parts: Vec<&str> = user.split(':').collect();
+    match parts.as_slice() {
+        [u] => match numeric_id(u) {
+            Some(Ok(uid)) => {
+                let gid = match db {
+                    Some(db) => db.passwd_gid_by_uid(uid).map_err(lookup)?.unwrap_or(0),
+                    None => 0,
+                };
+                Ok((uid, gid))
+            }
+            Some(Err(())) => Err(bad("uid")),
+            None => need_db()?
+                .passwd_by_name(u)
+                .map_err(lookup)?
+                .ok_or_else(|| SpecError::UserLookup(format!("user {u:?} not found in image"))),
+        },
+        [u, g] => {
+            let uid = match numeric_id(u) {
+                Some(Ok(v)) => v,
+                Some(Err(())) => return Err(bad("uid")),
+                None => {
+                    need_db()?
+                        .passwd_by_name(u)
+                        .map_err(lookup)?
+                        .ok_or_else(|| {
+                            SpecError::UserLookup(format!("user {u:?} not found in image"))
+                        })?
+                        .0
+                }
+            };
+            let gid = match numeric_id(g) {
+                Some(Ok(v)) => v,
+                Some(Err(())) => return Err(bad("gid")),
+                None => need_db()?
+                    .gid_by_group_name(g)
+                    .map_err(lookup)?
+                    .ok_or_else(|| {
+                        SpecError::UserLookup(format!("group {g:?} not found in image"))
+                    })?,
+            };
+            Ok((uid, gid))
+        }
+        _ => Err(SpecError::UserLookup(format!(
+            "invalid USER value {user:?}"
+        ))),
+    }
 }
 
 fn merge_env(image: &[(String, String)], cri: &[(String, String)]) -> Vec<String> {
@@ -569,21 +644,16 @@ pub fn build_container_spec(inp: &ContainerSpecInput<'_>) -> Result<Spec, SpecEr
         return Err(SpecError::EmptyArgs);
     }
 
-    // user: CRI runAsUser wins over the image user; a username cannot be
-    // resolved without the rootfs.
-    let (uid, gid) = match c.run_as_user {
-        Some(uid) => (
-            uid as u32,
-            c.run_as_group.map(|g| g as u32).unwrap_or(uid as u32),
-        ),
-        None if !c.run_as_username.is_empty() => {
-            return Err(SpecError::UnresolvedUser(c.run_as_username.clone()))
-        }
-        None => {
-            let (iu, ig) = parse_user(&inp.image.user)?;
-            (iu, c.run_as_group.map(|g| g as u32).unwrap_or(ig))
-        }
+    // user: build the same user string containerd's CRI plugin does (CRI
+    // runAsUser[:runAsGroup], else runAsUserName, else the image user) and
+    // resolve it with containerd's rules.
+    let user_str = match (c.run_as_user, c.run_as_group) {
+        (Some(u), Some(g)) => format!("{u}:{g}"),
+        (Some(u), None) => u.to_string(),
+        (None, _) if !c.run_as_username.is_empty() => c.run_as_username.clone(),
+        (None, _) => inp.image.user.clone(),
     };
+    let (uid, gid) = resolve_user(&user_str, inp.users)?;
     let mut extra_gids: Vec<u32> = Vec::new();
     for g in sb
         .supplemental_groups
