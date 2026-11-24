@@ -66,6 +66,19 @@ impl Task for Mock {
         resp.pid = 77;
         Ok(resp)
     }
+    async fn stats(
+        &self,
+        _: &TtrpcContext,
+        r: api::StatsRequest,
+    ) -> ttrpc::Result<api::StatsResponse> {
+        self.log(format!("stats:{}", r.id));
+        if r.id.starts_with("nostats") {
+            return Err(err("no stats"));
+        }
+        let mut resp = api::StatsResponse::new();
+        resp.stats = Some(crate::shim::stats::tests::v1_payload(5_000_000, 1000, 400)).into();
+        Ok(resp)
+    }
     async fn connect(
         &self,
         _: &TtrpcContext,
@@ -690,4 +703,40 @@ fn reattach_rootfs_derives_paths_without_creating_anything() {
     assert!(!p.uses_aliases() && !store.scratch.exists());
     std::fs::create_dir_all(store.alias_root.join("abcdef012345")).unwrap();
     assert!(rootfs::reattach_rootfs(&store, "abcdef0123456789", vec![]).uses_aliases());
+}
+
+#[tokio::test]
+async fn usage_maps_shim_stats_and_degrades_to_none() {
+    let f = fixture().await;
+    let sb = sandbox("stsb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    for id in ["st1", "nostats1"] {
+        f.rt.start_container(
+            &sb,
+            &container(id, "stsb"),
+            f.log_path("s.log").to_str().unwrap(),
+            "/x",
+        )
+        .await
+        .unwrap();
+    }
+    let u = f.rt.usage("st1").await.unwrap();
+    assert_eq!(
+        (u.cpu_nanos, u.mem_usage, u.mem_working_set),
+        (5_000_000, 1000, 600)
+    );
+    assert!(
+        f.rt.usage("nostats1").await.is_none(),
+        "shim error -> None, not a failure"
+    );
+    assert!(f.rt.usage("unknown").await.is_none());
+    f.rt.stop_container("st1", 15, Duration::from_secs(10))
+        .await;
+    assert!(
+        f.rt.usage("st1").await.is_none(),
+        "exited containers report no usage"
+    );
+    f.finish().await;
 }

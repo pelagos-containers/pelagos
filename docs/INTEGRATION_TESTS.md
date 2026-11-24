@@ -6496,3 +6496,12 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shimrt readop
 - `shimrt::tests::readopt_reports_lost_sandbox_and_leaves_its_bundle` — an unreachable sandbox shim is reported, its containers become exit 137, and its bundle directory is **left on disk** (a dead shim may leave overlay mounts under it; deleting blindly could reach through them).
 - `shimrt::tests::reattach_rootfs_derives_paths_without_creating_anything` — the rootfs cleanup handle is rebuilt with the same paths `plan_rootfs` used, creating nothing; alias dir included only if present.
 - `runtime::tests::test_readopt_shim_updates_cri_records` — `RuntimeSvc::readopt_shim` leaves a live pod and its running container Running, and sets a pod whose shim vanished NotReady with its containers Exited(137) so the kubelet replaces it. Startup no longer re-materialises native pelagos sandbox state for shim sandboxes.
+
+## `pelagos-cri` shim stats (issue #604)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::stats shimrt::tests::usage container_rpcs`. Not root-gated.
+
+- `shim::stats::tests::v1_cpu_and_working_set` — cgroups **v1** `Metrics` (what Kata's guest reports): CPU total ns, memory usage, working set = usage − total_inactive_file, saturating (inactive > usage cannot underflow the kubelet's eviction input).
+- `shim::stats::tests::v2_usec_converted_to_nanos` — cgroups **v2** payloads: `usage_usec` × 1000, working set from `inactive_file`.
+- `shim::stats::tests::empty_metrics_are_zero_and_junk_is_an_error` — an empty payload is zero usage; an unknown type URL or a malformed payload is a typed error (never a panic).
+- `shimrt::tests::usage_maps_shim_stats_and_degrades_to_none` — the mock shim's `Stats` is decoded; a shim error, an unknown container and an exited container all give `None`, so a stats call can never fail a CRI list.
+- `runtime::tests::test_container_rpcs_dispatch_to_shim_runtime` (extended) — `ContainerStats` and `PodSandboxStats` for a shim container report the shim's numbers (CPU 5 000 000 ns, working set 600), not host cgroup reads, and the pod aggregate includes the container.
