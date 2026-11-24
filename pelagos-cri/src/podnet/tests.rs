@@ -34,7 +34,7 @@ fn shim_policy_rejects_host_network_and_missing_cni() {
 }
 
 #[test]
-#[serial(cni_env)]
+#[serial(cni_env, cni_semaphore)]
 fn cni_bin_dirs_env_override_is_searched_first() {
     std::env::set_var("PELAGOS_CNI_BIN_DIRS", "/tmp/a::/tmp/b");
     let d = cni::bin_dirs();
@@ -160,7 +160,7 @@ fn sandbox_for(net: &PodNetwork, id: &str) -> CriSandbox {
 /// ADD runs against an existing netns and has finished, with `lo` up, by the
 /// time setup returns: the caller can start a VM immediately afterwards.
 #[tokio::test]
-#[serial(cni_env)]
+#[serial(cni_env, cni_semaphore)]
 async fn setup_runs_add_into_an_existing_netns_and_brings_lo_up() {
     if !is_root() {
         eprintln!("skipping podnet setup test: needs root (netns)");
@@ -200,7 +200,7 @@ async fn setup_runs_add_into_an_existing_netns_and_brings_lo_up() {
 /// A failed ADD must not leave the netns behind for the kubelet's retry, and
 /// is reported as INTERNAL.
 #[tokio::test]
-#[serial(cni_env)]
+#[serial(cni_env, cni_semaphore)]
 async fn add_failure_cleans_up_the_netns() {
     if !is_root() {
         eprintln!("skipping podnet failure test: needs root (netns)");
@@ -225,7 +225,7 @@ async fn add_failure_cleans_up_the_netns() {
 /// Shim teardown order: the shim sandbox is stopped (marker written) before
 /// CNI DEL runs, and the netns is gone only afterwards.
 #[tokio::test]
-#[serial(cni_env)]
+#[serial(cni_env, cni_semaphore)]
 async fn shim_teardown_stops_the_shim_before_cni_del() {
     if !is_root() {
         eprintln!("skipping podnet teardown-order test: needs root (netns)");
@@ -263,7 +263,7 @@ async fn shim_teardown_stops_the_shim_before_cni_del() {
 
 /// Policy rejections happen before any netns or CNI side effect.
 #[tokio::test]
-#[serial(cni_env)]
+#[serial(cni_env, cni_semaphore)]
 async fn rejected_shim_sandbox_has_no_side_effects() {
     let f = fake_cni();
     let host = NamespaceModes {

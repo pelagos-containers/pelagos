@@ -6467,3 +6467,5 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::stdio s
 - `shim::exec::tests::exec_sync_timeout_kills_and_flags` — a hung exec is SIGKILLed via the shim, reaped and deleted; `timed_out` is set and the code is 137.
 - `shim::exec::tests::exec_sync_shim_error_still_cleans_up` — a dead shim yields an error, not a hang or a panic, and leaves no FIFOs behind.
 - `shim::exec::tests::streaming_session_resize_close_and_finish` — streaming exec: a subscriber attached before start sees the first output, stdin is wired, ResizePty and CloseIO reach the shim, `finish` deletes the exec and removes the FIFOs.
+
+Test-isolation fix (found while verifying #597 as root on ipc7): the root-gated `podnet` tests drive `cni_add_bounded` and so draw from the process-wide CNI semaphore; they now also hold the `cni_semaphore` serial key. Without it, `test_cni_add_bounded_fails_fast_with_resource_exhausted_when_saturated` and `test_run_bounded_limits_concurrency_and_fails_fast_over_capacity` failed intermittently (a podnet test held a permit) — invisible when not root because the podnet tests skip.
