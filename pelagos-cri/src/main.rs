@@ -16,6 +16,7 @@ mod podnet;
 mod runtime;
 mod scope;
 mod shim;
+mod shimrt;
 mod state;
 mod streaming;
 
@@ -43,6 +44,38 @@ struct Args {
     /// beyond the node without an explicit operator choice.
     #[clap(long, default_value = "127.0.0.1:9091")]
     metrics_addr: String,
+    /// Shim-backed runtime handler as `NAME=SHIM_BINARY`, e.g.
+    /// `kata=/opt/kata/bin/containerd-shim-kata-v2`. Repeatable. Pods whose
+    /// RuntimeClass handler is NAME run through that containerd shim v2
+    /// binary; everything else stays native (#574).
+    #[clap(long = "shim-handler", multiple_occurrences = true)]
+    shim_handlers: Vec<String>,
+}
+
+/// Parse `NAME=BINARY` pairs; rejects empty or reserved names.
+fn parse_shim_handlers(
+    raw: &[String],
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut m = std::collections::HashMap::new();
+    for r in raw {
+        let (name, bin) = r
+            .split_once('=')
+            .ok_or_else(|| format!("--shim-handler {r:?}: expected NAME=BINARY"))?;
+        if name.is_empty() || bin.is_empty() {
+            return Err(format!(
+                "--shim-handler {r:?}: NAME and BINARY must be non-empty"
+            ));
+        }
+        if name == backend::DEFAULT_HANDLER || name == backend::NATIVE_HANDLER {
+            return Err(format!(
+                "--shim-handler {r:?}: {name:?} is reserved for the native runtime"
+            ));
+        }
+        if m.insert(name.to_string(), bin.to_string()).is_some() {
+            return Err(format!("--shim-handler: duplicate handler {name:?}"));
+        }
+    }
+    Ok(m)
 }
 
 /// Scan `/run/pelagos/containers/*/state.json` for containers that were
@@ -174,14 +207,28 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Shim handlers: the events sink + exit tracker exist only when at least
+    // one is configured, so native-only nodes are untouched (evented PLEG
+    // must not see a stream that omits native transitions).
+    let shim_handlers = parse_shim_handlers(&args.shim_handlers)?;
+    let shim = if shim_handlers.is_empty() {
+        None
+    } else {
+        let names: Vec<String> = shim_handlers.keys().cloned().collect();
+        let rt = shimrt::ShimRuntime::start(shimrt::ShimConfig::system(shim_handlers)).await?;
+        log::info!("shim runtime handlers enabled: {names:?}");
+        Some(std::sync::Arc::new(rt))
+    };
+
+    let shim_for_shutdown = shim.clone();
     let runtime_svc = RuntimeSvc {
         state: app_state.clone(),
         streaming_base_url: streaming_base_url.clone(),
         registry: registry.clone(),
-        backends: backend::BackendRegistry::new(args.pelagos_bin.clone()),
-        // No shim-backed handler exists yet; the events sink + tracker are
-        // started here once one is configured (epic #574).
-        shim_exits: None,
+        backends: backend::BackendRegistry::new(args.pelagos_bin.clone())
+            .with_shim_handlers(shim.iter().flat_map(|s| s.handler_names())),
+        shim_exits: shim.as_ref().map(|s| s.exits.clone()),
+        shim,
     };
     let image_svc = ImageSvc {
         state: app_state.clone(),
@@ -213,5 +260,36 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
+    if let Some(shim) = shim_for_shutdown {
+        shim.shutdown().await;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_shim_handlers;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn shim_handler_flags_parse_and_validate() {
+        let m = parse_shim_handlers(&v(&["kata=/opt/kata/bin/shim", "gv=runsc-shim"])).unwrap();
+        assert_eq!(m["kata"], "/opt/kata/bin/shim");
+        assert_eq!(m.len(), 2);
+        assert!(parse_shim_handlers(&v(&["nokata"])).is_err());
+        assert!(parse_shim_handlers(&v(&["=bin"])).is_err());
+        assert!(parse_shim_handlers(&v(&["kata="])).is_err());
+        assert!(
+            parse_shim_handlers(&v(&["pelagos=/x"])).is_err(),
+            "reserved"
+        );
+        assert!(
+            parse_shim_handlers(&v(&["k=/a", "k=/b"])).is_err(),
+            "duplicate"
+        );
+        assert!(parse_shim_handlers(&[]).unwrap().is_empty());
+    }
 }

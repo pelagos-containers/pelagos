@@ -168,7 +168,21 @@ async fn run(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = cmd.spawn().map_err(BootstrapError::Spawn)?;
+    // A shim binary that was just written (installers, and our own tests) can
+    // be briefly "text file busy" while another thread's fork still holds the
+    // write fd; that clears within milliseconds, so retry instead of failing
+    // the pod.
+    let mut attempts = 0;
+    let child = loop {
+        match cmd.spawn() {
+            Ok(c) => break c,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(BootstrapError::Spawn(e)),
+        }
+    };
     let out = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| BootstrapError::Timeout)?

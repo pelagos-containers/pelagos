@@ -181,13 +181,34 @@ impl RuntimeBackend for Backend {
 #[derive(Clone, Debug)]
 pub struct BackendRegistry {
     native: Backend,
+    /// Handlers served by `ShimRuntime` (#599). They resolve (so the CRI
+    /// accepts them) but never reach the native CLI backend: `runtime.rs`
+    /// dispatches to the shim runtime first.
+    shim_handlers: Vec<String>,
 }
 
 impl BackendRegistry {
     pub fn new(pelagos_bin: String) -> Self {
         Self {
             native: Backend::Native(NativeBackend::new(pelagos_bin)),
+            shim_handlers: Vec::new(),
         }
+    }
+
+    /// Register shim-backed handler names. A name colliding with the default
+    /// or native handler is ignored (it would shadow native pods).
+    pub fn with_shim_handlers(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        for n in names {
+            if n != DEFAULT_HANDLER && n != NATIVE_HANDLER && !self.shim_handlers.contains(&n) {
+                self.shim_handlers.push(n);
+            }
+        }
+        self.shim_handlers.sort();
+        self
+    }
+
+    pub fn is_shim_handler(&self, handler: &str) -> bool {
+        self.shim_handlers.iter().any(|h| h == handler)
     }
 
     /// Resolve a handler name. Unknown handlers are rejected rather than
@@ -198,6 +219,7 @@ impl BackendRegistry {
     pub fn resolve(&self, handler: &str) -> Result<&Backend, Status> {
         match handler {
             DEFAULT_HANDLER | NATIVE_HANDLER => Ok(&self.native),
+            h if self.is_shim_handler(h) => Ok(&self.native),
             other => Err(Status::invalid_argument(format!(
                 "unknown runtime handler {:?}; known handlers: {:?}",
                 other,
@@ -215,7 +237,9 @@ impl BackendRegistry {
 
     /// Handler names to advertise in the CRI `Status` response.
     pub fn handler_names(&self) -> Vec<String> {
-        vec![DEFAULT_HANDLER.to_string(), NATIVE_HANDLER.to_string()]
+        let mut v = vec![DEFAULT_HANDLER.to_string(), NATIVE_HANDLER.to_string()];
+        v.extend(self.shim_handlers.iter().cloned());
+        v
     }
 }
 
@@ -238,6 +262,17 @@ mod tests {
         let err = reg().resolve("kata").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("kata"));
+    }
+
+    #[test]
+    fn shim_handlers_resolve_and_are_advertised_but_cannot_shadow_native() {
+        let r =
+            reg().with_shim_handlers(["kata".to_string(), "pelagos".to_string(), "".to_string()]);
+        assert!(r.resolve("kata").is_ok());
+        assert!(r.is_shim_handler("kata"));
+        assert!(!r.is_shim_handler("pelagos") && !r.is_shim_handler(""));
+        assert_eq!(r.handler_names(), vec!["", "pelagos", "kata"]);
+        assert!(r.resolve("gvisor").is_err(), "unconfigured stays rejected");
     }
 
     #[test]
