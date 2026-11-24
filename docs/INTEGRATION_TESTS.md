@@ -6449,3 +6449,21 @@ The CNI sequence was extracted from `run_pod_sandbox` / `stop_pod_sandbox` into 
 - `podnet::tests::rejected_shim_sandbox_has_no_side_effects` — policy rejections make no CNI call and create no netns.
 - `state::tests::sandbox_json_without_sysctls_loads_empty_and_roundtrips` — on-disk sandbox state written before `sysctls` existed still loads; sysctls survive a round trip.
 - `shim::spec::tests::pod_sysctls_are_emitted_in_the_sandbox_spec_only` — pod sysctls become `linux.sysctl` on the sandbox spec (host-side net sysctls do not reach a guest netns) and never on container specs. Closes the #591 gap.
+
+## `pelagos-cri` shim stdio, logs and exec (issue #597)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::stdio shim::exec`. Not root-gated: FIFOs and an in-process mock ttrpc Task server only (no KVM, no real shim). Port-forward needs no stdio work: it dials the pod IP in the CNI netns (`streaming.rs`), which is how Kata pods are reachable too.
+
+- `shim::stdio::tests::log_writer_frames_lines_and_joins_partials` — raw bytes become `<rfc3339nano> <stream> F <line>` records; a line split across writes is joined; empty lines survive; an unterminated tail is held until `finish` (idempotent); streams are tagged independently. Failure means `crictl logs` output is corrupted or loses lines.
+- `shim::stdio::tests::log_writer_splits_overlong_lines_as_partial_records` — a line longer than `MAX_PARTIAL` is emitted as `P` records then an `F` terminator, bounding memory for a container that never prints a newline.
+- `shim::stdio::tests::log_writer_appends_across_reopen` — reopening the log (CRI restart / re-adoption) appends instead of truncating.
+- `shim::stdio::tests::stdio_create_fills_requests_and_cleans_up` — real FIFOs are created; `CreateTaskRequest`/`ExecProcessRequest` carry the paths; a terminal has no stderr FIFO and no stdin when not requested; `remove` unlinks; stale files from a crash are replaced.
+- `shim::stdio::tests::pump_writes_cri_log_and_fans_out_to_attach` — stdout/stderr FIFO bytes reach both the CRI log and a live broadcast subscriber (attach); bytes written immediately before `finish` are not lost (the drain waits for reactor readiness; a plain `try_read` dropped them); the trailing partial line is flushed; subscribers see the channel close.
+- `shim::stdio::tests::pump_capture_is_bounded_and_per_stream` — ExecSync capture keeps stdout and stderr separate, caps each stream, and sets `truncated`.
+- `shim::stdio::tests::terminal_pump_has_single_stream` — a tty pump reads only the merged stdout stream.
+- `shim::stdio::tests::stdin_writer_reaches_reader_and_close_gives_eof` — stdin writes (from cloned handles) reach the reader in order and `close` produces EOF; a closed writer stays closed for all clones.
+- `shim::exec::tests::spec_derives_from_container_process` — the exec `Process` replaces args/env/cwd/terminal but inherits user, no-new-privileges and the rest of the container's process (an exec must not escape the container's security settings); same-key env overrides.
+- `shim::exec::tests::spec_rejects_empty_command`, `base_process_reads_generated_bundle_config` — empty command is an error; the container process is read from the bundle `config.json`, and a missing config is a clear error.
+- `shim::exec::tests::exec_sync_captures_output_and_exit_code` — against the mock shim: Exec → Start → Wait → Delete in order, the guest's stdout/stderr (written into the FIFOs the CRI handed over) are captured, the exit code is returned, the process spec reaches the shim with the right type URL, and the FIFOs are removed.
+- `shim::exec::tests::exec_sync_timeout_kills_and_flags` — a hung exec is SIGKILLed via the shim, reaped and deleted; `timed_out` is set and the code is 137.
+- `shim::exec::tests::exec_sync_shim_error_still_cleans_up` — a dead shim yields an error, not a hang or a panic, and leaves no FIFOs behind.
+- `shim::exec::tests::streaming_session_resize_close_and_finish` — streaming exec: a subscriber attached before start sees the first output, stdin is wired, ResizePty and CloseIO reach the shim, `finish` deletes the exec and removes the FIFOs.
