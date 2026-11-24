@@ -215,3 +215,26 @@ async fn stdin_writer_reaches_reader_and_close_gives_eof() {
         "closed is closed for clones"
     );
 }
+
+#[test]
+fn log_writer_reopen_follows_a_rotated_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("c.log");
+    let mut w = CriLogWriter::open(&p).unwrap();
+    w.write(Stream::Stdout, b"before\nhal").unwrap();
+    // kubelet rotates: rename away, then asks us to reopen.
+    let rotated = tmp.path().join("c.log.20260101");
+    std::fs::rename(&p, &rotated).unwrap();
+    w.write(Stream::Stdout, b"f\n").unwrap();
+    assert_eq!(
+        lines(&rotated).len(),
+        2,
+        "still writing to the renamed inode"
+    );
+    w.reopen().unwrap();
+    assert!(p.exists(), "fresh file at the original path");
+    w.write(Stream::Stdout, b"after\n").unwrap();
+    let l = lines(&p);
+    assert_eq!(l.len(), 1);
+    assert_eq!(parse(&l[0]), ("stdout", "F", "after"));
+}

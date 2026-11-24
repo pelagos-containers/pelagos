@@ -221,6 +221,7 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shim_for_shutdown = shim.clone();
+    let shim_for_streaming = shim.clone();
     let runtime_svc = RuntimeSvc {
         state: app_state.clone(),
         streaming_base_url: streaming_base_url.clone(),
@@ -239,7 +240,12 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn the SPDY streaming server.
     let pelagos_bin = args.pelagos_bin.clone();
-    tokio::spawn(streaming::serve(streaming_listener, registry, pelagos_bin));
+    tokio::spawn(streaming::serve(
+        streaming_listener,
+        registry,
+        pelagos_bin,
+        shim_for_streaming,
+    ));
 
     let uds = tokio::net::UnixListener::bind(&args.socket)?;
     std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o660))?;

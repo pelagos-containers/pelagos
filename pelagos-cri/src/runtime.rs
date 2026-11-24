@@ -3033,6 +3033,10 @@ impl RuntimeService for RuntimeSvc {
         // relay's next per-flush append lands there — not in the renamed file (#344).
         // (The relay opens the path per write, so no fd needs reopening.)
         let container_id = request.into_inner().container_id;
+        if let Some((shim, _)) = self.shim_for_container(&container_id).await {
+            // The shim pump holds the log open: it must follow the new file.
+            shim.reopen_log(&container_id).await;
+        }
         let st = self.state.inner.lock().await;
         if let Some(container) = st.containers.get(&container_id) {
             let log_dir = st
@@ -3050,11 +3054,10 @@ impl RuntimeService for RuntimeSvc {
 
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
         let req = request.into_inner();
-        if self.shim_for_container(&req.container_id).await.is_some() {
-            return Err(Status::unimplemented(
-                "streaming exec for shim-backed runtime handlers is not implemented yet (#601)",
-            ));
-        }
+        let shim_container = self
+            .shim_for_container(&req.container_id)
+            .await
+            .map(|_| req.container_id.clone());
 
         let container_id = &req.container_id;
 
@@ -3078,6 +3081,7 @@ impl RuntimeService for RuntimeSvc {
                 stdout: req.stdout,
                 stderr: req.stderr,
                 tty: req.tty,
+                shim_container,
             },
         )
         .await;
@@ -3092,11 +3096,10 @@ impl RuntimeService for RuntimeSvc {
         request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
         let req = request.into_inner();
-        if self.shim_for_container(&req.container_id).await.is_some() {
-            return Err(Status::unimplemented(
-                "streaming attach for shim-backed runtime handlers is not implemented yet (#601)",
-            ));
-        }
+        let shim_container = self
+            .shim_for_container(&req.container_id)
+            .await
+            .map(|_| req.container_id.clone());
 
         let container_id = &req.container_id;
 
@@ -3121,6 +3124,7 @@ impl RuntimeService for RuntimeSvc {
                 stdout: req.stdout,
                 stderr: req.stderr,
                 tty: req.tty,
+                shim_container,
             },
         )
         .await;
@@ -5013,25 +5017,34 @@ mod tests {
         let log = std::fs::read_to_string(log_dir.join("app/0.log")).unwrap();
         assert!(log.contains(" stdout F hello from guest"), "{log}");
 
-        // Streaming exec/attach are explicitly unimplemented for shim pods (#601),
-        // not routed to the native path where they would fail confusingly.
-        let e = svc
+        // Streaming exec/attach on a shim pod register a token carrying the shim
+        // container id (the SPDY handler then talks to the shim, not `pelagos exec`).
+        let url = svc
             .exec(Request::new(ExecRequest {
                 container_id: "rc1".into(),
                 cmd: vec!["sh".into()],
                 ..Default::default()
             }))
             .await
-            .unwrap_err();
-        assert_eq!(e.code(), tonic::Code::Unimplemented);
-        let e = svc
+            .unwrap()
+            .into_inner()
+            .url;
+        let token = url.rsplit('/').next().unwrap();
+        assert!(matches!(
+            svc.registry.lock().await.get(token),
+            Some(crate::streaming::Pending::Exec(p)) if p.shim_container.as_deref() == Some("rc1")
+        ));
+        let url = svc
             .attach(Request::new(AttachRequest {
                 container_id: "rc1".into(),
+                stdin: true,
                 ..Default::default()
             }))
             .await
-            .unwrap_err();
-        assert_eq!(e.code(), tonic::Code::Unimplemented);
+            .unwrap()
+            .into_inner()
+            .url;
+        assert!(url.contains("/attach/"));
 
         // CRI container events carry the pod and container statuses (#599).
         let mut ev = container_stopped_event(&exit_of("rc1", None, 137)).unwrap();

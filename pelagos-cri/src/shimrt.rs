@@ -23,13 +23,13 @@ use crate::shim::bootstrap::{self, StartParams};
 use crate::shim::bundle::Bundle;
 use crate::shim::client::ShimClient;
 use crate::shim::events::{placeholder_publish_binary, EventsSink};
-use crate::shim::exec::{self, ExecLimits, ExecOutcome, ExecRequest};
+use crate::shim::exec::{self, ExecLimits, ExecOutcome, ExecRequest, ExecSession};
 use crate::shim::exit::{ContainerExit, ExitTracker};
 use crate::shim::rootfs::{self, LayeredUsers, RootfsPlan, StoreLayout};
 use crate::shim::spec::{
     self, ContainerSpecInput, ImageDefaults, SandboxResources, SandboxSpecInput,
 };
-use crate::shim::stdio::{CriLogWriter, Pump, Sink, StdinWriter, Stdio};
+use crate::shim::stdio::{Chunk, CriLogWriter, Pump, Sink, StdinWriter, Stdio};
 use crate::state::{CriContainer, CriMount, CriSandbox};
 
 /// containerd namespace used for all pelagos-cri tasks.
@@ -105,6 +105,20 @@ pub enum Readopted {
     Exited(u32),
     /// The shim or task is gone; recorded as exit 137.
     Lost,
+}
+
+/// A started streaming exec (CRI `Exec`).
+pub struct ExecStream {
+    pub session: ExecSession,
+    /// Live output; subscribed before the process started.
+    pub output: tokio::sync::broadcast::Receiver<Chunk>,
+    pub client: Arc<ShimClient>,
+}
+
+/// A streaming attach (CRI `Attach`) to a running container's stdio.
+pub struct AttachStream {
+    pub output: tokio::sync::broadcast::Receiver<Chunk>,
+    pub stdin: Option<StdinWriter>,
 }
 
 #[derive(Debug, Default)]
@@ -706,6 +720,58 @@ impl ShimRuntime {
             .filter(|(_, t)| t.sandbox_id == sandbox_id)
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// Start a streaming exec in a container.
+    pub async fn start_exec(
+        &self,
+        container_id: &str,
+        req: ExecRequest,
+    ) -> Result<ExecStream, ShimError> {
+        let t = self.task(container_id)?;
+        let base = exec::base_process(t.bundle.dir())?;
+        let exec_id = format!("exec-{}", uuid_like());
+        let mut output = None;
+        let session = ExecSession::start_with(
+            &t.client,
+            container_id,
+            &exec_id,
+            &base,
+            &req,
+            &self.cfg.root.join("io"),
+            |p| output = Some(p.subscribe()),
+        )
+        .await?;
+        Ok(ExecStream {
+            session,
+            output: output.expect("before_start ran"),
+            client: t.client.clone(),
+        })
+    }
+
+    /// Attach to a running container: follow its live output and write to its
+    /// stdin. Output before the attach point is not replayed.
+    pub async fn attach(&self, container_id: &str) -> Result<AttachStream, ShimError> {
+        let t = self.task(container_id)?;
+        let guard = t.pump.lock().await;
+        let pump = guard
+            .as_ref()
+            .ok_or_else(|| ShimError::UnknownContainer(container_id.into()))?;
+        Ok(AttachStream {
+            output: pump.subscribe(),
+            stdin: t.stdin.clone(),
+        })
+    }
+
+    /// Reopen a container's CRI log after rotation (`ReopenContainerLog`).
+    pub async fn reopen_log(&self, container_id: &str) {
+        if let Ok(t) = self.task(container_id) {
+            if let Some(p) = t.pump.lock().await.as_ref() {
+                if let Err(e) = p.reopen_log() {
+                    log::warn!("reopen log {container_id}: {e}");
+                }
+            }
+        }
     }
 
     pub async fn exec_sync(

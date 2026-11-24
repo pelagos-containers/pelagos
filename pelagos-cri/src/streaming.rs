@@ -30,6 +30,9 @@ pub struct PendingExec {
     pub stderr: bool,
     #[allow(dead_code)]
     pub tty: bool,
+    /// Set for containers run through a shim backend (#601): the container's
+    /// CRI id. The handlers then talk to the shim instead of `pelagos exec`.
+    pub shim_container: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +76,12 @@ async fn claim(registry: &Registry, token: &str) -> Option<Pending> {
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
 /// Bind the streaming listener and serve forever.
-pub async fn serve(listener: TcpListener, registry: Registry, pelagos_bin: String) {
+pub async fn serve(
+    listener: TcpListener,
+    registry: Registry,
+    pelagos_bin: String,
+    shim: Option<Arc<crate::shimrt::ShimRuntime>>,
+) {
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -85,8 +93,9 @@ pub async fn serve(listener: TcpListener, registry: Registry, pelagos_bin: Strin
         log::debug!("streaming connection from {peer}");
         let registry = Arc::clone(&registry);
         let pelagos_bin = pelagos_bin.clone();
+        let shim = shim.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, registry, pelagos_bin).await {
+            if let Err(e) = handle_connection(tcp, registry, pelagos_bin, shim).await {
                 log::warn!("streaming handler error: {e}");
             }
         });
@@ -137,6 +146,7 @@ async fn handle_connection(
     mut tcp: TcpStream,
     registry: Registry,
     pelagos_bin: String,
+    shim: Option<Arc<crate::shimrt::ShimRuntime>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use spdystream_rs::server::{parse_upgrade_request, send_upgrade_response_with_protocol};
 
@@ -171,13 +181,13 @@ async fn handle_connection(
 
     match (kind, pending) {
         ("exec", Pending::Exec(p)) => {
-            handle_exec(tcp, p, pelagos_bin).await?;
+            handle_exec(tcp, p, pelagos_bin, shim).await?;
         }
         // Attach is NOT exec-with-empty-command: it wires the client's streams to
         // the ALREADY-RUNNING container's stdio (stdin FIFO + tailing the raw
         // stdout/stderr logs), so it has its own handler (#403).
         ("attach", Pending::Exec(p)) => {
-            handle_attach(tcp, p).await?;
+            handle_attach(tcp, p, shim).await?;
         }
         ("portforward", Pending::PortForward(p)) => {
             handle_port_forward(tcp, p).await?;
@@ -196,6 +206,7 @@ async fn handle_exec(
     tcp: TcpStream,
     pending: PendingExec,
     pelagos_bin: String,
+    shim: Option<Arc<crate::shimrt::ShimRuntime>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use spdystream_rs::server::ServerConfig;
     use spdystream_rs::Stream;
@@ -207,7 +218,7 @@ async fn handle_exec(
     );
 
     // Shared state passed into the per-stream handler closure.
-    let state = Arc::new(ExecState::new(pending, pelagos_bin));
+    let state = Arc::new(ExecState::new(pending, pelagos_bin, shim));
 
     let config = ServerConfig::new({
         let state = Arc::clone(&state);
@@ -286,6 +297,7 @@ async fn handle_exec(
 async fn handle_attach(
     tcp: TcpStream,
     pending: PendingExec,
+    shim: Option<Arc<crate::shimrt::ShimRuntime>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use spdystream_rs::server::ServerConfig;
     use spdystream_rs::Stream;
@@ -301,7 +313,7 @@ async fn handle_attach(
         pending.tty
     );
 
-    let state = Arc::new(ExecState::new(pending, String::new()));
+    let state = Arc::new(ExecState::new(pending, String::new(), shim));
 
     let config = ServerConfig::new({
         let state = Arc::clone(&state);
@@ -384,6 +396,7 @@ async fn tail_file_to_spdy(
 struct ExecState {
     pending: PendingExec,
     pelagos_bin: String,
+    shim: Option<Arc<crate::shimrt::ShimRuntime>>,
     stdin_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
     stdout_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
     stderr_stream: Mutex<Option<Arc<spdystream_rs::Stream>>>,
@@ -393,10 +406,15 @@ struct ExecState {
 }
 
 impl ExecState {
-    fn new(pending: PendingExec, pelagos_bin: String) -> Self {
+    fn new(
+        pending: PendingExec,
+        pelagos_bin: String,
+        shim: Option<Arc<crate::shimrt::ShimRuntime>>,
+    ) -> Self {
         Self {
             pending,
             pelagos_bin,
+            shim,
             stdin_stream: Mutex::new(None),
             stdout_stream: Mutex::new(None),
             stderr_stream: Mutex::new(None),
@@ -459,6 +477,10 @@ impl ExecState {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
+
+        if let (Some(id), Some(shim)) = (&self.pending.shim_container, &self.shim) {
+            return self.run_shim_exec(shim, id).await;
+        }
 
         // Build: pelagos exec [-i] <name> -- <cmd...>
         // For tty=true we pass `-i`, which makes `pelagos exec` allocate a real PTY
@@ -565,43 +587,196 @@ impl ExecState {
             t.abort();
         }
 
-        // 1. Send error stream FIN FIRST with the exit code payload.
-        //    kubelet reads a JSON-encoded metav1.Status; for exit 0 we send
-        //    an empty FIN frame; for non-zero we send the structured message.
         let exit_code = status.code().unwrap_or(1);
-        if let Some(ref err_stream) = error_stream {
-            let payload = if exit_code != 0 {
-                let msg = format!(
-                    r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with exit code {exit_code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{exit_code}"}}]}}}}"#
-                );
-                Bytes::from(msg)
-            } else {
-                Bytes::new()
-            };
-            err_stream.write_data(payload, true).await.ok();
-        }
-
-        // Yield to the executor so the write task can flush the error stream
-        // frame to TCP before we send stdout/stderr FINs.  For zero-output
-        // commands (e.g. `exit 42`) the relay tasks complete instantly and
-        // the write queue is empty except for the error frame; yielding here
-        // guarantees the error DATA+FIN is in-flight before crictl receives
-        // the stdout/stderr FINs that signal "exec complete".
-        tokio::task::yield_now().await;
-
-        // 2. Send stdout / stderr FINs after the error stream FIN.
-        if let Some(ref spdy_out) = stdout_stream {
-            spdy_out.write_data(Bytes::new(), true).await.ok();
-        }
-        if let Some(ref spdy_err) = stderr_stream {
-            spdy_err.write_data(Bytes::new(), true).await.ok();
-        }
+        send_exit_and_fins(
+            exit_code,
+            error_stream.as_ref(),
+            stdout_stream.as_ref(),
+            stderr_stream.as_ref(),
+        )
+        .await;
 
         // Do not send GoAway — let crictl close the connection naturally
         // after reading all stream FINs.  Sending GoAway here races with
         // crictl's error-stream goroutine: if crictl processes GoAway before
         // it reads the error DATA frame, it may report exit code 0.
         Ok(())
+    }
+
+    /// Streaming exec in a shim-backed container (#601): the process runs in
+    /// the guest through the Task API; its FIFOs are bridged to the client's
+    /// SPDY streams. Resize frames reach the guest pty.
+    async fn run_shim_exec(
+        &self,
+        shim: &Arc<crate::shimrt::ShimRuntime>,
+        id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let stdin_stream = self.stdin_stream.lock().await.clone();
+        let stdout_stream = self.stdout_stream.lock().await.clone();
+        let stderr_stream = self.stderr_stream.lock().await.clone();
+        let error_stream = self.error_stream.lock().await.clone();
+        let resize_stream = self.resize_stream.lock().await.clone();
+
+        let req = crate::shim::exec::ExecRequest {
+            args: self.pending.cmd.clone(),
+            tty: self.pending.tty,
+            stdin: self.pending.stdin,
+            ..Default::default()
+        };
+        let es = match shim.start_exec(id, req).await {
+            Ok(es) => es,
+            Err(e) => {
+                log::warn!("streaming exec (shim) {id}: {e}");
+                send_exit_and_fins(
+                    126,
+                    error_stream.as_ref(),
+                    stdout_stream.as_ref(),
+                    stderr_stream.as_ref(),
+                )
+                .await;
+                return Err(Box::new(e));
+            }
+        };
+        let crate::shimrt::ExecStream {
+            session,
+            output,
+            client,
+        } = es;
+        let (cid, eid) = (session.id.clone(), session.exec_id.clone());
+
+        let out_task = tokio::spawn(relay_chunks(
+            output,
+            stdout_stream.clone(),
+            stderr_stream.clone(),
+        ));
+
+        let stdin_task = match (stdin_stream, session.stdin.clone()) {
+            (Some(spdy_in), Some(w)) => {
+                let (client, cid, eid) = (Arc::clone(&client), cid.clone(), eid.clone());
+                Some(tokio::spawn(async move {
+                    while let Ok(Some(data)) = spdy_in.read_data().await {
+                        if w.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Client EOF: the guest process sees end of input.
+                    w.close().await;
+                    let _ = client.close_io(&cid, &eid).await;
+                }))
+            }
+            _ => None,
+        };
+
+        let resize_task = resize_stream.map(|rs| {
+            let (client, cid, eid) = (Arc::clone(&client), cid.clone(), eid.clone());
+            tokio::spawn(async move {
+                while let Ok(Some(data)) = rs.read_data().await {
+                    for (w, h) in parse_resize_frames(&data) {
+                        if let Err(e) = client.resize_pty(&cid, &eid, w, h).await {
+                            log::debug!("exec resize {cid}/{eid}: {e}");
+                        }
+                    }
+                }
+            })
+        });
+
+        let exit_code = match session.wait(&client).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("streaming exec (shim) {id}: wait: {e}");
+                1
+            }
+        };
+        log::info!("streaming exec (shim) {id}: exited with {exit_code}");
+        // Deleting the exec drains the pump and closes the output channel, so
+        // the relay below ends after the last byte.
+        session.finish(&client).await;
+        let _ = out_task.await;
+        if let Some(t) = stdin_task {
+            t.abort();
+        }
+        if let Some(t) = resize_task {
+            t.abort();
+        }
+        send_exit_and_fins(
+            exit_code,
+            error_stream.as_ref(),
+            stdout_stream.as_ref(),
+            stderr_stream.as_ref(),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Attach to a running shim-backed container (#601): follow its live output
+    /// (the CRI log pump fans out to us) and write the client's stdin into its
+    /// stdin FIFO. Ends when the client detaches, closes stdin (one-shot
+    /// attach), or the container exits.
+    async fn run_shim_attach(
+        &self,
+        shim: &Arc<crate::shimrt::ShimRuntime>,
+        id: &str,
+        conn: Arc<spdystream_rs::connection::Connection>,
+    ) {
+        let stdin_stream = self.stdin_stream.lock().await.clone();
+        let stdout_stream = self.stdout_stream.lock().await.clone();
+        let stderr_stream = self.stderr_stream.lock().await.clone();
+        let error_stream = self.error_stream.lock().await.clone();
+
+        let at = match shim.attach(id).await {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("streaming attach (shim) {id}: {e}");
+                send_exit_and_fins(
+                    1,
+                    error_stream.as_ref(),
+                    stdout_stream.as_ref(),
+                    stderr_stream.as_ref(),
+                )
+                .await;
+                return;
+            }
+        };
+        let mut out_task = tokio::spawn(relay_chunks(
+            at.output,
+            stdout_stream.clone(),
+            stderr_stream.clone(),
+        ));
+
+        let stdin_closed = Arc::new(tokio::sync::Notify::new());
+        let stdin_task = match (self.pending.stdin, stdin_stream, at.stdin) {
+            (true, Some(spdy_in), Some(w)) => {
+                let stdin_closed = Arc::clone(&stdin_closed);
+                Some(tokio::spawn(async move {
+                    while let Ok(Some(data)) = spdy_in.read_data().await {
+                        if w.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    stdin_closed.notify_waiters();
+                }))
+            }
+            _ => None,
+        };
+
+        tokio::select! {
+            _ = conn.wait_closed() => {}
+            _ = &mut out_task => {}
+            _ = stdin_closed.notified(), if self.pending.stdin => {
+                // One-shot input delivered: give the container a moment to flush.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
+        out_task.abort();
+        if let Some(t) = stdin_task {
+            t.abort();
+        }
+        for s in [&error_stream, &stdout_stream, &stderr_stream]
+            .into_iter()
+            .flatten()
+        {
+            s.write_data(Bytes::new(), true).await.ok();
+        }
     }
 
     /// Relay an attach: client stdin → the container's stdin FIFO, and the
@@ -614,6 +789,10 @@ impl ExecState {
         container_dir: String,
     ) {
         use tokio::io::AsyncWriteExt;
+
+        if let (Some(id), Some(shim)) = (&self.pending.shim_container, &self.shim) {
+            return self.run_shim_attach(shim, id, conn).await;
+        }
 
         let stdin_stream = self.stdin_stream.lock().await.clone();
         let stdout_stream = self.stdout_stream.lock().await.clone();
@@ -725,6 +904,92 @@ impl ExecState {
         if let Some(ref s) = stderr_stream {
             s.write_data(Bytes::new(), true).await.ok();
         }
+    }
+}
+
+/// Forward pumped container output to the client's SPDY streams until the
+/// channel closes. With no separate stderr stream (a tty) stderr goes to stdout.
+async fn relay_chunks(
+    mut rx: tokio::sync::broadcast::Receiver<crate::shim::stdio::Chunk>,
+    stdout: Option<Arc<spdystream_rs::Stream>>,
+    stderr: Option<Arc<spdystream_rs::Stream>>,
+) {
+    use crate::shim::stdio::Stream as Out;
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match rx.recv().await {
+            Ok(chunk) => {
+                let target = match chunk.stream {
+                    Out::Stdout => stdout.as_ref(),
+                    Out::Stderr => stderr.as_ref().or(stdout.as_ref()),
+                };
+                if let Some(t) = target {
+                    if t.write_data(chunk.data, false).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(RecvError::Lagged(n)) => log::warn!("stream relay lagged; {n} chunks dropped"),
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Parse kubelet resize-stream frames: JSON `{"Width":80,"Height":24}`
+/// objects, possibly several per read.
+fn parse_resize_frames(data: &[u8]) -> Vec<(u32, u32)> {
+    #[derive(serde::Deserialize)]
+    struct Size {
+        #[serde(rename = "Width")]
+        width: u32,
+        #[serde(rename = "Height")]
+        height: u32,
+    }
+    serde_json::Deserializer::from_slice(data)
+        .into_iter::<Size>()
+        .filter_map(Result::ok)
+        .map(|s| (s.width, s.height))
+        .collect()
+}
+
+/// Report an exec's exit and close its streams, in the order crictl needs:
+/// the error stream (exit status) first, then stdout/stderr FINs, so crictl
+/// reads the exit code before it sees "complete" and closes the connection.
+async fn send_exit_and_fins(
+    exit_code: i32,
+    error_stream: Option<&Arc<spdystream_rs::Stream>>,
+    stdout_stream: Option<&Arc<spdystream_rs::Stream>>,
+    stderr_stream: Option<&Arc<spdystream_rs::Stream>>,
+) {
+    // 1. Send error stream FIN FIRST with the exit code payload.
+    //    kubelet reads a JSON-encoded metav1.Status; for exit 0 we send
+    //    an empty FIN frame; for non-zero we send the structured message.
+    if let Some(err_stream) = error_stream {
+        let payload = if exit_code != 0 {
+            let msg = format!(
+                r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with exit code {exit_code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{exit_code}"}}]}}}}"#
+            );
+            Bytes::from(msg)
+        } else {
+            Bytes::new()
+        };
+        err_stream.write_data(payload, true).await.ok();
+    }
+
+    // Yield to the executor so the write task can flush the error stream
+    // frame to TCP before we send stdout/stderr FINs.  For zero-output
+    // commands (e.g. `exit 42`) the relay tasks complete instantly and
+    // the write queue is empty except for the error frame; yielding here
+    // guarantees the error DATA+FIN is in-flight before crictl receives
+    // the stdout/stderr FINs that signal "exec complete".
+    tokio::task::yield_now().await;
+
+    // 2. Send stdout / stderr FINs after the error stream FIN.
+    if let Some(spdy_out) = stdout_stream {
+        spdy_out.write_data(Bytes::new(), true).await.ok();
+    }
+    if let Some(spdy_err) = stderr_stream {
+        spdy_err.write_data(Bytes::new(), true).await.ok();
     }
 }
 
@@ -893,5 +1158,24 @@ async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, tcp: TcpStream) {
     tokio::select! {
         _ = &mut pod_to_client => {}
         _ = client_to_pod => { pod_to_client.await; }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_frames_parse_single_multiple_and_junk() {
+        assert_eq!(
+            parse_resize_frames(br#"{"Width":120,"Height":40}"#),
+            [(120, 40)]
+        );
+        assert_eq!(
+            parse_resize_frames(br#"{"Width":1,"Height":2}{"Width":3,"Height":4}"#),
+            [(1, 2), (3, 4)]
+        );
+        assert!(parse_resize_frames(b"not json").is_empty());
+        assert!(parse_resize_frames(b"").is_empty());
     }
 }
