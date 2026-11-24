@@ -74,13 +74,31 @@ with handlers enabled; see the script header for variables.
 - Shim bundles: `/run/pelagos-cri/shim/k8s.io/<id>/`; per-container logs follow normal CRI
   paths. Leftover check after deleting all shim pods: no `pelagos-shim-*`
   scopes, no `qemu`/`runsc` processes.
+- **Removing a handler:** delete its pods first and let the kubelet garbage-collect
+  them (stopped sandboxes linger until GC). A CRI without the handler can no
+  longer manage those sandboxes, and their shim scope is left running; stop it
+  with `systemctl stop pelagos-shim-<id>.scope`.
 - Wasm via shim handlers is **not supported** (#614).
 
-## 6. Troubleshooting
+## 6. Sizing (Kata VM memory and CPU)
+
+The kubelet sends the sum of the pod's container limits plus RuntimeClass
+`overhead` in the sandbox config; `pelagos-cri` passes it to Kata as the
+sandbox cpu/memory annotations. Observed on a 256Mi/500m pod: a 256 MiB, 1 vCPU
+guest; 1Gi/2 CPU: 1011 MiB, 3 vCPUs; no limits at all: Kata's default
+(about 2 GiB, 1 vCPU, set by `default_memory`/`default_vcpus` in Kata's own
+`configuration.toml`). If any container lacks a limit the kubelet sends zero, and
+the default applies. To get predictable sizes, set limits on every container, or
+add `overhead` to the RuntimeClass. Limits are also enforced inside the guest,
+and Kata hot-plugs resources as containers start. Exact bin-packing accuracy is
+not a goal. gVisor has no VM; its pod cgroup limits apply on the host.
+
+## 7. Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | Sandbox fails "only shipped Kata configuration files are accepted" | Kata tree is not at `/opt/kata`. |
 | Sandbox fails with `/pause was not found` | Pause image missing and auto-pull disabled. |
 | gVisor shim exits at start | `runsc` not on `pelagos-cri`'s PATH. |
+| `image "busybox:latest" not found in the local store` | Fixed in #630 (short names are expanded). Older releases need a fully-qualified image. |
 | Pod stuck, CNI error | Node has no CNI config, or the CNI plugin needs `IgnoreUnknown` (#611). |

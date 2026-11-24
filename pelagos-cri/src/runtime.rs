@@ -35,6 +35,7 @@ use crate::cri::{
 use crate::netns_native;
 use crate::podnet;
 use crate::scope;
+use crate::shim::spec::SandboxResources;
 use crate::state::{
     self, AppState, ContainerState as MyContainerState, CriContainer, CriMount, CriSandbox,
     SandboxState,
@@ -1448,7 +1449,9 @@ impl RuntimeService for RuntimeSvc {
                     &sandbox,
                     &netns_path,
                     hostname,
-                    None,
+                    SandboxResources::from_cri(
+                        config.linux.as_ref().and_then(|l| l.resources.as_ref()),
+                    ),
                 )
                 .await
             {
