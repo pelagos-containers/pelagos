@@ -6415,7 +6415,7 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::spec`; 
 - `shim::spec::tests::generated_spec_is_readable_by_pelagos_oci_parser` — pelagos's own `OciConfig` parser (used by `pelagos create`) accepts the generated spec.
 - `shim::roundtrip::bootstrap_connect_and_lifecycle` now writes a *generated* sandbox spec into the bundle instead of `{}`, so the loopback shim bootstrap runs against a real config.json.
 
-**Known gaps (tracked on #591/#574):** `linux.sysctl` is not emitted (`CriSandbox` does not record pod sysctls yet); an explicit RuntimeDefault seccomp profile is not generated (the shim/guest default applies).
+**Known gaps (tracked on #591/#574):** an explicit RuntimeDefault seccomp profile is not generated (the shim/guest default applies).
 
 ## `pelagos-cri` rootfs Mount descriptors (issue #593)
 Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::rootfs`. Most tests are hermetic (fake store in a tempdir). Four are **root-gated** and print `skipping ...` and pass trivially when not root: `whiteout_hides_lower_layers`, `opaque_directory_hides_lower_layers`, `descriptor_mounts_a_real_image_as_a_shim_would`, `real_image_user_resolution` (the last two also need a pulled image in `/var/lib/pelagos`). Run them as root on a node with an image (ipc7) and check the output has no `skipping` lines (`--nocapture`).
@@ -6435,3 +6435,17 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::rootfs`
 - `shim::rootfs::tests::opaque_directory_hides_lower_layers` (root) — a `trusted.overlay.opaque` directory hides lower layers below it but still serves its own files.
 - `shim::rootfs::tests::descriptor_mounts_a_real_image_as_a_shim_would` (root, needs a pulled image) — mounts the overlay from the `Mount` fields exactly as a shim would, reads image content through it, confirms writes land in the planned upper dir, checks cleanup refuses while mounted, then unmounts and cleans up. This is the proof the descriptor is a mount the kernel accepts.
 - `shim::rootfs::tests::real_image_user_resolution` (root, needs a pulled image) — user resolution through a real image's layers.
+
+## `pelagos-cri` pod network ordering for shim sandboxes (issue #595)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- podnet`. The netns tests are **root-gated** (they print `skipping ...` and pass trivially when not root): run on ipc7 with `--nocapture` and check there are no `skipping` lines. They use a fake CNI plugin via `PELAGOS_CNI_BIN_DIRS`, never the node's real CNI, and unique `pcri-t595...` netns names.
+
+The CNI sequence was extracted from `run_pod_sandbox` / `stop_pod_sandbox` into `podnet.rs` (behaviour-preserving) so native and shim pods share it.
+
+- `podnet::tests::shim_policy_rejects_host_network_and_missing_cni` — `hostNetwork` pods are `INVALID_ARGUMENT` and a missing CNI config is `FAILED_PRECONDITION` for shim handlers (a VM cannot join the host netns, and the native pelagos bridge sandbox is useless to it); an ordinary pod passes.
+- `podnet::tests::cni_bin_dirs_env_override_is_searched_first` — `PELAGOS_CNI_BIN_DIRS` entries come first, defaults retained.
+- `podnet::tests::setup_runs_add_into_an_existing_netns_and_brings_lo_up` (root) — the plugin logs `ADD netns_exists=yes`, the reported IP is returned, and `lo` is UP (read via `SIOCGIFFLAGS` inside the netns) by the time setup returns. Failure means a VM could be started against an unconfigured netns.
+- `podnet::tests::add_failure_cleans_up_the_netns` (root) — a failing ADD is `INTERNAL` mentioning CNI ADD and leaves no `/run/netns/pcri-*` behind for the kubelet's retry.
+- `podnet::tests::shim_teardown_stops_the_shim_before_cni_del` (root) — the stop future runs while the netns still exists; the plugin's DEL then logs `stopped=yes netns_exists=yes`; the netns is removed only afterwards. Failure means CNI DEL / netns removal could run under a live VM.
+- `podnet::tests::rejected_shim_sandbox_has_no_side_effects` — policy rejections make no CNI call and create no netns.
+- `state::tests::sandbox_json_without_sysctls_loads_empty_and_roundtrips` — on-disk sandbox state written before `sysctls` existed still loads; sysctls survive a round trip.
+- `shim::spec::tests::pod_sysctls_are_emitted_in_the_sandbox_spec_only` — pod sysctls become `linux.sysctl` on the sandbox spec (host-side net sysctls do not reach a guest netns) and never on container specs. Closes the #591 gap.
