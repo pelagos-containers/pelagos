@@ -49,6 +49,15 @@ fn get_test_rootfs() -> Option<PathBuf> {
 /// PATH on any Command that will run inside the container.
 const ALPINE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Raw TCP probe of Cloudflare's 1.1.1.1:80, run inside a container: send an
+/// HTTP HEAD, print whatever comes back. Deliberately *not* `wget http://1.1.1.1/`:
+/// that URL answers `301 -> https://1.1.1.1/`, busybox wget follows it into TLS,
+/// and certificate verification then fails inside the minimal rootfs — an
+/// intermittent CI failure that has nothing to do with NAT or pasta. All these
+/// tests need to show is that TCP connects out and a reply comes back. (stdin
+/// stays open for 2s: busybox nc exits at stdin EOF, before the reply arrives.)
+const TCP_PROBE_1111: &str = "(printf 'HEAD / HTTP/1.0\\r\\n\\r\\n'; sleep 2) | nc -w 5 1.1.1.1 80";
+
 // ---------------------------------------------------------------------------
 // Cgroup inspection helpers (used by enforcement tests)
 // ---------------------------------------------------------------------------
@@ -5269,7 +5278,7 @@ mod networking {
         }
 
         let mut child = Command::new("/bin/sh")
-            .args(["-c", "wget -q -T 5 --spider http://1.1.1.1/"])
+            .args(["-c", TCP_PROBE_1111])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
             .with_nat()
@@ -5288,8 +5297,9 @@ mod networking {
         let err = String::from_utf8_lossy(&stderr);
 
         assert!(
-            status.success(),
-            "wget through NAT should succeed (TCP to 1.1.1.1).\nstdout: {}\nstderr: {}",
+            status.success() && out.starts_with("HTTP/1."),
+            "TCP probe through NAT should get an HTTP reply from 1.1.1.1:80.\nstatus: {:?}\nstdout: {}\nstderr: {}",
+            status,
             out,
             err
         );
@@ -8395,8 +8405,8 @@ mod rootless {
     /// Verify actual end-to-end internet connectivity through pasta.
     ///
     /// Non-root only. Spawns with `NetworkMode::Pasta`, sleeps briefly to let pasta
-    /// attach and configure the interface, then fetches `http://1.1.1.1/` (Cloudflare)
-    /// using `wget`. Asserts the command succeeds (exit 0).
+    /// attach and configure the interface, then probes `1.1.1.1:80` (Cloudflare)
+    /// with a raw TCP HEAD probe. Asserts an HTTP reply comes back.
     ///
     /// Failure means packets are not flowing through pasta's relay despite the TAP
     /// interface and IP being present (verified by `test_pasta_interface_exists`).
@@ -8421,11 +8431,11 @@ mod rootless {
 
         // The SIGSTOP/SIGCONT mechanism in spawn() ensures pasta has configured the
         // network before the container runs — no sleep needed.
-        // wget --spider: HEAD request — no body to save.
+        // Raw TCP HEAD probe (not wget: see TCP_PROBE_1111).
         let mut child = Command::new("/bin/ash")
             .args([
                 "-c",
-                "wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED",
+                &format!("{TCP_PROBE_1111} | grep -q '^HTTP/1\\.' && echo CONNECTED"),
             ])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -8444,7 +8454,7 @@ mod rootless {
             "pasta connectivity test failed (is outbound internet available?)\nstdout: {}\nstderr: {}", out, err);
         assert!(
             out.contains("CONNECTED"),
-            "wget succeeded but CONNECTED marker missing:\n{}",
+            "TCP probe ran but CONNECTED marker missing:\n{}",
             out
         );
     }

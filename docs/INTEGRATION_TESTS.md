@@ -944,8 +944,13 @@ only manifest when the container process dies unexpectedly — e.g. if `wait()` 
 ### `test_nat_end_to_end_tcp` — N3
 **Requires:** root, rootfs, outbound internet
 
-Spawns a bridge+NAT+DNS container that runs `wget --spider http://1.1.1.1/` and
-asserts exit 0. Skips gracefully if the host has no outbound internet (checked via
+Spawns a bridge+NAT+DNS container that sends a raw `HEAD /` to `1.1.1.1:80` with
+busybox `nc` and asserts exit 0 **and** an `HTTP/1.` reply on stdout. (It used to run
+`wget --spider http://1.1.1.1/`; that URL answers `301 -> https://1.1.1.1/`, wget
+followed it into TLS and certificate verification failed inside the minimal rootfs —
+the most frequent random CI failure. The probe is deliberately TLS- and
+redirect-free: all it must show is that TCP flows out through MASQUERADE and a reply
+comes back.) Skips gracefully if the host has no outbound internet (checked via
 host-side `ping -c1 -W2 1.1.1.1`).
 
 This is the true end-to-end NAT test — TCP packets flow from the container through
@@ -1612,9 +1617,9 @@ over half the time.
 ### `test_pasta_connectivity`
 **Requires:** non-root user, rootfs, pasta installed, outbound internet access
 
-Spawns a container with `NetworkMode::Pasta` and runs `wget -q -T 5 --spider http://1.1.1.1/`
-(HEAD request — no body to write, avoiding `/dev/null` which doesn't exist as a device node
-in the chroot). Asserts the command exits 0 and prints `CONNECTED`. No `sleep` is needed
+Spawns a container with `NetworkMode::Pasta` and sends a raw HTTP `HEAD /` to `1.1.1.1:80` with busybox `nc`
+(same TLS-free probe as `test_nat_end_to_end_tcp`; `wget` followed Cloudflare's
+http->https redirect into a certificate failure). Asserts an `HTTP/1.` reply and prints `CONNECTED`. No `sleep` is needed
 because `spawn()` synchronizes pasta setup with the container via a pre-fork pipe handshake
 before the container ever execs, ensuring pasta has configured the TAP first. Failure
 indicates pasta's packet relay is broken or outbound internet is unavailable in the test
