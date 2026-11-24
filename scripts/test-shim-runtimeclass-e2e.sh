@@ -23,6 +23,8 @@ KUBECTL="${KUBECTL:-kubectl}"
 NS="${NS:-shim-e2e}"
 RUNTIMES="${RUNTIMES:-kata gvisor}"
 IMAGE="${IMAGE:-docker.io/library/alpine:3.20}"
+# Deliberately unqualified: the kubelet passes the pod's image string as written (#630).
+SHORT_IMAGE="${SHORT_IMAGE:-busybox}"
 TIMEOUT="${TIMEOUT:-240}"
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -59,7 +61,7 @@ spec:
     resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
     volumeMounts: [{name: cm, mountPath: /cfg}, {name: scratch, mountPath: /scratch}]
   - name: sidecar
-    image: $IMAGE
+    image: $SHORT_IMAGE
     command: ["sh","-c","echo sidecar-up; echo shared > /scratch/from-sidecar; sleep 3600"]
     volumeMounts: [{name: scratch, mountPath: /scratch}]
   volumes: [{name: cm, configMap: {name: probe}}, {name: scratch, emptyDir: {}}]
@@ -72,6 +74,11 @@ YAML
   guest="$(k -n "$NS" exec "$rt-pod" -c main -- uname -r 2>/dev/null | tr -d '\r')"
   if [ -n "$guest" ] && [ "$guest" != "$host_kernel" ]; then pass "$rt: runs on its own kernel ($guest, host $host_kernel)"
   else fail "$rt: guest kernel '$guest' is not distinct from host '$host_kernel'"; fi
+  if [ "$rt" = kata ]; then   # #626: pod limits (256Mi) size the VM, not the ~2 GiB default
+    mem_mib="$(k -n "$NS" exec "$rt-pod" -c main -- cat /proc/meminfo 2>/dev/null | awk '/MemTotal/{print int($2/1024)}')"
+    if [ -n "$mem_mib" ] && [ "$mem_mib" -ge 128 ] && [ "$mem_mib" -le 512 ]; then pass "kata: VM sized from pod limits (guest ${mem_mib} MiB for a 256Mi limit)"
+    else fail "kata: guest memory '${mem_mib}' MiB not sized from the 256Mi pod limit"; fi
+  fi
   [ "$(k -n "$NS" exec "$rt-pod" -c main -- cat /cfg/greeting 2>/dev/null)" = "hello-from-configmap" ] \
     && pass "$rt: ConfigMap volume mounted" || fail "$rt: ConfigMap volume missing"
   k -n "$NS" exec "$rt-pod" -c main -- test -s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null \

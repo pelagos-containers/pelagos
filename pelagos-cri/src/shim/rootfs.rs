@@ -117,6 +117,23 @@ fn dirname(reference: &str) -> String {
     reference.replace([':', '/', '@'], "_")
 }
 
+/// Expand a short reference the way `pelagos image pull` stores it
+/// (`busybox` -> `docker.io/library/busybox:latest`; `PELAGOS_DEFAULT_REGISTRY`
+/// overrides the default registry). Mirrors `pelagos::image::normalise_reference`.
+fn normalise(reference: &str) -> String {
+    let r = if !reference.contains(':') && !reference.contains('@') {
+        format!("{reference}:latest")
+    } else {
+        reference.to_string()
+    };
+    if r.contains('/') {
+        return r;
+    }
+    let reg = std::env::var("PELAGOS_DEFAULT_REGISTRY")
+        .unwrap_or_else(|_| "docker.io/library".to_string());
+    format!("{reg}/{r}")
+}
+
 /// The CRI image id of a stored image: the sha256 of its `oci-config.json`
 /// (what `ImageStatus`/`PullImage` report), if that file exists.
 fn config_digest(image_dir: &Path) -> Option<String> {
@@ -132,11 +149,16 @@ pub fn find_manifest(
     store: &StoreLayout,
     image_ref: &str,
 ) -> Result<serde_json::Value, RootfsError> {
-    // Fast path: the directory pelagos itself would use.
-    let direct = store.images.join(dirname(image_ref)).join("manifest.json");
-    if let Ok(data) = fs::read_to_string(&direct) {
-        if let Ok(v) = serde_json::from_str(&data) {
-            return Ok(v);
+    // Fast path: the directory pelagos itself would use, for the reference as
+    // given and for its normalised form (the kubelet passes the pod's image
+    // string, which may be short, e.g. `busybox`).
+    let normalised = normalise(image_ref);
+    for r in [image_ref, normalised.as_str()] {
+        let direct = store.images.join(dirname(r)).join("manifest.json");
+        if let Ok(data) = fs::read_to_string(&direct) {
+            if let Ok(v) = serde_json::from_str(&data) {
+                return Ok(v);
+            }
         }
     }
     let rd = match fs::read_dir(&store.images) {

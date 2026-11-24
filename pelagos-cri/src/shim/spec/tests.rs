@@ -162,6 +162,27 @@ fn sandbox_resources_become_annotations() {
     assert_eq!(ann(&s)[ANN_SANDBOX_MEMORY], "1073741824");
 }
 
+#[test]
+fn sandbox_resources_from_cri_sum() {
+    use crate::cri::LinuxContainerResources as R;
+    assert!(SandboxResources::from_cri(None).is_none());
+    // The kubelet sends zeros when some container has no limit.
+    assert!(SandboxResources::from_cri(Some(&R::default())).is_none());
+    let r = R {
+        cpu_quota: 50_000,
+        cpu_period: 100_000,
+        cpu_shares: 512,
+        memory_limit_in_bytes: 256 << 20,
+        ..Default::default()
+    };
+    let s = SandboxResources::from_cri(Some(&r)).unwrap();
+    assert_eq!(
+        (s.cpu_quota, s.cpu_period, s.cpu_shares),
+        (50_000, 100_000, 512)
+    );
+    assert_eq!(s.memory_limit, 256 << 20);
+}
+
 // ── process ─────────────────────────────────────────────────────────────────
 
 #[test]

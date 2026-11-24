@@ -301,6 +301,23 @@ pub struct SandboxResources {
     pub memory_limit: i64,
 }
 
+impl SandboxResources {
+    /// Pod-level sizing from the CRI `LinuxPodSandboxConfig.resources` (the
+    /// kubelet's sum of container limits plus RuntimeClass overhead). `None`
+    /// when the kubelet gave nothing usable (e.g. a container without a
+    /// limit), in which case the shim's own defaults size the VM.
+    pub fn from_cri(res: Option<&crate::cri::LinuxContainerResources>) -> Option<Self> {
+        let r = res?;
+        let out = Self {
+            cpu_quota: r.cpu_quota.max(0),
+            cpu_period: r.cpu_period.max(0) as u64,
+            cpu_shares: r.cpu_shares.max(0) as u64,
+            memory_limit: r.memory_limit_in_bytes.max(0),
+        };
+        (out.cpu_quota != 0 || out.cpu_shares != 0 || out.memory_limit != 0).then_some(out)
+    }
+}
+
 pub struct ContainerSpecInput<'a> {
     pub container: &'a CriContainer,
     pub sandbox: &'a CriSandbox,

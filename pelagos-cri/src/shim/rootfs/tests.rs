@@ -57,6 +57,21 @@ fn find_manifest_by_reference_digest_and_missing() {
 }
 
 #[test]
+fn find_manifest_expands_short_references() {
+    // #630: the kubelet passes the pod's image string, e.g. `app:1`.
+    let t = tempfile::tempdir().unwrap();
+    let (store, _) = fake_store(t.path(), 1);
+    let m = find_manifest(&store, "app:1").unwrap();
+    assert_eq!(m["reference"], "docker.io/library/app:1");
+    assert_eq!(normalise("busybox"), "docker.io/library/busybox:latest");
+    assert_eq!(normalise("reg.io/x/y:2"), "reg.io/x/y:2");
+    assert!(matches!(
+        find_manifest(&store, "app"), // -> app:latest, not stored
+        Err(RootfsError::ImageNotFound(_))
+    ));
+}
+
+#[test]
 fn layers_are_top_first_deduplicated_and_verified() {
     let t = tempfile::tempdir().unwrap();
     let (store, m) = fake_store(t.path(), 3);
