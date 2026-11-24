@@ -191,7 +191,7 @@ pelagos-cri --shim-handler kata=/opt/kata/bin/containerd-shim-kata-v2 \
             --shim-handler gvisor=/usr/local/bin/containerd-shim-runsc-v1
 ```
 
-**Enabling it on a node.** The shipped `pelagos-cri` systemd units read
+**Enabling it on a node** (full how-to: `docs/SHIM_HANDLERS_GUIDE.md`). The shipped `pelagos-cri` systemd units read
 `/etc/pelagos/cri.env` (optional) and append `$PELAGOS_CRI_ARGS` to the command
 line. The package installs a helper that edits that file idempotently:
 
