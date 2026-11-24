@@ -2940,7 +2940,12 @@ impl RuntimeService for RuntimeSvc {
     }
 
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
-        let req = request.into_inner();
+        if self.shim_for_container(&req.container_id).await.is_some() {
+            return Err(Status::unimplemented(
+                "streaming exec for shim-backed runtime handlers is not implemented yet (#601)",
+            ));
+        }
+
         let container_id = &req.container_id;
 
         let (pelagos_name, _sandbox_id) = {
@@ -2976,7 +2981,12 @@ impl RuntimeService for RuntimeSvc {
         &self,
         request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
-        let req = request.into_inner();
+        if self.shim_for_container(&req.container_id).await.is_some() {
+            return Err(Status::unimplemented(
+                "streaming attach for shim-backed runtime handlers is not implemented yet (#601)",
+            ));
+        }
+
         let container_id = &req.container_id;
 
         let pelagos_name = {
@@ -4833,6 +4843,26 @@ mod tests {
         assert_eq!(st.exit_code, 137);
         let log = std::fs::read_to_string(log_dir.join("app/0.log")).unwrap();
         assert!(log.contains(" stdout F hello from guest"), "{log}");
+
+        // Streaming exec/attach are explicitly unimplemented for shim pods (#601),
+        // not routed to the native path where they would fail confusingly.
+        let e = svc
+            .exec(Request::new(ExecRequest {
+                container_id: "rc1".into(),
+                cmd: vec!["sh".into()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::Unimplemented);
+        let e = svc
+            .attach(Request::new(AttachRequest {
+                container_id: "rc1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::Unimplemented);
 
         // CRI container events carry the pod and container statuses (#599).
         let mut ev = container_stopped_event(&exit_of("rc1", None, 137)).unwrap();
