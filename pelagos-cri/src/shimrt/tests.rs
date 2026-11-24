@@ -242,6 +242,10 @@ fn fake_image(store: &StoreLayout) {
 }
 
 pub(crate) async fn fixture() -> Fixture {
+    fixture_with(None).await
+}
+
+pub(crate) async fn fixture_with(sandbox_image: Option<&str>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.sock");
     let b = tmp.path().join("b.sock");
@@ -267,6 +271,7 @@ pub(crate) async fn fixture() -> Fixture {
         handlers: [("fake".to_string(), script.to_string_lossy().into_owned())].into(),
         root,
         store,
+        sandbox_image: sandbox_image.map(str::to_string),
     };
     let rt = Arc::new(ShimRuntime::start(cfg.clone()).await.unwrap());
     Fixture {
@@ -890,5 +895,54 @@ async fn reopen_log_makes_the_pump_follow_a_rotated_file() {
     assert!(!std::fs::read_to_string(&rotated)
         .unwrap()
         .contains("post rotation"));
+    f.finish().await;
+}
+
+/// #609: with a sandbox image configured, the pause task gets the image's
+/// overlay as its rootfs (Kata's agent needs `/pause` on it); without one it
+/// gets none, and a missing image fails the sandbox before any shim starts.
+#[tokio::test]
+async fn sandbox_task_gets_pause_image_rootfs() {
+    let f = fixture_with(Some("docker.io/library/app:1")).await;
+    let sb = sandbox("pausesb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let req = f
+        .main
+        .creates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.id == "pausesb")
+        .cloned()
+        .unwrap();
+    assert_eq!(req.rootfs.len(), 1);
+    assert_eq!(req.rootfs[0].type_, "overlay");
+    f.rt.stop_sandbox("pausesb").await;
+    f.rt.remove_sandbox("pausesb");
+    f.finish().await;
+
+    let f = fixture_with(Some("docker.io/library/nope:1")).await;
+    let err =
+        f.rt.start_sandbox("fake", &sandbox("nopesb"), "/run/netns/x", None, None)
+            .await
+            .unwrap_err();
+    assert!(matches!(err, ShimError::Rootfs(_)), "{err}");
+    assert!(f.main.creates.lock().unwrap().is_empty());
+    f.finish().await;
+
+    let f = fixture().await;
+    f.rt.start_sandbox("fake", &sandbox("plainsb"), "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let no_rootfs = f
+        .main
+        .creates
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.rootfs.is_empty());
+    assert!(no_rootfs);
     f.finish().await;
 }

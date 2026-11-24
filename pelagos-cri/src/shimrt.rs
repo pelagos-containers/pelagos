@@ -68,7 +68,16 @@ pub struct ShimConfig {
     /// Bundles, events socket and FIFOs live under here.
     pub root: PathBuf,
     pub store: StoreLayout,
+    /// Image whose rootfs the pod sandbox ("pause") task runs from, resolved
+    /// in the local image store (so it must already be pulled). VM runtimes
+    /// need it: the guest agent execs `/pause` from the task's rootfs and
+    /// fails with "the file /pause was not found" otherwise (#609). `None`
+    /// sends no rootfs (shims whose sandbox needs none, and unit mocks).
+    pub sandbox_image: Option<String>,
 }
+
+/// Default pause image for shim-backed pods (`--shim-sandbox-image`).
+pub const DEFAULT_SANDBOX_IMAGE: &str = "registry.k8s.io/pause:3.10";
 
 impl ShimConfig {
     pub fn system(handlers: HashMap<String, String>) -> Self {
@@ -76,6 +85,7 @@ impl ShimConfig {
             handlers,
             root: "/run/pelagos-cri/shim".into(),
             store: StoreLayout::system(),
+            sandbox_image: Some(DEFAULT_SANDBOX_IMAGE.into()),
         }
     }
 }
@@ -84,6 +94,20 @@ struct SandboxShim {
     client: Arc<ShimClient>,
     binary: String,
     bundle: Bundle,
+    /// Host-side overlay scratch for the pause rootfs; cleaned after Delete.
+    plan: Option<RootfsPlan>,
+}
+
+impl ShimRuntime {
+    /// Layers of the configured sandbox image, top-first.
+    fn sandbox_layers(&self) -> Result<Option<Vec<PathBuf>>, ShimError> {
+        let Some(image) = self.cfg.sandbox_image.as_deref() else {
+            return Ok(None);
+        };
+        let store = &self.cfg.store;
+        let manifest = rootfs::find_manifest(store, image)?;
+        Ok(Some(rootfs::layers_top_first(store, image, &manifest)?))
+    }
 }
 
 struct TaskCtx {
@@ -227,19 +251,43 @@ impl ShimRuntime {
             pause_args: &[],
         })
         .map_err(|e| ShimError::Spec(e.to_string()))?;
-        let bundle = Bundle::create(&self.cfg.root.join("bundles"), NAMESPACE, &sb.id)?;
-        bundle.write_config(
-            &spec::to_config_json(&sbspec).map_err(|e| ShimError::Spec(e.to_string()))?,
-        )?;
-        let params = self.start_params(&binary, &sb.id, &bundle);
-        let addr = bootstrap::start(&params, BOOTSTRAP_TIMEOUT).await?;
-        bundle.persist_shim(&binary, &addr)?;
-        let client = Arc::new(ShimClient::connect(&addr.address).await?);
+        let plan = match self.sandbox_layers()? {
+            Some(layers) => Some(rootfs::plan_rootfs(&self.cfg.store, &sb.id, layers)?),
+            None => None,
+        };
+        let cleanup_plan = |plan: &Option<RootfsPlan>| {
+            if let Some(p) = plan {
+                let _ = p.cleanup();
+            }
+        };
+        let bundle = Bundle::create(&self.cfg.root.join("bundles"), NAMESPACE, &sb.id)
+            .inspect_err(|_| cleanup_plan(&plan))?;
+        let prepared = async {
+            bundle.write_config(
+                &spec::to_config_json(&sbspec).map_err(|e| ShimError::Spec(e.to_string()))?,
+            )?;
+            let params = self.start_params(&binary, &sb.id, &bundle);
+            let addr = bootstrap::start(&params, BOOTSTRAP_TIMEOUT).await?;
+            bundle.persist_shim(&binary, &addr)?;
+            Ok::<_, ShimError>(Arc::new(ShimClient::connect(&addr.address).await?))
+        }
+        .await;
+        let client = match prepared {
+            Ok(c) => c,
+            Err(e) => {
+                cleanup_plan(&plan);
+                let _ = bundle.remove();
+                return Err(e);
+            }
+        };
 
         let run = async {
             let mut req = api::CreateTaskRequest::new();
             req.id = sb.id.clone();
             req.bundle = bundle.dir().to_string_lossy().into_owned();
+            if let Some(p) = &plan {
+                req.rootfs = vec![p.to_api_mount()];
+            }
             client.create(req).await?;
             client.start(&sb.id).await?;
             Ok::<_, ShimError>(())
@@ -248,6 +296,8 @@ impl ShimRuntime {
         if let Err(e) = run {
             // Do not leave a half-started VM behind.
             let _ = client.shutdown(&sb.id).await;
+            let _ = client.delete(&sb.id).await;
+            cleanup_plan(&plan);
             let _ = bundle.remove();
             return Err(e);
         }
@@ -257,6 +307,7 @@ impl ShimRuntime {
                 client,
                 binary,
                 bundle,
+                plan,
             }),
         );
         Ok(())
@@ -285,6 +336,11 @@ impl ShimRuntime {
 
     pub fn remove_sandbox(&self, id: &str) {
         if let Some(sb) = lock(&self.sandboxes).remove(id) {
+            if let Some(p) = &sb.plan {
+                if let Err(e) = p.cleanup() {
+                    log::warn!("remove_sandbox {id}: rootfs cleanup: {e}");
+                }
+            }
             let _ = sb.bundle.remove();
         }
         self.exits.forget(id);
@@ -347,12 +403,18 @@ impl ShimRuntime {
         let rec = bundle.load_shim()?;
         let client = Arc::new(ShimClient::connect(&rec.address).await?);
         client.connect_task(&sb.id).await?;
+        let plan = self
+            .sandbox_layers()
+            .ok()
+            .flatten()
+            .map(|layers| rootfs::reattach_rootfs(&self.cfg.store, &sb.id, layers));
         lock(&self.sandboxes).insert(
             sb.id.clone(),
             Arc::new(SandboxShim {
                 client,
                 binary: rec.binary,
                 bundle,
+                plan,
             }),
         );
         Ok(())
