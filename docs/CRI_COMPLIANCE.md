@@ -238,6 +238,14 @@ Status of validation (2026-11-24, real shims on an x86_64 node):
   - Supporting it would take a sandbox-less handler mode, delivery of the
     module to the shim, and a shim that honours rootfs and stdio. Tracked in
     the wasm follow-up issue; native Wasm pods are unaffected by all of this.
+- **Through the real kubelet:** `scripts/test-shim-runtimeclass-e2e.sh` runs
+  two-container Kata and gVisor pods (ConfigMap, service-account and emptyDir
+  volumes, resource limits, Cilium CNI) under k3s on a node: 16/16, plus a CRI
+  restart with the pods running (VM uptime continued, shims re-adopted) and
+  clean deletion. This found four bugs `crictl` could not (kubelet image *ids*,
+  zero hugepage limits on cgroup v2, leaked per-container shims, a gVisor shim
+  surviving pod removal). Known gap: pod resource limits do not size the Kata
+  VM (#626).
 - **CRI conformance:** the critest `Streaming` bucket passes 5/5 against a
   build including the shim streaming changes (native handler).
 

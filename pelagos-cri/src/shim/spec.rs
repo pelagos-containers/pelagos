@@ -761,9 +761,15 @@ pub fn build_container_spec(inp: &ContainerSpecInput<'_>) -> Result<Spec, SpecEr
         }
         res = res.cpu(cpu.build()?);
     }
-    if !c.hugepage_limits.is_empty() {
+    // The kubelet sends `<size>=0` for every hugepage size a pod does not
+    // request. In a VM or sandbox kernel that restricts nothing useful, and
+    // gVisor's runsc fails the whole container writing it on a cgroup v2 host
+    // (`hugetlb.2MB.limit_in_bytes: no such file`, the v1 filename; #623).
+    // Pass only real (non-zero) limits.
+    let hugepage_limits: Vec<_> = c.hugepage_limits.iter().filter(|(_, l)| *l != 0).collect();
+    if !hugepage_limits.is_empty() {
         let mut v = Vec::new();
-        for (size, limit) in &c.hugepage_limits {
+        for (size, limit) in hugepage_limits {
             v.push(
                 LinuxHugepageLimitBuilder::default()
                     .page_size(size.clone())

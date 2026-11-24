@@ -1619,7 +1619,7 @@ impl RuntimeService for RuntimeSvc {
             for cid in shim.container_ids_of(&sandbox_id) {
                 shim.remove_container(&cid).await;
             }
-            shim.remove_sandbox(&sandbox_id);
+            shim.remove_sandbox(&sandbox_id).await;
         }
 
         let mut st = self.state.inner.lock().await;

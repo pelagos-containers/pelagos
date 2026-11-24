@@ -417,7 +417,25 @@ async fn sandbox_and_container_full_lifecycle() {
     for want in ["kill:sb1:9", "delete:sb1", "shutdown:sb1"] {
         assert!(calls.contains(&want.to_string()), "{want} in {calls:?}");
     }
-    f.rt.remove_sandbox("sb1");
+    let before = f
+        .main
+        .calls()
+        .iter()
+        .filter(|c| *c == "shutdown:sb1")
+        .count();
+    f.rt.remove_sandbox("sb1").await;
+    // #625: a second Shutdown at removal, once the container tasks are gone.
+    let after = f
+        .main
+        .calls()
+        .iter()
+        .filter(|c| *c == "shutdown:sb1")
+        .count();
+    assert_eq!(
+        after,
+        before + 1,
+        "Shutdown re-sent when the sandbox is removed"
+    );
     assert!(!f.tmp.path().join("rt/bundles/k8s.io/sb1").exists());
     f.finish().await;
 }
@@ -472,7 +490,14 @@ async fn container_falls_back_to_shim_start_when_sandbox_shim_rejects_create() {
     assert!(f.alt.calls().contains(&"kill:rej1:15".to_string()));
     assert!(!f.main.calls().contains(&"kill:rej1:15".to_string()));
     // The fallback also left the container's shim address on disk.
+    assert!(
+        !f.alt.calls().contains(&"shutdown:rej1".to_string()),
+        "a running task's dedicated shim stays up"
+    );
     f.rt.remove_container("rej1").await;
+    // #624: removing the container stops the shim it owns (not the pod's).
+    assert!(f.alt.calls().contains(&"shutdown:rej1".to_string()));
+    assert!(!f.main.calls().contains(&"shutdown:rej1".to_string()));
     f.finish().await;
 }
 
@@ -492,6 +517,12 @@ async fn failed_container_start_leaves_nothing_behind() {
         f.rt.start_container(&sb, &c, log.to_str().unwrap(), "/run/netns/x")
             .await;
     assert!(matches!(e, Err(ShimError::Rpc(_))), "{e:?}");
+    // #624: the dedicated shim the fallback launched is stopped again.
+    assert!(
+        f.alt.calls().contains(&"shutdown:rej2".to_string()),
+        "leaked per-container shim: {:?}",
+        f.alt.calls()
+    );
     assert!(!f.rt.is_running("rej2"));
     assert!(f.rt.container_ids_of("sb4").is_empty());
     assert!(
@@ -920,7 +951,7 @@ async fn sandbox_task_gets_pause_image_rootfs() {
     assert_eq!(req.rootfs.len(), 1);
     assert_eq!(req.rootfs[0].type_, "overlay");
     f.rt.stop_sandbox("pausesb").await;
-    f.rt.remove_sandbox("pausesb");
+    f.rt.remove_sandbox("pausesb").await;
     f.finish().await;
 
     let f = fixture_with(Some("docker.io/library/nope:1")).await;
@@ -1004,5 +1035,37 @@ async fn missing_sandbox_image_is_pulled_once() {
         err.contains("registry.example/none:1") && err.contains("nope"),
         "{err}"
     );
+    f.finish().await;
+}
+
+/// #622: the kubelet creates containers by image *id* (the sha256 of the image
+/// config), not by the tag it pulled. The shim path must resolve it, for start
+/// and for re-adoption (both go through `find_manifest`).
+#[tokio::test]
+async fn container_started_by_config_digest_image_id() {
+    use sha2::Digest as _;
+    let f = fixture().await;
+    let cfg = br#"{"architecture":"amd64","os":"linux"}"#;
+    let dir = f.cfg.store.images.join("docker.io_library_app_1");
+    std::fs::write(dir.join("oci-config.json"), cfg).unwrap();
+    let id = format!("sha256:{:x}", sha2::Sha256::digest(cfg));
+
+    // The id resolves to the same manifest as the reference.
+    let by_ref = rootfs::find_manifest(&f.cfg.store, "docker.io/library/app:1").unwrap();
+    let by_id = rootfs::find_manifest(&f.cfg.store, &id).unwrap();
+    assert_eq!(by_ref, by_id);
+    // An unknown sha256 is still not found (no accidental match).
+    assert!(rootfs::find_manifest(&f.cfg.store, &format!("sha256:{:064x}", 7)).is_err());
+
+    let sb = sandbox("idsb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let mut c = container("idc1", "idsb");
+    c.image = id;
+    f.rt.start_container(&sb, &c, f.log_path("id.log").to_str().unwrap(), "/x")
+        .await
+        .expect("a container created by image id starts");
+    assert!(f.rt.is_running("idc1"));
     f.finish().await;
 }

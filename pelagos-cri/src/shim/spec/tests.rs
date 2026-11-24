@@ -625,7 +625,8 @@ fn resources_and_cgroup_path() {
     c.cpu_period = 100_000;
     c.cpuset_cpus = "0-1".into();
     c.cpuset_mems = "0".into();
-    c.hugepage_limits = vec![("2MB".into(), 4 << 20)];
+    // A zero limit (the kubelet's "not requested") must be dropped (#623).
+    c.hugepage_limits = vec![("2MB".into(), 4 << 20), ("1GB".into(), 0)];
     let mut sb = sandbox();
     sb.cgroup_parent = "kubepods/besteffort/pod1".into();
     let s = build(&c, &sb, &image()).unwrap();
