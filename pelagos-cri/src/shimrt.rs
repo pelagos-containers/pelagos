@@ -366,8 +366,16 @@ impl ShimRuntime {
         }
     }
 
-    pub fn remove_sandbox(&self, id: &str) {
-        if let Some(sb) = lock(&self.sandboxes).remove(id) {
+    /// Forget a stopped sandbox and clean up after it. Sends the shim a second
+    /// `Shutdown`: the kubelet stops the pod sandbox first and only garbage-
+    /// collects its containers afterwards, and gVisor's shim ignores `Shutdown`
+    /// while container tasks still exist, so the one sent by `stop_sandbox` can
+    /// be a no-op. By the time the kubelet removes the sandbox the tasks are
+    /// gone and this one lets the shim exit (#625).
+    pub async fn remove_sandbox(&self, id: &str) {
+        let removed = lock(&self.sandboxes).remove(id);
+        if let Some(sb) = removed {
+            let _ = tokio::time::timeout(Duration::from_secs(5), sb.client.shutdown(id)).await;
             if let Some(p) = &sb.plan {
                 if let Err(e) = p.cleanup() {
                     log::warn!("remove_sandbox {id}: rootfs cleanup: {e}");
@@ -673,26 +681,42 @@ impl ShimRuntime {
                 c.id
             );
             let params = self.start_params(&sandbox.binary, &c.id, bundle);
+            // Once `start` has launched a dedicated shim, every later failure
+            // must stop it again: it lives in its own systemd scope, so nothing
+            // else would (#624).
+            let launched = std::sync::atomic::AtomicBool::new(false);
             let started = async {
                 let addr = bootstrap::start(&params, BOOTSTRAP_TIMEOUT).await?;
+                launched.store(true, std::sync::atomic::Ordering::Relaxed);
                 bundle.persist_shim(&sandbox.binary, &addr)?;
                 let cl = Arc::new(ShimClient::connect(&addr.address).await?);
-                cl.create(make_req()).await?;
+                if let Err(e) = cl.create(make_req()).await {
+                    let _ = cl.shutdown(&c.id).await;
+                    return Err(e.into());
+                }
                 Ok::<_, ShimError>(cl)
             }
             .await;
             match started {
                 Ok(cl) => client = cl,
                 Err(e2) => {
+                    if launched.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Covers a shim we could not even connect to.
+                        let _ = bootstrap::delete(&params, BOOTSTRAP_TIMEOUT).await;
+                    }
                     pump.finish().await;
                     return Err(e2);
                 }
             }
         }
+        let dedicated = !Arc::ptr_eq(&client, &sandbox.client);
         let pid = match client.start(&c.id).await {
             Ok(r) => r.pid,
             Err(e) => {
                 let _ = client.delete(&c.id).await;
+                if dedicated {
+                    let _ = client.shutdown(&c.id).await;
+                }
                 pump.finish().await;
                 return Err(e.into());
             }
@@ -780,6 +804,11 @@ impl ShimRuntime {
         finish_task_io(&t).await;
         if let Err(e) = t.client.delete(id).await {
             log::debug!("remove_container {id}: delete: {e}");
+        }
+        // A container that needed the per-container fallback owns its shim
+        // (it has its own shim.json); stop it with the task (#624).
+        if t.bundle.load_shim().is_ok() {
+            let _ = t.client.shutdown(id).await;
         }
         t.stdio.remove();
         if let Err(e) = t.plan.cleanup() {

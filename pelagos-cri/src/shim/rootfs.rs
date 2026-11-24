@@ -117,9 +117,17 @@ fn dirname(reference: &str) -> String {
     reference.replace([':', '/', '@'], "_")
 }
 
-/// Find an image's `manifest.json` by reference, manifest digest, or stored
-/// directory name. A config-digest image id must be mapped to a reference by
-/// the caller first (`RuntimeSvc::resolve_image_ref`).
+/// The CRI image id of a stored image: the sha256 of its `oci-config.json`
+/// (what `ImageStatus`/`PullImage` report), if that file exists.
+fn config_digest(image_dir: &Path) -> Option<String> {
+    use sha2::Digest as _;
+    let bytes = fs::read(image_dir.join("oci-config.json")).ok()?;
+    Some(format!("sha256:{:x}", sha2::Sha256::digest(&bytes)))
+}
+
+/// Find an image's `manifest.json` by reference, manifest digest, CRI image id
+/// (config digest) or stored directory name. The kubelet creates containers by
+/// image **id**, not the tag it pulled, so the id must resolve here (#622).
 pub fn find_manifest(
     store: &StoreLayout,
     image_ref: &str,
@@ -145,7 +153,11 @@ pub fn find_manifest(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
             continue;
         };
-        if v["reference"].as_str() == Some(image_ref) || v["digest"].as_str() == Some(image_ref) {
+        if v["reference"].as_str() == Some(image_ref)
+            || v["digest"].as_str() == Some(image_ref)
+            || (image_ref.starts_with("sha256:")
+                && config_digest(&ent.path()).as_deref() == Some(image_ref))
+        {
             return Ok(v);
         }
     }
