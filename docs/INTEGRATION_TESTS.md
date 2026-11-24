@@ -6505,3 +6505,15 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::stats s
 - `shim::stats::tests::empty_metrics_are_zero_and_junk_is_an_error` — an empty payload is zero usage; an unknown type URL or a malformed payload is a typed error (never a panic).
 - `shimrt::tests::usage_maps_shim_stats_and_degrades_to_none` — the mock shim's `Stats` is decoded; a shim error, an unknown container and an exited container all give `None`, so a stats call can never fail a CRI list.
 - `runtime::tests::test_container_rpcs_dispatch_to_shim_runtime` (extended) — `ContainerStats` and `PodSandboxStats` for a shim container report the shim's numbers (CPU 5 000 000 ns, working set 600), not host cgroup reads, and the pod aggregate includes the container.
+
+## `pelagos-cri` shim streaming exec/attach and log rotation (issue #601)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shimrt streaming stdio::tests::log_writer_reopen container_rpcs`. Not root-gated. The SPDY transport itself (`streaming.rs`) has no in-process client, so the SPDY glue is verified by the CRI streaming conformance bucket on a cluster node (critest `Streaming`) — **not run for this change** — while everything shim-side is covered below.
+
+- `shimrt::tests::streaming_exec_session_gets_live_output_and_exit` — `start_exec` subscribes to output *before* the process runs (first output not missed), `wait` returns the guest exit status, `finish` closes the output channel so the SPDY relay ends instead of hanging; unknown container is a typed error.
+- `shimrt::tests::attach_follows_live_output_and_exposes_stdin` — attach sees output written to the container's stdout FIFO after the attach point; a container created with `stdin` exposes its stdin writer, one without does not; unknown container is a typed error.
+- `shimrt::tests::reopen_log_makes_the_pump_follow_a_rotated_file` — after the kubelet renames the CRI log and calls `ReopenContainerLog`, new output lands in a fresh file at the original path, not the rotated one. Without this, a rotated shim container's logs would silently go to the old inode.
+- `shim::stdio::tests::log_writer_reopen_follows_a_rotated_file` — the writer-level behaviour: writes follow the renamed inode until `reopen`, then the new file; partial lines survive.
+- `streaming::tests::resize_frames_parse_single_multiple_and_junk` — kubelet resize frames (`{"Width":..,"Height":..}`, several per read, junk ignored) become `ResizePty` calls.
+- `runtime::tests::test_container_rpcs_dispatch_to_shim_runtime` (extended) — CRI `Exec`/`Attach` on a shim pod register a streaming token carrying the shim container id (the SPDY handler then talks to the shim rather than running `pelagos exec`); previously `UNIMPLEMENTED`.
+
+Refactor note: the exit-code/FIN sequence at the end of a native exec moved verbatim into `send_exit_and_fins` so both paths share the ordering crictl depends on (error stream first, then stdout/stderr FINs). Behaviour-preserving, but covered only by the cluster streaming bucket.

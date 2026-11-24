@@ -740,3 +740,155 @@ async fn usage_maps_shim_stats_and_degrades_to_none() {
     );
     f.finish().await;
 }
+
+#[tokio::test]
+async fn streaming_exec_session_gets_live_output_and_exit() {
+    let f = fixture().await;
+    let sb = sandbox("xsb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    f.rt.start_container(
+        &sb,
+        &container("xc1", "xsb"),
+        f.log_path("x.log").to_str().unwrap(),
+        "/x",
+    )
+    .await
+    .unwrap();
+    let mut es =
+        f.rt.start_exec(
+            "xc1",
+            exec::ExecRequest {
+                args: vec!["sh".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Subscribed before the process ran: the guest's first output is seen.
+    let chunk = tokio::time::timeout(Duration::from_secs(5), es.output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&chunk.data[..], b"execout");
+    assert_eq!(es.session.wait(&es.client).await.unwrap(), 5);
+    let client = es.client.clone();
+    es.session.finish(&client).await;
+    // The pump closing ends relays: the channel reports closed, not hangs.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), es.output.recv()).await {
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+            Ok(_) => continue,
+            Err(_) => panic!("exec output channel never closed"),
+        }
+    }
+    assert!(matches!(
+        f.rt.start_exec("nope", exec::ExecRequest::default()).await,
+        Err(ShimError::UnknownContainer(_))
+    ));
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn attach_follows_live_output_and_exposes_stdin() {
+    let f = fixture().await;
+    let sb = sandbox("asb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let mut c = container("ac1", "asb");
+    c.stdin = true;
+    f.rt.start_container(&sb, &c, f.log_path("a.log").to_str().unwrap(), "/x")
+        .await
+        .unwrap();
+    let mut at = f.rt.attach("ac1").await.unwrap();
+    assert!(
+        at.stdin.is_some(),
+        "container created with stdin has an attachable stdin"
+    );
+    let req = f
+        .main
+        .creates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.id == "ac1")
+        .cloned()
+        .unwrap();
+    {
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&req.stdout)
+            .unwrap();
+        w.write_all(b"live line\n").unwrap();
+    }
+    let chunk = tokio::time::timeout(Duration::from_secs(5), at.output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&chunk.data[..], b"live line\n");
+    // No stdin when the container was not created with it.
+    f.rt.start_container(
+        &sb,
+        &container("ac2", "asb"),
+        f.log_path("a2.log").to_str().unwrap(),
+        "/x",
+    )
+    .await
+    .unwrap();
+    assert!(f.rt.attach("ac2").await.unwrap().stdin.is_none());
+    assert!(matches!(
+        f.rt.attach("nope").await,
+        Err(ShimError::UnknownContainer(_))
+    ));
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn reopen_log_makes_the_pump_follow_a_rotated_file() {
+    let f = fixture().await;
+    let sb = sandbox("rsb9");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let log = f.log_path("rot.log");
+    f.rt.start_container(&sb, &container("rc9", "rsb9"), log.to_str().unwrap(), "/x")
+        .await
+        .unwrap();
+    let req = f
+        .main
+        .creates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.id == "rc9")
+        .cloned()
+        .unwrap();
+    eventually("first line logged", || {
+        std::fs::read_to_string(&log)
+            .map(|s| s.contains("hello from guest"))
+            .unwrap_or(false)
+    })
+    .await;
+    let rotated = f.log_path("rot.log.1");
+    std::fs::rename(&log, &rotated).unwrap();
+    f.rt.reopen_log("rc9").await;
+    {
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&req.stdout)
+            .unwrap();
+        w.write_all(b"post rotation\n").unwrap();
+    }
+    eventually("post-rotation line in the new file", || {
+        std::fs::read_to_string(&log)
+            .map(|s| s.contains("post rotation"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(!std::fs::read_to_string(&rotated)
+        .unwrap()
+        .contains("post rotation"));
+    f.finish().await;
+}

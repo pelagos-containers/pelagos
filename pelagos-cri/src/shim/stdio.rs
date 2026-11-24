@@ -141,6 +141,7 @@ pub const MAX_PARTIAL: usize = 16 * 1024;
 
 /// Writes the CRI log format to a file, framing raw bytes into lines.
 pub struct CriLogWriter {
+    path: PathBuf,
     file: std::fs::File,
     partial: [Vec<u8>; 2],
 }
@@ -157,9 +158,23 @@ impl CriLogWriter {
             .append(true)
             .open(path)?;
         Ok(Self {
+            path: path.to_path_buf(),
             file,
             partial: [Vec::new(), Vec::new()],
         })
+    }
+
+    /// Reopen the log path (creating it) after the kubelet rotated the file
+    /// away (`ReopenContainerLog`). Partial lines carry over.
+    pub fn reopen(&mut self) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        Ok(())
     }
 
     fn record(out: &mut Vec<u8>, stream: Stream, tag: char, body: &[u8]) {
@@ -287,6 +302,14 @@ impl Pump {
             sink,
             tx,
         })
+    }
+
+    /// Reopen a [`Sink::Log`] file (log rotation). No-op for other sinks.
+    pub fn reopen_log(&self) -> io::Result<()> {
+        match &mut *self.sink.lock().unwrap() {
+            SinkState::Log(w) => w.reopen(),
+            _ => Ok(()),
+        }
     }
 
     /// Follow live output (attach). Only chunks pumped after this call are seen.
