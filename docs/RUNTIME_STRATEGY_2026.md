@@ -36,6 +36,13 @@ discovery, compose, image build) rather than raw speed.
 Pelagos operates in the OCI low-level tier. These runtimes are not direct competitors; they
 serve workloads requiring hardware-level isolation that Pelagos explicitly does not attempt.
 
+**Pelagos as a shim v2 client (epic #574).** Rather than build a hypervisor tier,
+`pelagos-cri` can delegate selected pods to any containerd shim v2 runtime
+(Kata, gVisor `runsc`, runwasi) via `RuntimeClass` — see
+`docs/CRI_COMPLIANCE.md`. This keeps pelagos's own core small and rootless-first
+while offering VM-grade isolation where a cluster needs it. Native pods are
+unaffected. Hardware validation of the Kata path is still outstanding.
+
 ### Adjacent Runtimes
 
 | Runtime | Focus | Relevance to Pelagos |

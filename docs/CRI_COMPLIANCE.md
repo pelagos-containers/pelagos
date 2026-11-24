@@ -180,6 +180,49 @@ a separate goroutine-style async task per connection.
 
 ---
 
+## Shim-backed runtime handlers (Kata, gVisor, runwasi) — epic #574
+
+`pelagos-cri` can also act as a **containerd shim v2 client**, selected per pod
+through Kubernetes `RuntimeClass`. Pods without a RuntimeClass (or with
+`pelagos`) run exactly as before.
+
+```
+pelagos-cri --shim-handler kata=/opt/kata/bin/containerd-shim-kata-v2 \
+            --shim-handler gvisor=/usr/local/bin/containerd-shim-runsc-v1
+```
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: kata}
+handler: kata        # the NAME in --shim-handler NAME=BINARY
+```
+
+What happens for a shim-handler pod:
+
+| Step | Behaviour |
+|---|---|
+| RunPodSandbox | pod netns created and CNI ADD applied **first**, then the shim is bootstrapped (`start`) and the sandbox task created in it. No pause process. `hostNetwork` pods and nodes without a CNI config are rejected. Pod sysctls go into the sandbox spec. |
+| CreateContainer / StartContainer | CRI -> OCI `config.json` (always sets `io.kubernetes.cri.container-type` / `sandbox-id`); the image's overlay is passed to the shim as a `Mount` descriptor (the shim mounts it); the container joins the pod's shim, falling back to a per-container shim `start` if the pod shim rejects it. |
+| Logs | shim stdout/stderr FIFOs -> CRI log format; `ReopenContainerLog` supported. |
+| Exec / ExecSync / Attach | through the Task API (exec processes, FIFOs, pty resize). Port-forward dials the pod IP in the CNI netns, unchanged. |
+| Exit / events | `TaskExit` via the events sink **and** the `Wait` RPC; `GetContainerEvents` is served (with pod and container statuses) only when a shim handler is configured. |
+| Stats | shim `Stats` (cgroups v1/v2 metrics) mapped to container and sandbox stats. |
+| Restart | shims are re-adopted from their persisted bundles; unreachable ones are reported and their pods go NotReady so the kubelet replaces them. |
+| StopPodSandbox | stop shim, **then** CNI DEL, **then** delete the netns. |
+
+Status of validation (be honest about it): everything above is covered by
+in-process tests against mock shims (`docs/INTEGRATION_TESTS.md`). It has **not
+yet** been run against a real Kata, runsc or runwasi shim, and the CRI
+streaming conformance bucket has not been re-run since the streaming changes.
+Open assumptions to settle on real hardware: that Kata accepts containers on
+the pod's shim address; that its share_fs accepts the symlinked `lowerdir`
+aliases used only for images with roughly 40+ layers; and that Kata `Stats`
+arrive as cgroups v1 metrics. Design and upstream findings:
+`docs/SHIM_V2_CLIENT_DESIGN.md`. Not implemented: the containerd Sandbox API
+(not needed for Kata), an explicit `RuntimeDefault` seccomp profile for shim
+containers, and a generalised pelagos shim v2 *server*.
+
 ## Dependency summary
 
 ```
