@@ -6390,8 +6390,9 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::spec`; 
 **Process:**
 - `shim::spec::tests::argv_follows_cri_entrypoint_cmd_rules` — same rules as the native path (CRI command overrides entrypoint and drops image cmd; args replace only cmd).
 - `shim::spec::tests::empty_argv_is_an_error`, `env_merges_image_then_cri_overriding_by_key`, `cwd_prefers_cri_then_image_then_root` — empty command rejected; image env first with CRI overriding by key in stable order; cwd precedence CRI > image > `/`.
-- `shim::spec::tests::user_resolution` — image `uid[:gid]`, bare uid (gid = uid), CRI `runAsUser`/`runAsGroup` precedence, and merged/deduplicated supplemental groups.
-- `shim::spec::tests::usernames_are_rejected_not_guessed` — a username cannot be resolved before the rootfs is mounted, so it is an explicit error rather than silently uid 0.
+- `shim::spec::tests::user_string_follows_containerd_rules` — `resolve_user` follows containerd's `oci.WithUser` (verified against its source, #593): bare uid takes its gid from passwd and falls back to gid **0** when there is no entry (an earlier version of this generator wrongly used gid = uid); a name needs a passwd entry; `uid:gid` numeric is taken as given; `name:group` resolves the group via `/etc/group`; unknown names/groups and out-of-range ids are errors.
+- `shim::spec::tests::user_resolution_in_spec` — the CRI user string (`runAsUser[:runAsGroup]`, else `runAsUserName`, else the image user) is resolved through the image's user database; supplemental groups merge and dedupe.
+- `shim::spec::tests::usernames_error_without_a_user_database` — names fail loudly when no database is supplied instead of silently becoming uid 0.
 - `shim::spec::tests::capabilities_default_add_drop_all_privileged` — default set, add/drop (case and `CAP_` prefix insensitive), `drop: [ALL]` + `add: [X]` yields exactly `{X}` (drops apply before adds; this caught an ordering bug during development), privileged is every capability.
 - `shim::spec::tests::unknown_capability_is_an_error`, `every_listed_capability_parses` — typos fail loudly; every name in the built-in lists is a real `oci-spec` capability.
 - `shim::spec::tests::process_flags` — tty, no-new-privileges, `oomScoreAdj` (the `i32::MIN` unset sentinel is omitted), AppArmor localhost profile, SELinux label.
@@ -6414,4 +6415,23 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::spec`; 
 - `shim::spec::tests::generated_spec_is_readable_by_pelagos_oci_parser` — pelagos's own `OciConfig` parser (used by `pelagos create`) accepts the generated spec.
 - `shim::roundtrip::bootstrap_connect_and_lifecycle` now writes a *generated* sandbox spec into the bundle instead of `{}`, so the loopback shim bootstrap runs against a real config.json.
 
-**Known gaps (tracked on #591/#574):** `linux.sysctl` is not emitted (`CriSandbox` does not record pod sysctls yet); usernames need the rootfs, so they wait for the rootfs Mount item; an explicit RuntimeDefault seccomp profile is not generated (the shim/guest default applies).
+**Known gaps (tracked on #591/#574):** `linux.sysctl` is not emitted (`CriSandbox` does not record pod sysctls yet); an explicit RuntimeDefault seccomp profile is not generated (the shim/guest default applies).
+
+## `pelagos-cri` rootfs Mount descriptors (issue #593)
+Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shim::rootfs`. Most tests are hermetic (fake store in a tempdir). Four are **root-gated** and print `skipping ...` and pass trivially when not root: `whiteout_hides_lower_layers`, `opaque_directory_hides_lower_layers`, `descriptor_mounts_a_real_image_as_a_shim_would`, `real_image_user_resolution` (the last two also need a pulled image in `/var/lib/pelagos`). Run them as root on a node with an image (ipc7) and check the output has no `skipping` lines (`--nocapture`).
+
+- `shim::rootfs::tests::find_manifest_by_reference_digest_and_missing` — lookup by reference, manifest digest; unknown image and a missing images dir are `ImageNotFound`.
+- `shim::rootfs::tests::layers_are_top_first_deduplicated_and_verified` — lowerdir order is top-first, repeated layer digests collapse (overlayfs rejects duplicates), and a layer without the `.pelagos_complete` marker (interrupted extraction) is an error naming it.
+- `shim::rootfs::tests::wasm_and_layerless_images_are_rejected` — Wasm and zero-layer images have no overlay rootfs.
+- `shim::rootfs::tests::overlay_options_string` — exact `lowerdir=..,upperdir=..,workdir=..,metacopy=off` format.
+- `shim::rootfs::tests::plan_describes_overlay_creates_scratch_and_cleans_up` — descriptor is `overlay`/`overlay` with real layer paths; scratch parent `0700`, upper/work `0755`; the API `Mount` has an empty target (the shim mounts into its own `<bundle>/rootfs`); cleanup removes everything and is idempotent.
+- `shim::rootfs::tests::invalid_ids_and_empty_layers_rejected` — path-unsafe ids (`..`, `/`, `:`, `,`) and empty layer lists are rejected before anything is created.
+- `shim::rootfs::tests::many_layers_fall_back_to_short_aliases` — 60 layers overflow the one-page mount option limit with real paths; the plan switches to short symlink aliases that keep layer order and point at the real layers, stays under the limit, and cleanup removes the aliases. UNVERIFIED: how Kata's share_fs overlay path treats symlinked lowerdirs (check during Kata validation).
+- `shim::rootfs::tests::too_many_layers_and_unfittable_options_are_errors_that_leave_nothing_behind` — more than overlayfs' 500-layer cap, or option strings that cannot fit even aliased, are clear errors with no scratch or alias directories left.
+- `shim::rootfs::tests::mountinfo_parsing_detects_a_live_upper` — the guard that stops cleanup deleting an in-use upper dir matches only overlays with exactly that `upperdir` (not a prefix of another id, not a non-overlay mount).
+- `shim::rootfs::tests::parse_passwd_and_group_skip_comments_and_junk`, `top_layer_overrides_lower_layers`, `layered_users_resolve_with_containerd_rules`, `missing_passwd_leaves_numeric_uids_working` — layered `/etc/passwd`/`/etc/group` lookup: top layer shadows lower, group falls through independently, numeric uids work with no passwd.
+- `shim::rootfs::tests::symlinked_passwd_is_refused_not_followed` — an image `etc/passwd -> /etc/passwd` (or symlinked `etc`) is refused. Failure means an image could make the CRI read the host's user database.
+- `shim::rootfs::tests::whiteout_hides_lower_layers` (root) — a char-device 0:0 whiteout hides the entry and lower layers, including a whiteout of a parent directory.
+- `shim::rootfs::tests::opaque_directory_hides_lower_layers` (root) — a `trusted.overlay.opaque` directory hides lower layers below it but still serves its own files.
+- `shim::rootfs::tests::descriptor_mounts_a_real_image_as_a_shim_would` (root, needs a pulled image) — mounts the overlay from the `Mount` fields exactly as a shim would, reads image content through it, confirms writes land in the planned upper dir, checks cleanup refuses while mounted, then unmounts and cleans up. This is the proof the descriptor is a mount the kernel accepts.
+- `shim::rootfs::tests::real_image_user_resolution` (root, needs a pulled image) — user resolution through a real image's layers.

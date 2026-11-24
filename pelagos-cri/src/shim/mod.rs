@@ -10,6 +10,7 @@
 //! - [`client`]: ttrpc Task client wrapper.
 //! - [`events`]: ttrpc `Events` sink shims publish lifecycle events to.
 //! - [`exit`]: decodes those events and tracks per-container exit state.
+//! - [`rootfs`]: overlay `Mount` descriptors over the layer store.
 //! - [`spec`]: CRI -> OCI `config.json` generation for shim bundles.
 //!
 //! Nothing here is wired into the CRI request path yet; later epic items
@@ -21,6 +22,7 @@ pub mod bundle;
 pub mod client;
 pub mod events;
 pub mod exit;
+pub mod rootfs;
 pub mod spec;
 
 /// Loopback integration: a fake shim `start` script prints the address of an
