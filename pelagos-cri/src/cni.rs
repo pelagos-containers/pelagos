@@ -327,13 +327,26 @@ pub fn cni_del(
     }
 }
 
+/// Plugin search directories: any in `PELAGOS_CNI_BIN_DIRS` (colon-separated,
+/// searched first; used by tests with a fake plugin) then the standard ones.
+pub(crate) fn bin_dirs() -> Vec<String> {
+    let mut dirs: Vec<String> = std::env::var("PELAGOS_CNI_BIN_DIRS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(String::from)
+        .collect();
+    dirs.extend(CNI_BIN_DIRS.iter().map(|d| d.to_string()));
+    dirs
+}
+
 fn cni_path_env() -> String {
-    CNI_BIN_DIRS.join(":")
+    bin_dirs().join(":")
 }
 
 fn find_plugin_bin(plugin_type: &str) -> Result<PathBuf, String> {
-    for dir in CNI_BIN_DIRS {
-        let p = Path::new(dir).join(plugin_type);
+    for dir in bin_dirs() {
+        let p = Path::new(&dir).join(plugin_type);
         if p.is_file() {
             return Ok(p);
         }

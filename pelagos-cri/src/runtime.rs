@@ -33,6 +33,7 @@ use crate::cri::{
     VersionRequest, VersionResponse,
 };
 use crate::netns_native;
+use crate::podnet;
 use crate::scope;
 use crate::state::{
     self, AppState, ContainerState as MyContainerState, CriContainer, CriMount, CriSandbox,
@@ -988,73 +989,25 @@ impl RuntimeService for RuntimeSvc {
         } else if let Some(conf_path) = cni::find_cni_conf() {
             // ── CNI path ───────────────────────────────────────────────────
             let id = generate_id();
-            let ns_name = format!("pcri-{}", &id[..12]);
-
-            // `ip netns add` and CNI ADD both shell out. CNI ADD in particular can
-            // block for the plugin's full retry/timeout window (e.g. 30s while
-            // Cilium's agent socket doesn't exist yet). Both run on the blocking
-            // pool so a burst of concurrent sandbox creations after a reboot
-            // cannot pin down the async worker threads and starve unrelated RPCs;
-            // CNI ADD is additionally concurrency-bounded so that burst can't
-            // thundering-herd the CNI provider itself (#494).
-            let ns_name_bg = ns_name.clone();
-            let netns_path = tokio::task::spawn_blocking(move || cni::create_netns(&ns_name_bg))
-                .await
-                .map_err(|e| Status::internal(format!("create netns task join: {}", e)))?
-                .map_err(|e| Status::internal(format!("create netns for CNI sandbox: {}", e)))?;
-
-            let ip = match cni::cni_add_bounded(
-                id.clone(),
-                netns_path.clone(),
-                conf_path.clone(),
+            // netns -> CNI ADD -> lo up, shared with shim-backed sandboxes
+            // (`podnet`, #595). The netns is fully configured before anything
+            // below runs.
+            let podnet::PodNetwork {
+                ns_name,
+                netns_path,
+                ip,
+                ..
+            } = podnet::setup_pod_network(
+                &id,
+                podnet::PodRef {
+                    name: &meta.name,
+                    namespace: &meta.namespace,
+                    uid: &uid,
+                },
+                &conf_path,
                 cni_cap_args.clone(),
-                meta.name.clone(),
-                meta.namespace.clone(),
-                uid.clone(),
             )
-            .await
-            {
-                Ok(ip) => ip,
-                Err(cni::CniAddError::ResourceExhausted) => {
-                    cni::delete_netns(&ns_name);
-                    // kubelet retries RunPodSandbox on RESOURCE_EXHAUSTED via its normal
-                    // sync-loop backoff — an explicit, immediate signal instead of the
-                    // request hanging behind a full CNI semaphore queue (#500).
-                    return Err(Status::resource_exhausted(
-                        "CNI call semaphore at capacity, retry later",
-                    ));
-                }
-                Err(e @ cni::CniAddError::Plugin(_)) => {
-                    cni::delete_netns(&ns_name);
-                    return Err(Status::internal(format!("CNI ADD: {}", e)));
-                }
-            };
-
-            // Bring the loopback interface up and allow non-root container
-            // processes (e.g. coredns running as "nonroot") to bind privileged
-            // ports, both inside the sandbox's netns, natively (#564 — no
-            // `nsenter`/`ip`/`sysctl` subprocesses). The CNI spec requires a
-            // loopback plugin in the chain, but k3s/Flannel omit it — without
-            // bringing lo up, all intra-pod 127.0.0.1 traffic fails, breaking
-            // the sidecar pattern (issue #331). The unprivileged-port sysctl
-            // matches containerd's default.
-            let netns_path_for_setup = netns_path.clone();
-            let setup_result = tokio::task::spawn_blocking(move || {
-                netns_native::in_net_ns(&netns_path_for_setup, || {
-                    netns_native::set_link_up("lo")?;
-                    netns_native::write_sysctl("net.ipv4.ip_unprivileged_port_start", "0")
-                })
-            })
-            .await;
-            match setup_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => log::warn!(
-                    "sandbox netns setup (lo up / unprivileged ports) in {}: {}",
-                    ns_name,
-                    e
-                ),
-                Err(e) => log::warn!("sandbox netns setup task join error in {}: {}", ns_name, e),
-            }
+            .await?;
 
             // Spawn pause process: joins the CNI-configured netns, unshares IPC+UTS.
             // We re-use pelagos's own `sandbox __pause__ <ns_name>` subcommand.
@@ -1148,6 +1101,7 @@ impl RuntimeService for RuntimeSvc {
             created_at_ns: now_ns(),
             state: SandboxState::Running,
             runtime_handler,
+            sysctls: sandbox_sysctls.clone(),
             netns,
             ip,
             cni_conf,
@@ -1262,7 +1216,6 @@ impl RuntimeService for RuntimeSvc {
                 // stop entirely: leaking a transient unit (it self-collects via
                 // --collect once it eventually dies) is infinitely preferable to
                 // hanging PID 1. Network teardown happens last, on a quiesced netns.
-                let netns_path = format!("/run/netns/{}", sb.netns);
                 let mut pause_drained = true;
                 if sb.pause_pid > 0 {
                     log::debug!(
@@ -1308,34 +1261,7 @@ impl RuntimeService for RuntimeSvc {
                         );
                     }
                 }
-                if !sb.cni_conf.is_empty() {
-                    let cap_args = cni::port_mapping_cap_args(&sb.port_mappings);
-                    log::debug!(
-                        "StopPodSandbox {} step=cni_del netns={}",
-                        sandbox_id,
-                        sb.netns
-                    );
-                    // CNI DEL shells out to the plugin binary and can block for its
-                    // full retry window; run on the (concurrency-bounded) blocking
-                    // pool (#494).
-                    cni::cni_del_bounded(
-                        sandbox_id.clone(),
-                        netns_path.clone(),
-                        std::path::PathBuf::from(&sb.cni_conf),
-                        cap_args,
-                        sb.name.clone(),
-                        sb.namespace.clone(),
-                        sb.uid.clone(),
-                    )
-                    .await;
-                    log::debug!("StopPodSandbox {} step=cni_del DONE", sandbox_id);
-                }
-                log::debug!("StopPodSandbox {} step=delete_netns", sandbox_id);
-                {
-                    let ns_bg = sb.netns.clone();
-                    let _ = tokio::task::spawn_blocking(move || cni::delete_netns(&ns_bg)).await;
-                }
-                log::debug!("StopPodSandbox {} step=delete_netns DONE", sandbox_id);
+                podnet::teardown_pod_network(&sandbox_id, sb).await;
                 state::remove_pelagos_sandbox_state(&sandbox_id);
             } else {
                 // ── Pelagos native teardown ────────────────────────────────────
@@ -3625,6 +3551,7 @@ mod tests {
             namespaces,
             port_mappings: vec![],
             runtime_handler: String::new(),
+            sysctls: Default::default(),
         }
     }
 
@@ -4213,6 +4140,7 @@ mod tests {
             namespaces: state::NamespaceModes::default(),
             port_mappings: vec![],
             runtime_handler: String::new(),
+            sysctls: Default::default(),
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
@@ -4253,6 +4181,7 @@ mod tests {
             namespaces: state::NamespaceModes::default(),
             port_mappings: vec![],
             runtime_handler: String::new(),
+            sysctls: Default::default(),
         };
 
         let json = serde_json::to_string(&sandbox).expect("serialize");
