@@ -347,12 +347,19 @@ fn read_container_mem_bytes(pid: i32, cgroup_name: Option<&str>) -> (u64, u64) {
     (rss, rss)
 }
 
-fn build_container_stats(c: &CriContainer) -> ContainerStats {
+/// `shim` is the shim-reported usage for shim-backed containers (#604); native
+/// containers pass `None` and are read from the host cgroup as before.
+fn build_container_stats(
+    c: &CriContainer,
+    shim: Option<crate::shim::stats::TaskUsage>,
+) -> ContainerStats {
     let ts = now_ns();
     let state = read_pelagos_container_state(&c.pelagos_name);
     let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
     let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
-    let (cpu_nanos, mem_usage, mem_working_set) = if pid > 0 || cgroup_name.is_some() {
+    let (cpu_nanos, mem_usage, mem_working_set) = if let Some(u) = shim {
+        (u.cpu_nanos, u.mem_usage, u.mem_working_set)
+    } else if pid > 0 || cgroup_name.is_some() {
         let cpu = read_container_cpu_nanos(pid, cgroup_name);
         let (usage, working_set) = read_container_mem_bytes(pid, cgroup_name);
         (cpu, usage, working_set)
@@ -400,7 +407,11 @@ fn build_container_stats(c: &CriContainer) -> ContainerStats {
     }
 }
 
-fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandboxStats {
+fn build_sandbox_stats(
+    sb: &CriSandbox,
+    containers: &[CriContainer],
+    shim: &HashMap<String, crate::shim::stats::TaskUsage>,
+) -> PodSandboxStats {
     let ts = now_ns();
     // Aggregate CPU and memory across all app containers in this pod.
     // The pause process is a namespace holder that is essentially idle;
@@ -413,6 +424,13 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
         pod_containers
             .iter()
             .fold((0u64, 0u64, 0u64), |(cpu, usage, ws), c| {
+                if let Some(u) = shim.get(&c.id) {
+                    return (
+                        cpu.saturating_add(u.cpu_nanos),
+                        usage.saturating_add(u.mem_usage),
+                        ws.saturating_add(u.mem_working_set),
+                    );
+                }
                 let state = read_pelagos_container_state(&c.pelagos_name);
                 let pid = state.as_ref().map(|s| s.pid).unwrap_or(0);
                 let cgroup_name = state.as_ref().and_then(|s| s.cgroup_name.as_deref());
@@ -462,7 +480,7 @@ fn build_sandbox_stats(sb: &CriSandbox, containers: &[CriContainer]) -> PodSandb
             process: None,
             containers: pod_containers
                 .iter()
-                .map(|c| build_container_stats(c))
+                .map(|c| build_container_stats(c, shim.get(&c.id).copied()))
                 .collect(),
             io: None,
         }),
@@ -860,6 +878,39 @@ impl RuntimeSvc {
             report.containers.len(),
             running
         );
+    }
+
+    /// Shim-reported usage of the running shim-backed containers in `containers`,
+    /// queried concurrently; absent entries fall back to host-side reads.
+    async fn shim_usage(
+        &self,
+        containers: &[CriContainer],
+    ) -> HashMap<String, crate::shim::stats::TaskUsage> {
+        let Some(shim) = self.shim.clone() else {
+            return HashMap::new();
+        };
+        let handlers: HashMap<String, String> = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes
+                .iter()
+                .map(|(id, s)| (id.clone(), s.runtime_handler.clone()))
+                .collect()
+        };
+        let mut set = tokio::task::JoinSet::new();
+        for c in containers {
+            let is_shim = handlers.get(&c.sandbox_id).is_some_and(|h| shim.handles(h));
+            if is_shim && c.state == MyContainerState::Running {
+                let (shim, id) = (shim.clone(), c.id.clone());
+                set.spawn(async move { shim.usage(&id).await.map(|u| (id, u)) });
+            }
+        }
+        let mut out = HashMap::new();
+        while let Some(r) = set.join_next().await {
+            if let Ok(Some((id, u))) = r {
+                out.insert(id, u);
+            }
+        }
+        out
     }
 
     /// Run a container through the shim backend and record it as Running.
@@ -3127,8 +3178,12 @@ impl RuntimeService for RuntimeSvc {
             st.containers.get(&id).cloned()
         };
         let container = container.ok_or_else(|| Status::not_found("container not found"))?;
+        let usage = self.shim_usage(std::slice::from_ref(&container)).await;
         Ok(Response::new(ContainerStatsResponse {
-            stats: Some(build_container_stats(&container)),
+            stats: Some(build_container_stats(
+                &container,
+                usage.get(&container.id).copied(),
+            )),
         }))
     }
 
@@ -3160,7 +3215,11 @@ impl RuntimeService for RuntimeSvc {
                 .cloned()
                 .collect()
         };
-        let stats = containers.iter().map(build_container_stats).collect();
+        let usage = self.shim_usage(&containers).await;
+        let stats = containers
+            .iter()
+            .map(|c| build_container_stats(c, usage.get(&c.id).copied()))
+            .collect();
         Ok(Response::new(ListContainerStatsResponse { stats }))
     }
 
@@ -3169,15 +3228,24 @@ impl RuntimeService for RuntimeSvc {
         request: Request<PodSandboxStatsRequest>,
     ) -> Result<Response<PodSandboxStatsResponse>, Status> {
         let sb_id = request.into_inner().pod_sandbox_id;
-        let st = self.state.inner.lock().await;
-        let sb = st
-            .sandboxes
-            .get(&sb_id)
-            .ok_or_else(|| Status::not_found(format!("sandbox not found: {}", sb_id)))?
-            .clone();
-        let containers: Vec<CriContainer> = st.containers.values().cloned().collect();
+        let (sb, containers) = {
+            let st = self.state.inner.lock().await;
+            let sb = st
+                .sandboxes
+                .get(&sb_id)
+                .ok_or_else(|| Status::not_found(format!("sandbox not found: {}", sb_id)))?
+                .clone();
+            let containers: Vec<CriContainer> = st
+                .containers
+                .values()
+                .filter(|c| c.sandbox_id == sb_id)
+                .cloned()
+                .collect();
+            (sb, containers)
+        };
+        let usage = self.shim_usage(&containers).await;
         Ok(Response::new(PodSandboxStatsResponse {
-            stats: Some(build_sandbox_stats(&sb, &containers)),
+            stats: Some(build_sandbox_stats(&sb, &containers, &usage)),
         }))
     }
 
@@ -3186,8 +3254,17 @@ impl RuntimeService for RuntimeSvc {
         request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
         let filter = request.into_inner().filter;
+        let containers: Vec<CriContainer> = self
+            .state
+            .inner
+            .lock()
+            .await
+            .containers
+            .values()
+            .cloned()
+            .collect();
+        let usage = self.shim_usage(&containers).await;
         let st = self.state.inner.lock().await;
-        let containers: Vec<CriContainer> = st.containers.values().cloned().collect();
         let stats = st
             .sandboxes
             .values()
@@ -3203,7 +3280,7 @@ impl RuntimeService for RuntimeSvc {
                 }
                 true
             })
-            .map(|sb| build_sandbox_stats(sb, &containers))
+            .map(|sb| build_sandbox_stats(sb, &containers, &usage))
             .collect();
         Ok(Response::new(ListPodSandboxStatsResponse { stats }))
     }
@@ -4871,6 +4948,38 @@ mod tests {
             "{}",
             st.log_path
         );
+
+        // Stats come from the shim (cgroups v1 payload from the mock), not host cgroups (#604).
+        let cs = svc
+            .container_stats(Request::new(ContainerStatsRequest {
+                container_id: "rc1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .stats
+            .unwrap();
+        assert_eq!(
+            cs.cpu.unwrap().usage_core_nano_seconds.unwrap().value,
+            5_000_000
+        );
+        assert_eq!(cs.memory.unwrap().working_set_bytes.unwrap().value, 600);
+        let ps = svc
+            .pod_sandbox_stats(Request::new(PodSandboxStatsRequest {
+                pod_sandbox_id: "rsb1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .stats
+            .unwrap()
+            .linux
+            .unwrap();
+        assert_eq!(
+            ps.cpu.unwrap().usage_core_nano_seconds.unwrap().value,
+            5_000_000
+        );
+        assert_eq!(ps.containers.len(), 1);
 
         let r = svc
             .exec_sync(Request::new(ExecSyncRequest {

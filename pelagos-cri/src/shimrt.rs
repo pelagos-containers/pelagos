@@ -681,6 +681,24 @@ impl ShimRuntime {
         self.exits.forget(id);
     }
 
+    /// Current CPU/memory of a running container, from the shim's `Stats`.
+    /// `None` when the container is unknown, exited, or the shim cannot answer
+    /// (stats must never fail a CRI list call).
+    pub async fn usage(&self, id: &str) -> Option<crate::shim::stats::TaskUsage> {
+        let t = self.task(id).ok()?;
+        if self.exits.exit_of(id).is_some() {
+            return None;
+        }
+        let resp = tokio::time::timeout(Duration::from_secs(5), t.client.stats(id))
+            .await
+            .ok()?
+            .map_err(|e| log::debug!("stats {id}: {e}"))
+            .ok()?;
+        crate::shim::stats::decode_usage(resp.stats.as_ref()?)
+            .map_err(|e| log::warn!("stats {id}: {e}"))
+            .ok()
+    }
+
     /// Containers of a sandbox this runtime currently tracks.
     pub fn container_ids_of(&self, sandbox_id: &str) -> Vec<String> {
         lock(&self.tasks)

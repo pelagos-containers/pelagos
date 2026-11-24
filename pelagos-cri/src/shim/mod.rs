@@ -13,6 +13,7 @@
 //! - [`stdio`]: stdio FIFOs, CRI log relay and attach fan-out.
 //! - [`exec`]: exec / ExecSync over the Task API.
 //! - [`rootfs`]: overlay `Mount` descriptors over the layer store.
+//! - [`stats`]: decode shim `Stats` (cgroups v1/v2 metrics) to CRI usage.
 //! - [`spec`]: CRI -> OCI `config.json` generation for shim bundles.
 //!
 //! Nothing here is wired into the CRI request path yet; later epic items
@@ -27,6 +28,7 @@ pub mod exec;
 pub mod exit;
 pub mod rootfs;
 pub mod spec;
+pub mod stats;
 pub mod stdio;
 
 /// Loopback integration: a fake shim `start` script prints the address of an

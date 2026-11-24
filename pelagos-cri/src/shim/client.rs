@@ -157,6 +157,12 @@ impl ShimClient {
         self.task.close_io(ctx(self.timeout), &r).await.map(|_| ())
     }
 
+    pub async fn stats(&self, id: &str) -> Result<api::StatsResponse> {
+        let mut r = api::StatsRequest::new();
+        r.id = id.into();
+        self.task.stats(ctx(self.timeout), &r).await
+    }
+
     pub async fn shutdown(&self, id: &str) -> Result<()> {
         let mut r = api::ShutdownRequest::new();
         r.id = id.into();
