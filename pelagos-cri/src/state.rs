@@ -573,6 +573,14 @@ impl AppState {
         // first time — makes re-adoption fully self-healing regardless of
         // why the file went missing.
         for sandbox in inner.sandboxes.values() {
+            // Shim (VM) sandboxes have no native pelagos sandbox: no pause
+            // process, handler other than native (#602).
+            if sandbox.pause_pid == 0
+                && !sandbox.runtime_handler.is_empty()
+                && sandbox.runtime_handler != "pelagos"
+            {
+                continue;
+            }
             if let Err(e) = write_pelagos_sandbox_state(
                 &sandbox.id,
                 Some(&sandbox.name),

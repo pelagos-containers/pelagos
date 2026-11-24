@@ -25,6 +25,8 @@ pub(crate) struct Mock {
     reject_create: Mutex<Vec<String>>,
     creates: Mutex<Vec<api::CreateTaskRequest>>,
     execs: Mutex<Vec<api::ExecProcessRequest>>,
+    /// Ids whose Connect fails (shim/VM gone).
+    reject_connect: Mutex<Vec<String>>,
 }
 
 impl Mock {
@@ -62,6 +64,51 @@ impl Task for Mock {
         self.creates.lock().unwrap().push(r);
         let mut resp = api::CreateTaskResponse::new();
         resp.pid = 77;
+        Ok(resp)
+    }
+    async fn connect(
+        &self,
+        _: &TtrpcContext,
+        r: api::ConnectRequest,
+    ) -> ttrpc::Result<api::ConnectResponse> {
+        self.log(format!("connect:{}", r.id));
+        if self.reject_connect.lock().unwrap().contains(&r.id) {
+            return Err(err("gone"));
+        }
+        Ok(api::ConnectResponse::new())
+    }
+    async fn state(
+        &self,
+        _: &TtrpcContext,
+        r: api::StateRequest,
+    ) -> ttrpc::Result<api::StateResponse> {
+        self.log(format!("state:{}", r.id));
+        if r.id.starts_with("lost") {
+            return Err(err("no such task"));
+        }
+        let create = self
+            .creates
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.id == r.id)
+            .cloned();
+        let mut resp = api::StateResponse::new();
+        resp.id = r.id.clone();
+        resp.pid = 77;
+        if let Some(c) = create {
+            resp.stdin = c.stdin;
+            resp.stdout = c.stdout;
+            resp.stderr = c.stderr;
+        }
+        if r.id.starts_with("done") {
+            resp.status =
+                containerd_shim_protos::protobuf::EnumOrUnknown::new(api::Status::STOPPED);
+            resp.exit_status = 3;
+        } else {
+            resp.status =
+                containerd_shim_protos::protobuf::EnumOrUnknown::new(api::Status::RUNNING);
+        }
         Ok(resp)
     }
     async fn exec(
@@ -150,6 +197,7 @@ impl Task for Mock {
 pub(crate) struct Fixture {
     pub(crate) tmp: tempfile::TempDir,
     pub(crate) rt: Arc<ShimRuntime>,
+    cfg: ShimConfig,
     pub(crate) main: Arc<Mock>,
     pub(crate) alt: Arc<Mock>,
     servers: Vec<Server>,
@@ -202,18 +250,16 @@ pub(crate) async fn fixture() -> Fixture {
     let root = tmp.path().join("rt");
     let store = StoreLayout::under(&tmp.path().join("store"));
     fake_image(&store);
-    let rt = Arc::new(
-        ShimRuntime::start(ShimConfig {
-            handlers: [("fake".to_string(), script.to_string_lossy().into_owned())].into(),
-            root,
-            store,
-        })
-        .await
-        .unwrap(),
-    );
+    let cfg = ShimConfig {
+        handlers: [("fake".to_string(), script.to_string_lossy().into_owned())].into(),
+        root,
+        store,
+    };
+    let rt = Arc::new(ShimRuntime::start(cfg.clone()).await.unwrap());
     Fixture {
         tmp,
         rt,
+        cfg,
         main,
         alt,
         servers: vec![s1, s2],
@@ -242,6 +288,10 @@ pub(crate) fn container(id: &str, sandbox_id: &str) -> CriContainer {
 }
 
 impl Fixture {
+    pub(crate) fn reject_connect(&self, id: &str) {
+        self.main.reject_connect.lock().unwrap().push(id.into());
+    }
+
     pub(crate) async fn finish(mut self) {
         self.main
             .release_all
@@ -519,4 +569,125 @@ async fn exec_sync_runs_in_the_container_and_captures_output() {
     let p: oci_spec::runtime::Process = serde_json::from_slice(&spec.value).unwrap();
     assert_eq!(p.args().clone().unwrap(), ["echo", "hi"]);
     f.finish().await;
+}
+
+/// A "restarted CRI": a fresh runtime over the same root/store, as after a
+/// process restart. The old runtime's pumps are closed first (its process is
+/// gone in reality).
+pub(crate) async fn restart(f: &Fixture, ids: &[&str]) -> Arc<ShimRuntime> {
+    for id in ids {
+        f.rt.flush_logs(id).await;
+    }
+    Arc::new(ShimRuntime::start(f.cfg.clone()).await.unwrap())
+}
+
+#[tokio::test]
+async fn readopt_reattaches_running_exited_and_lost_tasks() {
+    let f = fixture().await;
+    let sb = sandbox("rsb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let mut specs = Vec::new();
+    for id in ["live1", "done1", "lost1"] {
+        let c = container(id, "rsb");
+        let log = f.log_path(&format!("{id}.log"));
+        f.rt.start_container(&sb, &c, log.to_str().unwrap(), "/x")
+            .await
+            .unwrap();
+        specs.push((c, log.to_string_lossy().into_owned()));
+    }
+    let rt2 = restart(&f, &["live1", "done1", "lost1"]).await;
+    assert!(
+        rt2.container_ids_of("rsb").is_empty(),
+        "fresh runtime knows nothing yet"
+    );
+
+    let report = rt2.readopt(std::slice::from_ref(&sb), &specs).await;
+    assert!(report.sandboxes_lost.is_empty());
+    let by: std::collections::HashMap<_, _> = report.containers.iter().cloned().collect();
+    assert_eq!(by["live1"], Readopted::Running);
+    assert_eq!(by["done1"], Readopted::Exited(3));
+    assert_eq!(by["lost1"], Readopted::Lost);
+    assert_eq!(rt2.container_exit("done1").unwrap().exit_status, 3);
+    assert_eq!(rt2.container_exit("lost1").unwrap().exit_status, 137);
+    assert!(rt2.container_exit("live1").is_none());
+
+    // The running task is fully usable again: output flows to the CRI log
+    // (appended after what was logged before the restart) ...
+    let req = f
+        .main
+        .creates
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.id == "live1")
+        .cloned()
+        .unwrap();
+    {
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&req.stdout)
+            .unwrap();
+        w.write_all(b"after restart\n").unwrap();
+    }
+    // ... and stop goes through the re-attached client, then cleans up.
+    let x = rt2
+        .stop_container("live1", 15, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(x.exit_status, 137);
+    let log = std::fs::read_to_string(f.log_path("live1.log")).unwrap();
+    assert!(
+        log.contains("hello from guest") && log.contains("after restart"),
+        "{log}"
+    );
+    rt2.remove_container("live1").await;
+    rt2.remove_container("done1").await;
+    assert!(!f.tmp.path().join("rt/bundles/k8s.io/live1").exists());
+    // The sandbox shim was re-attached too.
+    rt2.stop_sandbox("rsb").await;
+    assert!(f.main.calls().contains(&"shutdown:rsb".to_string()));
+    rt2.shutdown().await;
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn readopt_reports_lost_sandbox_and_leaves_its_bundle() {
+    let f = fixture().await;
+    let sb = sandbox("gonesb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let c = container("c1", "gonesb");
+    f.rt.start_container(&sb, &c, f.log_path("g.log").to_str().unwrap(), "/x")
+        .await
+        .unwrap();
+    f.main.reject_connect.lock().unwrap().push("gonesb".into());
+    let rt2 = restart(&f, &["c1"]).await;
+    let report = rt2.readopt(&[sb], &[(c, "/dev/null".into())]).await;
+    assert_eq!(report.sandboxes_lost, ["gonesb"]);
+    assert_eq!(report.containers, [("c1".to_string(), Readopted::Lost)]);
+    assert_eq!(rt2.container_exit("c1").unwrap().exit_status, 137);
+    assert!(
+        f.tmp.path().join("rt/bundles/k8s.io/gonesb").exists(),
+        "a dead shim's bundle may hold mounts: never deleted blindly"
+    );
+    rt2.shutdown().await;
+    f.finish().await;
+}
+
+#[test]
+fn reattach_rootfs_derives_paths_without_creating_anything() {
+    let t = tempfile::tempdir().unwrap();
+    let store = StoreLayout::under(t.path());
+    let p = rootfs::reattach_rootfs(&store, "abcdef0123456789", vec![]);
+    assert_eq!(
+        p.scratch_dir(),
+        store.scratch.join("cri-shim-abcdef0123456789")
+    );
+    assert_eq!(p.upper_dir(), p.scratch_dir().join("upper"));
+    assert!(!p.uses_aliases() && !store.scratch.exists());
+    std::fs::create_dir_all(store.alias_root.join("abcdef012345")).unwrap();
+    assert!(rootfs::reattach_rootfs(&store, "abcdef0123456789", vec![]).uses_aliases());
 }

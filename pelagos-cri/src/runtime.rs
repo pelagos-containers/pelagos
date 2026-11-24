@@ -804,6 +804,64 @@ impl RuntimeSvc {
         }
     }
 
+    /// Re-adopt shim-backed pods after a CRI restart (#602): reconnect their
+    /// shims, re-attach running tasks, and fold what was lost or finished
+    /// while we were down into the CRI records so the kubelet replaces them.
+    pub async fn readopt_shim(&self) {
+        let Some(shim) = self.shim.clone() else {
+            return;
+        };
+        let (sandboxes, containers) = {
+            let st = self.state.inner.lock().await;
+            let sbs: Vec<CriSandbox> = st
+                .sandboxes
+                .values()
+                .filter(|s| shim.handles(&s.runtime_handler))
+                .cloned()
+                .collect();
+            let ctrs: Vec<(CriContainer, String)> = st
+                .containers
+                .values()
+                .filter(|c| c.state == MyContainerState::Running)
+                .filter_map(|c| {
+                    let sb = sbs.iter().find(|s| s.id == c.sandbox_id)?;
+                    let log =
+                        effective_cri_log_path(&sb.log_directory, &c.log_path, &c.pelagos_name);
+                    Some((c.clone(), log))
+                })
+                .collect();
+            (sbs, ctrs)
+        };
+        if sandboxes.is_empty() {
+            return;
+        }
+        let report = shim.readopt(&sandboxes, &containers).await;
+        for sb in &sandboxes {
+            self.mark_shim_containers_exited(&shim, &sb.id).await;
+        }
+        if !report.sandboxes_lost.is_empty() {
+            let mut st = self.state.inner.lock().await;
+            for id in &report.sandboxes_lost {
+                if let Some(s) = st.sandboxes.get_mut(id) {
+                    s.state = SandboxState::NotReady;
+                    let _ = state::save_sandbox(s);
+                }
+            }
+        }
+        let running = report
+            .containers
+            .iter()
+            .filter(|(_, r)| *r == crate::shimrt::Readopted::Running)
+            .count();
+        log::info!(
+            "shim re-adoption: {} sandbox(es) ({} lost), {} container(s) ({} still running)",
+            sandboxes.len(),
+            report.sandboxes_lost.len(),
+            report.containers.len(),
+            running
+        );
+    }
+
     /// Run a container through the shim backend and record it as Running.
     async fn start_shim_container(
         &self,
@@ -4886,6 +4944,50 @@ mod tests {
         .unwrap();
         assert!(!svc.state.inner.lock().await.containers.contains_key("rc1"));
         assert!(f.main.calls().contains(&"delete:rc1".to_string()));
+        f.finish().await;
+    }
+
+    /// After a CRI restart, shim pods are re-adopted: a live pod keeps its
+    /// running container; a pod whose shim vanished goes NotReady with its
+    /// containers Exited(137) so the kubelet replaces it (#602).
+    #[tokio::test]
+    async fn test_readopt_shim_updates_cri_records() {
+        use crate::shimrt::tests::{container, fixture, restart, sandbox};
+        let f = fixture().await;
+        let mk = |id: &str, log: &str| {
+            let mut s = sandbox(id);
+            s.log_directory = f.tmp.path().join(log).to_string_lossy().into_owned();
+            s
+        };
+        let (live, dead) = (mk("liveSb", "l"), mk("deadSb", "d"));
+        let mut svc = test_svc();
+        svc.backends =
+            BackendRegistry::new("pelagos".into()).with_shim_handlers(["fake".to_string()]);
+        for (sb, cid) in [(&live, "lc1"), (&dead, "dc1")] {
+            f.rt.start_sandbox("fake", sb, "/run/netns/x", None, None)
+                .await
+                .unwrap();
+            let mut c = container(cid, &sb.id);
+            c.log_path = "c.log".into();
+            let log = format!("{}/c.log", sb.log_directory);
+            f.rt.start_container(sb, &c, &log, "/x").await.unwrap();
+            c.state = MyContainerState::Running;
+            let mut st = svc.state.inner.lock().await;
+            st.sandboxes.insert(sb.id.clone(), sb.clone());
+            st.containers.insert(cid.into(), c);
+        }
+        f.reject_connect("deadSb");
+        svc.shim = Some(restart(&f, &["lc1", "dc1"]).await);
+
+        svc.readopt_shim().await;
+
+        let st = svc.state.inner.lock().await;
+        assert_eq!(st.sandboxes["liveSb"].state, SandboxState::Running);
+        assert_eq!(st.containers["lc1"].state, MyContainerState::Running);
+        assert_eq!(st.sandboxes["deadSb"].state, SandboxState::NotReady);
+        assert_eq!(st.containers["dc1"].state, MyContainerState::Exited);
+        assert_eq!(st.containers["dc1"].exit_code, 137);
+        drop(st);
         f.finish().await;
     }
 

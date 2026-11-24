@@ -384,6 +384,30 @@ pub fn plan_rootfs(
     })
 }
 
+/// Rebuild the cleanup handle of an already-planned rootfs after a CRI
+/// restart (re-adoption): nothing is created, the scratch paths are derived
+/// exactly as [`plan_rootfs`] derived them, and the alias directory is
+/// included only if it exists. `layers` may be empty when the image is gone;
+/// it only serves user resolution, which a running container no longer needs.
+pub fn reattach_rootfs(
+    store: &StoreLayout,
+    container_id: &str,
+    layers: Vec<PathBuf>,
+) -> RootfsPlan {
+    let scratch = store.scratch.join(format!("cri-shim-{container_id}"));
+    let short = &container_id[..container_id.len().min(12)];
+    let alias = store.alias_root.join(short);
+    RootfsPlan {
+        typ: "overlay".into(),
+        source: "overlay".into(),
+        options: Vec::new(),
+        upper: scratch.join("upper"),
+        scratch,
+        alias_dir: alias.is_dir().then_some(alias),
+        layers,
+    }
+}
+
 // ── layered /etc/passwd + /etc/group ─────────────────────────────────────────
 
 /// Is `path` an overlay-opaque directory (hides lower layers)?
