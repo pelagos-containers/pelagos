@@ -191,6 +191,25 @@ pelagos-cri --shim-handler kata=/opt/kata/bin/containerd-shim-kata-v2 \
             --shim-handler gvisor=/usr/local/bin/containerd-shim-runsc-v1
 ```
 
+**Enabling it on a node** (full how-to: `docs/SHIM_HANDLERS_GUIDE.md`). The shipped `pelagos-cri` systemd units read
+`/etc/pelagos/cri.env` (optional) and append `$PELAGOS_CRI_ARGS` to the command
+line. The package installs a helper that edits that file idempotently:
+
+```
+sudo pelagos-cri-shim-handlers add kata=/opt/kata/bin/containerd-shim-kata-v2 \
+                                   gvisor=/usr/local/bin/containerd-shim-runsc-v1
+pelagos-cri-shim-handlers runtimeclass kata gvisor     # kubectl apply
+pelagos-cri-shim-handlers list | remove NAME           # inspect / undo
+```
+
+Restarting `pelagos-cri` re-adopts running shim pods, so adding a handler does
+not disturb them. Example RuntimeClass manifests are in
+`/usr/share/pelagos/runtimeclass/`, and a commented template in
+`/usr/share/pelagos/cri.env.example`. Prerequisites the helper does not
+install: the shim binaries themselves (Kata only accepts its configuration at
+its shipped `/opt/kata` paths; gVisor's shim needs `runsc` on `PATH`), and a CNI
+configuration. With no `cri.env`, nothing changes from the native behaviour.
+
 ```yaml
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass

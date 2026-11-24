@@ -7,10 +7,12 @@ Before=k3s-agent.service
 [Service]
 Type=simple
 ExecStartPre=/usr/bin/mkdir -p /run/pelagos
-ExecStart=/usr/local/bin/pelagos-cri --pelagos-bin /usr/local/bin/pelagos --socket /run/pelagos/cri.sock
+ExecStart=/usr/local/bin/pelagos-cri --pelagos-bin /usr/local/bin/pelagos --socket /run/pelagos/cri.sock $PELAGOS_CRI_ARGS
 Restart=always
 RestartSec=5s
 Environment=RUST_LOG=info
+# Optional operator settings (shim handlers etc.); see /usr/share/pelagos/cri.env.example
+EnvironmentFile=-/etc/pelagos/cri.env
 LimitNOFILE=1048576
 
 [Install]

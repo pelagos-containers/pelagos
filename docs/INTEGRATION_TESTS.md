@@ -6535,3 +6535,13 @@ Part of epic #574. `cargo test -p pelagos-cri --bin pelagos-cri -- shimrt stream
 - `runtime::tests::test_container_rpcs_dispatch_to_shim_runtime` (extended) — CRI `Exec`/`Attach` on a shim pod register a streaming token carrying the shim container id (the SPDY handler then talks to the shim rather than running `pelagos exec`); previously `UNIMPLEMENTED`.
 
 Refactor note: the exit-code/FIN sequence at the end of a native exec moved verbatim into `send_exit_and_fins` so both paths share the ordering crictl depends on (error stream first, then stdout/stderr FINs). Behaviour-preserving, but covered only by the cluster streaming bucket.
+
+## scripts/test-shim-handlers-script.sh
+
+No root, no rootfs, no cluster. Exercises `scripts/pelagos-cri-shim-handlers.sh`
+against a temporary env file: add, replace (one entry per name), remove, list;
+that unrelated flags and variables in `cri.env` survive edits; that bad names,
+the reserved `pelagos` name, missing binaries and specs without `=` are
+rejected; and that both unit templates declare the optional `EnvironmentFile`
+and consume `$PELAGOS_CRI_ARGS`. A failure means enabling a shim handler would
+silently drop operator settings or the units would ignore the file.

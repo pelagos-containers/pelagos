@@ -40,6 +40,26 @@ contents:
     file_info:
       mode: 0755
 
+  - src: scripts/pelagos-cri-shim-handlers.sh
+    dst: /usr/bin/pelagos-cri-shim-handlers
+    file_info:
+      mode: 0755
+
+  - src: pkg/nfpm/cri.env.example
+    dst: /usr/share/pelagos/cri.env.example
+    file_info:
+      mode: 0644
+
+  - src: pkg/runtimeclass/kata.yaml
+    dst: /usr/share/pelagos/runtimeclass/kata.yaml
+    file_info:
+      mode: 0644
+
+  - src: pkg/runtimeclass/gvisor.yaml
+    dst: /usr/share/pelagos/runtimeclass/gvisor.yaml
+    file_info:
+      mode: 0644
+
   - src: pkg/nfpm/pelagos.tmpfiles
     dst: /usr/lib/tmpfiles.d/pelagos.conf
     file_info:
