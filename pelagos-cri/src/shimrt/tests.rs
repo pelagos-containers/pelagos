@@ -946,3 +946,63 @@ async fn sandbox_task_gets_pause_image_rootfs() {
     assert!(no_rootfs);
     f.finish().await;
 }
+
+/// #619: a missing pause image is pulled via `<bin> image pull` exactly once
+/// even for concurrent pods; a present image is never pulled; a failing pull
+/// is reported.
+#[tokio::test]
+async fn missing_sandbox_image_is_pulled_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture_with(Some("registry.example/pause:1")).await;
+    assert_eq!(
+        f.rt.missing_sandbox_image().as_deref(),
+        Some("registry.example/pause:1")
+    );
+    let store = f.cfg.store.clone();
+    // Fake `pelagos`: logs the call and writes the manifest a real pull would.
+    let bin = f.tmp.path().join("fake-pelagos");
+    let dir = store.images.join("registry.example_pause_1");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {log}\nmkdir -p {dir}\necho '{{\"reference\":\"registry.example/pause:1\",\"digest\":\"sha256:aa\",\"layers\":[],\"layer_types\":[],\"config\":{{}}}}' > {dir}/manifest.json\n",
+            log = f.tmp.path().join("pulls.log").display(),
+            dir = dir.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let b = bin.to_string_lossy().into_owned();
+    let (a, c) = tokio::join!(f.rt.ensure_sandbox_image(&b), f.rt.ensure_sandbox_image(&b));
+    a.unwrap();
+    c.unwrap();
+    let log = std::fs::read_to_string(f.tmp.path().join("pulls.log")).unwrap();
+    assert_eq!(log.lines().count(), 1, "pulled once: {log}");
+    assert_eq!(log.trim(), "image pull registry.example/pause:1");
+    assert!(f.rt.missing_sandbox_image().is_none());
+    f.rt.ensure_sandbox_image(&b).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("pulls.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "present image: no pull"
+    );
+    f.finish().await;
+
+    // Failing pull is surfaced.
+    let f = fixture_with(Some("registry.example/none:1")).await;
+    let bad = f.tmp.path().join("bad-pelagos");
+    std::fs::write(&bad, "#!/bin/sh\necho nope >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err =
+        f.rt.ensure_sandbox_image(bad.to_str().unwrap())
+            .await
+            .unwrap_err();
+    assert!(
+        err.contains("registry.example/none:1") && err.contains("nope"),
+        "{err}"
+    );
+    f.finish().await;
+}

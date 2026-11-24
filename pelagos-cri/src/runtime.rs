@@ -1437,6 +1437,11 @@ impl RuntimeService for RuntimeSvc {
             let shim = self.shim.as_ref().expect("is_shim implies a shim runtime");
             let netns_path = format!("/run/netns/{}", sandbox.netns);
             let hostname = (!sandbox_hostname.is_empty()).then_some(sandbox_hostname.as_str());
+            let bin = self.bin().await;
+            if let Err(e) = shim.ensure_sandbox_image(&bin).await {
+                podnet::teardown_pod_network(&sandbox_id, &sandbox).await;
+                return Err(Status::internal(e));
+            }
             if let Err(e) = shim
                 .start_sandbox(
                     &sandbox.runtime_handler,

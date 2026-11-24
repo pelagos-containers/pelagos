@@ -111,6 +111,11 @@ pub fn sandbox_unit(sandbox_id: &str) -> String {
     format!("pelagos-sbx-{}.service", sanitize(sandbox_id))
 }
 
+/// Unit name for a shim's scope, e.g. `pelagos-shim-<id>.scope` (#618).
+pub fn shim_unit(id: &str) -> String {
+    format!("pelagos-shim-{}.scope", sanitize(id))
+}
+
 /// Build the `systemd-run --scope` argv that wraps a quick-returning command
 /// whose forked descendants must outlive the runtime (the `pelagos run --detach`
 /// watcher). Returns the full argv beginning with `systemd-run`.

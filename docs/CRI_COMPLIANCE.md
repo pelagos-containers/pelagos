@@ -221,8 +221,10 @@ Status of validation (2026-11-24, real shims on an x86_64 node):
   Requirements this surfaced: the shim client speaks `containerd.task.v3.Task`
   first and falls back to `v2` (all these shims register v2); the sandbox task
   needs a pause image rootfs (`--shim-sandbox-image`, default
-  `registry.k8s.io/pause:3.10`, **must already be pulled**); every bundle gets
-  a `log` FIFO (Go shims exit without it).
+  `registry.k8s.io/pause:3.10`, pulled automatically on first use); every
+  bundle gets a `log` FIFO (Go shims exit without it); and each shim is
+  started in its own `pelagos.slice` systemd scope so a CRI restart does not
+  kill it (Go shims such as runsc do not escape the service cgroup on their own).
 - **Wasm is NOT supported through shim handlers.**
   - runwasi's `containerd-shim-wasmtime` calls containerd's own
     Containers/Images/Content/Leases gRPC services at its `-address` socket, so
@@ -241,8 +243,7 @@ Status of validation (2026-11-24, real shims on an x86_64 node):
 
 Design and upstream findings: `docs/SHIM_V2_CLIENT_DESIGN.md`. Not
 implemented: the containerd Sandbox API (not needed for Kata), an explicit
-`RuntimeDefault` seccomp profile for shim containers, automatic pulling of the
-pause image, and a generalised pelagos shim v2 *server*.
+`RuntimeDefault` seccomp profile for shim containers, and a generalised pelagos shim v2 *server*.
 
 ## Dependency summary
 
