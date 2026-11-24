@@ -202,7 +202,7 @@ What happens for a shim-handler pod:
 
 | Step | Behaviour |
 |---|---|
-| RunPodSandbox | pod netns created and CNI ADD applied **first**, then the shim is bootstrapped (`start`) and the sandbox task created in it. No pause process. `hostNetwork` pods and nodes without a CNI config are rejected. Pod sysctls go into the sandbox spec. |
+| RunPodSandbox | pod netns created and CNI ADD applied **first**, then the shim is bootstrapped (`start`) and the sandbox task created in it. The sandbox task runs `/pause` from the configured pause image. `hostNetwork` pods and nodes without a CNI config are rejected. Pod sysctls go into the sandbox spec. |
 | CreateContainer / StartContainer | CRI -> OCI `config.json` (always sets `io.kubernetes.cri.container-type` / `sandbox-id`); the image's overlay is passed to the shim as a `Mount` descriptor (the shim mounts it); the container joins the pod's shim, falling back to a per-container shim `start` if the pod shim rejects it. |
 | Logs | shim stdout/stderr FIFOs -> CRI log format; `ReopenContainerLog` supported. |
 | Exec / ExecSync / Attach | through the Task API (exec processes, FIFOs, pty resize). Port-forward dials the pod IP in the CNI netns, unchanged. |
@@ -211,17 +211,38 @@ What happens for a shim-handler pod:
 | Restart | shims are re-adopted from their persisted bundles; unreachable ones are reported and their pods go NotReady so the kubelet replaces them. |
 | StopPodSandbox | stop shim, **then** CNI DEL, **then** delete the netns. |
 
-Status of validation (be honest about it): everything above is covered by
-in-process tests against mock shims (`docs/INTEGRATION_TESTS.md`). It has **not
-yet** been run against a real Kata, runsc or runwasi shim, and the CRI
-streaming conformance bucket has not been re-run since the streaming changes.
-Open assumptions to settle on real hardware: that Kata accepts containers on
-the pod's shim address; that its share_fs accepts the symlinked `lowerdir`
-aliases used only for images with roughly 40+ layers; and that Kata `Stats`
-arrive as cgroups v1 metrics. Design and upstream findings:
-`docs/SHIM_V2_CLIENT_DESIGN.md`. Not implemented: the containerd Sandbox API
-(not needed for Kata), an explicit `RuntimeDefault` seccomp profile for shim
-containers, and a generalised pelagos shim v2 *server*.
+Status of validation (2026-11-24, real shims on an x86_64 node):
+
+- **Kata 4.4.0 (runtime-rs) and gVisor runsc: validated.** Sandbox and
+  container lifecycle, logs, exec (including stdin), stats, a 44-layer image
+  (the symlinked `lowerdir` alias path), clean teardown (no leaked VM, netns,
+  mounts or IPAM) and CRI-restart re-adoption (Kata) all work. Kata accepts
+  containers on the pod shim's address and its stats arrive as cgroups v2.
+  Requirements this surfaced: the shim client speaks `containerd.task.v3.Task`
+  first and falls back to `v2` (all these shims register v2); the sandbox task
+  needs a pause image rootfs (`--shim-sandbox-image`, default
+  `registry.k8s.io/pause:3.10`, **must already be pulled**); every bundle gets
+  a `log` FIFO (Go shims exit without it).
+- **Wasm is NOT supported through shim handlers.**
+  - runwasi's `containerd-shim-wasmtime` calls containerd's own
+    Containers/Images/Content/Leases gRPC services at its `-address` socket, so
+    it cannot run without a containerd daemon (`Create` fails with
+    `Others("transport error")`).
+  - `pelagos-shim-wasm` ignores `CreateTask.rootfs` and the stdio FIFOs, runs
+    the sandbox's `/pause` as a wasm module, and its daemon dies at startup
+    (it initialises a logger twice).
+  - `pelagos-cri` itself rejects Wasm images on the shim path ("image is a Wasm
+    image; it has no overlay rootfs"): their layers are modules, not an overlay.
+  - Supporting it would take a sandbox-less handler mode, delivery of the
+    module to the shim, and a shim that honours rootfs and stdio. Tracked in
+    the wasm follow-up issue; native Wasm pods are unaffected by all of this.
+- **CRI conformance:** the critest `Streaming` bucket passes 5/5 against a
+  build including the shim streaming changes (native handler).
+
+Design and upstream findings: `docs/SHIM_V2_CLIENT_DESIGN.md`. Not
+implemented: the containerd Sandbox API (not needed for Kata), an explicit
+`RuntimeDefault` seccomp profile for shim containers, automatic pulling of the
+pause image, and a generalised pelagos shim v2 *server*.
 
 ## Dependency summary
 
