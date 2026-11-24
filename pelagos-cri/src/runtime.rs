@@ -580,6 +580,26 @@ fn cri_container_state_val(s: &MyContainerState) -> i32 {
 
 /// Convert a CRI Signal proto enum value to a signal name string for `pelagos --stop-signal`.
 /// Returns empty string for RUNTIME_DEFAULT (0) meaning "use runtime default (SIGTERM)".
+/// Signal number for a CRI `stop_signal` name (`SIGTERM`, `TERM`, `15`);
+/// SIGTERM when empty or unrecognised.
+fn stop_signal_number(name: &str) -> u32 {
+    let n = name.trim().trim_start_matches("SIG");
+    if let Ok(v) = n.parse::<u32>() {
+        return v;
+    }
+    match n {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "KILL" => 9,
+        "USR1" => 10,
+        "USR2" => 12,
+        "ALRM" => 14,
+        "WINCH" => 28,
+        _ => 15,
+    }
+}
+
 fn cri_signal_to_name(sig: i32) -> String {
     match sig {
         0 => String::new(), // RUNTIME_DEFAULT — no override
@@ -671,6 +691,7 @@ fn container_to_proto(c: &CriContainer) -> crate::cri::Container {
 
 // ── RuntimeSvc ───────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct RuntimeSvc {
     pub state: AppState,
     pub streaming_base_url: String,
@@ -680,6 +701,8 @@ pub struct RuntimeSvc {
     /// shim-backed runtime handler is configured: `GetContainerEvents` then
     /// stays unimplemented, exactly as before.
     pub shim_exits: Option<crate::shim::exit::ExitTracker>,
+    /// Shim-backed runtime handlers (#599). `None` when none are configured.
+    pub shim: Option<std::sync::Arc<crate::shimrt::ShimRuntime>>,
 }
 
 impl RuntimeSvc {
@@ -700,6 +723,143 @@ impl RuntimeSvc {
             .resolve(&handler)
             .unwrap_or_else(|_| self.backends.default_backend())
             .clone()
+    }
+
+    /// The shim runtime, when `sandbox_id` was created with a shim handler.
+    async fn shim_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<std::sync::Arc<crate::shimrt::ShimRuntime>> {
+        let shim = self.shim.as_ref()?;
+        let handler = self
+            .state
+            .inner
+            .lock()
+            .await
+            .sandboxes
+            .get(sandbox_id)
+            .map(|s| s.runtime_handler.clone())?;
+        shim.handles(&handler).then(|| shim.clone())
+    }
+
+    /// The shim runtime and container, when `container_id` belongs to a
+    /// shim-handler sandbox.
+    async fn shim_for_container(
+        &self,
+        container_id: &str,
+    ) -> Option<(std::sync::Arc<crate::shimrt::ShimRuntime>, CriContainer)> {
+        let c = self
+            .state
+            .inner
+            .lock()
+            .await
+            .containers
+            .get(container_id)
+            .cloned()?;
+        let shim = self.shim_for_sandbox(&c.sandbox_id).await?;
+        Some((shim, c))
+    }
+
+    /// Add the pod and per-container statuses the kubelet's evented PLEG
+    /// reads from a container event. Unknown containers (e.g. already
+    /// removed) leave the event with identifiers only.
+    async fn fill_event_statuses(&self, ev: &mut ContainerEventResponse) {
+        // Settle the CRI records first so the statuses reflect the exit.
+        if let Some((shim, c)) = self.shim_for_container(&ev.container_id).await {
+            shim.flush_logs(&ev.container_id).await;
+            self.mark_shim_containers_exited(&shim, &c.sandbox_id).await;
+        }
+        let (sandbox_id, container_ids) = {
+            let st = self.state.inner.lock().await;
+            let Some(c) = st.containers.get(&ev.container_id) else {
+                return;
+            };
+            let ids: Vec<String> = st
+                .containers
+                .values()
+                .filter(|o| o.sandbox_id == c.sandbox_id)
+                .map(|o| o.id.clone())
+                .collect();
+            (c.sandbox_id.clone(), ids)
+        };
+        if let Ok(r) = self
+            .pod_sandbox_status(Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: sandbox_id,
+                verbose: false,
+            }))
+            .await
+        {
+            ev.pod_sandbox_status = r.into_inner().status;
+        }
+        for id in container_ids {
+            if let Ok(r) = self
+                .container_status(Request::new(ContainerStatusRequest {
+                    container_id: id,
+                    verbose: false,
+                }))
+                .await
+            {
+                ev.containers_statuses.extend(r.into_inner().status);
+            }
+        }
+    }
+
+    /// Run a container through the shim backend and record it as Running.
+    async fn start_shim_container(
+        &self,
+        shim: &std::sync::Arc<crate::shimrt::ShimRuntime>,
+        container: CriContainer,
+    ) -> Result<Response<StartContainerResponse>, Status> {
+        let sandbox = self
+            .state
+            .inner
+            .lock()
+            .await
+            .sandboxes
+            .get(&container.sandbox_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let log_dest = effective_cri_log_path(
+            &sandbox.log_directory,
+            &container.log_path,
+            &container.pelagos_name,
+        );
+        let netns_path = format!("/run/netns/{}", sandbox.netns);
+        shim.start_container(&sandbox, &container, &log_dest, &netns_path)
+            .await
+            .map_err(|e| Status::internal(format!("start shim container: {e}")))?;
+        let mut st = self.state.inner.lock().await;
+        if let Some(c) = st.containers.get_mut(&container.id) {
+            c.state = MyContainerState::Running;
+            c.started_at_ns = now_ns();
+            let _ = state::save_container(c);
+        }
+        Ok(Response::new(StartContainerResponse {}))
+    }
+
+    /// Fold shim-reported exits into the CRI records of `sandbox_id`'s
+    /// running containers.
+    async fn mark_shim_containers_exited(
+        &self,
+        shim: &crate::shimrt::ShimRuntime,
+        sandbox_id: &str,
+    ) {
+        let mut st = self.state.inner.lock().await;
+        for c in st.containers.values_mut() {
+            if c.sandbox_id != sandbox_id || c.state != MyContainerState::Running {
+                continue;
+            }
+            if let Some(x) = shim.container_exit(&c.id) {
+                c.state = MyContainerState::Exited;
+                c.exit_code = x.exit_status as i32;
+                c.finished_at_ns = x
+                    .exited_at
+                    .map(|(s, n)| s.saturating_mul(1_000_000_000).saturating_add(n as i64))
+                    .unwrap_or_else(now_ns);
+                c.oom_killed = shim.exits.oom_seen(&c.id);
+                let _ = state::save_container(c);
+            }
+        }
     }
 
     async fn bin(&self) -> String {
@@ -943,7 +1103,34 @@ impl RuntimeService for RuntimeSvc {
 
         // hostNetwork takes a dedicated branch (no CNI); otherwise try CNI first
         // and fall back to pelagos native bridge networking.
-        let (sandbox_id, netns, ip, cni_conf, pause_pid) = if host_network {
+        let is_shim = self
+            .shim
+            .as_ref()
+            .is_some_and(|s| s.handles(&runtime_handler));
+        let (sandbox_id, netns, ip, cni_conf, pause_pid) = if is_shim {
+            // ── Shim (VM) path: netns + CNI first, no pause process; the shim
+            // is started below once the sandbox record exists (#599).
+            let id = generate_id();
+            let net = podnet::prepare_shim_sandbox_network(
+                &id,
+                podnet::PodRef {
+                    name: &meta.name,
+                    namespace: &meta.namespace,
+                    uid: &uid,
+                },
+                &namespaces,
+                cni::find_cni_conf(),
+                cni_cap_args.clone(),
+            )
+            .await?;
+            (
+                id,
+                net.ns_name,
+                net.ip,
+                net.conf_path.to_string_lossy().to_string(),
+                0,
+            )
+        } else if host_network {
             // ── HostNetwork path: no CNI, no netns; share the host network ──
             let id = generate_id();
             let ip = node_primary_ipv4();
@@ -1137,6 +1324,26 @@ impl RuntimeService for RuntimeSvc {
             port_mappings: sandbox_port_mappings,
         };
 
+        if is_shim {
+            let shim = self.shim.as_ref().expect("is_shim implies a shim runtime");
+            let netns_path = format!("/run/netns/{}", sandbox.netns);
+            let hostname = (!sandbox_hostname.is_empty()).then_some(sandbox_hostname.as_str());
+            if let Err(e) = shim
+                .start_sandbox(
+                    &sandbox.runtime_handler,
+                    &sandbox,
+                    &netns_path,
+                    hostname,
+                    None,
+                )
+                .await
+            {
+                // Nothing runs the VM: release the network again.
+                podnet::teardown_pod_network(&sandbox_id, &sandbox).await;
+                return Err(Status::internal(format!("start shim sandbox: {e}")));
+            }
+        }
+
         {
             let mut st = self.state.inner.lock().await;
             state::save_sandbox(&sandbox)
@@ -1166,7 +1373,18 @@ impl RuntimeService for RuntimeSvc {
                 .collect()
         };
 
+        let shim = self.shim_for_sandbox(&sandbox_id).await;
+        if let Some(shim) = &shim {
+            for cid in shim.container_ids_of(&sandbox_id) {
+                shim.stop_container(&cid, 9, std::time::Duration::from_secs(5))
+                    .await;
+            }
+            self.mark_shim_containers_exited(shim, &sandbox_id).await;
+        }
         for (pelagos_name, cstate) in &containers_to_stop {
+            if shim.is_some() {
+                break;
+            }
             if *cstate == MyContainerState::Running {
                 log::debug!(
                     "StopPodSandbox {} step=stop-container {}",
@@ -1189,7 +1407,10 @@ impl RuntimeService for RuntimeSvc {
         // fail-fast included) — see `AppState::begin_stop_pod_sandbox` (#561).
         let sandbox = self.state.begin_stop_pod_sandbox(&sandbox_id).await;
 
-        if let Some(ref sb) = sandbox {
+        if let (Some(sb), Some(shim)) = (&sandbox, &shim) {
+            // VM first, then CNI DEL and netns removal (`podnet`, #595).
+            podnet::teardown_after_shim_stop(shim.stop_sandbox(&sandbox_id), &sandbox_id, sb).await;
+        } else if let Some(ref sb) = sandbox {
             if !sb.netns.is_empty() {
                 // ── CNI teardown ───────────────────────────────────────────────
                 // ORDER MATTERS, and the killer subtlety is systemd, not the network.
@@ -1279,6 +1500,13 @@ impl RuntimeService for RuntimeSvc {
         request: Request<RemovePodSandboxRequest>,
     ) -> Result<Response<RemovePodSandboxResponse>, Status> {
         let sandbox_id = request.into_inner().pod_sandbox_id;
+
+        if let Some(shim) = self.shim_for_sandbox(&sandbox_id).await {
+            for cid in shim.container_ids_of(&sandbox_id) {
+                shim.remove_container(&cid).await;
+            }
+            shim.remove_sandbox(&sandbox_id);
+        }
 
         let mut st = self.state.inner.lock().await;
         let container_ids: Vec<String> = st
@@ -1792,6 +2020,10 @@ impl RuntimeService for RuntimeSvc {
                 .ok_or_else(|| Status::not_found("container not found"))?
         };
 
+        if let Some(shim) = self.shim_for_sandbox(&container.sandbox_id).await {
+            return self.start_shim_container(&shim, container).await;
+        }
+
         let mut args: Vec<String> = vec![
             "run".into(),
             "--name".into(),
@@ -2262,7 +2494,16 @@ impl RuntimeService for RuntimeSvc {
         &self,
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
-        let container_id = request.into_inner().container_id;
+        let req = request.into_inner();
+        let container_id = req.container_id;
+
+        if let Some((shim, c)) = self.shim_for_container(&container_id).await {
+            let timeout = std::time::Duration::from_secs(req.timeout.max(0) as u64);
+            shim.stop_container(&container_id, stop_signal_number(&c.stop_signal), timeout)
+                .await;
+            self.mark_shim_containers_exited(&shim, &c.sandbox_id).await;
+            return Ok(Response::new(StopContainerResponse {}));
+        }
 
         let (pelagos_name, sandbox_id) = {
             let st = self.state.inner.lock().await;
@@ -2310,6 +2551,14 @@ impl RuntimeService for RuntimeSvc {
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
         let container_id = request.into_inner().container_id;
+
+        if let Some((shim, _)) = self.shim_for_container(&container_id).await {
+            shim.remove_container(&container_id).await;
+            let mut st = self.state.inner.lock().await;
+            st.containers.remove(&container_id);
+            state::remove_container_file(&container_id);
+            return Ok(Response::new(RemoveContainerResponse {}));
+        }
 
         let (pelagos_name, sandbox_id) = {
             let st = self.state.inner.lock().await;
@@ -2400,6 +2649,14 @@ impl RuntimeService for RuntimeSvc {
         // writing the CRI log before we report its status. critest (and the kubelet)
         // read the log right after seeing the container exited, so it must be
         // complete — otherwise the read races the relay's final flush (#344).
+        if let Some((shim, c)) = self.shim_for_container(&container_id).await {
+            // Reflect a natural exit, and make sure the CRI log is complete
+            // before the kubelet sees "exited".
+            if shim.container_exit(&container_id).is_some() {
+                shim.flush_logs(&container_id).await;
+            }
+            self.mark_shim_containers_exited(&shim, &c.sandbox_id).await;
+        }
         let pname_state = {
             let st = self.state.inner.lock().await;
             st.containers
@@ -2545,6 +2802,20 @@ impl RuntimeService for RuntimeSvc {
         let container_id = req.container_id;
         let cmd = req.cmd;
         let timeout_secs = req.timeout;
+
+        if let Some((shim, _)) = self.shim_for_container(&container_id).await {
+            let timeout =
+                (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs as u64));
+            let out = shim
+                .exec_sync(&container_id, cmd, timeout)
+                .await
+                .map_err(|e| Status::internal(format!("exec in shim container: {e}")))?;
+            return Ok(Response::new(ExecSyncResponse {
+                stdout: out.captured.stdout,
+                stderr: out.captured.stderr,
+                exit_code: out.exit_code,
+            }));
+        }
 
         let (pelagos_name, bin) = {
             let st = self.state.inner.lock().await;
@@ -2973,7 +3244,10 @@ impl RuntimeService for RuntimeSvc {
         // exits would make a kubelet with evented PLEG miss every native
         // transition, so stay unimplemented until a shim backend is wired.
         match &self.shim_exits {
-            Some(tracker) => Ok(Response::new(Box::pin(container_event_stream(tracker)))),
+            Some(tracker) => Ok(Response::new(Box::pin(container_event_stream(
+                tracker,
+                self.clone(),
+            )))),
             None => Err(Status::unimplemented("not implemented")),
         }
     }
@@ -3026,6 +3300,7 @@ pub(crate) fn container_stopped_event(
 /// skips the missed events with a warning rather than failing the stream.
 pub(crate) fn container_event_stream(
     tracker: &crate::shim::exit::ExitTracker,
+    svc: RuntimeSvc,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<ContainerEventResponse, Status>> {
     use tokio::sync::broadcast::error::RecvError;
     let mut sub = tracker.subscribe();
@@ -3034,7 +3309,8 @@ pub(crate) fn container_event_stream(
         loop {
             match sub.recv().await {
                 Ok(x) => {
-                    if let Some(ev) = container_stopped_event(&x) {
+                    if let Some(mut ev) = container_stopped_event(&x) {
+                        svc.fill_event_statuses(&mut ev).await;
                         if tx.send(Ok(ev)).await.is_err() {
                             return;
                         }
@@ -3568,6 +3844,7 @@ mod tests {
             registry: Default::default(),
             backends: BackendRegistry::new("pelagos".to_string()),
             shim_exits: None,
+            shim: None,
         };
         {
             let mut st = svc.state.inner.lock().await;
@@ -4381,6 +4658,7 @@ mod tests {
             registry: Default::default(),
             backends: BackendRegistry::new("pelagos".to_string()),
             shim_exits: None,
+            shim: None,
         };
 
         // Insert a Running sidecar container (attempt 0) directly into state,
@@ -4470,7 +4748,113 @@ mod tests {
             registry: Default::default(),
             backends: BackendRegistry::new("pelagos".to_string()),
             shim_exits: None,
+            shim: None,
         }
+    }
+
+    /// CRI container RPCs on a shim-handler sandbox go to the shim runtime
+    /// (mock shim), not the native CLI backend.
+    #[tokio::test]
+    async fn test_container_rpcs_dispatch_to_shim_runtime() {
+        use crate::shimrt::tests::{container, fixture, sandbox};
+        let f = fixture().await;
+        let mut svc = test_svc();
+        svc.backends =
+            BackendRegistry::new("pelagos".into()).with_shim_handlers(["fake".to_string()]);
+        svc.shim = Some(f.rt.clone());
+        let sb = sandbox("rsb1");
+        let log_dir = f.tmp.path().join("podlogs");
+        let mut sb2 = sb.clone();
+        sb2.log_directory = log_dir.to_string_lossy().into_owned();
+        sb2.netns = "pcri-rsb1".into();
+        let mut c = container("rc1", "rsb1");
+        c.log_path = "app/0.log".into();
+        f.rt.start_sandbox("fake", &sb2, "/run/netns/pcri-rsb1", None, None)
+            .await
+            .unwrap();
+        {
+            let mut st = svc.state.inner.lock().await;
+            st.sandboxes.insert("rsb1".into(), sb2);
+            st.containers.insert("rc1".into(), c);
+        }
+        svc.start_container(Request::new(StartContainerRequest {
+            container_id: "rc1".into(),
+        }))
+        .await
+        .unwrap();
+        let st = svc
+            .container_status(Request::new(ContainerStatusRequest {
+                container_id: "rc1".into(),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .unwrap();
+        assert_eq!(
+            st.state,
+            crate::cri::ContainerState::ContainerRunning as i32
+        );
+        assert!(
+            st.log_path.ends_with("podlogs/app/0.log"),
+            "{}",
+            st.log_path
+        );
+
+        let r = svc
+            .exec_sync(Request::new(ExecSyncRequest {
+                container_id: "rc1".into(),
+                cmd: vec!["id".into()],
+                timeout: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.exit_code, r.stdout.as_slice()), (5, &b"execout"[..]));
+
+        svc.stop_container(Request::new(StopContainerRequest {
+            container_id: "rc1".into(),
+            timeout: 5,
+        }))
+        .await
+        .unwrap();
+        let st = svc
+            .container_status(Request::new(ContainerStatusRequest {
+                container_id: "rc1".into(),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .unwrap();
+        assert_eq!(st.state, crate::cri::ContainerState::ContainerExited as i32);
+        assert_eq!(st.exit_code, 137);
+        let log = std::fs::read_to_string(log_dir.join("app/0.log")).unwrap();
+        assert!(log.contains(" stdout F hello from guest"), "{log}");
+
+        // CRI container events carry the pod and container statuses (#599).
+        let mut ev = container_stopped_event(&exit_of("rc1", None, 137)).unwrap();
+        svc.fill_event_statuses(&mut ev).await;
+        assert_eq!(ev.pod_sandbox_status.as_ref().unwrap().id, "rsb1");
+        assert_eq!(ev.containers_statuses.len(), 1);
+        assert_eq!(
+            ev.containers_statuses[0].state,
+            crate::cri::ContainerState::ContainerExited as i32
+        );
+        let mut unknown = container_stopped_event(&exit_of("gone", None, 1)).unwrap();
+        svc.fill_event_statuses(&mut unknown).await;
+        assert!(unknown.pod_sandbox_status.is_none() && unknown.containers_statuses.is_empty());
+
+        svc.remove_container(Request::new(RemoveContainerRequest {
+            container_id: "rc1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(!svc.state.inner.lock().await.containers.contains_key("rc1"));
+        assert!(f.main.calls().contains(&"delete:rc1".to_string()));
+        f.finish().await;
     }
 
     /// An unknown RuntimeClass handler must be rejected up front, before any

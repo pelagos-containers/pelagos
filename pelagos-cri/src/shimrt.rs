@@ -1,0 +1,590 @@
+//! Shim-backed runtime handlers (epic #574, #599).
+//!
+//! [`ShimRuntime`] owns everything the CRI needs to run pods through a
+//! containerd shim v2 binary (Kata, runsc, runwasi): the events sink and exit
+//! tracker, one shim per pod sandbox, and per-container task state (bundle,
+//! rootfs plan, stdio pump). It is deliberately independent of CRI protobufs
+//! and of root: `runtime.rs` prepares the pod network (`podnet`) and calls in.
+//!
+//! Container-to-shim strategy: a container first tries the **sandbox's shim
+//! address** (how a pod's containers share one VM). If that shim rejects the
+//! container's `Create`, we fall back to running the shim `start` bootstrap
+//! for the container and using the address it returns. Kata validation
+//! (epic item) decides which is canonical; both are tested.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use containerd_shim_protos::api;
+
+use crate::shim::bootstrap::{self, StartParams};
+use crate::shim::bundle::Bundle;
+use crate::shim::client::ShimClient;
+use crate::shim::events::{placeholder_publish_binary, EventsSink};
+use crate::shim::exec::{self, ExecLimits, ExecOutcome, ExecRequest};
+use crate::shim::exit::{ContainerExit, ExitTracker};
+use crate::shim::rootfs::{self, LayeredUsers, RootfsPlan, StoreLayout};
+use crate::shim::spec::{
+    self, ContainerSpecInput, ImageDefaults, SandboxResources, SandboxSpecInput,
+};
+use crate::shim::stdio::{CriLogWriter, Pump, Sink, StdinWriter, Stdio};
+use crate::state::{CriContainer, CriMount, CriSandbox};
+
+/// containerd namespace used for all pelagos-cri tasks.
+pub const NAMESPACE: &str = "k8s.io";
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Grace for an exit event to arrive after the Wait RPC failed.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShimError {
+    #[error("no shim configured for runtime handler {0:?}")]
+    UnknownHandler(String),
+    #[error("unknown sandbox {0}")]
+    UnknownSandbox(String),
+    #[error("unknown container {0}")]
+    UnknownContainer(String),
+    #[error("{0}")]
+    Spec(String),
+    #[error("rootfs: {0}")]
+    Rootfs(#[from] rootfs::RootfsError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("shim bootstrap: {0}")]
+    Bootstrap(#[from] bootstrap::BootstrapError),
+    #[error("shim: {0}")]
+    Rpc(#[from] containerd_shim_protos::ttrpc::Error),
+    #[error("exec: {0}")]
+    Exec(#[from] exec::ExecError),
+}
+
+/// Static configuration.
+#[derive(Debug, Clone)]
+pub struct ShimConfig {
+    /// runtime handler name -> shim binary.
+    pub handlers: HashMap<String, String>,
+    /// Bundles, events socket and FIFOs live under here.
+    pub root: PathBuf,
+    pub store: StoreLayout,
+}
+
+impl ShimConfig {
+    pub fn system(handlers: HashMap<String, String>) -> Self {
+        Self {
+            handlers,
+            root: "/run/pelagos-cri/shim".into(),
+            store: StoreLayout::system(),
+        }
+    }
+}
+
+struct SandboxShim {
+    client: Arc<ShimClient>,
+    binary: String,
+    bundle: Bundle,
+}
+
+struct TaskCtx {
+    sandbox_id: String,
+    client: Arc<ShimClient>,
+    bundle: Bundle,
+    plan: RootfsPlan,
+    stdio: Stdio,
+    pump: tokio::sync::Mutex<Option<Pump>>,
+    stdin: Option<StdinWriter>,
+}
+
+pub struct ShimRuntime {
+    cfg: ShimConfig,
+    events_addr: String,
+    pub exits: ExitTracker,
+    sink: tokio::sync::Mutex<EventsSink>,
+    sandboxes: Mutex<HashMap<String, Arc<SandboxShim>>>,
+    tasks: Mutex<HashMap<String, Arc<TaskCtx>>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl ShimRuntime {
+    /// Start the events sink and exit tracker.
+    pub async fn start(cfg: ShimConfig) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&cfg.root)?;
+        let (sink, rx) = EventsSink::start(&cfg.root.join("events.sock")).await?;
+        Ok(Self {
+            events_addr: sink.address(),
+            exits: ExitTracker::spawn(rx),
+            sink: tokio::sync::Mutex::new(sink),
+            cfg,
+            sandboxes: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub async fn shutdown(&self) {
+        self.sink.lock().await.shutdown().await;
+    }
+
+    pub fn handles(&self, handler: &str) -> bool {
+        self.cfg.handlers.contains_key(handler)
+    }
+
+    pub fn handler_names(&self) -> Vec<String> {
+        let mut v: Vec<_> = self.cfg.handlers.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn start_params(&self, binary: &str, id: &str, bundle: &Bundle) -> StartParams {
+        StartParams {
+            binary: binary.to_string(),
+            namespace: NAMESPACE.into(),
+            id: id.into(),
+            address: self
+                .cfg
+                .root
+                .join("containerd.sock")
+                .to_string_lossy()
+                .into(),
+            ttrpc_address: self.events_addr.clone(),
+            publish_binary: placeholder_publish_binary(),
+            bundle: bundle.dir().to_path_buf(),
+        }
+    }
+
+    fn sandbox(&self, id: &str) -> Result<Arc<SandboxShim>, ShimError> {
+        lock(&self.sandboxes)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ShimError::UnknownSandbox(id.into()))
+    }
+
+    fn task(&self, id: &str) -> Result<Arc<TaskCtx>, ShimError> {
+        lock(&self.tasks)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ShimError::UnknownContainer(id.into()))
+    }
+
+    // ── sandbox ──────────────────────────────────────────────────────────
+
+    /// Bootstrap the pod's shim and run the sandbox (pause) task in it. The
+    /// pod netns (CNI applied) must already exist.
+    pub async fn start_sandbox(
+        &self,
+        handler: &str,
+        sb: &CriSandbox,
+        netns_path: &str,
+        hostname: Option<&str>,
+        resources: Option<SandboxResources>,
+    ) -> Result<(), ShimError> {
+        let binary = self
+            .cfg
+            .handlers
+            .get(handler)
+            .ok_or_else(|| ShimError::UnknownHandler(handler.into()))?
+            .clone();
+        let sbspec = spec::build_sandbox_spec(&SandboxSpecInput {
+            sandbox: sb,
+            netns_path: Some(netns_path),
+            resources,
+            hostname,
+            pause_args: &[],
+        })
+        .map_err(|e| ShimError::Spec(e.to_string()))?;
+        let bundle = Bundle::create(&self.cfg.root.join("bundles"), NAMESPACE, &sb.id)?;
+        bundle.write_config(
+            &spec::to_config_json(&sbspec).map_err(|e| ShimError::Spec(e.to_string()))?,
+        )?;
+        let params = self.start_params(&binary, &sb.id, &bundle);
+        let addr = bootstrap::start(&params, BOOTSTRAP_TIMEOUT).await?;
+        bundle.persist_shim(&binary, &addr)?;
+        let client = Arc::new(ShimClient::connect(&addr.address).await?);
+
+        let run = async {
+            let mut req = api::CreateTaskRequest::new();
+            req.id = sb.id.clone();
+            req.bundle = bundle.dir().to_string_lossy().into_owned();
+            client.create(req).await?;
+            client.start(&sb.id).await?;
+            Ok::<_, ShimError>(())
+        }
+        .await;
+        if let Err(e) = run {
+            // Do not leave a half-started VM behind.
+            let _ = client.shutdown(&sb.id).await;
+            let _ = bundle.remove();
+            return Err(e);
+        }
+        lock(&self.sandboxes).insert(
+            sb.id.clone(),
+            Arc::new(SandboxShim {
+                client,
+                binary,
+                bundle,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Stop the sandbox task and shim. Best effort past the first error: the
+    /// caller goes on to CNI DEL / netns removal, which must happen after the
+    /// VM is gone (`podnet::teardown_after_shim_stop`).
+    pub async fn stop_sandbox(&self, id: &str) {
+        let Ok(sb) = self.sandbox(id) else { return };
+        if let Err(e) = sb.client.kill(id, 9, true).await {
+            log::debug!("stop_sandbox {id}: kill: {e}");
+        }
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.exits.wait_exit_or_poll(id, &sb.client, EXIT_GRACE),
+        )
+        .await;
+        if let Err(e) = sb.client.delete(id).await {
+            log::debug!("stop_sandbox {id}: delete: {e}");
+        }
+        if let Err(e) = sb.client.shutdown(id).await {
+            log::debug!("stop_sandbox {id}: shutdown: {e}");
+        }
+    }
+
+    pub fn remove_sandbox(&self, id: &str) {
+        if let Some(sb) = lock(&self.sandboxes).remove(id) {
+            let _ = sb.bundle.remove();
+        }
+        self.exits.forget(id);
+    }
+
+    // ── containers ───────────────────────────────────────────────────────
+
+    /// Create and start a container's task in its pod's VM. Returns the pid.
+    pub async fn start_container(
+        &self,
+        sb: &CriSandbox,
+        c: &CriContainer,
+        cri_log_path: &str,
+        netns_path: &str,
+    ) -> Result<u32, ShimError> {
+        let sandbox = self.sandbox(&sb.id)?;
+        let store = &self.cfg.store;
+        let manifest = rootfs::find_manifest(store, &c.image)?;
+        let image = ImageDefaults::from_manifest(&manifest);
+        let layers = rootfs::layers_top_first(store, &c.image, &manifest)?;
+        let plan = rootfs::plan_rootfs(store, &c.id, layers.clone())?;
+        let users = LayeredUsers::new(layers);
+
+        let bundle_root = self.cfg.root.join("bundles");
+        let bundle = Bundle::create(&bundle_root, NAMESPACE, &c.id)?;
+        let built = self
+            .prepare_container(sb, c, &image, &users, netns_path, &sandbox, &bundle)
+            .await;
+        let stdio = match built {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = plan.cleanup();
+                let _ = bundle.remove();
+                return Err(e);
+            }
+        };
+
+        let result = self
+            .create_and_start(sb, c, &plan, &bundle, &stdio, cri_log_path, &sandbox)
+            .await;
+        match result {
+            Ok((pid, ctx)) => {
+                self.spawn_exit_watch(&c.id, ctx.clone());
+                lock(&self.tasks).insert(c.id.clone(), ctx);
+                Ok(pid)
+            }
+            Err(e) => {
+                stdio.remove();
+                let _ = plan.cleanup();
+                let _ = bundle.remove();
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_container(
+        &self,
+        sb: &CriSandbox,
+        c: &CriContainer,
+        image: &ImageDefaults,
+        users: &LayeredUsers,
+        netns_path: &str,
+        sandbox: &SandboxShim,
+        bundle: &Bundle,
+    ) -> Result<Stdio, ShimError> {
+        let devices = c
+            .devices
+            .iter()
+            .map(spec::resolve_device)
+            .collect::<Result<Vec<_>, _>>()?;
+        let seccomp = if c.seccomp_profile_type == 2 && !c.privileged {
+            Some(spec::load_seccomp_profile(&c.seccomp_profile_path)?)
+        } else {
+            None
+        };
+        // Pod DNS: the guest has no host resolver config, so hand it the
+        // sandbox's as a bind mount (the shim shares it into the VM).
+        let mut extra_mounts: Vec<CriMount> = Vec::new();
+        if !sb.dns_servers.is_empty() {
+            let p = sandbox.bundle.dir().join("resolv.conf");
+            std::fs::write(&p, resolv_conf(sb))?;
+            extra_mounts.push(CriMount {
+                host_path: p.to_string_lossy().into_owned(),
+                container_path: "/etc/resolv.conf".into(),
+                readonly: true,
+                recursive_read_only: false,
+                propagation: 0,
+            });
+        }
+        let cspec = spec::build_container_spec(&ContainerSpecInput {
+            container: c,
+            sandbox: sb,
+            image,
+            netns_path: Some(netns_path),
+            extra_mounts: &extra_mounts,
+            devices: &devices,
+            seccomp,
+            hostname: None,
+            users: Some(users),
+        })
+        .map_err(|e| ShimError::Spec(e.to_string()))?;
+        bundle.write_config(
+            &spec::to_config_json(&cspec).map_err(|e| ShimError::Spec(e.to_string()))?,
+        )?;
+        Ok(Stdio::create(
+            &self.cfg.root.join("io"),
+            &c.id,
+            c.stdin,
+            c.tty,
+        )?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_and_start(
+        &self,
+        sb: &CriSandbox,
+        c: &CriContainer,
+        plan: &RootfsPlan,
+        bundle: &Bundle,
+        stdio: &Stdio,
+        cri_log_path: &str,
+        sandbox: &SandboxShim,
+    ) -> Result<(u32, Arc<TaskCtx>), ShimError> {
+        let pump = Pump::spawn(stdio, Sink::Log(CriLogWriter::open(cri_log_path.as_ref())?))?;
+        let stdin = match &stdio.stdin {
+            Some(p) => StdinWriter::open(p).ok(),
+            None => None,
+        };
+        let make_req = || {
+            let mut r = api::CreateTaskRequest::new();
+            r.id = c.id.clone();
+            r.bundle = bundle.dir().to_string_lossy().into_owned();
+            r.rootfs = vec![plan.to_api_mount()];
+            stdio.fill_create(&mut r);
+            r
+        };
+
+        // Preferred: the pod's own shim.
+        let mut client = sandbox.client.clone();
+        if let Err(e) = client.create(make_req()).await {
+            // Fallback: ask the shim binary to bootstrap this container.
+            log::warn!(
+                "container {}: sandbox shim rejected Create ({e}); falling back to shim start",
+                c.id
+            );
+            let params = self.start_params(&sandbox.binary, &c.id, bundle);
+            let started = async {
+                let addr = bootstrap::start(&params, BOOTSTRAP_TIMEOUT).await?;
+                bundle.persist_shim(&sandbox.binary, &addr)?;
+                let cl = Arc::new(ShimClient::connect(&addr.address).await?);
+                cl.create(make_req()).await?;
+                Ok::<_, ShimError>(cl)
+            }
+            .await;
+            match started {
+                Ok(cl) => client = cl,
+                Err(e2) => {
+                    pump.finish().await;
+                    return Err(e2);
+                }
+            }
+        }
+        let pid = match client.start(&c.id).await {
+            Ok(r) => r.pid,
+            Err(e) => {
+                let _ = client.delete(&c.id).await;
+                pump.finish().await;
+                return Err(e.into());
+            }
+        };
+        let ctx = Arc::new(TaskCtx {
+            sandbox_id: sb.id.clone(),
+            client,
+            bundle: bundle.clone(),
+            plan: plan.clone(),
+            stdio: stdio.clone(),
+            pump: tokio::sync::Mutex::new(Some(pump)),
+            stdin,
+        });
+        Ok((pid, ctx))
+    }
+
+    /// Feed the exit tracker from the Wait RPC as well as events, so a shim
+    /// that never publishes still reports exits.
+    /// When the task exits the log pump is drained and closed right away, so
+    /// the CRI log is complete by the time the exit is visible.
+    fn spawn_exit_watch(&self, id: &str, ctx: Arc<TaskCtx>) {
+        let exits = self.exits.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            match exits.wait_exit_or_poll(&id, &ctx.client, EXIT_GRACE).await {
+                Ok(_) => finish_task_io(&ctx).await,
+                Err(e) => log::warn!("container {id}: {e}"),
+            }
+        });
+    }
+
+    /// Drain and close a container's log pump (idempotent).
+    pub async fn flush_logs(&self, id: &str) {
+        if let Ok(t) = self.task(id) {
+            finish_task_io(&t).await;
+        }
+    }
+
+    pub fn container_exit(&self, id: &str) -> Option<ContainerExit> {
+        self.exits.exit_of(id)
+    }
+
+    #[cfg(test)]
+    pub fn is_running(&self, id: &str) -> bool {
+        lock(&self.tasks).contains_key(id) && self.exits.exit_of(id).is_none()
+    }
+
+    /// Stop a container: `signal`, wait up to `timeout`, then SIGKILL. Returns
+    /// the exit, or `None` if the shim was lost.
+    pub async fn stop_container(
+        &self,
+        id: &str,
+        signal: u32,
+        timeout: Duration,
+    ) -> Option<ContainerExit> {
+        let t = self.task(id).ok()?;
+        if self.exits.exit_of(id).is_none() {
+            if let Err(e) = t.client.kill(id, signal, false).await {
+                log::debug!("stop_container {id}: kill {signal}: {e}");
+            }
+            let waited = tokio::time::timeout(
+                timeout,
+                self.exits.wait_exit_or_poll(id, &t.client, EXIT_GRACE),
+            )
+            .await;
+            if waited.is_err() {
+                log::info!("container {id}: SIGKILL after {timeout:?}");
+                let _ = t.client.kill(id, 9, true).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.exits.wait_exit_or_poll(id, &t.client, EXIT_GRACE),
+                )
+                .await;
+            }
+        }
+        finish_task_io(&t).await;
+        self.exits.exit_of(id)
+    }
+
+    /// Delete the task and clean up host-side state. Idempotent.
+    pub async fn remove_container(&self, id: &str) {
+        let Some(t) = lock(&self.tasks).remove(id) else {
+            return;
+        };
+        finish_task_io(&t).await;
+        if let Err(e) = t.client.delete(id).await {
+            log::debug!("remove_container {id}: delete: {e}");
+        }
+        t.stdio.remove();
+        if let Err(e) = t.plan.cleanup() {
+            log::warn!("remove_container {id}: rootfs cleanup: {e}");
+        }
+        let _ = t.bundle.remove();
+        self.exits.forget(id);
+    }
+
+    /// Containers of a sandbox this runtime currently tracks.
+    pub fn container_ids_of(&self, sandbox_id: &str) -> Vec<String> {
+        lock(&self.tasks)
+            .iter()
+            .filter(|(_, t)| t.sandbox_id == sandbox_id)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    pub async fn exec_sync(
+        &self,
+        container_id: &str,
+        args: Vec<String>,
+        timeout: Option<Duration>,
+    ) -> Result<ExecOutcome, ShimError> {
+        let t = self.task(container_id)?;
+        let base = exec::base_process(t.bundle.dir())?;
+        let exec_id = format!("exec-{}", uuid_like());
+        Ok(exec::exec_sync(
+            &t.client,
+            container_id,
+            &exec_id,
+            &base,
+            &ExecRequest {
+                args,
+                ..Default::default()
+            },
+            &self.cfg.root.join("io"),
+            ExecLimits {
+                timeout,
+                ..Default::default()
+            },
+        )
+        .await?)
+    }
+}
+
+async fn finish_task_io(t: &TaskCtx) {
+    if let Some(w) = &t.stdin {
+        w.close().await;
+    }
+    if let Some(p) = t.pump.lock().await.take() {
+        p.finish().await;
+    }
+}
+
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn resolv_conf(sb: &CriSandbox) -> String {
+    let mut s = String::new();
+    for n in &sb.dns_servers {
+        s.push_str(&format!("nameserver {n}\n"));
+    }
+    if !sb.dns_searches.is_empty() {
+        s.push_str(&format!("search {}\n", sb.dns_searches.join(" ")));
+    }
+    if !sb.dns_options.is_empty() {
+        s.push_str(&format!("options {}\n", sb.dns_options.join(" ")));
+    }
+    s
+}
+
+#[cfg(test)]
+pub(crate) mod tests;
