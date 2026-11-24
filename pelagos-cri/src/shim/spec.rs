@@ -899,6 +899,11 @@ pub fn build_sandbox_spec(inp: &SandboxSpecInput<'_>) -> Result<Spec, SpecError>
     if !sb.cgroup_parent.is_empty() {
         linux = linux.cgroups_path(PathBuf::from(format!("{}/{}", sb.cgroup_parent, sb.id)));
     }
+    // Pod sysctls ride in the sandbox spec so they reach the guest (host-side
+    // net sysctls do not cross into a VM's netns).
+    if !sb.sysctls.is_empty() {
+        linux = linux.sysctl(sb.sysctls.clone());
+    }
 
     let caps = caps_to_oci(&capability_set(false, &[], &[])?)?;
     let capabilities = LinuxCapabilitiesBuilder::default()

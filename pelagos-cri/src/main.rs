@@ -12,6 +12,7 @@ mod grpc_metrics;
 mod image;
 mod invoke;
 mod netns_native;
+mod podnet;
 mod runtime;
 mod scope;
 mod shim;

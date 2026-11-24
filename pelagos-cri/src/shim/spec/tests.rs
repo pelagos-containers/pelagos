@@ -824,3 +824,32 @@ fn generated_spec_is_readable_by_pelagos_oci_parser() {
     assert_eq!(a[ANN_CONTAINER_TYPE], "container");
     assert_eq!(a[ANN_SANDBOX_ID], "sb1");
 }
+
+#[test]
+fn pod_sysctls_are_emitted_in_the_sandbox_spec_only() {
+    let mut sb = sandbox();
+    sb.sysctls
+        .insert("net.ipv4.ip_local_port_range".into(), "1024 2048".into());
+    let s = build_sandbox_spec(&SandboxSpecInput {
+        sandbox: &sb,
+        netns_path: None,
+        resources: None,
+        hostname: None,
+        pause_args: &[],
+    })
+    .unwrap();
+    let got = s.linux().clone().unwrap().sysctl().clone().unwrap();
+    assert_eq!(got["net.ipv4.ip_local_port_range"], "1024 2048");
+    // None configured: no sysctl map at all; containers never carry pod sysctls.
+    let none = build_sandbox_spec(&SandboxSpecInput {
+        sandbox: &sandbox(),
+        netns_path: None,
+        resources: None,
+        hostname: None,
+        pause_args: &[],
+    })
+    .unwrap();
+    assert_eq!(none.linux().clone().unwrap().sysctl(), &None);
+    let c = build(&container(), &sb, &image()).unwrap();
+    assert_eq!(c.linux().clone().unwrap().sysctl(), &None);
+}

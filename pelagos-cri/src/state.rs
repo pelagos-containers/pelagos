@@ -181,6 +181,11 @@ pub struct CriSandbox {
     /// sandbox state loadable.
     #[serde(default)]
     pub runtime_handler: String,
+    /// Pod sysctls from `PodSandboxConfig.linux.sysctls`. Native pods apply them
+    /// to the pause's namespaces; shim-backed pods carry them in the sandbox
+    /// OCI spec (`linux.sysctl`) so they reach the guest (#595).
+    #[serde(default)]
+    pub sysctls: HashMap<String, String>,
 }
 
 /// A CRI `PortMapping` (host_port → container_port) persisted with the sandbox.
@@ -1369,6 +1374,17 @@ mod tests {
         // above builds exactly such JSON) must load with the default handler.
         let sb = sandbox("legacy", 0);
         assert_eq!(sb.runtime_handler, "");
+    }
+
+    #[test]
+    fn sandbox_json_without_sysctls_loads_empty_and_roundtrips() {
+        // State written before `sysctls` existed must still load (#595).
+        let mut sb = sandbox("legacy", 0);
+        assert!(sb.sysctls.is_empty());
+        sb.sysctls
+            .insert("net.core.somaxconn".into(), "1024".into());
+        let back: CriSandbox = serde_json::from_str(&serde_json::to_string(&sb).unwrap()).unwrap();
+        assert_eq!(back.sysctls["net.core.somaxconn"], "1024");
     }
 
     #[test]
