@@ -2940,6 +2940,7 @@ impl RuntimeService for RuntimeSvc {
     }
 
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
+        let req = request.into_inner();
         if self.shim_for_container(&req.container_id).await.is_some() {
             return Err(Status::unimplemented(
                 "streaming exec for shim-backed runtime handlers is not implemented yet (#601)",
@@ -2981,6 +2982,7 @@ impl RuntimeService for RuntimeSvc {
         &self,
         request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
+        let req = request.into_inner();
         if self.shim_for_container(&req.container_id).await.is_some() {
             return Err(Status::unimplemented(
                 "streaming attach for shim-backed runtime handlers is not implemented yet (#601)",
