@@ -96,6 +96,24 @@ struct TaskCtx {
     stdin: Option<StdinWriter>,
 }
 
+/// What re-adoption found for a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readopted {
+    /// Task alive; log pump, stdin and exit watch re-attached.
+    Running,
+    /// Task finished while we were down (exit recorded).
+    Exited(u32),
+    /// The shim or task is gone; recorded as exit 137.
+    Lost,
+}
+
+#[derive(Debug, Default)]
+pub struct ReadoptReport {
+    /// Sandboxes whose shim could not be reached.
+    pub sandboxes_lost: Vec<String>,
+    pub containers: Vec<(String, Readopted)>,
+}
+
 pub struct ShimRuntime {
     cfg: ShimConfig,
     events_addr: String,
@@ -256,6 +274,153 @@ impl ShimRuntime {
             let _ = sb.bundle.remove();
         }
         self.exits.forget(id);
+    }
+
+    // ── re-adoption ─────────────────────────────────────────────────────
+
+    /// Rebuild runtime state for pods created before a CRI restart. `containers`
+    /// pairs each CRI container (of a shim sandbox) with its CRI log path.
+    /// Unreachable shims/tasks are *reported*, never silently dropped, and
+    /// their bundles are left on disk (a dead shim may leave mounts; deleting
+    /// the tree blindly could reach through them).
+    pub async fn readopt(
+        &self,
+        sandboxes: &[CriSandbox],
+        containers: &[(CriContainer, String)],
+    ) -> ReadoptReport {
+        let mut report = ReadoptReport::default();
+        let bundles = self.cfg.root.join("bundles");
+        for sb in sandboxes
+            .iter()
+            .filter(|s| self.handles(&s.runtime_handler))
+        {
+            match self.reconnect_sandbox(&bundles, sb).await {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn!("readopt: sandbox {} unreachable: {e}", sb.id);
+                    report.sandboxes_lost.push(sb.id.clone());
+                }
+            }
+        }
+        for (c, log_path) in containers {
+            let outcome = if report.sandboxes_lost.contains(&c.sandbox_id) {
+                None
+            } else {
+                self.readopt_container(&bundles, c, log_path).await
+            };
+            let outcome = outcome.unwrap_or_else(|| {
+                self.exits
+                    .apply(crate::shim::exit::TaskEvent::Exit(ContainerExit {
+                        container_id: c.id.clone(),
+                        exec_id: None,
+                        pid: 0,
+                        exit_status: 137,
+                        exited_at: None,
+                    }));
+                Readopted::Lost
+            });
+            report.containers.push((c.id.clone(), outcome));
+        }
+        report
+    }
+
+    async fn reconnect_sandbox(
+        &self,
+        bundles: &std::path::Path,
+        sb: &CriSandbox,
+    ) -> Result<(), ShimError> {
+        let bundle = Bundle::open(bundles, NAMESPACE, &sb.id)?;
+        let rec = bundle.load_shim()?;
+        let client = Arc::new(ShimClient::connect(&rec.address).await?);
+        client.connect_task(&sb.id).await?;
+        lock(&self.sandboxes).insert(
+            sb.id.clone(),
+            Arc::new(SandboxShim {
+                client,
+                binary: rec.binary,
+                bundle,
+            }),
+        );
+        Ok(())
+    }
+
+    /// `None` = lost.
+    async fn readopt_container(
+        &self,
+        bundles: &std::path::Path,
+        c: &CriContainer,
+        cri_log_path: &str,
+    ) -> Option<Readopted> {
+        let sandbox = self.sandbox(&c.sandbox_id).ok()?;
+        let bundle = Bundle::open(bundles, NAMESPACE, &c.id).ok()?;
+        // A container that needed the per-container fallback has its own shim.
+        let client = match bundle.load_shim() {
+            Ok(rec) => Arc::new(ShimClient::connect(&rec.address).await.ok()?),
+            Err(_) => sandbox.client.clone(),
+        };
+        let st = match client.state(&c.id).await {
+            Ok(st) => st,
+            Err(e) => {
+                log::warn!("readopt: container {}: {e}", c.id);
+                return None;
+            }
+        };
+        let store = &self.cfg.store;
+        let layers = rootfs::find_manifest(store, &c.image)
+            .ok()
+            .and_then(|m| rootfs::layers_top_first(store, &c.image, &m).ok())
+            .unwrap_or_default();
+        let plan = rootfs::reattach_rootfs(store, &c.id, layers);
+        let opt = |s: &str| (!s.is_empty()).then(|| PathBuf::from(s));
+        let stdio = Stdio {
+            stdin: opt(&st.stdin),
+            stdout: PathBuf::from(&st.stdout),
+            stderr: opt(&st.stderr),
+            terminal: st.terminal,
+        };
+        use containerd_shim_protos::api::Status as S;
+        let stopped = matches!(st.status.enum_value(), Ok(S::STOPPED));
+        let (pump, stdin) = if stopped {
+            (None, None)
+        } else {
+            let w = match CriLogWriter::open(cri_log_path.as_ref()) {
+                Ok(w) => w,
+                Err(e) => {
+                    log::warn!("readopt: container {}: log {cri_log_path}: {e}", c.id);
+                    return None;
+                }
+            };
+            let pump = Pump::spawn(&stdio, Sink::Log(w)).ok()?;
+            let stdin = stdio
+                .stdin
+                .as_deref()
+                .and_then(|p| StdinWriter::open(p).ok());
+            (Some(pump), stdin)
+        };
+        let ctx = Arc::new(TaskCtx {
+            sandbox_id: c.sandbox_id.clone(),
+            client,
+            bundle,
+            plan,
+            stdio,
+            pump: tokio::sync::Mutex::new(pump),
+            stdin,
+        });
+        lock(&self.tasks).insert(c.id.clone(), ctx.clone());
+        if stopped {
+            self.exits
+                .apply(crate::shim::exit::TaskEvent::Exit(ContainerExit {
+                    container_id: c.id.clone(),
+                    exec_id: None,
+                    pid: st.pid,
+                    exit_status: st.exit_status,
+                    exited_at: st.exited_at.as_ref().map(|t| (t.seconds, t.nanos)),
+                }));
+            Some(Readopted::Exited(st.exit_status))
+        } else {
+            self.spawn_exit_watch(&c.id, ctx);
+            Some(Readopted::Running)
+        }
     }
 
     // ── containers ───────────────────────────────────────────────────────

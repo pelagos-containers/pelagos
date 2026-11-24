@@ -234,6 +234,9 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         state: app_state.clone(),
     };
 
+    // Re-adopt shim-backed pods that survived the restart before serving.
+    runtime_svc.readopt_shim().await;
+
     // Spawn the SPDY streaming server.
     let pelagos_bin = args.pelagos_bin.clone();
     tokio::spawn(streaming::serve(streaming_listener, registry, pelagos_bin));
