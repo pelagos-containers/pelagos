@@ -37,8 +37,11 @@ async-trait = "0.1"
 containerd-shim-protos = { version = "0.12", features = ["async"] }
 ttrpc = { version = "0.10", features = ["async"] }
 protobuf = "3.7"
+oci-spec = { version = "0.10", default-features = false, features = ["runtime"] }
 
 [dev-dependencies]
+# pelagos's own OCI config parser, to prove generated specs are readable by it.
+pelagos = { path = ".." }
 tempfile = "3"
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 serial_test = "3"
