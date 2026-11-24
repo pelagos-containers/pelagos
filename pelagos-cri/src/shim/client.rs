@@ -40,7 +40,9 @@ const TASK_V3: &str = "containerd.task.v3.Task";
 const TASK_V2: &str = "containerd.task.v2.Task";
 
 pub struct ShimClient {
-    client: Client,
+    address: String,
+    /// Replaced on reconnect (see the v2 fallback in `call`).
+    client: std::sync::Mutex<Client>,
     /// Set once a v3 call is answered "service does not exist": the shim
     /// speaks v2 only. Probing v3 first matches containerd 2.x shims.
     use_v2: AtomicBool,
@@ -71,7 +73,8 @@ impl ShimClient {
     pub async fn connect(address: &str) -> Result<Self> {
         let client = Client::connect(&ttrpc_address(address)).await?;
         Ok(Self {
-            client,
+            address: address.to_string(),
+            client: std::sync::Mutex::new(client),
             use_v2: AtomicBool::new(false),
             timeout: DEFAULT_TIMEOUT,
         })
@@ -105,7 +108,12 @@ impl ShimClient {
             payload,
             ..Default::default()
         };
-        let res = self.client.request(creq).await?;
+        let client = self
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let res = client.request(creq).await?;
         Resp::parse_from_bytes(&res.payload)
             .map_err(|e| ttrpc::Error::Others(format!("decode {method}: {e}")))
     }
@@ -121,6 +129,15 @@ impl ShimClient {
             Err(e) if svc == TASK_V3 && is_service_missing(&e) => {
                 log::info!("shim has no {TASK_V3}; falling back to {TASK_V2}");
                 self.use_v2.store(true, Ordering::Relaxed);
+                // ttrpc-rust servers (runwasi) drop the connection after
+                // answering a request for an unknown service, so retry on a
+                // fresh one (#613).
+                match Client::connect(&ttrpc_address(&self.address)).await {
+                    Ok(fresh) => {
+                        *self.client.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+                    }
+                    Err(e) => log::debug!("reconnect to {}: {e}", self.address),
+                }
                 self.call_as(TASK_V2, method, ctx(timeout), req).await
             }
             r => r,
