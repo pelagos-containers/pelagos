@@ -99,6 +99,64 @@ impl ShimClient {
         self.task.delete(ctx(self.timeout), &r).await
     }
 
+    // ── Exec processes (stdio item, #597) ───────────────────────────────────
+
+    /// Register an exec process. `spec` is the OCI `Process` JSON.
+    pub async fn exec(&self, req: api::ExecProcessRequest) -> Result<()> {
+        self.task.exec(ctx(self.timeout), &req).await.map(|_| ())
+    }
+
+    pub async fn start_exec(&self, id: &str, exec_id: &str) -> Result<api::StartResponse> {
+        let mut r = api::StartRequest::new();
+        r.id = id.into();
+        r.exec_id = exec_id.into();
+        self.task.start(ctx(self.timeout), &r).await
+    }
+
+    pub async fn kill_exec(&self, id: &str, exec_id: &str, signal: u32) -> Result<()> {
+        let mut r = api::KillRequest::new();
+        r.id = id.into();
+        r.exec_id = exec_id.into();
+        r.signal = signal;
+        self.task.kill(ctx(self.timeout), &r).await.map(|_| ())
+    }
+
+    /// Block until the exec process exits (no deadline; callers bound it).
+    pub async fn wait_exec(&self, id: &str, exec_id: &str) -> Result<api::WaitResponse> {
+        let mut r = api::WaitRequest::new();
+        r.id = id.into();
+        r.exec_id = exec_id.into();
+        self.task.wait(ctx(Duration::ZERO), &r).await
+    }
+
+    pub async fn delete_exec(&self, id: &str, exec_id: &str) -> Result<api::DeleteResponse> {
+        let mut r = api::DeleteRequest::new();
+        r.id = id.into();
+        r.exec_id = exec_id.into();
+        self.task.delete(ctx(self.timeout), &r).await
+    }
+
+    pub async fn resize_pty(&self, id: &str, exec_id: &str, width: u32, height: u32) -> Result<()> {
+        let mut r = api::ResizePtyRequest::new();
+        r.id = id.into();
+        r.exec_id = exec_id.into();
+        r.width = width;
+        r.height = height;
+        self.task
+            .resize_pty(ctx(self.timeout), &r)
+            .await
+            .map(|_| ())
+    }
+
+    /// Close the process's stdin (EOF to the guest process).
+    pub async fn close_io(&self, id: &str, exec_id: &str) -> Result<()> {
+        let mut r = api::CloseIORequest::new();
+        r.id = id.into();
+        r.exec_id = exec_id.into();
+        r.stdin = true;
+        self.task.close_io(ctx(self.timeout), &r).await.map(|_| ())
+    }
+
     pub async fn shutdown(&self, id: &str) -> Result<()> {
         let mut r = api::ShutdownRequest::new();
         r.id = id.into();
