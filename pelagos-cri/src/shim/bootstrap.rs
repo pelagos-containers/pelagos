@@ -12,6 +12,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::scope;
+
 /// Task API version a shim speaks when it does not say (legacy plain reply).
 pub const DEFAULT_SHIM_VERSION: u32 = 2;
 
@@ -148,15 +150,47 @@ pub fn parse_start_output(out: &str) -> Result<ShimAddress, BootstrapError> {
     })
 }
 
+/// Program and argv for running a shim subcommand. With `scope_unit` the shim
+/// (and the daemon it forks) is placed in its own transient systemd scope under
+/// `pelagos.slice`, so it lives outside `pelagos-cri.service`: systemd's default
+/// `KillMode=control-group` would otherwise kill every shim (and its VM or
+/// sandbox) when the CRI restarts. Kata's shim escapes by moving itself to
+/// another cgroup; Go shims such as runsc do not (#618). Same approach as the
+/// native supervisors (#336, `scope.rs`).
+pub(crate) fn shim_invocation(
+    binary: &str,
+    args: &[String],
+    scope_unit: Option<&str>,
+) -> (String, Vec<String>) {
+    match scope_unit {
+        Some(unit) => {
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            let mut argv = scope::build_scope_argv(unit, binary, &a, &[]);
+            let program = argv.remove(0);
+            (program, argv)
+        }
+        None => (binary.to_string(), args.to_vec()),
+    }
+}
+
+/// Whether `start` should be wrapped in a scope: needs a live systemd and
+/// root (a transient scope under the system manager is privileged).
+fn use_scope() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    scope::systemd_available() && unsafe { libc::geteuid() } == 0
+}
+
 async fn run(
     binary: &str,
     args: &[String],
     cwd: &Path,
     ttrpc_address: &str,
     timeout: Duration,
+    scope_unit: Option<&str>,
 ) -> Result<String, BootstrapError> {
-    let mut cmd = Command::new(binary);
-    cmd.args(args).current_dir(cwd).env("MAX_SHIM_VERSION", "2");
+    let (program, argv) = shim_invocation(binary, args, scope_unit);
+    let mut cmd = Command::new(program);
+    cmd.args(argv).current_dir(cwd).env("MAX_SHIM_VERSION", "2");
     if ttrpc_address.is_empty() {
         // Never leak an inherited value that would point the shim at some
         // other client's sink.
@@ -198,12 +232,14 @@ async fn run(
 
 /// Run `start` and return the shim's address.
 pub async fn start(p: &StartParams, timeout: Duration) -> Result<ShimAddress, BootstrapError> {
+    let unit = use_scope().then(|| scope::shim_unit(&p.id));
     let out = run(
         &p.binary,
         &start_args(p),
         &p.bundle,
         &p.ttrpc_address,
         timeout,
+        unit.as_deref(),
     )
     .await?;
     parse_start_output(&out)
@@ -218,12 +254,36 @@ pub async fn delete(p: &StartParams, timeout: Duration) -> Result<String, Bootst
         &p.bundle,
         &p.ttrpc_address,
         timeout,
+        None,
     )
     .await
 }
 
 #[cfg(test)]
 mod tests {
+    /// #618: with a scope unit the shim command is wrapped in
+    /// `systemd-run --scope --slice=pelagos.slice`; without one it is run as-is.
+    #[test]
+    fn shim_invocation_wraps_in_a_scope_only_when_asked() {
+        let args: Vec<String> = ["-namespace", "k8s.io", "-id", "p1", "start"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (prog, argv) = shim_invocation("/opt/shim", &args, None);
+        assert_eq!((prog.as_str(), argv.as_slice()), ("/opt/shim", &args[..]));
+
+        let unit = crate::scope::shim_unit("p1");
+        assert_eq!(unit, "pelagos-shim-p1.scope");
+        let (prog, argv) = shim_invocation("/opt/shim", &args, Some(&unit));
+        assert_eq!(prog, "systemd-run");
+        assert!(argv.contains(&"--scope".to_string()));
+        assert!(argv.contains(&"--slice=pelagos.slice".to_string()));
+        assert!(argv.contains(&format!("--unit={unit}")));
+        let dd = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[dd + 1..dd + 2], ["/opt/shim"]);
+        assert_eq!(&argv[dd + 2..], &args[..]);
+    }
+
     use super::*;
 
     fn params() -> StartParams {
@@ -286,5 +346,58 @@ mod tests {
         assert!(parse_start_output("  \n").is_err());
         assert!(parse_start_output(r#"{"address":""}"#).is_err());
         assert!(parse_start_output("{garbage").is_err());
+    }
+
+    /// #618 (root + systemd only): a process the shim's `start` leaves behind
+    /// lives in a `pelagos.slice` scope, not in the CRI's own cgroup, so a CRI
+    /// restart (KillMode=control-group) cannot take it down.
+    #[tokio::test]
+    async fn shim_daemon_lives_outside_the_cri_cgroup() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 || !crate::scope::systemd_available() {
+            eprintln!("skipped: needs root and systemd");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("containerd-shim-scopetest-v2");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep 120 >/dev/null 2>&1 </dev/null &\necho $! > ./daemon.pid\necho unix:///x\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = format!("scopetest{}", std::process::id());
+        let p = StartParams {
+            binary: script.to_string_lossy().into_owned(),
+            namespace: "k8s.io".into(),
+            id: id.clone(),
+            address: "/run/x.sock".into(),
+            ttrpc_address: String::new(),
+            publish_binary: "/bin/true".into(),
+            bundle: tmp.path().to_path_buf(),
+        };
+        let addr = start(&p, Duration::from_secs(20)).await.unwrap();
+        assert_eq!(addr.address, "unix:///x");
+        let pid: i32 = std::fs::read_to_string(tmp.path().join("daemon.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let theirs = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let ours = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let unit = crate::scope::shim_unit(&id);
+        crate::scope::stop_unit(&unit).await;
+        // SAFETY: plain signal to a process we spawned.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(
+            theirs.contains("pelagos.slice") && theirs.contains(&unit),
+            "shim daemon cgroup: {theirs}"
+        );
+        assert_ne!(
+            theirs.trim(),
+            ours.trim(),
+            "must not share the CRI's cgroup"
+        );
     }
 }

@@ -159,6 +159,8 @@ pub struct ShimRuntime {
     sink: tokio::sync::Mutex<EventsSink>,
     sandboxes: Mutex<HashMap<String, Arc<SandboxShim>>>,
     tasks: Mutex<HashMap<String, Arc<TaskCtx>>>,
+    /// Serialises pause-image pulls so concurrent pods pull it once.
+    pull_lock: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -177,7 +179,37 @@ impl ShimRuntime {
             cfg,
             sandboxes: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
+            pull_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The configured sandbox image if it is absent from the local store.
+    pub fn missing_sandbox_image(&self) -> Option<String> {
+        let image = self.cfg.sandbox_image.as_deref()?;
+        match rootfs::find_manifest(&self.cfg.store, image) {
+            Err(rootfs::RootfsError::ImageNotFound(_)) => Some(image.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Make sure the sandbox (pause) image is in the local store, pulling it
+    /// with `<bin> image pull` when it is not (#619). VM runtimes cannot start
+    /// a pod without it, and nothing else pulls it: the kubelet only pulls
+    /// workload images. Concurrent callers pull once.
+    pub async fn ensure_sandbox_image(&self, bin: &str) -> Result<(), String> {
+        if self.missing_sandbox_image().is_none() {
+            return Ok(());
+        }
+        let _guard = self.pull_lock.lock().await;
+        let Some(image) = self.missing_sandbox_image() else {
+            return Ok(());
+        };
+        log::info!("pulling sandbox image {image}");
+        match crate::invoke::run_pelagos(bin, &["image", "pull", &image]).await {
+            Ok(o) if o.success => Ok(()),
+            Ok(o) => Err(format!("pull sandbox image {image}: {}", o.stderr.trim())),
+            Err(e) => Err(format!("pull sandbox image {image}: {e}")),
+        }
     }
 
     pub async fn shutdown(&self) {
