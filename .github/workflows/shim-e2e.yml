@@ -35,7 +35,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables iproute2 passt fuse-overlayfs zstd curl python3 protobuf-compiler
+          sudo apt-get install -y nftables iproute2 passt fuse-overlayfs zstd curl python3
+      - name: Install protoc (>=23 for debug_redact support)
+        run: |
+          PROTOC_VERSION=25.3
+          curl -sL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -q /tmp/protoc.zip bin/protoc -d /usr/local
+          sudo chmod +x /usr/local/bin/protoc
       - name: Make /dev/kvm usable
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
