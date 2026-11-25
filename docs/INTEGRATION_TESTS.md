@@ -6588,3 +6588,21 @@ against a fake plugin that behaves like stock `bridge`: it exits with
 `ARGS: unknown args [...]` unless `IgnoreUnknown=1` is present. It fails if the
 flag is dropped. Verified on a live Cilium node (ipc7): a pod created through the
 new binary got its Cilium IP, so Cilium's K8sArgs accepts `IgnoreUnknown`.
+
+## scripts/ci-shim-e2e.sh + .github/workflows/shim-e2e.yml (CI, root, needs /dev/kvm)
+
+#635. The only automated test that runs REAL shims (Kata 4.4.0, gVisor
+20261116.0, checksum-pinned) through a REAL kubelet. On a GitHub ubuntu-latest
+runner it builds pelagos and pelagos-cri, installs the shims, starts pelagos-cri
+with `--shim-handler kata=... --shim-handler gvisor=...` through the shipped
+`pelagos-cri-shim-handlers` helper and `cri.env` (so the unit wiring is exercised
+too), starts a one-node k3s (pinned v1.35.5+k3s1) whose runtime is pelagos-cri
+with k3s's stock flannel CNI (this needs `IgnoreUnknown=1`, #611), then runs
+`scripts/test-shim-runtimeclass-e2e.sh` (17 checks: Ready, distinct guest kernel,
+Kata VM sized from limits, volumes, logs, pod IP, cross-runtime ping, clean
+delete) and `scripts/test-portforward-multi.sh` (#617). Runs on PRs/pushes that
+touch the shim path or the harness, and as a **gate in release.yml**. Failure
+dumps the pelagos-cri and k3s journals and pod descriptions. A failure here means
+a kubelet-visible shim regression that no mock test covers. Not a developer-machine
+script: it starts k3s and writes /opt/kata. arm64 is not covered: hosted arm
+runners have no /dev/kvm (probe on #635), so Kata arm64 needs real hardware.

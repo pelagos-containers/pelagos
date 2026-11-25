@@ -78,8 +78,14 @@ jobs:
       - name: Run integration tests
         run: sudo -E env "PATH=$PATH" cargo test --test integration_tests -- --test-threads=1
 
+  # Real Kata + gVisor shims through a real kubelet (#635). Gate: shim-handler
+  # pods were once released without ever having run under the kubelet.
+  shim-e2e:
+    uses: ./.github/workflows/shim-e2e.yml
+    secrets: inherit
+
   build:
-    needs: [lint, unit-tests, integration-tests]
+    needs: [lint, unit-tests, integration-tests, shim-e2e]
     strategy:
       matrix:
         include:

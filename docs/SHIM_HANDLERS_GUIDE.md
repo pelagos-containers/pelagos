@@ -55,6 +55,10 @@ that have the handler, e.g. with `scheduling.nodeSelector` on the RuntimeClass.
 
 ## 4. Verify a node end to end
 
+CI runs this on every shim-related change and at release time
+(`.github/workflows/shim-e2e.yml`, `scripts/ci-shim-e2e.sh`): real Kata and gVisor
+on a one-node k3s. To check an actual node by hand:
+
 `scripts/test-shim-runtimeclass-e2e.sh` runs two-container pods per runtime
 through the real kubelet: Ready, distinct guest kernel, ConfigMap, service
 account token, shared emptyDir, logs, pod IP, cross-runtime ping, clean delete.

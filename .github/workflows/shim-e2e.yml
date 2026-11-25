@@ -4,6 +4,7 @@ name: Shim e2e
 # this harness changes, and on demand.
 on:
   workflow_dispatch:
+  workflow_call:   # the release workflow gates on this job
   push:
     branches: [main]
     paths:
