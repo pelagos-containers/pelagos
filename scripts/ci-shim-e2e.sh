@@ -95,4 +95,8 @@ NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" RUNTIMES="kata gvisor" TIMEOUT=3
 
 log "kubectl port-forward serves many connections (#617)"
 NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" bash scripts/test-portforward-multi.sh
+log "Kata pod recovers when its shim or VMM is killed (#641, #642)"
+NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" \
+  CRICTL="/usr/local/bin/k3s crictl -r unix:///run/pelagos/cri.sock" \
+  bash scripts/test-shim-failure-recovery.sh
 log "ALL SHIM E2E PASSED"

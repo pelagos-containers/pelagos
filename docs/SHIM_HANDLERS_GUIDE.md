@@ -106,6 +106,12 @@ with handlers enabled; see the script header for variables.
   them (stopped sandboxes linger until GC). A CRI without the handler can no
   longer manage those sandboxes, and their shim scope is left running; stop it
   with `systemctl stop pelagos-shim-<id>.scope`.
+- **A shim or VM that dies unasked** (SIGKILL, OOM, host kill of qemu) makes the
+  pod's sandbox report NotReady within seconds; the kubelet then replaces the
+  pod (`SandboxChanged`). pelagos-cri kills the VM processes the dead shim left
+  behind (found by the sandbox id at the end of their cgroup path), also after a
+  `pelagos-cri` restart when a shim cannot be reached (#641, #642). Check with
+  `scripts/test-shim-failure-recovery.sh`.
 - Wasm via shim handlers is **not supported** (#614).
 
 ## 6. Sizing (Kata VM memory and CPU)
