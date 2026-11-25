@@ -34,6 +34,14 @@ Undo: `pelagos-cri-shim-handlers remove kata gvisor` (no handlers = native only)
 Cluster installs using `k3s-experiments/scripts/install-pelagos.sh` get the
 same `EnvironmentFile` line in the unit it writes.
 
+Which installs can enable handlers (#639): the `.deb`/`.rpm` packages ship
+`pelagos-cri`, `pelagos-cri-shim-handlers`, `cri.env.example` and the RuntimeClass
+manifests (release CI asserts they are present); `scripts/install.sh` installs
+`pelagos-cri` and the helper to `INSTALL_DIR`; `install-pelagos.sh` writes a
+unit that reads `cri.env` (nodes installed before that change keep their old
+unit until the script is re-run). The AUR packages do not ship `pelagos-cri`,
+so they cannot run shim handlers.
+
 ## 3. Create the RuntimeClasses and run a pod
 
 ```

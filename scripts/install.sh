@@ -18,25 +18,31 @@ do_install() {
     # Install the shim under both its Cargo name and the containerd-expected name.
     install -m 755 target/release/pelagos-shim-wasm "${dst}/pelagos-shim-wasm"
     install -m 755 target/release/pelagos-shim-wasm "${dst}/containerd-shim-pelagos-wasm-v1"
+    # CRI server + shim-handler helper (Kata/gVisor via RuntimeClass, #639).
+    # pelagos-cri is a separate package: skipped if it was not built.
+    if [ -x target/release/pelagos-cri ]; then
+        install -m 755 target/release/pelagos-cri "${dst}/pelagos-cri"
+        install -m 755 scripts/pelagos-cri-shim-handlers.sh "${dst}/pelagos-cri-shim-handlers"
+    fi
 }
 
 # If we're root via sudo (not a true root session like CI), the user's
 # rustup/cargo may not be on root's PATH. Build as the invoking user.
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
     echo "Building pelagos (release) as ${SUDO_USER}..."
-    sudo -u "$SUDO_USER" cargo build --release
+    sudo -u "$SUDO_USER" cargo build --release -p pelagos -p pelagos-cri
     echo "Installing binaries to ${INSTALL_DIR}..."
     do_install "${INSTALL_DIR}"
 elif [ "$(id -u)" -eq 0 ]; then
     # True root (CI, container, etc.) — just build and install directly.
     echo "Building pelagos (release)..."
-    cargo build --release
+    cargo build --release -p pelagos -p pelagos-cri
     echo "Installing binaries to ${INSTALL_DIR}..."
     do_install "${INSTALL_DIR}"
 else
     # Normal user — build, then sudo for the install step.
     echo "Building pelagos (release)..."
-    cargo build --release
+    cargo build --release -p pelagos -p pelagos-cri
     echo "Installing binaries to ${INSTALL_DIR} (may prompt for sudo)..."
     sudo bash -c "$(declare -f do_install); do_install '${INSTALL_DIR}'"
 fi

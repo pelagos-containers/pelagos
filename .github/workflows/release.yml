@@ -315,6 +315,11 @@ jobs:
           pelagos --version
           test "$(which pelagos-cri)" = "/usr/bin/pelagos-cri"
           pelagos-cri --version
+          # Shim-handler (Kata/gVisor) support must ship in every package (#639).
+          test -x /usr/bin/pelagos-cri-shim-handlers
+          test -f /usr/share/pelagos/cri.env.example
+          test -f /usr/share/pelagos/runtimeclass/kata.yaml
+          test -f /usr/share/pelagos/runtimeclass/gvisor.yaml
           test -d /var/lib/pelagos
           test -f /usr/share/pelagos/setup.sh
           test -f /usr/lib/tmpfiles.d/pelagos.conf
