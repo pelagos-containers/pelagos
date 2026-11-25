@@ -375,8 +375,10 @@ impl ShimRuntime {
         sb.stopping
             .store(true, std::sync::atomic::Ordering::Release);
         if sb.is_lost() {
-            // The shim is already gone and the watch reaped its scope; there is
-            // nobody to send Kill/Delete/Shutdown to.
+            // The shim is already gone; there is nobody to send Kill/Delete/
+            // Shutdown to. Make sure the VM is gone before the caller tears the
+            // netns down.
+            reap_lost_sandbox(id).await;
             return;
         }
         if let Err(e) = sb.client.kill(id, 9, true).await {
@@ -439,6 +441,10 @@ impl ShimRuntime {
                 Ok(()) => {}
                 Err(e) => {
                     log::warn!("readopt: sandbox {} unreachable: {e}", sb.id);
+                    // Its containers are reported lost below and the kubelet
+                    // replaces the pod, so a VM still running without a shim
+                    // we can talk to is only a leak (#641).
+                    reap_lost_sandbox(&sb.id).await;
                     report.sandboxes_lost.push(sb.id.clone());
                 }
             }
@@ -840,9 +846,7 @@ impl ShimRuntime {
                 Err(e) => log::warn!("sandbox {id}: {e}; treating the pod as lost"),
             }
             sb.lost.store(true, std::sync::atomic::Ordering::Release);
-            if bootstrap::use_scope() {
-                crate::scope::stop_unit(&crate::scope::shim_unit(&id)).await;
-            }
+            reap_lost_sandbox(&id).await;
         });
     }
 
@@ -1019,6 +1023,55 @@ async fn finish_task_io(t: &TaskCtx) {
     if let Some(p) = t.pump.lock().await.take() {
         p.finish().await;
     }
+}
+
+/// PIDs whose cgroup path ends in `/<sandbox_id>`, per `<proc_root>/<pid>/cgroup`.
+///
+/// Kata puts qemu and virtiofsd in the pod's kubelet cgroup
+/// (`.../pod<uid>/<sandbox id>`), not in the shim's systemd scope, so stopping
+/// the scope of a dead shim leaves the VM running (#641). The sandbox id is a
+/// 64-hex container id, so matching its last path component cannot hit
+/// unrelated processes; anything else is refused.
+fn sandbox_cgroup_pids(proc_root: &std::path::Path, sandbox_id: &str) -> Vec<i32> {
+    if sandbox_id.len() < 32 || !sandbox_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Vec::new();
+    }
+    let suffix = format!("/{sandbox_id}");
+    let Ok(rd) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup"))
+                .is_ok_and(|c| c.lines().any(|l| l.ends_with(&suffix)))
+        })
+        .collect()
+}
+
+/// Stop a lost sandbox's shim scope and kill the VM processes Kata moved out
+/// of it (#641). Idempotent.
+async fn reap_lost_sandbox(id: &str) {
+    if bootstrap::use_scope() {
+        crate::scope::stop_unit(&crate::scope::shim_unit(id)).await;
+    }
+    let sid = id.to_string();
+    let killed = tokio::task::spawn_blocking(move || reap_sandbox_processes(&sid))
+        .await
+        .unwrap_or(0);
+    if killed > 0 {
+        log::warn!("sandbox {id}: killed {killed} leftover VM process(es) of the lost shim");
+    }
+}
+
+/// SIGKILL what is left of a lost sandbox's VM. Returns how many were killed.
+fn reap_sandbox_processes(sandbox_id: &str) -> usize {
+    let pids = sandbox_cgroup_pids(std::path::Path::new("/proc"), sandbox_id);
+    for pid in &pids {
+        // SAFETY: plain kill(2) on a pid we just found.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    pids.len()
 }
 
 fn uuid_like() -> String {

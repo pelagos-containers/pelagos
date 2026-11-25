@@ -1126,3 +1126,35 @@ async fn deliberate_stop_is_not_reported_as_a_lost_shim() {
     assert!(f.rt.lost_sandboxes().is_empty());
     f.finish().await;
 }
+
+/// #641: Kata moves qemu/virtiofsd out of the shim's scope into the pod cgroup;
+/// the reaper finds them by the sandbox id at the end of their cgroup path and
+/// nothing else.
+#[test]
+fn sandbox_cgroup_pids_match_only_the_exact_trailing_component() {
+    let t = tempfile::tempdir().unwrap();
+    let id = "df44ae9785307cebb0e6a2ff9b14f80242aa3f81f1eb79321561d6bc893a176a";
+    let put = |pid: &str, cg: &str| {
+        let d = t.path().join(pid);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup"), cg).unwrap();
+    };
+    put("100", &format!("0::/kubepods/besteffort/podX/{id}\n"));
+    put("101", &format!("0::/kubepods/besteffort/podX/{id}\n"));
+    put(
+        "200",
+        "0::/kubepods/besteffort/podX/0123456789abcdef0123456789abcdef\n",
+    );
+    put(
+        "300",
+        &format!("0::/kubepods/besteffort/podX/{id}/child-not-us\n"),
+    );
+    put("400", "0::/user.slice/session-1.scope\n");
+    std::fs::create_dir_all(t.path().join("self")).unwrap();
+    let mut got = sandbox_cgroup_pids(t.path(), id);
+    got.sort();
+    assert_eq!(got, [100, 101]);
+    // Refuses anything that is not a long hex container id.
+    assert!(sandbox_cgroup_pids(t.path(), "podX").is_empty());
+    assert!(sandbox_cgroup_pids(t.path(), "").is_empty());
+}
