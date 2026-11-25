@@ -37,6 +37,9 @@ trap cleanup EXIT
 
 echo "=== shim RuntimeClass end-to-end on $NODE ==="
 k create namespace "$NS" >/dev/null 2>&1 || true
+# A fresh cluster creates the namespace's default ServiceAccount asynchronously;
+# pods are rejected until it exists.
+for _ in $(seq 1 60); do k -n "$NS" get serviceaccount default >/dev/null 2>&1 && break; sleep 1; done
 k -n "$NS" create configmap probe --from-literal=greeting=hello-from-configmap >/dev/null 2>&1 || true
 host_kernel="$(k get node "$NODE" -o jsonpath='{.status.nodeInfo.kernelVersion}')"
 

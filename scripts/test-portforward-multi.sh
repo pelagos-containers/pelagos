@@ -18,6 +18,7 @@ cleanup() { rm -f "$RES"; [ -n "$PF" ] && kill "$PF" 2>/dev/null; k delete ns "$
 trap cleanup EXIT
 
 k create ns "$NS" >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do k -n "$NS" get serviceaccount default >/dev/null 2>&1 && break; sleep 1; done
 k -n "$NS" apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
