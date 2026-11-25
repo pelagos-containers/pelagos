@@ -1032,16 +1032,9 @@ async fn handle_port_forward(
 
     let pod_ip = Arc::new(pending.pod_ip.clone());
 
-    // Signalled when a data stream's relay finishes. We must NOT close the SPDY
-    // connection until then: closing immediately (the old bug) dropped the client
-    // before it even opened its data stream → critest "lost connection to pod".
-    let done = Arc::new(tokio::sync::Notify::new());
-
     let config = ServerConfig::new({
-        let done = Arc::clone(&done);
         move |stream: Arc<Stream>| {
             let pod_ip = Arc::clone(&pod_ip);
-            let done = Arc::clone(&done);
             Box::pin(async move {
                 // The portforward.k8s.io protocol opens TWO streams per port: an
                 // "error" side-channel and the actual "data" stream. Only the data
@@ -1074,7 +1067,6 @@ async fn handle_port_forward(
                         .reset(spdystream_rs::frame::RstStatus::ProtocolError)
                         .await
                         .ok();
-                    done.notify_one();
                     return;
                 }
 
@@ -1091,7 +1083,6 @@ async fn handle_port_forward(
                             .ok();
                     }
                 }
-                done.notify_one();
             })
         }
     });
@@ -1100,13 +1091,20 @@ async fn handle_port_forward(
     let handler = Arc::clone(&config.handler);
     let conn = spdystream_rs::connection::Connection::serve(tcp, move |s| handler(s)).await?;
 
-    // Keep the connection alive until a data relay completes (bounded so a client
-    // that never opens a data stream can't wedge us), then close to release the
-    // client's sockets.
-    let _ = tokio::time::timeout(Duration::from_secs(60), done.notified()).await;
+    // One SPDY connection carries the WHOLE forward: `kubectl port-forward` opens
+    // a fresh error+data stream pair for every local connection and keeps the
+    // connection until it exits. So we must not close after the first relay
+    // finishes (#617: the second connection died with "lost connection to pod").
+    // The client ends the session by closing the connection; the cap only
+    // bounds a client that vanished without doing so (it matches the kubelet's
+    // default streaming idle timeout).
+    let _ = tokio::time::timeout(PORT_FORWARD_SESSION_CAP, conn.wait_closed()).await;
     let _ = conn.close().await;
     Ok(())
 }
+
+/// Longest a port-forward SPDY connection is kept without the client closing it.
+const PORT_FORWARD_SESSION_CAP: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Bidirectional relay between a SPDY stream and a TCP connection.
 async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, tcp: TcpStream) {
@@ -1164,6 +1162,114 @@ async fn relay_spdy_tcp(stream: Arc<spdystream_rs::Stream>, tcp: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #617: one SPDY connection must serve several consecutive forwarded
+    /// connections (kubectl port-forward reuses it for every local connection).
+    #[tokio::test]
+    async fn port_forward_serves_consecutive_connections_on_one_session() {
+        use spdystream_rs::frame::{DataFrame, Frame, SynStreamFrame, DATA_FLAG_FIN};
+        use spdystream_rs::framer::Framer;
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        // The "pod": echoes one message per connection, then closes it.
+        let pod = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = pod.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = pod.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    let n = c.read(&mut buf).await.unwrap_or(0);
+                    let _ = c.write_all(&buf[..n]).await;
+                });
+            }
+        });
+
+        // Streaming server side: handle_port_forward on an accepted socket.
+        let lst = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = lst.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = lst.accept().await.unwrap();
+            handle_port_forward(
+                tcp,
+                PendingPortForward {
+                    pod_ip: "127.0.0.1".into(),
+                    ports: vec![port as u32],
+                },
+            )
+            .await
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = split(tcp);
+        let mut enc = Framer::new(w, tokio::io::empty());
+        let mut dec = Framer::new(tokio::io::sink(), r);
+        let t = Duration::from_secs(5);
+        let settings = tokio::time::timeout(t, dec.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(settings, Frame::Settings(_)));
+
+        // Three sequential forwarded connections: error stream + data stream each.
+        let mut id = 1u32;
+        for round in 0..3 {
+            let mut data_id = 0;
+            for kind in ["error", "data"] {
+                let mut h = http::HeaderMap::new();
+                h.insert("streamType", kind.parse().unwrap());
+                h.insert("port", port.to_string().parse().unwrap());
+                enc.write_frame(&Frame::SynStream(SynStreamFrame {
+                    stream_id: id,
+                    associated_stream_id: 0,
+                    priority: 0,
+                    headers: h,
+                    flags: 0,
+                }))
+                .await
+                .unwrap();
+                if kind == "data" {
+                    data_id = id;
+                }
+                id += 2;
+            }
+            let msg = format!("hello-{round}");
+            enc.write_frame(&Frame::Data(DataFrame {
+                stream_id: data_id,
+                flags: DATA_FLAG_FIN,
+                data: Bytes::from(msg.clone()),
+            }))
+            .await
+            .unwrap();
+            // Collect the echoed bytes on the data stream until its FIN.
+            let mut got = Vec::new();
+            loop {
+                let f = tokio::time::timeout(t, dec.read_frame())
+                    .await
+                    .unwrap_or_else(|_| panic!("round {round}: session died / no reply"))
+                    .unwrap_or_else(|e| panic!("round {round}: connection closed: {e}"));
+                if let Frame::Data(d) = f {
+                    if d.stream_id == data_id {
+                        got.extend_from_slice(&d.data);
+                        if d.flags & DATA_FLAG_FIN != 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            assert_eq!(got, msg.as_bytes(), "round {round}");
+            // The forward sits idle between local connections.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        assert!(!server.is_finished(), "server must keep the session open");
+        // Client ends the session by dropping its side.
+        drop(enc);
+        drop(dec);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server ends when the client closes")
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn resize_frames_parse_single_multiple_and_junk() {
