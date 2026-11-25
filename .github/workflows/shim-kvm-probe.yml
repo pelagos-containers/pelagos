@@ -1,0 +1,53 @@
+name: Shim KVM probe
+# #635 step 1: can GitHub-hosted runners run Kata (needs /dev/kvm)? Reports
+# facts and tries to boot Kata's guest kernel under QEMU/KVM. Informational;
+# remove once the real-shim e2e job (#635) exists.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: [".github/workflows/shim-kvm-probe.yml"]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Host facts
+        run: |
+          uname -a; lscpu | grep -E "Model name|Virtualization|Hypervisor|Flags" | cut -c1-200 || true
+          grep -c -E "vmx|svm" /proc/cpuinfo || true
+          ls -l /dev/kvm || echo "NO /dev/kvm"
+          nproc; free -g | head -2; df -h / | tail -1
+      - name: Make /dev/kvm usable
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules; sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "NO /dev/kvm after udev"
+          test -r /dev/kvm -a -w /dev/kvm && echo "KVM_USABLE=yes" || echo "KVM_USABLE=no"
+      - name: Boot Kata guest kernel under KVM (x86 only)
+        if: runner.arch == 'X64'
+        run: |
+          set -x
+          sudo apt-get install -y zstd >/dev/null
+          t0=$(date +%s)
+          curl -sfL -o kata.tar.zst https://github.com/kata-containers/kata-containers/releases/download/4.4.0/kata-static-4.4.0-amd64.tar.zst
+          echo "download_seconds=$(( $(date +%s) - t0 )) size=$(stat -c %s kata.tar.zst)"
+          t0=$(date +%s)
+          sudo mkdir -p /opt/kata-x && sudo tar --zstd -xf kata.tar.zst -C /opt/kata-x
+          echo "extract_seconds=$(( $(date +%s) - t0 ))"
+          K=/opt/kata-x/opt/kata/share/kata-containers
+          ls $K | head -20
+          Q=/opt/kata-x/opt/kata/bin/qemu-system-x86_64
+          $Q --version || true
+          # Kernel + initrd (the initrd carries the kata agent); expect the kernel to
+          # boot and start init. Time to the first "Run /init" line is the signal.
+          t0=$(date +%s.%N)
+          timeout 60 $Q -enable-kvm -machine q35,accel=kvm -cpu host -m 512 -smp 2 -nographic -no-reboot \
+            -kernel $K/vmlinux.container -initrd $K/kata-containers-initrd.img \
+            -append "console=ttyS0 panic=1 agent.log=debug" > boot.log 2>&1 || true
+          echo "boot_wall_seconds=$(echo "$(date +%s.%N) - $t0" | bc)"
+          grep -n -E "Linux version|Run /init|kata-agent|Kernel panic|KVM|Hypervisor detected" boot.log | head -20
+          grep -q "Run /init" boot.log && echo "GUEST_BOOTED=yes" || { echo "GUEST_BOOTED=no"; tail -30 boot.log; }
