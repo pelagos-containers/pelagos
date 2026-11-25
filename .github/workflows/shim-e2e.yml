@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: &paths
+    paths:
       - "pelagos-cri/**"
       - "scripts/ci-shim-e2e.sh"
       - "scripts/test-shim-runtimeclass-e2e.sh"
@@ -14,7 +14,13 @@ on:
       - "scripts/pelagos-cri-shim-handlers.sh"
       - ".github/workflows/shim-e2e.yml"
   pull_request:
-    paths: *paths
+    paths:
+      - "pelagos-cri/**"
+      - "scripts/ci-shim-e2e.sh"
+      - "scripts/test-shim-runtimeclass-e2e.sh"
+      - "scripts/test-portforward-multi.sh"
+      - "scripts/pelagos-cri-shim-handlers.sh"
+      - ".github/workflows/shim-e2e.yml"
 
 jobs:
   shim-e2e:
