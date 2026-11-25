@@ -38,7 +38,7 @@ $S add kata="$D/missing" --no-restart 2>/dev/null && fail "accepted missing bina
 $S add kata --no-restart 2>/dev/null && fail "accepted spec without ="
 
 # Units consume the variable (systemd expands $VAR in ExecStart).
-for u in pelagos-cri/pelagos-cri-server.service pelagos-cri/pelagos-cri-agent.service; do
+for u in pelagos-cri/pelagos-cri-server.service pelagos-cri/pelagos-cri-agent.service pkg/nfpm/pelagos-cri.service; do
   grep -q '^EnvironmentFile=-/etc/pelagos/cri.env' "$u" || fail "$u: no EnvironmentFile"
   grep -q '^ExecStart=.*\$PELAGOS_CRI_ARGS' "$u" || fail "$u: ExecStart ignores PELAGOS_CRI_ARGS"
 done

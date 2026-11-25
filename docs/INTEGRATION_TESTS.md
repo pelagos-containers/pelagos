@@ -6606,3 +6606,17 @@ dumps the pelagos-cri and k3s journals and pod descriptions. A failure here mean
 a kubelet-visible shim regression that no mock test covers. Not a developer-machine
 script: it starts k3s and writes /opt/kata. arm64 is not covered: hosted arm
 runners have no /dev/kvm (probe on #635), so Kata arm64 needs real hardware.
+
+## Release package-test: shim-handler files (.github/workflows/release.yml, #639)
+
+Not a cargo test. After installing the built `.deb` on a clean amd64 and arm64
+runner, the "Verify installation" step asserts that the package ships the
+shim-handler helper (`/usr/bin/pelagos-cri-shim-handlers`), `cri.env.example`,
+the Kata and gVisor RuntimeClass manifests, the guide, and a
+`pelagos-cri.service` whose `EnvironmentFile`/`PELAGOS_CRI_ARGS` wiring is intact.
+A failure means a packaging change would leave installs unable to enable Kata or
+gVisor handlers, which nothing else would notice until an operator tried.
+`scripts/test-shim-handlers-script.sh` also checks that wiring on the packaged
+unit source (`pkg/nfpm/pelagos-cri.service`). The AUR packages and
+`scripts/install.sh` are not exercised by CI (AUR PKGBUILDs are only parsed by the
+release's `.SRCINFO` step).

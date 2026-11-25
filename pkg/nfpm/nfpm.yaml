@@ -50,6 +50,16 @@ contents:
     file_info:
       mode: 0644
 
+  - src: pkg/nfpm/pelagos-cri.service
+    dst: /usr/lib/systemd/system/pelagos-cri.service
+    file_info:
+      mode: 0644
+
+  - src: docs/SHIM_HANDLERS_GUIDE.md
+    dst: /usr/share/doc/pelagos/SHIM_HANDLERS_GUIDE.md
+    file_info:
+      mode: 0644
+
   - src: pkg/runtimeclass/kata.yaml
     dst: /usr/share/pelagos/runtimeclass/kata.yaml
     file_info:

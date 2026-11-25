@@ -5,6 +5,22 @@ validation results: `docs/CRI_COMPLIANCE.md` ("Shim-backed runtime handlers").
 Epic #574. Pods without a RuntimeClass keep running natively; nothing here
 changes them.
 
+## 0. After installing pelagos: the checklist
+
+Packages (`.deb`/`.rpm`, AUR) and `scripts/install.sh` put every pelagos piece in
+place: `pelagos-cri`, `pelagos-cri-shim-handlers`, the `pelagos-cri.service` unit
+(packages only), `cri.env.example` and the RuntimeClass manifests. They do not
+enable the service or any handler, and they cannot install Kata/gVisor themselves.
+Remaining steps, in order:
+
+1. `sudo systemctl enable --now pelagos-cri` (packages; with `install.sh` copy
+   `pelagos-cri/pelagos-cri-agent.service` and adjust paths). Point the kubelet at
+   `unix:///run/pelagos/cri.sock`.
+2. Install the runtime(s): section 1.
+3. Enable handlers: section 2 (`pelagos-cri-shim-handlers add ...`).
+4. Create RuntimeClasses: section 3.
+5. Verify the node: section 4.
+
 ## 1. Prerequisites (not installed by pelagos)
 
 | Need | Notes |
@@ -33,6 +49,14 @@ Undo: `pelagos-cri-shim-handlers remove kata gvisor` (no handlers = native only)
 
 Cluster installs using `k3s-experiments/scripts/install-pelagos.sh` get the
 same `EnvironmentFile` line in the unit it writes.
+
+Which installs can enable handlers (#639): the `.deb`/`.rpm` packages and both
+AUR packages ship `pelagos-cri`, `pelagos-cri-shim-handlers`, the
+`pelagos-cri.service` unit, `cri.env.example` and the RuntimeClass manifests
+(release CI asserts the `.deb` has them); `scripts/install.sh` installs
+`pelagos-cri` and the helper to `INSTALL_DIR` (no unit); `install-pelagos.sh`
+writes a unit that reads `cri.env` (nodes installed before that change keep
+their old unit until the script is re-run).
 
 ## 3. Create the RuntimeClasses and run a pod
 

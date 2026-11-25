@@ -17,12 +17,14 @@ optdepends=(
 install=$pkgname.install
 source_x86_64=("pelagos-x86_64::https://github.com/pelagos-containers/pelagos/releases/download/v$pkgver/pelagos-x86_64-linux"
                "pelagos-x86_64.sha256::https://github.com/pelagos-containers/pelagos/releases/download/v$pkgver/pelagos-x86_64-linux.sha256"
-               "pelagos-$pkgver-src.tar.gz::https://github.com/pelagos-containers/pelagos/archive/refs/tags/v$pkgver.tar.gz")
+               "pelagos-$pkgver-src.tar.gz::https://github.com/pelagos-containers/pelagos/archive/refs/tags/v$pkgver.tar.gz"
+               "pelagos-cri-x86_64::https://github.com/pelagos-containers/pelagos/releases/download/v$pkgver/pelagos-cri-x86_64-linux")
 source_aarch64=("pelagos-aarch64::https://github.com/pelagos-containers/pelagos/releases/download/v$pkgver/pelagos-aarch64-linux"
                 "pelagos-aarch64.sha256::https://github.com/pelagos-containers/pelagos/releases/download/v$pkgver/pelagos-aarch64-linux.sha256"
-                "pelagos-$pkgver-src.tar.gz::https://github.com/pelagos-containers/pelagos/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums_x86_64=('96ee51dcdd949ceab0c3455a0444ebf476b3a32c2d87098dd415a656649aaa65' 'SKIP' '85079ca7fc6bd4f516667b586883d86855e7691288c5186eaaa79863c4c0a908')
-sha256sums_aarch64=('ebbabe2ab22d1cde0eb34db653a05577606e166a29e3160a663b1a95242e35bf' 'SKIP' '85079ca7fc6bd4f516667b586883d86855e7691288c5186eaaa79863c4c0a908')
+                "pelagos-$pkgver-src.tar.gz::https://github.com/pelagos-containers/pelagos/archive/refs/tags/v$pkgver.tar.gz"
+                "pelagos-cri-aarch64::https://github.com/pelagos-containers/pelagos/releases/download/v$pkgver/pelagos-cri-aarch64-linux")
+sha256sums_x86_64=('96ee51dcdd949ceab0c3455a0444ebf476b3a32c2d87098dd415a656649aaa65' 'SKIP' '85079ca7fc6bd4f516667b586883d86855e7691288c5186eaaa79863c4c0a908' 'SKIP')
+sha256sums_aarch64=('ebbabe2ab22d1cde0eb34db653a05577606e166a29e3160a663b1a95242e35bf' 'SKIP' '85079ca7fc6bd4f516667b586883d86855e7691288c5186eaaa79863c4c0a908' 'SKIP')
 
 package() {
     # Install the pre-built binary.
@@ -34,6 +36,15 @@ package() {
     # (Once the release workflow uploads them as separate artifacts this can be
     # simplified to direct binary installs.)
     local _srcdir="pelagos-$pkgver"
+
+    # CRI server (separate release artifact) + shim-handler support files.
+    install -Dm755 "pelagos-cri-${CARCH}" "$pkgdir/usr/bin/pelagos-cri"
+    install -Dm755 "$_srcdir/scripts/pelagos-cri-shim-handlers.sh" "$pkgdir/usr/bin/pelagos-cri-shim-handlers"
+    install -Dm644 "$_srcdir/pkg/nfpm/pelagos-cri.service" "$pkgdir/usr/lib/systemd/system/pelagos-cri.service"
+    install -Dm644 "$_srcdir/pkg/nfpm/cri.env.example" "$pkgdir/usr/share/pelagos/cri.env.example"
+    install -Dm644 "$_srcdir/pkg/runtimeclass/kata.yaml" "$pkgdir/usr/share/pelagos/runtimeclass/kata.yaml"
+    install -Dm644 "$_srcdir/pkg/runtimeclass/gvisor.yaml" "$pkgdir/usr/share/pelagos/runtimeclass/gvisor.yaml"
+    install -Dm644 "$_srcdir/docs/SHIM_HANDLERS_GUIDE.md" "$pkgdir/usr/share/doc/$pkgname/SHIM_HANDLERS_GUIDE.md"
 
     # License and docs from source tarball.
     install -Dm644 "$_srcdir/LICENSE"    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
