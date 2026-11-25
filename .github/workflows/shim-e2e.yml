@@ -1,0 +1,52 @@
+name: Shim e2e
+# Real Kata + gVisor shims through a real kubelet (#635). Hosted x86 runners
+# have /dev/kvm (see the probe results on #635). Runs when the shim path or
+# this harness changes, and on demand.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: &paths
+      - "pelagos-cri/**"
+      - "scripts/ci-shim-e2e.sh"
+      - "scripts/test-shim-runtimeclass-e2e.sh"
+      - "scripts/test-portforward-multi.sh"
+      - "scripts/pelagos-cri-shim-handlers.sh"
+      - ".github/workflows/shim-e2e.yml"
+  pull_request:
+    paths: *paths
+
+jobs:
+  shim-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2 passt fuse-overlayfs zstd curl python3
+      - name: Make /dev/kvm usable
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules; sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Build pelagos and pelagos-cri
+        run: cargo build --bin pelagos && cargo build -p pelagos-cri --bin pelagos-cri
+      - name: Set up pelagos system directories
+        run: sudo ./scripts/setup.sh --no-user
+      - name: Configure registry mirror (ECR Public — avoid Docker Hub rate limits)
+        run: |
+          sudo install -d /etc/pelagos
+          sudo install -m 0644 ci/registries.toml /etc/pelagos/registries.toml
+      - name: Authenticate ECR Public pulls (avoid anonymous quota)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ECR_PUBLIC_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ECR_PUBLIC_AWS_SECRET_ACCESS_KEY }}
+        run: bash scripts/ci-ecr-public-auth.sh
+      - name: Run real-shim e2e
+        run: sudo -E env "PATH=$PATH" bash scripts/ci-shim-e2e.sh target/debug
