@@ -44,8 +44,10 @@ jobs:
           $Q --version || true
           # Kernel + initrd (the initrd carries the kata agent); expect the kernel to
           # boot and start init. Time to the first "Run /init" line is the signal.
+          ROMS=$(dirname "$(find /opt/kata-x -name bios-256k.bin | head -1)")
+          echo "qemu roms: $ROMS"
           t0=$(date +%s.%N)
-          timeout 60 $Q -enable-kvm -machine q35,accel=kvm -cpu host -m 512 -smp 2 -nographic -no-reboot \
+          timeout 60 $Q -L "$ROMS" -nodefaults -display none -serial stdio -enable-kvm -machine q35,accel=kvm -cpu host -m 512 -smp 2 -nographic -no-reboot \
             -kernel $K/vmlinux.container -initrd $K/kata-containers-initrd.img \
             -append "console=ttyS0 panic=1 agent.log=debug" > boot.log 2>&1 || true
           echo "boot_wall_seconds=$(echo "$(date +%s.%N) - $t0" | bc)"
