@@ -6620,3 +6620,20 @@ gVisor handlers, which nothing else would notice until an operator tried.
 unit source (`pkg/nfpm/pelagos-cri.service`). The AUR packages and
 `scripts/install.sh` are not exercised by CI (AUR PKGBUILDs are only parsed by the
 release's `.SRCINFO` step).
+
+## scripts/test-shim-failure-recovery.sh (root, on a node with Kata; also in the shim-e2e CI gate)
+
+#641/#642. Through the real kubelet, a Kata pod with a Secret volume is
+SIGKILLed twice: first its shim (`containerd-shim-kata-v2`), then its VMM
+(`qemu-system`). For each kill it asserts that the sandbox is replaced (a
+different sandbox id is Ready and the pod is `1/1 Running` again) and that no
+qemu or shim process of the old sandbox is left. Before the fix a killed shim
+left the pod Ready and later stuck in Terminating with the VM orphaned, and a
+killed VMM left the sandbox Ready forever (RunContainerError loop, no
+SandboxChanged). Unit coverage in `shimrt/tests.rs`:
+`dead_shim_marks_the_sandbox_lost_and_its_containers_exited` (fails without the
+sandbox watch), `deliberate_stop_is_not_reported_as_a_lost_shim` (our own
+StopPodSandbox must not look like a loss) and
+`sandbox_cgroup_pids_match_only_the_exact_trailing_component` (the reaper only
+matches `/<sandbox id>` at the end of a cgroup path, because Kata moves qemu out
+of the shim's scope into the pod cgroup).

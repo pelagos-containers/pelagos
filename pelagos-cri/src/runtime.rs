@@ -947,6 +947,27 @@ impl RuntimeSvc {
         Ok(Response::new(StartContainerResponse {}))
     }
 
+    /// Fold shim-reported exits (natural exits and lost shims, #641) into the
+    /// CRI records of every shim-backed sandbox. `ListContainers` has no shim
+    /// state of its own, so without this a pod whose shim died, or a container
+    /// that exited by itself, would keep listing as Running.
+    async fn fold_shim_exits(&self) {
+        let Some(shim) = self.shim.clone() else {
+            return;
+        };
+        let ids: Vec<String> = {
+            let st = self.state.inner.lock().await;
+            st.sandboxes
+                .values()
+                .filter(|s| shim.handles(&s.runtime_handler))
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        for id in ids {
+            self.mark_shim_containers_exited(&shim, &id).await;
+        }
+    }
+
     /// Fold shim-reported exits into the CRI records of `sandbox_id`'s
     /// running containers.
     async fn mark_shim_containers_exited(
@@ -1651,12 +1672,20 @@ impl RuntimeService for RuntimeSvc {
         let sandbox_id = request.into_inner().pod_sandbox_id;
 
         let st = self.state.inner.lock().await;
-        let sandbox = st
+        let mut sandbox = st
             .sandboxes
             .get(&sandbox_id)
             .ok_or_else(|| Status::not_found("sandbox not found"))?
             .clone();
         drop(st);
+        // A pod whose shim died unasked is not ready (#641); the kubelet then
+        // stops and recreates it. The stored state is left alone: `NotReady` is
+        // only ever written by `stop_pod_sandbox`.
+        if let Some(shim) = &self.shim {
+            if shim.sandbox_lost(&sandbox_id) {
+                sandbox.state = SandboxState::NotReady;
+            }
+        }
 
         // For CNI sandboxes, ip is stored directly in CriSandbox.
         // For native sandboxes, fall back to reading the pelagos state file.
@@ -1714,6 +1743,11 @@ impl RuntimeService for RuntimeSvc {
         request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
         let filter = request.into_inner().filter;
+        let lost: std::collections::HashSet<String> = self
+            .shim
+            .as_ref()
+            .map(|s| s.lost_sandboxes().into_iter().collect())
+            .unwrap_or_default();
         let mut st = self.state.inner.lock().await;
 
         // Self-heal at the point of observation: never return a dead-pause
@@ -1754,7 +1788,11 @@ impl RuntimeService for RuntimeSvc {
                     }
                     if let Some(ref sv) = f.state {
                         let want = sv.state;
-                        let have = cri_sandbox_state_val(&s.state);
+                        let have = if lost.contains(&s.id) {
+                            cri_sandbox_state_val(&SandboxState::NotReady)
+                        } else {
+                            cri_sandbox_state_val(&s.state)
+                        };
                         if want != have {
                             return false;
                         }
@@ -1765,7 +1803,15 @@ impl RuntimeService for RuntimeSvc {
                 }
                 true
             })
-            .map(sandbox_to_proto)
+            .map(|s| {
+                if lost.contains(&s.id) {
+                    let mut s = s.clone();
+                    s.state = SandboxState::NotReady;
+                    sandbox_to_proto(&s)
+                } else {
+                    sandbox_to_proto(s)
+                }
+            })
             .collect();
 
         Ok(Response::new(ListPodSandboxResponse { items }))
@@ -2703,6 +2749,7 @@ impl RuntimeService for RuntimeSvc {
         request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
         let filter = request.into_inner().filter;
+        self.fold_shim_exits().await;
         let mut st = self.state.inner.lock().await;
 
         // Refresh running containers from disk

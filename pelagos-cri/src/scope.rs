@@ -189,6 +189,16 @@ pub async fn service_main_pid(unit: &str) -> Option<i32> {
     }
 }
 
+/// SIGKILL every process of a transient unit right away. `stop` only sends
+/// SIGTERM and then waits out `TimeoutStopSec` (90 s) for a process that does
+/// not exit, which is what a shim whose VM is gone does (#641).
+pub async fn kill_unit(unit: &str) {
+    let _ = tokio::process::Command::new("systemctl")
+        .args(["kill", "--signal=SIGKILL", unit])
+        .output()
+        .await;
+}
+
 /// Best-effort stop of a transient unit (scope or service). Errors are ignored:
 /// scopes auto-collect when empty, and a missing unit is already gone.
 pub async fn stop_unit(unit: &str) {

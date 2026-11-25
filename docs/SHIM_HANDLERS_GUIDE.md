@@ -26,7 +26,7 @@ Remaining steps, in order:
 | Need | Notes |
 |---|---|
 | A shim binary per runtime | Kata: `containerd-shim-kata-v2` (runtime-rs 4.x tested). gVisor: `containerd-shim-runsc-v1` **and** `runsc`. |
-| Kata location | Kata only accepts its configuration from its shipped paths, so install the release tree at `/opt/kata` (shim at `/opt/kata/bin/containerd-shim-kata-v2`). |
+| Kata location | Kata only accepts its configuration from its shipped paths, so install the release tree at `/opt/kata` (shim at `/opt/kata/runtime-rs/bin/containerd-shim-kata-v2`). |
 | gVisor `runsc` | Must be on `pelagos-cri`'s `PATH` (the shim looks it up). Put it in `/usr/local/bin`, or set `PATH=` in `/etc/pelagos/cri.env`. |
 | KVM for Kata | `/dev/kvm` must exist on the node. |
 | A CNI config | Shim pods get their netns + CNI ADD before the VM starts; nodes without CNI config and `hostNetwork` pods are rejected. |
@@ -36,7 +36,7 @@ Remaining steps, in order:
 
 ```
 sudo pelagos-cri-shim-handlers add \
-    kata=/opt/kata/bin/containerd-shim-kata-v2 \
+    kata=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2 \
     gvisor=/usr/local/bin/containerd-shim-runsc-v1
 sudo pelagos-cri-shim-handlers list
 ```
@@ -91,7 +91,7 @@ account token, shared emptyDir, logs, pod IP, cross-runtime ping, clean delete.
 NODE=<node> KUBECTL="sudo kubectl" RUNTIMES="kata gvisor" scripts/test-shim-runtimeclass-e2e.sh
 ```
 
-It creates and removes its own namespace and RuntimeClasses. Run it on a node
+It creates and removes its own namespace and its own uniquely named RuntimeClasses (`<runtime>-e2e-<pid>`); your `kata`/`gvisor` are never touched. Run it on a node
 with handlers enabled; see the script header for variables.
 
 ## 5. Operating notes
@@ -106,6 +106,12 @@ with handlers enabled; see the script header for variables.
   them (stopped sandboxes linger until GC). A CRI without the handler can no
   longer manage those sandboxes, and their shim scope is left running; stop it
   with `systemctl stop pelagos-shim-<id>.scope`.
+- **A shim or VM that dies unasked** (SIGKILL, OOM, host kill of qemu) makes the
+  pod's sandbox report NotReady within seconds; the kubelet then replaces the
+  pod (`SandboxChanged`). pelagos-cri kills the VM processes the dead shim left
+  behind (found by the sandbox id at the end of their cgroup path), also after a
+  `pelagos-cri` restart when a shim cannot be reached (#641, #642). Check with
+  `scripts/test-shim-failure-recovery.sh`.
 - Wasm via shim handlers is **not supported** (#614).
 
 ## 6. Sizing (Kata VM memory and CPU)

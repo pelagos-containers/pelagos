@@ -1069,3 +1069,159 @@ async fn container_started_by_config_digest_image_id() {
     assert!(f.rt.is_running("idc1"));
     f.finish().await;
 }
+
+/// #641: the shim dies (SIGKILL) while its pod runs. Nothing is sent to the CRI,
+/// so the sandbox watch must notice the dead connection and mark the pod lost,
+/// and its containers must read as exited (137) so the kubelet replaces the pod.
+#[tokio::test]
+async fn dead_shim_marks_the_sandbox_lost_and_its_containers_exited() {
+    let mut f = fixture().await;
+    let sb = sandbox("deadsb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let c = container("dc1", "deadsb");
+    f.rt.start_container(&sb, &c, f.log_path("d.log").to_str().unwrap(), "/x")
+        .await
+        .unwrap();
+    assert!(!f.rt.sandbox_lost("deadsb"));
+    assert!(
+        f.rt.container_exit("dc1").is_none(),
+        "running before the kill"
+    );
+
+    // The shim goes away: its ttrpc connections drop without any Shutdown RPC.
+    f.servers[0].disconnect().await;
+
+    let mut lost = false;
+    for _ in 0..600 {
+        if f.rt.sandbox_lost("deadsb") {
+            lost = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(lost, "sandbox watch never noticed the dead shim");
+    assert_eq!(f.rt.lost_sandboxes(), ["deadsb"]);
+    assert_eq!(f.rt.container_exit("dc1").unwrap().exit_status, 137);
+    // The kubelet's StopPodSandbox must not hang on a shim that cannot answer.
+    tokio::time::timeout(Duration::from_secs(3), f.rt.stop_sandbox("deadsb"))
+        .await
+        .expect("stop_sandbox returned promptly for a lost shim");
+    f.finish().await;
+}
+
+/// #641 negative: a deliberate StopPodSandbox ends the sandbox task too, and
+/// must not be mistaken for a loss (that would reap the scope mid-teardown).
+#[tokio::test]
+async fn deliberate_stop_is_not_reported_as_a_lost_shim() {
+    let f = fixture().await;
+    let sb = sandbox("okstop");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    f.rt.stop_sandbox("okstop").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!f.rt.sandbox_lost("okstop"));
+    assert!(f.rt.lost_sandboxes().is_empty());
+    f.finish().await;
+}
+
+/// #641: Kata moves qemu/virtiofsd out of the shim's scope into the pod cgroup;
+/// the reaper finds them by the sandbox id at the end of their cgroup path and
+/// nothing else.
+#[test]
+fn sandbox_cgroup_pids_match_only_the_exact_trailing_component() {
+    let t = tempfile::tempdir().unwrap();
+    let id = "df44ae9785307cebb0e6a2ff9b14f80242aa3f81f1eb79321561d6bc893a176a";
+    let put = |pid: &str, cg: &str| {
+        let d = t.path().join(pid);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup"), cg).unwrap();
+    };
+    put("100", &format!("0::/kubepods/besteffort/podX/{id}\n"));
+    put("101", &format!("0::/kubepods/besteffort/podX/{id}\n"));
+    put(
+        "200",
+        "0::/kubepods/besteffort/podX/0123456789abcdef0123456789abcdef\n",
+    );
+    put(
+        "300",
+        &format!("0::/kubepods/besteffort/podX/{id}/child-not-us\n"),
+    );
+    put("400", "0::/user.slice/session-1.scope\n");
+    // The shim: not in the pod cgroup, found by `-id <sandbox id>`.
+    let putc = |pid: &str, args: &[&str]| {
+        let d = t.path().join(pid);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup"), "0::/system.slice/pelagos-cri.service\n").unwrap();
+        std::fs::write(d.join("cmdline"), args.join("\0") + "\0").unwrap();
+    };
+    putc(
+        "500",
+        &[
+            "/opt/kata/runtime-rs/bin/containerd-shim-kata-v2",
+            "-id",
+            id,
+            "-namespace",
+            "k8s.io",
+        ],
+    );
+    putc(
+        "501",
+        &[
+            "/opt/kata/runtime-rs/bin/containerd-shim-kata-v2",
+            "-id",
+            "0123456789abcdef0123456789abcdef",
+        ],
+    );
+    putc("502", &["sh", "-c", id]); // mentions the id but is not `-id <id>`
+    std::fs::create_dir_all(t.path().join("self")).unwrap();
+    let mut got = sandbox_cgroup_pids(t.path(), id);
+    got.sort();
+    assert_eq!(got, [100, 101, 500]);
+    // Refuses anything that is not a long hex container id.
+    assert!(sandbox_cgroup_pids(t.path(), "podX").is_empty());
+    assert!(sandbox_cgroup_pids(t.path(), "").is_empty());
+}
+
+/// #641: a killed shim leaves /run/kata/<id> and the shared sandbox dir behind.
+/// They are removed only when nothing is mounted under them (the shared dir
+/// holds bind mounts of host volumes) and only for a real 64-hex sandbox id.
+#[test]
+fn stale_kata_dirs_are_removed_only_when_nothing_is_mounted_under_them() {
+    let t = tempfile::tempdir().unwrap();
+    let id = "df44ae9785307cebb0e6a2ff9b14f80242aa3f81f1eb79321561d6bc893a176a";
+    let a = t.path().join("a");
+    let b = t.path().join("b");
+    for base in [&a, &b] {
+        std::fs::create_dir_all(base.join(id).join("x")).unwrap();
+    }
+    let bases = [a.to_str().unwrap(), b.to_str().unwrap()];
+    let none = "36 29 0:31 / /run rw - tmpfs tmpfs rw\n";
+    let (ok, mounted) = removable_kata_dirs(&bases, id, none);
+    assert_eq!((ok.len(), mounted.len()), (2, 0));
+
+    let under = format!(
+        "{none}99 36 0:50 / {}/{id}/ro/passthrough/vol rw - tmpfs tmpfs rw\n",
+        b.display()
+    );
+    let (ok, mounted) = removable_kata_dirs(&bases, id, &under);
+    assert_eq!(ok, [a.join(id)]);
+    assert_eq!(mounted, [b.join(id)]);
+
+    // A mount of an unrelated sibling with the id as a prefix is not "under".
+    let sibling = format!(
+        "{none}99 36 0:50 / {}/{id}x rw - tmpfs tmpfs rw\n",
+        a.display()
+    );
+    assert_eq!(removable_kata_dirs(&bases, id, &sibling).0.len(), 2);
+
+    // Not a container id: nothing, even though a dir of that name exists.
+    std::fs::create_dir_all(a.join("podX")).unwrap();
+    assert!(removable_kata_dirs(&bases, "podX", none).0.is_empty());
+    // Missing dirs are skipped.
+    assert!(removable_kata_dirs(&bases, &"ab".repeat(32), none)
+        .0
+        .is_empty());
+}

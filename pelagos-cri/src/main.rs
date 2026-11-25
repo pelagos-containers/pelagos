@@ -45,7 +45,7 @@ struct Args {
     #[clap(long, default_value = "127.0.0.1:9091")]
     metrics_addr: String,
     /// Shim-backed runtime handler as `NAME=SHIM_BINARY`, e.g.
-    /// `kata=/opt/kata/bin/containerd-shim-kata-v2`. Repeatable. Pods whose
+    /// `kata=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2`. Repeatable. Pods whose
     /// RuntimeClass handler is NAME run through that containerd shim v2
     /// binary; everything else stays native (#574).
     #[clap(long = "shim-handler", multiple_occurrences = true)]

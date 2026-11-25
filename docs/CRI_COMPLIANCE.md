@@ -187,7 +187,7 @@ through Kubernetes `RuntimeClass`. Pods without a RuntimeClass (or with
 `pelagos`) run exactly as before.
 
 ```
-pelagos-cri --shim-handler kata=/opt/kata/bin/containerd-shim-kata-v2 \
+pelagos-cri --shim-handler kata=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2 \
             --shim-handler gvisor=/usr/local/bin/containerd-shim-runsc-v1
 ```
 
@@ -196,7 +196,7 @@ pelagos-cri --shim-handler kata=/opt/kata/bin/containerd-shim-kata-v2 \
 line. The package installs a helper that edits that file idempotently:
 
 ```
-sudo pelagos-cri-shim-handlers add kata=/opt/kata/bin/containerd-shim-kata-v2 \
+sudo pelagos-cri-shim-handlers add kata=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2 \
                                    gvisor=/usr/local/bin/containerd-shim-runsc-v1
 pelagos-cri-shim-handlers runtimeclass kata gvisor     # kubectl apply
 pelagos-cri-shim-handlers list | remove NAME           # inspect / undo

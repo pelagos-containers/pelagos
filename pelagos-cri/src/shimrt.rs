@@ -96,6 +96,34 @@ struct SandboxShim {
     bundle: Bundle,
     /// Host-side overlay scratch for the pause rootfs; cleaned after Delete.
     plan: Option<RootfsPlan>,
+    /// Set by the sandbox watch when the shim died (or the sandbox task
+    /// exited) without us asking: the pod is gone even though nothing said so
+    /// (#641). Reported as NotReady; its containers read as exited (137).
+    lost: std::sync::atomic::AtomicBool,
+    /// Set before a deliberate stop/remove so the watch does not mistake our
+    /// own teardown for a loss.
+    stopping: std::sync::atomic::AtomicBool,
+}
+
+impl SandboxShim {
+    fn new(
+        client: Arc<ShimClient>,
+        binary: String,
+        bundle: Bundle,
+        plan: Option<RootfsPlan>,
+    ) -> Self {
+        Self {
+            client,
+            binary,
+            bundle,
+            plan,
+            lost: Default::default(),
+            stopping: Default::default(),
+        }
+    }
+    fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl ShimRuntime {
@@ -333,15 +361,9 @@ impl ShimRuntime {
             let _ = bundle.remove();
             return Err(e);
         }
-        lock(&self.sandboxes).insert(
-            sb.id.clone(),
-            Arc::new(SandboxShim {
-                client,
-                binary,
-                bundle,
-                plan,
-            }),
-        );
+        let shim = Arc::new(SandboxShim::new(client, binary, bundle, plan));
+        lock(&self.sandboxes).insert(sb.id.clone(), shim.clone());
+        self.spawn_sandbox_watch(&sb.id, shim);
         Ok(())
     }
 
@@ -350,6 +372,15 @@ impl ShimRuntime {
     /// VM is gone (`podnet::teardown_after_shim_stop`).
     pub async fn stop_sandbox(&self, id: &str) {
         let Ok(sb) = self.sandbox(id) else { return };
+        sb.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        if sb.is_lost() {
+            // The shim is already gone; there is nobody to send Kill/Delete/
+            // Shutdown to. Make sure the VM is gone before the caller tears the
+            // netns down.
+            reap_lost_sandbox(id).await;
+            return;
+        }
         if let Err(e) = sb.client.kill(id, 9, true).await {
             log::debug!("stop_sandbox {id}: kill: {e}");
         }
@@ -375,6 +406,8 @@ impl ShimRuntime {
     pub async fn remove_sandbox(&self, id: &str) {
         let removed = lock(&self.sandboxes).remove(id);
         if let Some(sb) = removed {
+            sb.stopping
+                .store(true, std::sync::atomic::Ordering::Release);
             let _ = tokio::time::timeout(Duration::from_secs(5), sb.client.shutdown(id)).await;
             if let Some(p) = &sb.plan {
                 if let Err(e) = p.cleanup() {
@@ -408,6 +441,10 @@ impl ShimRuntime {
                 Ok(()) => {}
                 Err(e) => {
                     log::warn!("readopt: sandbox {} unreachable: {e}", sb.id);
+                    // Its containers are reported lost below and the kubelet
+                    // replaces the pod, so a VM still running without a shim
+                    // we can talk to is only a leak (#641).
+                    reap_lost_sandbox(&sb.id).await;
                     report.sandboxes_lost.push(sb.id.clone());
                 }
             }
@@ -448,15 +485,9 @@ impl ShimRuntime {
             .ok()
             .flatten()
             .map(|layers| rootfs::reattach_rootfs(&self.cfg.store, &sb.id, layers));
-        lock(&self.sandboxes).insert(
-            sb.id.clone(),
-            Arc::new(SandboxShim {
-                client,
-                binary: rec.binary,
-                bundle,
-                plan,
-            }),
-        );
+        let shim = Arc::new(SandboxShim::new(client, rec.binary, bundle, plan));
+        lock(&self.sandboxes).insert(sb.id.clone(), shim.clone());
+        self.spawn_sandbox_watch(&sb.id, shim);
         Ok(())
     }
 
@@ -756,7 +787,67 @@ impl ShimRuntime {
     }
 
     pub fn container_exit(&self, id: &str) -> Option<ContainerExit> {
+        if let Some(x) = self.exits.exit_of(id) {
+            return Some(x);
+        }
+        // A container whose pod's shim died never reports an exit of its own:
+        // record the loss as SIGKILL (137) so the kubelet sees it exited (#641).
+        let sandbox_id = lock(&self.tasks).get(id)?.sandbox_id.clone();
+        if !self.sandbox_lost(&sandbox_id) {
+            return None;
+        }
+        self.exits
+            .apply(crate::shim::exit::TaskEvent::Exit(ContainerExit {
+                container_id: id.to_string(),
+                exec_id: None,
+                pid: 0,
+                exit_status: 137,
+                exited_at: None,
+            }));
         self.exits.exit_of(id)
+    }
+
+    /// Whether the shim of `sandbox_id` died without being asked to (#641).
+    pub fn sandbox_lost(&self, sandbox_id: &str) -> bool {
+        lock(&self.sandboxes)
+            .get(sandbox_id)
+            .is_some_and(|sb| sb.is_lost())
+    }
+
+    /// Ids of the sandboxes whose shim died unasked (#641).
+    pub fn lost_sandboxes(&self) -> Vec<String> {
+        lock(&self.sandboxes)
+            .iter()
+            .filter(|(_, sb)| sb.is_lost())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Watch the sandbox (pause) task. It only ever ends when the pod is torn
+    /// down by us (flagged `stopping`) or when the shim/VM dies underneath us.
+    /// In the second case no other signal reaches the CRI: the pod would stay
+    /// Ready and then stick in Terminating while the orphaned VMM runs on
+    /// (#641). Mark it lost and stop the shim's systemd scope, which holds the
+    /// whole VM (qemu, virtiofsd, ...), so nothing leaks.
+    fn spawn_sandbox_watch(&self, id: &str, sb: Arc<SandboxShim>) {
+        let exits = self.exits.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let ended = exits.wait_exit_or_poll(&id, &sb.client, EXIT_GRACE).await;
+            if sb.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            match ended {
+                Ok(x) => log::warn!(
+                    "sandbox {id}: sandbox task exited (status {}) without a stop request; \
+                     treating the pod as lost",
+                    x.exit_status
+                ),
+                Err(e) => log::warn!("sandbox {id}: {e}; treating the pod as lost"),
+            }
+            sb.lost.store(true, std::sync::atomic::Ordering::Release);
+            reap_lost_sandbox(&id).await;
+        });
     }
 
     #[cfg(test)]
@@ -932,6 +1023,136 @@ async fn finish_task_io(t: &TaskCtx) {
     if let Some(p) = t.pump.lock().await.take() {
         p.finish().await;
     }
+}
+
+/// PIDs of a sandbox's VM: cgroup path ending in `/<sandbox_id>`, or a shim
+/// invoked with `-id <sandbox_id>`, per `<proc_root>/<pid>/{cgroup,cmdline}`.
+///
+/// Kata puts qemu and virtiofsd in the pod's kubelet cgroup
+/// (`.../pod<uid>/<sandbox id>`), not in the shim's systemd scope, so stopping
+/// the scope of a dead shim leaves the VM running (#641). The sandbox id is a
+/// 64-hex container id, so matching its last path component cannot hit
+/// unrelated processes; anything else is refused.
+fn sandbox_cgroup_pids(proc_root: &std::path::Path, sandbox_id: &str) -> Vec<i32> {
+    if sandbox_id.len() < 32 || !sandbox_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Vec::new();
+    }
+    let suffix = format!("/{sandbox_id}");
+    let Ok(rd) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            let dir = proc_root.join(pid.to_string());
+            // The VMM and virtiofsd: last component of the cgroup path.
+            let in_cgroup = std::fs::read_to_string(dir.join("cgroup"))
+                .is_ok_and(|c| c.lines().any(|l| l.ends_with(&suffix)));
+            // The shim itself, which survives a dead VMM and need not be in a
+            // scope or in that cgroup: `<shim> -id <sandbox id> ...`.
+            let is_shim = std::fs::read(dir.join("cmdline")).is_ok_and(|raw| {
+                let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+                args.windows(2)
+                    .any(|w| w[0] == b"-id" && w[1] == sandbox_id.as_bytes())
+            });
+            in_cgroup || is_shim
+        })
+        .collect()
+}
+
+/// Stop a lost sandbox's shim scope and kill the VM processes Kata moved out
+/// of it (#641). Idempotent.
+async fn reap_lost_sandbox(id: &str) {
+    if bootstrap::use_scope() {
+        // The shim has lost its VM and has nothing to shut down gracefully:
+        // SIGKILL it (stop would wait out TimeoutStopSec), then let the scope go.
+        let unit = crate::scope::shim_unit(id);
+        crate::scope::kill_unit(&unit).await;
+        crate::scope::stop_unit(&unit).await;
+    }
+    let sid = id.to_string();
+    let killed = tokio::task::spawn_blocking(move || {
+        let n = reap_sandbox_processes(&sid);
+        if n > 0 {
+            // Give the kernel a moment to tear the killed processes down so
+            // their mounts and files are released before we look at the dirs.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        remove_stale_kata_dirs(&sid);
+        n
+    })
+    .await
+    .unwrap_or(0);
+    if killed > 0 {
+        log::warn!("sandbox {id}: killed {killed} leftover VM process(es) of the lost shim");
+    }
+}
+
+/// Where Kata keeps per-sandbox state that a killed shim never cleans up.
+const KATA_SANDBOX_DIRS: [&str; 2] = ["/run/kata", "/run/kata-containers/shared/sandboxes"];
+
+/// The stale per-sandbox directories of `sandbox_id` that are safe to delete:
+/// they exist and nothing is mounted at or under them. The shared dir holds
+/// bind mounts of host volumes, and removing a tree through a live mount would
+/// delete host data, so any mount under it means "leave it" (the caller logs).
+fn removable_kata_dirs(
+    bases: &[&str],
+    sandbox_id: &str,
+    mountinfo: &str,
+) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let mut ok = Vec::new();
+    let mut mounted = Vec::new();
+    if sandbox_id.len() < 32 || !sandbox_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (ok, mounted);
+    }
+    // mountinfo field 5 is the mount point (octal-escaped; ids contain none).
+    let points: Vec<&str> = mountinfo
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .collect();
+    for b in bases {
+        let dir = std::path::Path::new(b).join(sandbox_id);
+        if !dir.is_dir() {
+            continue;
+        }
+        let prefix = format!("{}/", dir.display());
+        if points
+            .iter()
+            .any(|m| *m == dir.to_string_lossy() || m.starts_with(&prefix))
+        {
+            mounted.push(dir);
+        } else {
+            ok.push(dir);
+        }
+    }
+    (ok, mounted)
+}
+
+fn remove_stale_kata_dirs(sandbox_id: &str) {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let (ok, mounted) = removable_kata_dirs(&KATA_SANDBOX_DIRS, sandbox_id, &mountinfo);
+    for d in mounted {
+        log::warn!(
+            "sandbox {sandbox_id}: leaving {} (still has mounts)",
+            d.display()
+        );
+    }
+    for d in ok {
+        match std::fs::remove_dir_all(&d) {
+            Ok(()) => log::info!("sandbox {sandbox_id}: removed stale {}", d.display()),
+            Err(e) => log::warn!("sandbox {sandbox_id}: remove {}: {e}", d.display()),
+        }
+    }
+}
+
+/// SIGKILL what is left of a lost sandbox's VM. Returns how many were killed.
+fn reap_sandbox_processes(sandbox_id: &str) -> usize {
+    let pids = sandbox_cgroup_pids(std::path::Path::new("/proc"), sandbox_id);
+    for pid in &pids {
+        // SAFETY: plain kill(2) on a pid we just found.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    pids.len()
 }
 
 fn uuid_like() -> String {

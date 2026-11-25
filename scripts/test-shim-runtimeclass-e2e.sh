@@ -32,7 +32,11 @@ fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 k() { $KUBECTL "$@"; }
 
 cleanup() { k delete namespace "$NS" --wait=true --timeout=120s >/dev/null 2>&1 || true
-            for r in $RUNTIMES; do k delete runtimeclass "$r" >/dev/null 2>&1 || true; done; }
+            # RuntimeClasses are cluster-scoped: this run only ever creates and deletes
+            # its own uniquely named ones (<runtime>-e2e-<pid>), never an operator's
+            # `kata`/`gvisor`, whose scheduling/labels a test must not touch.
+            for r in $OWNED_RC; do k delete runtimeclass "$r" >/dev/null 2>&1 || true; done; }
+OWNED_RC=""
 trap cleanup EXIT
 
 echo "=== shim RuntimeClass end-to-end on $NODE ==="
@@ -45,17 +49,15 @@ host_kernel="$(k get node "$NODE" -o jsonpath='{.status.nodeInfo.kernelVersion}'
 
 for rt in $RUNTIMES; do
   echo "--- runtime: $rt"
+  rc="$rt-e2e-$$"
+  printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata: {name: %s}\nhandler: %s\n' "$rc" "$rt" | k create -f - >/dev/null
+  OWNED_RC="$OWNED_RC $rc"
   k apply -f - >/dev/null <<YAML
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata: {name: $rt}
-handler: $rt
----
 apiVersion: v1
 kind: Pod
 metadata: {name: $rt-pod, namespace: $NS}
 spec:
-  runtimeClassName: $rt
+  runtimeClassName: $rc
   nodeName: $NODE
   containers:
   - name: main
