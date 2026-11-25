@@ -175,7 +175,7 @@ pub(crate) fn shim_invocation(
 
 /// Whether `start` should be wrapped in a scope: needs a live systemd and
 /// root (a transient scope under the system manager is privileged).
-fn use_scope() -> bool {
+pub(crate) fn use_scope() -> bool {
     // SAFETY: geteuid has no preconditions.
     scope::systemd_available() && unsafe { libc::geteuid() } == 0
 }

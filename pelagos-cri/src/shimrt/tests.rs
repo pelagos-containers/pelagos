@@ -1069,3 +1069,60 @@ async fn container_started_by_config_digest_image_id() {
     assert!(f.rt.is_running("idc1"));
     f.finish().await;
 }
+
+/// #641: the shim dies (SIGKILL) while its pod runs. Nothing is sent to the CRI,
+/// so the sandbox watch must notice the dead connection and mark the pod lost,
+/// and its containers must read as exited (137) so the kubelet replaces the pod.
+#[tokio::test]
+async fn dead_shim_marks_the_sandbox_lost_and_its_containers_exited() {
+    let mut f = fixture().await;
+    let sb = sandbox("deadsb");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    let c = container("dc1", "deadsb");
+    f.rt.start_container(&sb, &c, f.log_path("d.log").to_str().unwrap(), "/x")
+        .await
+        .unwrap();
+    assert!(!f.rt.sandbox_lost("deadsb"));
+    assert!(
+        f.rt.container_exit("dc1").is_none(),
+        "running before the kill"
+    );
+
+    // The shim goes away: its ttrpc connections drop without any Shutdown RPC.
+    f.servers[0].disconnect().await;
+
+    let mut lost = false;
+    for _ in 0..600 {
+        if f.rt.sandbox_lost("deadsb") {
+            lost = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(lost, "sandbox watch never noticed the dead shim");
+    assert_eq!(f.rt.lost_sandboxes(), ["deadsb"]);
+    assert_eq!(f.rt.container_exit("dc1").unwrap().exit_status, 137);
+    // The kubelet's StopPodSandbox must not hang on a shim that cannot answer.
+    tokio::time::timeout(Duration::from_secs(3), f.rt.stop_sandbox("deadsb"))
+        .await
+        .expect("stop_sandbox returned promptly for a lost shim");
+    f.finish().await;
+}
+
+/// #641 negative: a deliberate StopPodSandbox ends the sandbox task too, and
+/// must not be mistaken for a loss (that would reap the scope mid-teardown).
+#[tokio::test]
+async fn deliberate_stop_is_not_reported_as_a_lost_shim() {
+    let f = fixture().await;
+    let sb = sandbox("okstop");
+    f.rt.start_sandbox("fake", &sb, "/run/netns/x", None, None)
+        .await
+        .unwrap();
+    f.rt.stop_sandbox("okstop").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!f.rt.sandbox_lost("okstop"));
+    assert!(f.rt.lost_sandboxes().is_empty());
+    f.finish().await;
+}

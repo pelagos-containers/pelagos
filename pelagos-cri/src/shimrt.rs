@@ -96,6 +96,34 @@ struct SandboxShim {
     bundle: Bundle,
     /// Host-side overlay scratch for the pause rootfs; cleaned after Delete.
     plan: Option<RootfsPlan>,
+    /// Set by the sandbox watch when the shim died (or the sandbox task
+    /// exited) without us asking: the pod is gone even though nothing said so
+    /// (#641). Reported as NotReady; its containers read as exited (137).
+    lost: std::sync::atomic::AtomicBool,
+    /// Set before a deliberate stop/remove so the watch does not mistake our
+    /// own teardown for a loss.
+    stopping: std::sync::atomic::AtomicBool,
+}
+
+impl SandboxShim {
+    fn new(
+        client: Arc<ShimClient>,
+        binary: String,
+        bundle: Bundle,
+        plan: Option<RootfsPlan>,
+    ) -> Self {
+        Self {
+            client,
+            binary,
+            bundle,
+            plan,
+            lost: Default::default(),
+            stopping: Default::default(),
+        }
+    }
+    fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl ShimRuntime {
@@ -333,15 +361,9 @@ impl ShimRuntime {
             let _ = bundle.remove();
             return Err(e);
         }
-        lock(&self.sandboxes).insert(
-            sb.id.clone(),
-            Arc::new(SandboxShim {
-                client,
-                binary,
-                bundle,
-                plan,
-            }),
-        );
+        let shim = Arc::new(SandboxShim::new(client, binary, bundle, plan));
+        lock(&self.sandboxes).insert(sb.id.clone(), shim.clone());
+        self.spawn_sandbox_watch(&sb.id, shim);
         Ok(())
     }
 
@@ -350,6 +372,13 @@ impl ShimRuntime {
     /// VM is gone (`podnet::teardown_after_shim_stop`).
     pub async fn stop_sandbox(&self, id: &str) {
         let Ok(sb) = self.sandbox(id) else { return };
+        sb.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        if sb.is_lost() {
+            // The shim is already gone and the watch reaped its scope; there is
+            // nobody to send Kill/Delete/Shutdown to.
+            return;
+        }
         if let Err(e) = sb.client.kill(id, 9, true).await {
             log::debug!("stop_sandbox {id}: kill: {e}");
         }
@@ -375,6 +404,8 @@ impl ShimRuntime {
     pub async fn remove_sandbox(&self, id: &str) {
         let removed = lock(&self.sandboxes).remove(id);
         if let Some(sb) = removed {
+            sb.stopping
+                .store(true, std::sync::atomic::Ordering::Release);
             let _ = tokio::time::timeout(Duration::from_secs(5), sb.client.shutdown(id)).await;
             if let Some(p) = &sb.plan {
                 if let Err(e) = p.cleanup() {
@@ -448,15 +479,9 @@ impl ShimRuntime {
             .ok()
             .flatten()
             .map(|layers| rootfs::reattach_rootfs(&self.cfg.store, &sb.id, layers));
-        lock(&self.sandboxes).insert(
-            sb.id.clone(),
-            Arc::new(SandboxShim {
-                client,
-                binary: rec.binary,
-                bundle,
-                plan,
-            }),
-        );
+        let shim = Arc::new(SandboxShim::new(client, rec.binary, bundle, plan));
+        lock(&self.sandboxes).insert(sb.id.clone(), shim.clone());
+        self.spawn_sandbox_watch(&sb.id, shim);
         Ok(())
     }
 
@@ -756,7 +781,69 @@ impl ShimRuntime {
     }
 
     pub fn container_exit(&self, id: &str) -> Option<ContainerExit> {
+        if let Some(x) = self.exits.exit_of(id) {
+            return Some(x);
+        }
+        // A container whose pod's shim died never reports an exit of its own:
+        // record the loss as SIGKILL (137) so the kubelet sees it exited (#641).
+        let sandbox_id = lock(&self.tasks).get(id)?.sandbox_id.clone();
+        if !self.sandbox_lost(&sandbox_id) {
+            return None;
+        }
+        self.exits
+            .apply(crate::shim::exit::TaskEvent::Exit(ContainerExit {
+                container_id: id.to_string(),
+                exec_id: None,
+                pid: 0,
+                exit_status: 137,
+                exited_at: None,
+            }));
         self.exits.exit_of(id)
+    }
+
+    /// Whether the shim of `sandbox_id` died without being asked to (#641).
+    pub fn sandbox_lost(&self, sandbox_id: &str) -> bool {
+        lock(&self.sandboxes)
+            .get(sandbox_id)
+            .is_some_and(|sb| sb.is_lost())
+    }
+
+    /// Ids of the sandboxes whose shim died unasked (#641).
+    pub fn lost_sandboxes(&self) -> Vec<String> {
+        lock(&self.sandboxes)
+            .iter()
+            .filter(|(_, sb)| sb.is_lost())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Watch the sandbox (pause) task. It only ever ends when the pod is torn
+    /// down by us (flagged `stopping`) or when the shim/VM dies underneath us.
+    /// In the second case no other signal reaches the CRI: the pod would stay
+    /// Ready and then stick in Terminating while the orphaned VMM runs on
+    /// (#641). Mark it lost and stop the shim's systemd scope, which holds the
+    /// whole VM (qemu, virtiofsd, ...), so nothing leaks.
+    fn spawn_sandbox_watch(&self, id: &str, sb: Arc<SandboxShim>) {
+        let exits = self.exits.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let ended = exits.wait_exit_or_poll(&id, &sb.client, EXIT_GRACE).await;
+            if sb.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            match ended {
+                Ok(x) => log::warn!(
+                    "sandbox {id}: sandbox task exited (status {}) without a stop request; \
+                     treating the pod as lost",
+                    x.exit_status
+                ),
+                Err(e) => log::warn!("sandbox {id}: {e}; treating the pod as lost"),
+            }
+            sb.lost.store(true, std::sync::atomic::Ordering::Release);
+            if bootstrap::use_scope() {
+                crate::scope::stop_unit(&crate::scope::shim_unit(&id)).await;
+            }
+        });
     }
 
     #[cfg(test)]

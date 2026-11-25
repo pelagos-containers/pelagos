@@ -26,7 +26,7 @@ Remaining steps, in order:
 | Need | Notes |
 |---|---|
 | A shim binary per runtime | Kata: `containerd-shim-kata-v2` (runtime-rs 4.x tested). gVisor: `containerd-shim-runsc-v1` **and** `runsc`. |
-| Kata location | Kata only accepts its configuration from its shipped paths, so install the release tree at `/opt/kata` (shim at `/opt/kata/bin/containerd-shim-kata-v2`). |
+| Kata location | Kata only accepts its configuration from its shipped paths, so install the release tree at `/opt/kata` (shim at `/opt/kata/runtime-rs/bin/containerd-shim-kata-v2`). |
 | gVisor `runsc` | Must be on `pelagos-cri`'s `PATH` (the shim looks it up). Put it in `/usr/local/bin`, or set `PATH=` in `/etc/pelagos/cri.env`. |
 | KVM for Kata | `/dev/kvm` must exist on the node. |
 | A CNI config | Shim pods get their netns + CNI ADD before the VM starts; nodes without CNI config and `hostNetwork` pods are rejected. |
@@ -36,7 +36,7 @@ Remaining steps, in order:
 
 ```
 sudo pelagos-cri-shim-handlers add \
-    kata=/opt/kata/bin/containerd-shim-kata-v2 \
+    kata=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2 \
     gvisor=/usr/local/bin/containerd-shim-runsc-v1
 sudo pelagos-cri-shim-handlers list
 ```
