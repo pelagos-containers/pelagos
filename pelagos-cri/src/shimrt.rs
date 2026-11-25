@@ -1025,7 +1025,8 @@ async fn finish_task_io(t: &TaskCtx) {
     }
 }
 
-/// PIDs whose cgroup path ends in `/<sandbox_id>`, per `<proc_root>/<pid>/cgroup`.
+/// PIDs of a sandbox's VM: cgroup path ending in `/<sandbox_id>`, or a shim
+/// invoked with `-id <sandbox_id>`, per `<proc_root>/<pid>/{cgroup,cmdline}`.
 ///
 /// Kata puts qemu and virtiofsd in the pod's kubelet cgroup
 /// (`.../pod<uid>/<sandbox id>`), not in the shim's systemd scope, so stopping
@@ -1043,8 +1044,18 @@ fn sandbox_cgroup_pids(proc_root: &std::path::Path, sandbox_id: &str) -> Vec<i32
     rd.flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
         .filter(|pid| {
-            std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup"))
-                .is_ok_and(|c| c.lines().any(|l| l.ends_with(&suffix)))
+            let dir = proc_root.join(pid.to_string());
+            // The VMM and virtiofsd: last component of the cgroup path.
+            let in_cgroup = std::fs::read_to_string(dir.join("cgroup"))
+                .is_ok_and(|c| c.lines().any(|l| l.ends_with(&suffix)));
+            // The shim itself, which survives a dead VMM and need not be in a
+            // scope or in that cgroup: `<shim> -id <sandbox id> ...`.
+            let is_shim = std::fs::read(dir.join("cmdline")).is_ok_and(|raw| {
+                let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+                args.windows(2)
+                    .any(|w| w[0] == b"-id" && w[1] == sandbox_id.as_bytes())
+            });
+            in_cgroup || is_shim
         })
         .collect()
 }

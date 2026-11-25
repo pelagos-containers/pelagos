@@ -1150,10 +1150,36 @@ fn sandbox_cgroup_pids_match_only_the_exact_trailing_component() {
         &format!("0::/kubepods/besteffort/podX/{id}/child-not-us\n"),
     );
     put("400", "0::/user.slice/session-1.scope\n");
+    // The shim: not in the pod cgroup, found by `-id <sandbox id>`.
+    let putc = |pid: &str, args: &[&str]| {
+        let d = t.path().join(pid);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup"), "0::/system.slice/pelagos-cri.service\n").unwrap();
+        std::fs::write(d.join("cmdline"), args.join("\0") + "\0").unwrap();
+    };
+    putc(
+        "500",
+        &[
+            "/opt/kata/runtime-rs/bin/containerd-shim-kata-v2",
+            "-id",
+            id,
+            "-namespace",
+            "k8s.io",
+        ],
+    );
+    putc(
+        "501",
+        &[
+            "/opt/kata/runtime-rs/bin/containerd-shim-kata-v2",
+            "-id",
+            "0123456789abcdef0123456789abcdef",
+        ],
+    );
+    putc("502", &["sh", "-c", id]); // mentions the id but is not `-id <id>`
     std::fs::create_dir_all(t.path().join("self")).unwrap();
     let mut got = sandbox_cgroup_pids(t.path(), id);
     got.sort();
-    assert_eq!(got, [100, 101]);
+    assert_eq!(got, [100, 101, 500]);
     // Refuses anything that is not a long hex container id.
     assert!(sandbox_cgroup_pids(t.path(), "podX").is_empty());
     assert!(sandbox_cgroup_pids(t.path(), "").is_empty());
