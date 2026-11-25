@@ -6545,3 +6545,19 @@ the reserved `pelagos` name, missing binaries and specs without `=` are
 rejected; and that both unit templates declare the optional `EnvironmentFile`
 and consume `$PELAGOS_CRI_ARGS`. A failure means enabling a shim handler would
 silently drop operator settings or the units would ignore the file.
+
+## scripts/test-portforward-multi.sh (cluster) and streaming::tests::port_forward_serves_consecutive_connections_on_one_session (unit)
+
+Regression for #617 (`kubectl port-forward` died after the first connection).
+The unit test runs `handle_port_forward` against a real SPDY client over
+loopback and a local echo "pod": three consecutive error+data stream pairs with
+idle gaps on ONE SPDY session must each be forwarded, the server must keep the
+session open between them, and it must end when the client closes. It fails
+if the server closes the session after the first relay finishes.
+The script does the same through a real kubelet/CRI: starts a tiny HTTP pod on
+NODE, opens one `kubectl port-forward`, and asserts 8 sequential requests, a
+request after an idle gap, 10 concurrent requests, and that the forward process
+is still alive. Needs kubectl access from the machine running it (run it on a
+control-plane node with `KUBECTL="sudo kubectl"`). On v0.65.112 it fails
+(0/8); with the fix 4/4 pass. critest Streaming 5/5 still passes (port-forward
+specs close their own session).
