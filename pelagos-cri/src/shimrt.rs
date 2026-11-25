@@ -1053,7 +1053,11 @@ fn sandbox_cgroup_pids(proc_root: &std::path::Path, sandbox_id: &str) -> Vec<i32
 /// of it (#641). Idempotent.
 async fn reap_lost_sandbox(id: &str) {
     if bootstrap::use_scope() {
-        crate::scope::stop_unit(&crate::scope::shim_unit(id)).await;
+        // The shim has lost its VM and has nothing to shut down gracefully:
+        // SIGKILL it (stop would wait out TimeoutStopSec), then let the scope go.
+        let unit = crate::scope::shim_unit(id);
+        crate::scope::kill_unit(&unit).await;
+        crate::scope::stop_unit(&unit).await;
     }
     let sid = id.to_string();
     let killed = tokio::task::spawn_blocking(move || reap_sandbox_processes(&sid))
