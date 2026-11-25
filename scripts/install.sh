@@ -48,3 +48,4 @@ else
 fi
 
 echo "Done. $(pelagos --version 2>/dev/null || echo 'pelagos installed')"
+echo "Kubernetes / Kata / gVisor are optional: see docs/SHIM_HANDLERS_GUIDE.md section 0 (post-install checklist)."

@@ -1,0 +1,20 @@
+[Unit]
+Description=Pelagos CRI gRPC server
+Documentation=https://github.com/pelagos-containers/pelagos
+After=network.target
+Before=k3s.service k3s-agent.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/pelagos
+ExecStart=/usr/bin/pelagos-cri --pelagos-bin /usr/bin/pelagos --socket /run/pelagos/cri.sock $PELAGOS_CRI_ARGS
+Restart=always
+RestartSec=5s
+Environment=RUST_LOG=info
+# Per-node settings written by `pelagos-cri-shim-handlers` (Kata/gVisor handlers);
+# template: /usr/share/pelagos/cri.env.example
+EnvironmentFile=-/etc/pelagos/cri.env
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

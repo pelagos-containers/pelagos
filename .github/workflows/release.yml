@@ -318,6 +318,10 @@ jobs:
           # Shim-handler (Kata/gVisor) support must ship in every package (#639).
           test -x /usr/bin/pelagos-cri-shim-handlers
           test -f /usr/share/pelagos/cri.env.example
+          test -f /usr/share/doc/pelagos/SHIM_HANDLERS_GUIDE.md
+          # The packaged unit must read cri.env, or `pelagos-cri-shim-handlers add` is a no-op.
+          grep -q 'EnvironmentFile=-/etc/pelagos/cri.env' /usr/lib/systemd/system/pelagos-cri.service
+          grep -q 'PELAGOS_CRI_ARGS' /usr/lib/systemd/system/pelagos-cri.service
           test -f /usr/share/pelagos/runtimeclass/kata.yaml
           test -f /usr/share/pelagos/runtimeclass/gvisor.yaml
           test -d /var/lib/pelagos
@@ -438,10 +442,14 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           X86=$(curl -sL "https://github.com/pelagos-containers/pelagos/releases/download/v${VERSION}/pelagos-x86_64-linux.sha256" | awk '{print $1}')
           ARM=$(curl -sL "https://github.com/pelagos-containers/pelagos/releases/download/v${VERSION}/pelagos-aarch64-linux.sha256" | awk '{print $1}')
+          CRI_X86=$(curl -sL "https://github.com/pelagos-containers/pelagos/releases/download/v${VERSION}/pelagos-cri-x86_64-linux.sha256" | awk '{print $1}')
+          CRI_ARM=$(curl -sL "https://github.com/pelagos-containers/pelagos/releases/download/v${VERSION}/pelagos-cri-aarch64-linux.sha256" | awk '{print $1}')
           SRC=$(curl -sL "https://github.com/pelagos-containers/pelagos/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | awk '{print $1}')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "X86_SHA=$X86"     >> $GITHUB_ENV
           echo "ARM_SHA=$ARM"     >> $GITHUB_ENV
+          echo "CRI_X86_SHA=$CRI_X86" >> $GITHUB_ENV
+          echo "CRI_ARM_SHA=$CRI_ARM" >> $GITHUB_ENV
           echo "SRC_SHA=$SRC"     >> $GITHUB_ENV
       - name: Update PKGBUILDs
         run: |
@@ -449,8 +457,8 @@ jobs:
           sed -i "s/^sha256sums=(.*/sha256sums=('${SRC_SHA}')/" pkg/aur/pelagos/PKGBUILD
 
           sed -i "s/^pkgver=.*/pkgver=${VERSION}/" pkg/aur/pelagos-bin/PKGBUILD
-          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${X86_SHA}' 'SKIP' '${SRC_SHA}')/" pkg/aur/pelagos-bin/PKGBUILD
-          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${ARM_SHA}' 'SKIP' '${SRC_SHA}')/" pkg/aur/pelagos-bin/PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${X86_SHA}' 'SKIP' '${SRC_SHA}' '${CRI_X86_SHA}')/" pkg/aur/pelagos-bin/PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${ARM_SHA}' 'SKIP' '${SRC_SHA}' '${CRI_ARM_SHA}')/" pkg/aur/pelagos-bin/PKGBUILD
       - name: Generate .SRCINFO files
         run: |
           docker run --rm -v "$PWD:/src" archlinux:latest bash -c "
