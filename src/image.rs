@@ -460,6 +460,84 @@ pub fn load_blob_diffid(blob_digest: &str) -> Option<String> {
     std::fs::read_to_string(crate::paths::blob_diffid_path(blob_digest)).ok()
 }
 
+/// The diff_id (`sha256:<hex>` of the UNCOMPRESSED tar) of a gzip layer blob.
+pub fn diff_id_of_gzip(blob: &[u8]) -> io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read;
+    let mut dec = flate2::read::GzDecoder::new(blob);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = dec.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Replace `rootfs.diff_ids` in an OCI image config with `ids`.
+///
+/// Returns `Ok(None)` when the config already lists exactly `ids` (the caller
+/// keeps the original bytes, so a correct config keeps its digest), otherwise
+/// the rewritten JSON.
+pub fn rewrite_config_diff_ids(
+    config_json: &str,
+    ids: &[String],
+) -> Result<Option<String>, serde_json::Error> {
+    let mut v: serde_json::Value = serde_json::from_str(config_json)?;
+    let current: Vec<&str> = v["rootfs"]["diff_ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if current.len() == ids.len() && current.iter().zip(ids).all(|(a, b)| *a == b.as_str()) {
+        return Ok(None);
+    }
+    if !v["rootfs"].is_object() {
+        v["rootfs"] = serde_json::json!({"type": "layers"});
+    }
+    v["rootfs"]["diff_ids"] = serde_json::json!(ids);
+    serde_json::to_string(&v).map(Some)
+}
+
+/// Best-known diff_id for a layer identified by its (compressed) digest:
+/// the build sidecar, else the diff_id a stored image's own config assigns to
+/// that layer (pulled base layers). `None` if neither exists.
+pub fn known_diff_id(layer_digest: &str) -> Option<String> {
+    if let Some(d) = load_blob_diffid(layer_digest) {
+        return Some(d);
+    }
+    for ent in std::fs::read_dir(crate::paths::images_dir())
+        .ok()?
+        .flatten()
+    {
+        let dir = ent.path();
+        let Ok(m) = std::fs::read_to_string(dir.join("manifest.json")) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<serde_json::Value>(&m) else {
+            continue;
+        };
+        let Some(idx) = m["layers"]
+            .as_array()
+            .and_then(|l| l.iter().position(|x| x.as_str() == Some(layer_digest)))
+        else {
+            continue;
+        };
+        let Ok(c) = std::fs::read_to_string(dir.join("oci-config.json")) else {
+            continue;
+        };
+        let Ok(c) = serde_json::from_str::<serde_json::Value>(&c) else {
+            continue;
+        };
+        if let Some(id) = c["rootfs"]["diff_ids"][idx].as_str() {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 /// Return the path to the raw OCI config JSON for an image reference.
 pub fn oci_config_path(reference: &str) -> std::path::PathBuf {
     image_dir(reference).join("oci-config.json")
@@ -1104,6 +1182,40 @@ pub fn cleanup_incomplete_layers() -> io::Result<u32> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn diff_id_is_hash_of_uncompressed_content_not_of_the_blob() {
+        use sha2::{Digest as _, Sha256};
+        let raw = b"layer tar bytes".repeat(1000);
+        let blob = gz(&raw);
+        let id = diff_id_of_gzip(&blob).unwrap();
+        assert_eq!(id, format!("sha256:{:x}", Sha256::digest(&raw)));
+        assert_ne!(id, format!("sha256:{:x}", Sha256::digest(&blob)));
+        assert!(diff_id_of_gzip(b"not gzip").is_err());
+    }
+
+    #[test]
+    fn config_diff_ids_rewritten_only_when_they_differ() {
+        let cfg = r#"{"architecture":"amd64","config":{"Env":["A=1"]},"rootfs":{"type":"layers","diff_ids":["sha256:aa","sha256:bb"]}}"#;
+        let same = vec!["sha256:aa".to_string(), "sha256:bb".to_string()];
+        assert_eq!(rewrite_config_diff_ids(cfg, &same).unwrap(), None);
+        let new = vec!["sha256:aa".to_string(), "sha256:cc".to_string()];
+        let out = rewrite_config_diff_ids(cfg, &new).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["rootfs"]["diff_ids"][1], "sha256:cc");
+        assert_eq!(v["config"]["Env"][0], "A=1", "other fields preserved");
+        assert_eq!(v["architecture"], "amd64");
+        // A config with no rootfs gets one.
+        let bare = rewrite_config_diff_ids("{}", &new).unwrap().unwrap();
+        assert!(bare.contains("sha256:cc"));
+    }
 
     // Concurrent save_image + load_image on the same reference must never yield a
     // parse error. A non-atomic writer (plain fs::write, truncate-then-write)

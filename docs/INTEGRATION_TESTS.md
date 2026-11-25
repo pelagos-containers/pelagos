@@ -6546,6 +6546,22 @@ rejected; and that both unit templates declare the optional `EnvironmentFile`
 and consume `$PELAGOS_CRI_ARGS`. A failure means enabling a shim handler would
 silently drop operator settings or the units would ignore the file.
 
+## scripts/test-image-diffids.sh (needs a pelagos store; sudo)
+
+Regression for #632. For a pulled+retagged image and an image built `FROM` a
+pulled base (and, with `REGISTRY=host:port`, for what a plain-HTTP registry holds
+after `image push`), asserts that for every layer `gunzip < blob | sha256sum`
+equals `rootfs.diff_ids[i]` in the exported config. Stock containerd verifies
+this and rejects the image otherwise ("wrong diff id"). Before the fix (v0.65.112)
+distroless:nonroot fails 13 of 13 layers retagged and 13 of 14 built, exactly as
+reported; after it all pass. Unit tests `image::tests::diff_id_is_hash_of_uncompressed_content_not_of_the_blob`
+and `config_diff_ids_rewritten_only_when_they_differ` cover the helpers: a config
+that is already consistent is left byte-identical (digest unchanged), otherwise
+only `rootfs.diff_ids` is replaced. Run `PELAGOS="sudo target/release/pelagos"
+BASE=gcr.io/distroless/static:nonroot REGISTRY=localhost:5000 scripts/test-image-diffids.sh`.
+||||||| 689df5f
+
+
 ## scripts/test-portforward-multi.sh (cluster) and streaming::tests::port_forward_serves_consecutive_connections_on_one_session (unit)
 
 Regression for #617 (`kubectl port-forward` died after the first connection).

@@ -1325,14 +1325,21 @@ pub fn execute_build(
 
 /// Generate a minimal OCI image config JSON for a built image.
 ///
-/// Uses the diff_id sidecar files saved by `create_layer_from_dir`.  Falls
-/// back to the compressed digest when the sidecar is absent (e.g. for layers
-/// pulled from a registry, where the OCI config JSON is already saved verbatim
-/// by `cmd_image_pull`).
+/// diff_ids come from the sidecar files saved by `create_layer_from_dir`, or,
+/// for layers pulled from a registry, from the pulled image's own config
+/// (`image::known_diff_id`) (#632).
 fn generate_oci_config_json(config: &ImageConfig, layer_digests: &[String]) -> String {
     let diff_ids: Vec<String> = layer_digests
         .iter()
-        .map(|d| image::load_blob_diffid(d).unwrap_or_else(|| d.clone()))
+        .map(|d| {
+            image::known_diff_id(d).unwrap_or_else(|| {
+                // Last resort. A compressed digest is NOT a diff_id, so this
+                // would be wrong; `image push`/`save` recompute diff_ids from
+                // the blobs they actually emit, which repairs it (#632).
+                log::warn!("no diff_id known for layer {d}; push/save will recompute it");
+                d.clone()
+            })
+        })
         .collect();
 
     let mut oci_config = serde_json::json!({
