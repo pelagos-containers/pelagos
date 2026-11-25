@@ -18,7 +18,6 @@ GVISOR_REL=20261116.0
 GVISOR_SHA512=a34261504066142b6c1cc4d1813bb2d092761675416e350edc98c4cc66469b63b6f41acdeed09681b6c717c00e80e437f5f2f9c8d37705b8a9260632867c2b7d
 K3S_VER='v1.35.5+k3s1'
 K3S_SHA256=267d18da7b3c837d82283f0588fb9031a8a6ff3c0dac772c260c40852ce515f6
-PAUSE=registry.k8s.io/pause:3.10
 W="${RUNNER_TEMP:-/var/tmp}/shim-e2e"; mkdir -p "$W"
 NODE=ci-shim
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -83,8 +82,7 @@ systemd-run --unit=k3s --property=Restart=no /usr/local/bin/k3s server \
   --container-runtime-endpoint unix:///run/pelagos/cri.sock \
   --node-name "$NODE" --write-kubeconfig-mode 644 \
   --disable traefik --disable servicelb --disable metrics-server --disable coredns --disable local-storage \
-  --disable-network-policy --disable-cloud-controller \
-  --kubelet-arg=pod-infra-container-image=$PAUSE >/dev/null
+  --disable-network-policy --disable-cloud-controller >/dev/null
 for _ in $(seq 1 120); do
   /usr/local/bin/k3s kubectl get node "$NODE" 2>/dev/null | grep -q " Ready" && break; sleep 2
 done
