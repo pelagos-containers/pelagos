@@ -643,11 +643,11 @@ async fn push_image(
         .map_err(|_| format!("OCI config not found for '{}' — re-pull or rebuild the image to populate the blob cache", src_ref))?;
 
     // Build ImageLayer list. Re-synthesize blobs from layer dirs when needed
-    // (pulled images do not retain blobs after layer unpack — issue #127).
-    let mut layers = Vec::with_capacity(manifest.layers.len());
-    for digest in &manifest.layers {
-        let data = ensure_blob(digest)?;
-        // Recompute digest from actual bytes (re-synthesized blobs may differ).
+    // (pulled images do not retain blobs after layer unpack — issue #127), and
+    // make the config's diff_ids describe exactly the blobs we upload (#632).
+    let (blobs, config_json) = consistent_layers(&manifest.layers, config_json)?;
+    let mut layers = Vec::with_capacity(blobs.len());
+    for (_orig, data) in blobs {
         let actual_digest = format!("sha256:{:x}", {
             use sha2::{Digest as _, Sha256};
             Sha256::digest(&data)
@@ -1023,6 +1023,44 @@ fn ensure_blob(digest: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(image::load_blob(&new_digest)?)
 }
 
+/// Layer blobs for `layers` plus an image config whose `rootfs.diff_ids`
+/// match the uncompressed content of exactly those blobs.
+///
+/// Blobs not retained locally are re-synthesized from the unpacked layer
+/// directory, which yields a different tar (and so different digest and
+/// diff_id) than the registry's original. A registry or runtime that verifies
+/// diff_ids (stock containerd) rejects an image whose config still names the
+/// original ones (#632). A config that is already consistent is returned
+/// byte-for-byte, so its digest does not change.
+/// `(original digest, blob bytes)` per layer, and the matching config JSON.
+type ConsistentLayers = (Vec<(String, Vec<u8>)>, String);
+
+fn consistent_layers(
+    layers: &[String],
+    config_json: String,
+) -> Result<ConsistentLayers, Box<dyn std::error::Error>> {
+    let mut blobs = Vec::with_capacity(layers.len());
+    let mut ids = Vec::with_capacity(layers.len());
+    for digest in layers {
+        let data = ensure_blob(digest)?;
+        ids.push(image::diff_id_of_gzip(&data).map_err(|e| {
+            format!(
+                "layer {} is not a valid gzip blob: {e}",
+                &digest[..19.min(digest.len())]
+            )
+        })?);
+        blobs.push((digest.clone(), data));
+    }
+    let config_json = match image::rewrite_config_diff_ids(&config_json, &ids)? {
+        Some(rewritten) => {
+            log::info!("rewrote config diff_ids to match the layer blobs being exported");
+            rewritten
+        }
+        None => config_json,
+    };
+    Ok((blobs, config_json))
+}
+
 /// Save a locally stored image to an OCI Image Layout tar archive.
 ///
 /// Output goes to `output` (a file path) or stdout if `None`.
@@ -1041,13 +1079,10 @@ pub fn cmd_image_save(
             src_ref
         )
     })?;
+    // Collect layer blobs (re-synthesize from layer dir if blob was not
+    // retained) and keep the config's diff_ids consistent with them (#632).
+    let (layer_blobs, config_json) = consistent_layers(&manifest.layers, config_json)?;
     let config_bytes = config_json.into_bytes();
-
-    // Collect layer blobs (re-synthesize from layer dir if blob was not retained).
-    let mut layer_blobs: Vec<(String, Vec<u8>)> = Vec::new();
-    for digest in &manifest.layers {
-        layer_blobs.push((digest.clone(), ensure_blob(digest)?));
-    }
 
     let tar_bytes = build_oci_tar(&src_ref, &config_bytes, &layer_blobs)?;
 
