@@ -6577,3 +6577,14 @@ is still alive. Needs kubectl access from the machine running it (run it on a
 control-plane node with `KUBECTL="sudo kubectl"`). On v0.65.112 it fails
 (0/8); with the fix 4/4 pass. critest Streaming 5/5 still passes (port-forward
 specs close their own session).
+
+## cni::tests::test_cni_args_format and cni::tests::stock_style_plugin_accepts_our_cni_args (unit)
+
+#611. `test_cni_args_format` pins the exact `CNI_ARGS` string the CRI sends
+(`IgnoreUnknown=1;K8S_POD_NAMESPACE=..;K8S_POD_NAME=..;K8S_POD_UID=..`) by
+calling the real `cni_args()` (the old test re-implemented the format and so
+could not fail). `stock_style_plugin_accepts_our_cni_args` runs `run_plugin`
+against a fake plugin that behaves like stock `bridge`: it exits with
+`ARGS: unknown args [...]` unless `IgnoreUnknown=1` is present. It fails if the
+flag is dropped. Verified on a live Cilium node (ipc7): a pod created through the
+new binary got its Cilium IP, so Cilium's K8sArgs accepts `IgnoreUnknown`.

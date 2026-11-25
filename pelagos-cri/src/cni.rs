@@ -82,6 +82,22 @@ pub fn delete_netns(name: &str) {
 
 // ── Internals ─────────────────────────────────────────────────────────────────
 
+/// The `CNI_ARGS` string for a pod: `IgnoreUnknown=1` plus the Kubernetes
+/// identity fields, semicolon-separated.
+///
+/// Cilium 1.19.x K8sArgs only recognises `K8S_POD_NAMESPACE`, `K8S_POD_NAME`
+/// and `K8S_POD_UID`, so those are the only identity fields sent (#476/#482;
+/// `K8S_POD_INFRA_CONTAINER_ID` is rejected). Stock plugins (bridge, flannel's
+/// delegate) reject ANY unknown key unless `IgnoreUnknown` is set, so it is
+/// always sent, as containerd does (#611). Cilium's K8sArgs embeds the CNI
+/// `CommonArgs`, which defines `IgnoreUnknown`, so it accepts it.
+fn cni_args(pod: &PodId<'_>) -> String {
+    format!(
+        "IgnoreUnknown=1;K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_UID={}",
+        pod.namespace, pod.name, pod.uid
+    )
+}
+
 /// Pod identity fields passed as CNI_ARGS to plugin binaries.
 struct PodId<'a> {
     name: &'a str,
@@ -368,14 +384,7 @@ fn run_plugin(
     pod: &PodId<'_>,
 ) -> Result<Option<serde_json::Value>, String> {
     let bin = find_plugin_bin(plugin_type)?;
-    // CNI_ARGS carries Kubernetes pod identity in semicolon-separated K=V format.
-    // Cilium 1.19.x K8sArgs only recognises K8S_POD_NAMESPACE, K8S_POD_NAME, and
-    // K8S_POD_UID (IgnoreUnknown=false); K8S_POD_INFRA_CONTAINER_ID is rejected.
-    // Modern runtimes (containerd 1.7+) send exactly these three fields.
-    let cni_args = format!(
-        "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_UID={}",
-        pod.namespace, pod.name, pod.uid
-    );
+    let cni_args = cni_args(pod);
 
     let mut child = Command::new(&bin)
         .env("CNI_COMMAND", command)
@@ -610,27 +619,55 @@ mod tests {
         );
     }
 
-    /// #476/#482: CNI_ARGS must carry K8S_POD_NAMESPACE, K8S_POD_NAME, K8S_POD_UID in the
-    /// semicolon-separated format required by Kubernetes-aware CNI plugins. Cilium 1.19.x
-    /// K8sArgs only recognises these three fields (IgnoreUnknown=false); K8S_POD_INFRA_CONTAINER_ID
-    /// is NOT included — Cilium rejects it with "unknown args".
+    /// #476/#482/#611: CNI_ARGS carries IgnoreUnknown=1 (stock plugins reject
+    /// unknown keys without it) plus exactly K8S_POD_NAMESPACE, K8S_POD_NAME and
+    /// K8S_POD_UID (Cilium 1.19.x K8sArgs rejects K8S_POD_INFRA_CONTAINER_ID).
     #[test]
     fn test_cni_args_format() {
-        let pod_namespace = "kube-system";
-        let pod_name = "cilium-abc123";
-        let pod_uid = "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb";
-        let cni_args = format!(
-            "K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_UID={}",
-            pod_namespace, pod_name, pod_uid
+        let pod = PodId {
+            namespace: "kube-system",
+            name: "cilium-abc123",
+            uid: "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb",
+        };
+        let args = cni_args(&pod);
+        assert_eq!(
+            args,
+            "IgnoreUnknown=1;K8S_POD_NAMESPACE=kube-system;K8S_POD_NAME=cilium-abc123;K8S_POD_UID=aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb"
         );
-        assert!(cni_args.contains("K8S_POD_NAMESPACE=kube-system"));
-        assert!(cni_args.contains("K8S_POD_NAME=cilium-abc123"));
-        assert!(cni_args.contains(&format!("K8S_POD_UID={}", pod_uid)));
-        // Must NOT include K8S_POD_INFRA_CONTAINER_ID — Cilium 1.19.x rejects it.
-        assert!(!cni_args.contains("K8S_POD_INFRA_CONTAINER_ID"));
-        // Semicolon-separated, no trailing semicolon.
-        let parts: Vec<&str> = cni_args.split(';').collect();
-        assert_eq!(parts.len(), 3);
+        assert!(!args.contains("K8S_POD_INFRA_CONTAINER_ID"));
+        // Semicolon-separated, no trailing semicolon, IgnoreUnknown first.
+        assert!(!args.ends_with(';'));
+        assert_eq!(args.split(';').count(), 4);
+        assert!(args.starts_with("IgnoreUnknown=1;"));
+    }
+
+    /// #611: a plugin that behaves like stock `bridge` (rejects every key it
+    /// does not know unless IgnoreUnknown is set) must accept our CNI_ARGS.
+    #[serial(cni_semaphore)]
+    #[test]
+    fn stock_style_plugin_accepts_our_cni_args() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let plugin = d.path().join("strictplugin");
+        std::fs::write(
+            &plugin,
+            "#!/bin/sh\n\
+             cat >/dev/null\n\
+             case \";$CNI_ARGS;\" in *\";IgnoreUnknown=1;\"*) ;; *)\n\
+               echo \"ARGS: unknown args [$CNI_ARGS]\" >&2; exit 1;; esac\n\
+             echo '{\"cniVersion\":\"1.0.0\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("PELAGOS_CNI_BIN_DIRS", d.path());
+        let pod = PodId {
+            name: "p",
+            namespace: "ns",
+            uid: "u",
+        };
+        let r = run_plugin("ADD", "sbx", "/run/netns/x", "strictplugin", "{}", &pod);
+        std::env::remove_var("PELAGOS_CNI_BIN_DIRS");
+        assert!(r.is_ok(), "strict plugin rejected our CNI_ARGS: {r:?}");
     }
 
     /// #354: portmap (capabilities.portMappings) gets runtimeConfig injected;
