@@ -86,7 +86,9 @@ for sc in $SCENARIOS; do
   fi
   for _ in $(seq 1 20); do [ "$(vm_procs "$old")" = 0 ] && break; sleep 1; done
   [ "$(vm_procs "$old")" = 0 ] && pass "$sc: no VM process of the old sandbox left" \
-                                || fail "$sc: orphaned VM process(es) of ${old:0:12} remain"
+                                || { fail "$sc: orphaned VM process(es) of ${old:0:12} remain"
+                                     ps -eo pid,ppid,stat,wchan:22,args 2>/dev/null | grep -F "${old}" | grep -v grep | cut -c1-200
+                                     systemctl status "pelagos-shim-${old}.scope" --no-pager 2>&1 | head -8; }
 done
 
 echo "=== $PASS passed, $FAIL failed ==="
