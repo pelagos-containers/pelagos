@@ -91,7 +91,7 @@ account token, shared emptyDir, logs, pod IP, cross-runtime ping, clean delete.
 NODE=<node> KUBECTL="sudo kubectl" RUNTIMES="kata gvisor" scripts/test-shim-runtimeclass-e2e.sh
 ```
 
-It creates and removes its own namespace, and only the RuntimeClasses that did not already exist (yours are left alone). Run it on a node
+It creates and removes its own namespace and its own uniquely named RuntimeClasses (`<runtime>-e2e-<pid>`); your `kata`/`gvisor` are never touched. Run it on a node
 with handlers enabled; see the script header for variables.
 
 ## 5. Operating notes

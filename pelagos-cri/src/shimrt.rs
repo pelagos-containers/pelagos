@@ -1071,11 +1071,77 @@ async fn reap_lost_sandbox(id: &str) {
         crate::scope::stop_unit(&unit).await;
     }
     let sid = id.to_string();
-    let killed = tokio::task::spawn_blocking(move || reap_sandbox_processes(&sid))
-        .await
-        .unwrap_or(0);
+    let killed = tokio::task::spawn_blocking(move || {
+        let n = reap_sandbox_processes(&sid);
+        if n > 0 {
+            // Give the kernel a moment to tear the killed processes down so
+            // their mounts and files are released before we look at the dirs.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        remove_stale_kata_dirs(&sid);
+        n
+    })
+    .await
+    .unwrap_or(0);
     if killed > 0 {
         log::warn!("sandbox {id}: killed {killed} leftover VM process(es) of the lost shim");
+    }
+}
+
+/// Where Kata keeps per-sandbox state that a killed shim never cleans up.
+const KATA_SANDBOX_DIRS: [&str; 2] = ["/run/kata", "/run/kata-containers/shared/sandboxes"];
+
+/// The stale per-sandbox directories of `sandbox_id` that are safe to delete:
+/// they exist and nothing is mounted at or under them. The shared dir holds
+/// bind mounts of host volumes, and removing a tree through a live mount would
+/// delete host data, so any mount under it means "leave it" (the caller logs).
+fn removable_kata_dirs(
+    bases: &[&str],
+    sandbox_id: &str,
+    mountinfo: &str,
+) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let mut ok = Vec::new();
+    let mut mounted = Vec::new();
+    if sandbox_id.len() < 32 || !sandbox_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (ok, mounted);
+    }
+    // mountinfo field 5 is the mount point (octal-escaped; ids contain none).
+    let points: Vec<&str> = mountinfo
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .collect();
+    for b in bases {
+        let dir = std::path::Path::new(b).join(sandbox_id);
+        if !dir.is_dir() {
+            continue;
+        }
+        let prefix = format!("{}/", dir.display());
+        if points
+            .iter()
+            .any(|m| *m == dir.to_string_lossy() || m.starts_with(&prefix))
+        {
+            mounted.push(dir);
+        } else {
+            ok.push(dir);
+        }
+    }
+    (ok, mounted)
+}
+
+fn remove_stale_kata_dirs(sandbox_id: &str) {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let (ok, mounted) = removable_kata_dirs(&KATA_SANDBOX_DIRS, sandbox_id, &mountinfo);
+    for d in mounted {
+        log::warn!(
+            "sandbox {sandbox_id}: leaving {} (still has mounts)",
+            d.display()
+        );
+    }
+    for d in ok {
+        match std::fs::remove_dir_all(&d) {
+            Ok(()) => log::info!("sandbox {sandbox_id}: removed stale {}", d.display()),
+            Err(e) => log::warn!("sandbox {sandbox_id}: remove {}: {e}", d.display()),
+        }
     }
 }
 

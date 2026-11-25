@@ -1184,3 +1184,44 @@ fn sandbox_cgroup_pids_match_only_the_exact_trailing_component() {
     assert!(sandbox_cgroup_pids(t.path(), "podX").is_empty());
     assert!(sandbox_cgroup_pids(t.path(), "").is_empty());
 }
+
+/// #641: a killed shim leaves /run/kata/<id> and the shared sandbox dir behind.
+/// They are removed only when nothing is mounted under them (the shared dir
+/// holds bind mounts of host volumes) and only for a real 64-hex sandbox id.
+#[test]
+fn stale_kata_dirs_are_removed_only_when_nothing_is_mounted_under_them() {
+    let t = tempfile::tempdir().unwrap();
+    let id = "df44ae9785307cebb0e6a2ff9b14f80242aa3f81f1eb79321561d6bc893a176a";
+    let a = t.path().join("a");
+    let b = t.path().join("b");
+    for base in [&a, &b] {
+        std::fs::create_dir_all(base.join(id).join("x")).unwrap();
+    }
+    let bases = [a.to_str().unwrap(), b.to_str().unwrap()];
+    let none = "36 29 0:31 / /run rw - tmpfs tmpfs rw\n";
+    let (ok, mounted) = removable_kata_dirs(&bases, id, none);
+    assert_eq!((ok.len(), mounted.len()), (2, 0));
+
+    let under = format!(
+        "{none}99 36 0:50 / {}/{id}/ro/passthrough/vol rw - tmpfs tmpfs rw\n",
+        b.display()
+    );
+    let (ok, mounted) = removable_kata_dirs(&bases, id, &under);
+    assert_eq!(ok, [a.join(id)]);
+    assert_eq!(mounted, [b.join(id)]);
+
+    // A mount of an unrelated sibling with the id as a prefix is not "under".
+    let sibling = format!(
+        "{none}99 36 0:50 / {}/{id}x rw - tmpfs tmpfs rw\n",
+        a.display()
+    );
+    assert_eq!(removable_kata_dirs(&bases, id, &sibling).0.len(), 2);
+
+    // Not a container id: nothing, even though a dir of that name exists.
+    std::fs::create_dir_all(a.join("podX")).unwrap();
+    assert!(removable_kata_dirs(&bases, "podX", none).0.is_empty());
+    // Missing dirs are skipped.
+    assert!(removable_kata_dirs(&bases, &"ab".repeat(32), none)
+        .0
+        .is_empty());
+}

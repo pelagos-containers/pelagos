@@ -28,9 +28,9 @@ fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 k() { $KUBECTL "$@"; }
 KILL="${KILL:-kill}"
 cleanup() { k delete namespace "$NS" --wait=true --timeout=120s >/dev/null 2>&1 || true
-            # cluster-scoped: only remove a RuntimeClass this run created
-            [ -z "$OWNED_RC" ] || k delete runtimeclass kata >/dev/null 2>&1 || true; }
-OWNED_RC=""
+            # cluster-scoped: only ever the uniquely named class this run created
+            k delete runtimeclass "$RC" >/dev/null 2>&1 || true; }
+RC="kata-e2e-$$"
 trap cleanup EXIT
 
 ready_sandbox() { $CRICTL pods --name kp --state ready -q 2>/dev/null | head -1; }
@@ -44,16 +44,13 @@ echo "=== Kata failure recovery on $NODE ==="
 k create namespace "$NS" >/dev/null 2>&1 || true
 for _ in $(seq 1 60); do k -n "$NS" get serviceaccount default >/dev/null 2>&1 && break; sleep 1; done
 k -n "$NS" create secret generic s --from-literal=a=b >/dev/null 2>&1 || true
-if ! k get runtimeclass kata >/dev/null 2>&1; then
-  printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata: {name: kata}\nhandler: kata\n' | k create -f - >/dev/null
-  OWNED_RC=1
-fi
+printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata: {name: %s}\nhandler: kata\n' "$RC" | k create -f - >/dev/null
 k apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
 metadata: {name: kp, namespace: $NS}
 spec:
-  runtimeClassName: kata
+  runtimeClassName: $RC
   nodeName: $NODE
   containers:
   - name: a
