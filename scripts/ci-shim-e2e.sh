@@ -14,9 +14,8 @@ set -euo pipefail
 BIN="${1:-target/debug}"
 KATA_VER=4.4.0
 KATA_SHA256=ccbc0cbc591089d0c57012b78da64b23ef43e0bac0f869dc7bfebe8588c33986
-GVISOR_REL=20261116
-RUNSC_SHA512=bd4281b101a1c406790b1196401f8b76b9b49146068ec0cfefd416c2a57b9c472478cc646d28d0894f0d515c7464c4072b2007227e65dbb1a69de16ea2325c2a
-RUNSC_SHIM_SHA512=832440dc5f3066ce4af7d9372c35af922490e39672d68cd3d232be8271876e50cdd53d06cae2748d271e4604c3cc31781ffdae8af97366b2569a4dc03c8953bc
+GVISOR_REL=20261116.0
+GVISOR_SHA512=a34261504066142b6c1cc4d1813bb2d092761675416e350edc98c4cc66469b63b6f41acdeed09681b6c717c00e80e437f5f2f9c8d37705b8a9260632867c2b7d
 K3S_VER='v1.35.5+k3s1'
 K3S_SHA256=267d18da7b3c837d82283f0588fb9031a8a6ff3c0dac772c260c40852ce515f6
 PAUSE=registry.k8s.io/pause:3.10
@@ -44,12 +43,11 @@ echo "$KATA_SHA256  $W/kata.tar.zst" | sha256sum -c -
 tar --zstd -xf "$W/kata.tar.zst" -C / ; ls /opt/kata/runtime-rs/bin/containerd-shim-kata-v2
 rm -f "$W/kata.tar.zst"
 
-log "gVisor $GVISOR_REL"
-for f in runsc containerd-shim-runsc-v1; do
-  curl -sfL -o "/usr/local/bin/$f" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_REL/x86_64/$f"; chmod +x "/usr/local/bin/$f"
-done
-echo "$RUNSC_SHA512  /usr/local/bin/runsc" | sha512sum -c -
-echo "$RUNSC_SHIM_SHA512  /usr/local/bin/containerd-shim-runsc-v1" | sha512sum -c -
+log "gVisor $GVISOR_REL (runsc + containerd-shim-runsc-v1 + gvisor-bin/) -> /usr/local/bin"
+curl -sfL -o "$W/gvisor.tar.zstd" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_REL/x86_64/gvisor.tar.zstd"
+echo "$GVISOR_SHA512  $W/gvisor.tar.zstd" | sha512sum -c -
+tar --zstd -xf "$W/gvisor.tar.zstd" -C /usr/local/bin
+rm -f "$W/gvisor.tar.zstd"; runsc --version | head -1
 
 log "k3s $K3S_VER"
 curl -sfL -o /usr/local/bin/k3s "https://github.com/k3s-io/k3s/releases/download/${K3S_VER//+/%2B}/k3s"
