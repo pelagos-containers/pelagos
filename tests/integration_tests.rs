@@ -32599,8 +32599,18 @@ mod issue_412_cgroup_kill_orphans {
             pids
         );
         // Sanity: at least one is a session leader in its own session (the setsid'd one),
-        // which a single-PID kill of the shell would not reap.
-        let has_setsid = pids.iter().any(|&p| unsafe { libc::getsid(p) } == p);
+        // which a single-PID kill of the shell would not reap. The backgrounded job joins
+        // the cgroup the moment it forks, a little before it execs `setsid` and becomes a
+        // session leader, so wait for that rather than asserting once (#652).
+        let mut has_setsid = false;
+        for _ in 0..80 {
+            pids = read_pids();
+            has_setsid = pids.iter().any(|&p| unsafe { libc::getsid(p) } == p);
+            if has_setsid {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(
             has_setsid,
             "expected a setsid session leader in the cgroup: {:?}",
