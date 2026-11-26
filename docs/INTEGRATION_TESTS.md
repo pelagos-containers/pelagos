@@ -6649,3 +6649,18 @@ compared with its own host-side file, not with another pod's. Result on ipc7
 1-2 s later (one 10 s outlier) and the Kata guest 1-2 s later in every round. The
 delay is the kubelet's, the Kata/shim path adds about a second. Use it to check
 that this stays true.
+||||||| d8e93e2
+
+
+## scripts/test-shim-cri-restart.sh (root, on a node with the handlers; in the shim-e2e CI gate)
+
+#644 (property behind #602 and #618). For each runtime (Kata and/or gVisor) a pod
+is started through the real kubelet, `pelagos-cri` is restarted, and the test
+asserts: the shim is the same process (pid still alive), the sandbox is still
+Ready with the same id, the pod is Running and the container never restarted
+(restartCount 0), and the guest's `/proc/uptime` kept counting (a restarted VM or
+sandbox would reset it; this also proves `kubectl exec` works again). It prints
+the shim's cgroup: Kata's shim sits in the pod's kubelet cgroup, gVisor's in its
+`pelagos-shim-<id>.scope`. A failure means a CRI restart (an upgrade, a crash)
+kills or disturbs running shim pods. It checks the property, not the mechanism,
+so it holds whichever cgroup a shim ends up in.
