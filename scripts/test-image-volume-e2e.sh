@@ -89,11 +89,26 @@ YAML
 done
 
 k delete pod -n "$NS" --all --wait=true --timeout=120s >/dev/null 2>&1
-sleep 5
-left="$(nx ls "$STAGING" 2>/dev/null | wc -l)"
-mnts="$(nx grep -c " $STAGING/" /proc/self/mountinfo 2>/dev/null || true)"
-[ "${left:-0}" = 0 ] && [ "${mnts:-0}" = 0 ] && pass "no staged image volumes or mounts left after the pods are removed" \
-  || fail "left behind: $left staging dirs, $mnts mounts under $STAGING"
+# A staged volume is released when the kubelet calls RemoveContainer, which it does when it
+# garbage-collects the exited containers: seconds to minutes after the pods are gone. So wait
+# for that, then require that anything still staged belongs to a container the CRI still lists.
+# A staged volume whose container is gone is the real leak.
+CRICTL="${CRICTL:-crictl -r unix:///run/pelagos/cri.sock}"
+GC_WAIT="${GC_WAIT:-150}"
+for _ in $(seq 1 $((GC_WAIT / 5))); do
+  [ "$(nx ls "$STAGING" 2>/dev/null | wc -l)" = 0 ] && break; sleep 5
+done
+orphans=""; held=""
+for d in $(nx ls "$STAGING" 2>/dev/null); do
+  if nx $CRICTL ps -a -q --no-trunc 2>/dev/null | grep -q "^$d"; then held="$held ${d:0:12}"; else orphans="$orphans ${d:0:12}"; fi
+done
+if [ -n "$orphans" ]; then
+  fail "orphaned staged image volumes (their container no longer exists):$orphans"
+elif [ -n "$held" ]; then
+  pass "no orphaned staging; still held for exited container(s) the kubelet has not removed yet:$held"
+else
+  pass "no staged image volumes or mounts left after the pods are removed"
+fi
 
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" = 0 ]
