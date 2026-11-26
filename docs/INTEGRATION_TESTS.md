@@ -5773,6 +5773,10 @@ cgroup (atomic `cgroup.kill`, or a `cgroup.procs` walk) so nothing survives. The
 specifically verifies a **setsid session leader** — which a single-PID/process-group kill
 would leave alive — is reaped. A failure here means container teardown can leak orphans.
 
+The precondition that a `setsid` session leader is in the cgroup is polled (up to 4 s), not
+asserted once: the backgrounded job joins the cgroup when it forks, slightly before it execs
+`setsid` and becomes a session leader, so a one-shot check flaked on a loaded runner (#652).
+
 ## `issue_412_cgroup_kill_orphans::test_teardown_cgroup_reaps_orphan_on_self_exit`
 **Requires root** and **cgroup v2** (skips otherwise). Guards the *reopened* half of
 #412: the **teardown** path, not just the CLI stop/rm paths. Creates a test cgroup, runs
