@@ -6713,8 +6713,10 @@ handler and optionally Kata/gVisor (`RUNTIMES="native kata"`). The volume image
 which it sees. It asserts: the pod becomes Ready; the volume image's files are visible;
 the container's own image is not what is mounted; the volume is read-only; a binary
 from it executes (no `noexec`); `subPath: etc` exposes only that directory; and after
-the pods are removed no staged directories or mounts remain under
-`/run/pelagos-cri/imgvol`. Before the fix the pod started but the volume was an empty
+the pods are removed (the check waits up to 150 s for the kubelet's container
+garbage collection, which is what triggers RemoveContainer and releases the staging) nothing is
+orphaned under `/run/pelagos-cri/imgvol`: anything still staged must belong to a container the
+CRI still lists; a staged volume whose container is gone fails the test. Before the fix the pod started but the volume was an empty
 writable directory (4 of the 8 native checks failed). Node-local checks go through
 `NODE_EXEC` (e.g. `ssh -q <node>`).
 
