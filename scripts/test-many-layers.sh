@@ -5,13 +5,15 @@
 # /var/lib/pelagos/layers/<64 hex> paths) is cut mid-path and the mount fails
 # with ENOENT ("mount overlay in host namespace: No such file or directory").
 #
-# Builds FROM $BASE with $STEPS `RUN` steps (one layer each), runs the result,
-# and checks that every layer's marker file is visible in the merged rootfs.
+# Builds FROM $BASE with $STEPS `RUN` steps (one layer each; the default stays
+# inside Docker's 125-layer depth limit), runs the result, and checks that every
+# layer's marker file is visible in the merged rootfs. Then builds TOO_MANY steps
+# and checks it fails with a clear "too many layers" error, not ENOENT.
 #
 # Needs root (overlay + bridge-less run). Usage:
-#   sudo PELAGOS=target/debug/pelagos [BASE=alpine:3.20] [STEPS=130] scripts/test-many-layers.sh
+#   sudo PELAGOS=target/debug/pelagos [BASE=alpine:3.20] [STEPS=120] [TOO_MANY=170] scripts/test-many-layers.sh
 set -uo pipefail
-PELAGOS="${PELAGOS:-pelagos}"; BASE="${BASE:-alpine:3.20}"; STEPS="${STEPS:-130}"
+PELAGOS="${PELAGOS:-pelagos}"; BASE="${BASE:-alpine:3.20}"; STEPS="${STEPS:-120}"; TOO_MANY="${TOO_MANY:-170}"
 TAG="manylayers-test:1"
 W="$(mktemp -d)"; trap 'rm -rf "$W"; $PELAGOS image rm "$TAG" >/dev/null 2>&1 || true' EXIT
 PASS=0; FAIL=0
@@ -32,6 +34,17 @@ fi
 out="$($PELAGOS run "$TAG" 2>&1 | tail -1)"
 if [ "$out" = "$STEPS" ]; then pass "run sees all $STEPS marker files in the merged rootfs"
 else fail "run: expected $STEPS marker files, got '$out'"; fi
+
+# Past what a page can hold even with short aliases: a clear error, not a truncated mount.
+{ echo "FROM $BASE"; for i in $(seq 1 "$TOO_MANY"); do echo "RUN echo $i > /m$i"; done; } > "$W/Remfile.big"
+if $PELAGOS build -t "$TAG-big" --file "$W/Remfile.big" "$W" >"$W/big.log" 2>&1; then
+  fail "build with $TOO_MANY steps unexpectedly succeeded (raise TOO_MANY if the limit moved)"
+elif grep -q "too many layers" "$W/big.log" && ! grep -q "No such file" "$W/big.log"; then
+  pass "build with $TOO_MANY steps fails with a clear 'too many layers' error"
+else
+  fail "build with $TOO_MANY steps failed unclearly: $(tail -2 "$W/big.log" | tr '\n' ' ')"
+fi
+$PELAGOS image rm "$TAG-big" >/dev/null 2>&1 || true
 
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" = 0 ]

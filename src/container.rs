@@ -112,13 +112,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Counter for unique overlay merged-dir names.
 static OVERLAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Largest overlay option string handed to mount(2). The kernel copies the mount
-/// data argument in with a one-page limit (4096 bytes) and silently truncates the
-/// rest, so a long `lowerdir=` list is cut mid-path and the mount fails with
+/// Largest overlay option string handed to mount(2) (a page is 4096 bytes, with room
+/// for the NUL). The kernel copies the mount data argument in with a one-page limit
+/// and silently truncates the rest, so a long `lowerdir=` list is cut mid-path and the mount fails with
 /// ENOENT (#612).
-const OVERLAY_OPTIONS_MAX: usize = 3900;
-/// Slack for the fixed parts of the option string (option names, flags).
-const OVERLAY_OPTIONS_SLACK: usize = 160;
+const OVERLAY_OPTIONS_MAX: usize = 4000;
+/// Slack for the fixed parts of the option string: the option names and the longest
+/// flag set (`,squash_to_uid=0,squash_to_gid=0,allow_other`) come to about 75 bytes.
+const OVERLAY_OPTIONS_SLACK: usize = 100;
 
 /// Short runtime-dir path for the symlink aliases of an overlay's lower layers,
 /// derived from the scratch base's name (`overlay-<pid>-<n>` -> `o<pid>-<n>`).
