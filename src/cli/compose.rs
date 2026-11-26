@@ -46,6 +46,16 @@ pub enum ComposeCmd {
         /// Never pull images; fail immediately if an image is not cached locally
         #[clap(long)]
         no_pull: bool,
+        /// Return as soon as the supervisor is forked instead of waiting for every service
+        /// to start (the old behaviour: a startup failure is then only visible in
+        /// `compose ps` and the supervisor log)
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for all services to start before giving up waiting (the
+        /// supervisor keeps going in the background). Dependency readiness polling alone
+        /// can take 60 s per service.
+        #[clap(long, value_name = "SECS", default_value = "300")]
+        startup_timeout: u64,
     },
     /// Stop and remove all services
     Down {
@@ -117,7 +127,18 @@ pub fn cmd_compose(cmd: ComposeCmd) -> Result<(), Box<dyn std::error::Error>> {
             project,
             foreground,
             no_pull,
-        } => cmd_compose_up(&file, project.as_deref(), foreground, no_pull),
+            no_wait,
+            startup_timeout,
+        } => cmd_compose_up(
+            &file,
+            project.as_deref(),
+            UpOptions {
+                foreground,
+                no_pull,
+                no_wait,
+                startup_timeout: Duration::from_secs(startup_timeout),
+            },
+        ),
         ComposeCmd::Down {
             file,
             project,
@@ -137,13 +158,188 @@ pub fn cmd_compose(cmd: ComposeCmd) -> Result<(), Box<dyn std::error::Error>> {
 // compose up
 // ---------------------------------------------------------------------------
 
+/// How `compose up` behaves, besides which file and project.
+#[derive(Clone, Copy)]
+struct UpOptions {
+    foreground: bool,
+    no_pull: bool,
+    /// Do not wait for the supervisor to report that every service started.
+    no_wait: bool,
+    startup_timeout: Duration,
+}
+
 fn cmd_compose_up(
     file: &std::path::Path,
     project_name: Option<&str>,
-    foreground: bool,
-    no_pull: bool,
+    opts: UpOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    cmd_compose_up_reml(file, project_name, foreground, no_pull)
+    cmd_compose_up_reml(file, project_name, opts)
+}
+
+// ---------------------------------------------------------------------------
+// Startup handshake (#653)
+//
+// In background mode `compose up` forks a supervisor that starts the services. Before this,
+// the parent slept 200 ms and printed "Project started" whatever happened next, so any
+// failure after that (a service that cannot spawn, a missing runtime, a dependency that never
+// becomes ready) was invisible: the supervisor rolled everything back and the user saw
+// "started", exit 0, and later "no project found". Now the supervisor reports over a pipe,
+// once, with a framed message: 1 status byte ('S' started / 'F' failed), a 4-byte
+// little-endian length, then that many bytes of UTF-8 text (notes / the error). The parent
+// waits for it, noticing a dead supervisor and a timeout.
+// ---------------------------------------------------------------------------
+
+/// The supervisor's side of the pipe. Sends at most one frame; later calls are no-ops.
+pub struct StartupNotifier {
+    fd: std::cell::Cell<i32>,
+}
+
+impl StartupNotifier {
+    /// A notifier that reports to nobody (foreground mode, `--no-wait`).
+    pub fn none() -> Self {
+        Self {
+            fd: std::cell::Cell::new(-1),
+        }
+    }
+    fn new(fd: i32) -> Self {
+        Self {
+            fd: std::cell::Cell::new(fd),
+        }
+    }
+    fn send(&self, status: u8, text: &str) {
+        let fd = self.fd.replace(-1);
+        if fd < 0 {
+            return;
+        }
+        let frame = encode_startup_frame(status, text);
+        let mut off = 0;
+        while off < frame.len() {
+            // SAFETY: writing from a live buffer to an fd we own.
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    frame[off..].as_ptr() as *const libc::c_void,
+                    frame.len() - off,
+                )
+            };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if n <= 0 {
+                break; // the parent is gone; nothing more to tell it
+            }
+            off += n as usize;
+        }
+        unsafe { libc::close(fd) };
+    }
+    /// Every service started. `notes` carries warnings (e.g. a service already exited).
+    pub fn started(&self, notes: &str) {
+        self.send(b'S', notes);
+    }
+    /// Startup failed (after rollback); `error` is what the user should read.
+    pub fn failed(&self, error: &str) {
+        self.send(b'F', error);
+    }
+}
+
+fn encode_startup_frame(status: u8, text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut f = Vec::with_capacity(5 + bytes.len());
+    f.push(status);
+    f.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    f.extend_from_slice(bytes);
+    f
+}
+
+/// A complete frame at the start of `buf`: `(status, text)`. `None` while it is incomplete.
+fn decode_startup_frame(buf: &[u8]) -> Option<(u8, String)> {
+    if buf.len() < 5 {
+        return None;
+    }
+    let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let body = buf.get(5..5 + len)?;
+    Some((buf[0], String::from_utf8_lossy(body).into_owned()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupWait {
+    /// All services started; the string holds any warnings.
+    Started(String),
+    /// Startup failed and was rolled back; the string is the error.
+    Failed(String),
+    /// The supervisor exited (or closed the pipe) without reporting.
+    SupervisorDied,
+    /// Still starting when the timeout ran out.
+    TimedOut,
+}
+
+/// Wait on `fd` (the read end) for the supervisor's frame. Closes `fd`. If `supervisor_pid`
+/// is given it is reaped with WNOHANG as a second way to notice a supervisor that died.
+fn wait_for_startup(fd: i32, timeout: Duration, supervisor_pid: Option<i32>) -> StartupWait {
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    let done = |fd: i32, r: StartupWait| {
+        unsafe { libc::close(fd) };
+        r
+    };
+    // Non-blocking, so a read after poll() or after the supervisor exited can never hang on a
+    // pipe whose write end something else still holds open.
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    loop {
+        if let Some((status, text)) = decode_startup_frame(&buf) {
+            return done(
+                fd,
+                if status == b'S' {
+                    StartupWait::Started(text)
+                } else {
+                    StartupWait::Failed(text)
+                },
+            );
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return done(fd, StartupWait::TimedOut);
+        }
+        let slice_ms = (deadline - now).min(Duration::from_millis(200)).as_millis() as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd, 1, slice_ms.max(1)) };
+        if r > 0 {
+            let mut chunk = [0u8; 4096];
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+            if n > 0 {
+                buf.extend_from_slice(&chunk[..n as usize]);
+            } else if n == 0 {
+                // EOF: the writer closed without a complete frame.
+                return done(fd, StartupWait::SupervisorDied);
+            } else if !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                return done(fd, StartupWait::SupervisorDied);
+            }
+        } else if let Some(pid) = supervisor_pid {
+            let mut status = 0;
+            let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if w == pid {
+                // Exited: take whatever it managed to write, then decide.
+                let mut chunk = [0u8; 4096];
+                let n =
+                    unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+                if n > 0 {
+                    buf.extend_from_slice(&chunk[..n as usize]);
+                    continue;
+                }
+                return done(fd, StartupWait::SupervisorDied);
+            }
+        }
+    }
 }
 
 /// Pull any images in `spec` that are not already cached locally.
@@ -186,9 +382,14 @@ fn pull_missing_images(
 fn cmd_compose_up_reml(
     file: &std::path::Path,
     project_name: Option<&str>,
-    foreground: bool,
-    no_pull: bool,
+    opts: UpOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let UpOptions {
+        foreground,
+        no_pull,
+        no_wait,
+        startup_timeout,
+    } = opts;
     // Derive a preliminary project name from the file path so that
     // imperative `container-start` calls during eval use the right scope.
     let preliminary_project = if let Some(name) = project_name {
@@ -295,8 +496,15 @@ fn cmd_compose_up_reml(
             &created_volumes,
             &hooks,
             &compose_dir,
+            &StartupNotifier::none(),
         )
     } else {
+        // The startup handshake pipe (#653). CLOEXEC so no service the supervisor spawns
+        // keeps the write end open. Skipped with --no-wait.
+        let mut fds = [-1i32; 2];
+        if !no_wait && unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         let fork_result = unsafe { libc::fork() };
         match fork_result {
             -1 => Err(std::io::Error::last_os_error().into()),
@@ -305,6 +513,12 @@ fn cmd_compose_up_reml(
                 // Become a subreaper so orphaned container descendants are
                 // re-parented to us, not host init.
                 unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+                let notifier = if no_wait {
+                    StartupNotifier::none()
+                } else {
+                    unsafe { libc::close(fds[0]) };
+                    StartupNotifier::new(fds[1])
+                };
                 if let Err(e) = run_compose_with_hooks(
                     &project,
                     file,
@@ -314,16 +528,50 @@ fn cmd_compose_up_reml(
                     &created_volumes,
                     &hooks,
                     &compose_dir,
+                    &notifier,
                 ) {
                     log::error!("compose supervisor: {}", e);
+                    // Idempotent: a no-op if the rollback path already reported.
+                    notifier.failed(&e.to_string());
                     unsafe { libc::_exit(1) };
                 }
                 unsafe { libc::_exit(0) };
             }
-            _child_pid => {
-                std::thread::sleep(Duration::from_millis(200));
-                println!("Project '{}' started", project);
-                Ok(())
+            child_pid => {
+                if no_wait {
+                    std::thread::sleep(Duration::from_millis(200));
+                    println!("Project '{}' started", project);
+                    return Ok(());
+                }
+                unsafe { libc::close(fds[1]) };
+                match wait_for_startup(fds[0], startup_timeout, Some(child_pid)) {
+                    StartupWait::Started(notes) => {
+                        println!("Project '{}' started", project);
+                        if !notes.is_empty() {
+                            eprintln!("{}", notes);
+                        }
+                        Ok(())
+                    }
+                    StartupWait::Failed(err) => {
+                        Err(format!("project '{}' failed to start: {}", project, err).into())
+                    }
+                    StartupWait::SupervisorDied => Err(format!(
+                        "the compose supervisor for project '{}' exited before reporting that it \
+                         had started (run with RUST_LOG=info for its log)",
+                        project
+                    )
+                    .into()),
+                    StartupWait::TimedOut => Err(format!(
+                        "project '{}' is still starting after {} s. The supervisor (pid {}) keeps \
+                         going in the background: check `pelagos compose ps`, or `pelagos compose \
+                         down` to abandon it. Raise --startup-timeout for a slow stack, or use \
+                         --no-wait",
+                        project,
+                        startup_timeout.as_secs(),
+                        child_pid
+                    )
+                    .into()),
+                }
             }
         }
     }
@@ -342,6 +590,7 @@ pub fn run_compose_with_hooks(
     created_volumes: &[String],
     on_ready: &HookMap,
     compose_dir: &std::path::Path,
+    startup: &StartupNotifier,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let supervisor_pid = unsafe { libc::getpid() };
 
@@ -463,11 +712,14 @@ pub fn run_compose_with_hooks(
         }
         let project_dir = pelagos::paths::compose_project_dir(project);
         let _ = std::fs::remove_dir_all(&project_dir);
+        // Rolled back: now tell `compose up` (#653), so it reports the error and exits non-zero.
+        startup.failed(&e.to_string());
         return Err(e);
     }
 
     // Warn if any container has already exited before the supervisor loop starts.
     // This surfaces unexpected early exits (e.g. bind+network on ZFS — issue #227).
+    let mut notes: Vec<String> = Vec::new();
     for (cn, pid, _) in &started {
         if !check_liveness(*pid) {
             let exit_code = super::read_state(cn)
@@ -483,9 +735,15 @@ pub fn run_compose_with_hooks(
                 exit_code,
                 cn
             );
+            notes.push(format!(
+                "warning: service '{}' has already exited ({}); check `pelagos logs {}`",
+                cn, exit_code, cn
+            ));
         }
     }
 
+    // Every service is up: tell `compose up` (#653), with any early-exit warnings.
+    startup.started(&notes.join("\n"));
     println!("All services started for project '{}'", project);
 
     loop {
@@ -1054,9 +1312,16 @@ fn spawn_service(
         .stdout(Stdio::Piped)
         .stderr(Stdio::Piped);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn '{}' failed: {}", svc.name, e))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // The state dir was created above for a container that never started. The rollback
+            // only cleans up services that did start, so remove it here or it is left behind
+            // (and `compose ps` then mistakes the failed project for a live one).
+            let _ = pelagos::paths::guarded_remove_dir_all(&dir);
+            return Err(format!("spawn '{}' failed: {}", svc.name, e).into());
+        }
+    };
     let pid = child.pid();
 
     let spawn_config = build_compose_spawn_config(
@@ -1924,5 +2189,139 @@ mod tests {
             .to_string();
         assert!(err.contains("service 'w'"), "{err}");
         assert!(err.contains("ports") && err.contains("memory"), "{err}");
+    }
+
+    // ── #653: the startup handshake ──────────────────────────────────────────
+
+    fn pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        (fds[0], fds[1])
+    }
+    fn write_all(fd: i32, bytes: &[u8]) {
+        let n = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+        assert_eq!(n as usize, bytes.len());
+    }
+
+    #[test]
+    fn startup_frames_round_trip_and_wait_for_the_whole_frame() {
+        for (st, text) in [
+            (b'S', ""),
+            (b'F', "boom"),
+            (b'F', "multi\nline \u{1F980} error"),
+        ] {
+            let f = encode_startup_frame(st, text);
+            assert_eq!(decode_startup_frame(&f), Some((st, text.to_string())));
+        }
+        let f = encode_startup_frame(b'F', "hello world");
+        for cut in 0..f.len() {
+            assert_eq!(decode_startup_frame(&f[..cut]), None, "cut at {cut}");
+        }
+        // Bytes after the frame are ignored.
+        let mut two = encode_startup_frame(b'S', "a");
+        two.extend(encode_startup_frame(b'F', "b"));
+        assert_eq!(decode_startup_frame(&two), Some((b'S', "a".to_string())));
+    }
+
+    #[test]
+    fn wait_reports_started_with_the_supervisors_notes() {
+        let (r, w) = pipe();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            write_all(
+                w,
+                &encode_startup_frame(b'S', "warning: service 'x' exited"),
+            );
+            unsafe { libc::close(w) };
+        });
+        let got = wait_for_startup(r, Duration::from_secs(10), None);
+        t.join().unwrap();
+        assert_eq!(
+            got,
+            StartupWait::Started("warning: service 'x' exited".into())
+        );
+    }
+
+    #[test]
+    fn wait_reports_the_failure_text() {
+        let (r, w) = pipe();
+        write_all(
+            w,
+            &encode_startup_frame(b'F', "spawn 'db' failed: no such file"),
+        );
+        let got = wait_for_startup(r, Duration::from_secs(10), None);
+        unsafe { libc::close(w) };
+        assert_eq!(
+            got,
+            StartupWait::Failed("spawn 'db' failed: no such file".into())
+        );
+    }
+
+    #[test]
+    fn wait_notices_a_supervisor_that_closes_the_pipe_without_reporting() {
+        let (r, w) = pipe();
+        unsafe { libc::close(w) };
+        assert_eq!(
+            wait_for_startup(r, Duration::from_secs(10), None),
+            StartupWait::SupervisorDied
+        );
+        // A frame cut short is the same thing.
+        let (r, w) = pipe();
+        let f = encode_startup_frame(b'F', "partial");
+        write_all(w, &f[..f.len() - 3]);
+        unsafe { libc::close(w) };
+        assert_eq!(
+            wait_for_startup(r, Duration::from_secs(10), None),
+            StartupWait::SupervisorDied
+        );
+    }
+
+    #[test]
+    fn wait_times_out_while_the_supervisor_is_still_starting() {
+        let (r, w) = pipe();
+        let t0 = Instant::now();
+        let got = wait_for_startup(r, Duration::from_millis(400), None);
+        let took = t0.elapsed();
+        unsafe { libc::close(w) };
+        assert_eq!(got, StartupWait::TimedOut);
+        assert!(
+            took >= Duration::from_millis(350) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn wait_notices_a_supervisor_process_that_exited_without_writing() {
+        // The pipe's write end stays open here (as if a grandchild inherited it), so only the
+        // waitpid check can see the supervisor is gone.
+        let (r, w) = pipe();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let t0 = Instant::now();
+        let got = wait_for_startup(r, Duration::from_secs(30), Some(child.id() as i32));
+        let took = t0.elapsed();
+        unsafe { libc::close(w) };
+        assert_eq!(got, StartupWait::SupervisorDied);
+        assert!(
+            took < Duration::from_secs(10),
+            "should not wait out the timeout: {took:?}"
+        );
+    }
+
+    #[test]
+    fn notifier_sends_exactly_one_frame() {
+        let (r, w) = pipe();
+        let n = StartupNotifier::new(w);
+        n.started("first");
+        n.failed("second"); // after started(): must be a no-op, and must not write
+        n.started("third");
+        assert_eq!(
+            wait_for_startup(r, Duration::from_secs(5), None),
+            StartupWait::Started("first".into())
+        );
+        // A notifier with nobody to tell is silent.
+        StartupNotifier::none().failed("nobody listens");
     }
 }

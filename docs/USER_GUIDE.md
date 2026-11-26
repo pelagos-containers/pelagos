@@ -681,6 +681,12 @@ sudo pelagos compose up -f mystack.reml -p myproject
 # Skip auto-pull — fail immediately if any image is not cached locally
 sudo pelagos compose up --no-pull
 
+# Don't wait for the services to start (return as soon as the supervisor is forked)
+sudo pelagos compose up --no-wait
+
+# Give a slow stack longer than the default 300 s before `up` stops waiting
+sudo pelagos compose up --startup-timeout 900
+
 # List services
 pelagos compose ps
 
@@ -720,6 +726,26 @@ values — name them with `define`, pass them as arguments, generate them with `
       (list 'depends-on "db" 5432)
       '(port       8080 8080))))
 ```
+
+### What `compose up` tells you
+
+In the default (daemonised) mode `compose up` starts a supervisor in the background and then
+**waits for it to report**. It prints `Project '<name>' started` and exits 0 only once every
+service is started (including each `depends-on` readiness wait), and:
+
+- if a service cannot start, it rolls everything back, prints
+  `project '<name>' failed to start: <reason>` and exits non-zero;
+- if the supervisor dies without reporting, it says so and exits non-zero;
+- if the stack is still starting after `--startup-timeout` (default 300 s; one dependency
+  readiness wait alone can take 60 s) it stops waiting, exits non-zero and says the supervisor
+  keeps going in the background: use `compose ps`, or `compose down` to abandon it;
+- a service that started but has already exited is reported as a warning on stderr
+  (`warning: service '...' has already exited (exit code N)`).
+
+`--no-wait` restores the old behaviour: return after a moment with `started` and exit 0,
+whatever happens next (a later failure is then only visible in `compose ps` and the
+supervisor log). `--foreground` runs the supervisor in your terminal and prints errors as
+they happen.
 
 ### Wasm services in a compose file
 

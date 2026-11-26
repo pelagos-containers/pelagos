@@ -124,6 +124,8 @@ jobs:
         run: sudo ./scripts/reset-test-env.sh
       - name: Run e2e tests
         run: sudo -E env "PATH=$PATH" bash scripts/test-e2e.sh
+      - name: Run compose startup e2e (#653)
+        run: sudo -E env "PATH=$PATH" bash scripts/test-compose-startup.sh
 
   wasm-e2e-tests:
     runs-on: ubuntu-latest
