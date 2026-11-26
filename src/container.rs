@@ -4008,14 +4008,21 @@ impl Command {
             ) {
                 if !ov.lower_dirs.is_empty() {
                     let alias = overlay_alias_dir_for(merged);
-                    if let Some(joined) = alias_long_overlay_lowers(
+                    let aliased = alias_long_overlay_lowers(
                         &ov.lower_dirs,
                         &ov.upper_dir,
                         &ov.work_dir,
                         &alias,
                     )
-                    .map_err(Error::Io)?
-                    {
+                    .map_err(|e| {
+                        // Nothing was started: do not leave the scratch dirs created
+                        // above behind (an image with too many layers lands here).
+                        if let Some(base) = merged.parent() {
+                            let _ = crate::paths::guarded_remove_dir_all(base);
+                        }
+                        Error::Io(e)
+                    })?;
+                    if let Some(joined) = aliased {
                         log::debug!(
                             "overlay: {} layers; mounting through short aliases in {}",
                             ov.lower_dirs.len(),
@@ -7660,14 +7667,21 @@ impl Command {
             ) {
                 if !ov.lower_dirs.is_empty() {
                     let alias = overlay_alias_dir_for(merged);
-                    if let Some(joined) = alias_long_overlay_lowers(
+                    let aliased = alias_long_overlay_lowers(
                         &ov.lower_dirs,
                         &ov.upper_dir,
                         &ov.work_dir,
                         &alias,
                     )
-                    .map_err(Error::Io)?
-                    {
+                    .map_err(|e| {
+                        // Nothing was started: do not leave the scratch dirs created
+                        // above behind (an image with too many layers lands here).
+                        if let Some(base) = merged.parent() {
+                            let _ = crate::paths::guarded_remove_dir_all(base);
+                        }
+                        Error::Io(e)
+                    })?;
+                    if let Some(joined) = aliased {
                         log::debug!(
                             "overlay: {} layers; mounting through short aliases in {}",
                             ov.lower_dirs.len(),
