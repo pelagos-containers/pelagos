@@ -9736,7 +9736,9 @@ mod images {
     /// 90 layers whose store-style paths (`.../var/lib/pelagos/layers/<64 hex>`)
     /// make the overlay `lowerdir=` list far longer than one page (4096 bytes),
     /// which the kernel silently truncates (#612: ENOENT from mount). Each layer
-    /// holds one marker file; `ls /` inside the container must show all of them,
+    /// holds one marker file (named `ovl612-layer<i>`: the shared rootfs can contain
+    /// other tests' leftovers such as a `/marker` dir); `ls /` inside the container
+    /// must show all of them,
     /// in the right order (the top layer shadows a file the bottom also has).
     ///
     /// Failure indicates the long-lowerdir aliasing is broken: the mount fails,
@@ -9771,7 +9773,7 @@ mod images {
         let mut layers: Vec<std::path::PathBuf> = Vec::new();
         for i in 1..90 {
             let d = mk(i);
-            std::fs::write(d.join(format!("marker{i}")), "x").unwrap();
+            std::fs::write(d.join(format!("ovl612-layer{i}")), "x").unwrap();
             layers.push(d);
         }
         std::fs::write(layers[0].join("shadowed"), "top-of-bottom").unwrap();
@@ -9781,7 +9783,7 @@ mod images {
         assert!(joined > 4096, "test must exceed one page, got {joined}");
 
         let mut child = Command::new("/bin/sh")
-            .args(["-c", "ls / | grep -c '^marker'; cat /shadowed"])
+            .args(["-c", "ls / | grep -c '^ovl612-layer'; cat /shadowed"])
             .with_image_layers(layers)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
             .env("PATH", ALPINE_PATH)
