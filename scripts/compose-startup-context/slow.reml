@@ -1,0 +1,12 @@
+; "late" waits for a TCP port on "base" that nothing ever opens, so startup takes the
+; dependency's full 60 s timeout. With --startup-timeout 5, `compose up` must stop waiting
+; and say the project is still starting.
+(compose-up
+  (compose
+    (service "base"
+      '(image "alpine:3.20")
+      '(command "sleep" "3600"))
+    (service "late"
+      '(image "alpine:3.20")
+      '(command "sleep" "3600")
+      (list 'depends-on "base" 9999))))
