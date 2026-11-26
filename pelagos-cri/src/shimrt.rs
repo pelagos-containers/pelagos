@@ -653,6 +653,7 @@ impl ShimRuntime {
                 readonly: true,
                 recursive_read_only: false,
                 propagation: 0,
+                ..Default::default()
             });
         }
         let cspec = spec::build_container_spec(&ContainerSpecInput {

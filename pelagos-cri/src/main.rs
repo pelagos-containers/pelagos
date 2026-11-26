@@ -10,6 +10,7 @@ mod cni;
 mod cri_metrics;
 mod grpc_metrics;
 mod image;
+mod imgvol;
 mod invoke;
 mod netns_native;
 mod podnet;
@@ -241,6 +242,9 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let image_svc = ImageSvc {
         state: app_state.clone(),
     };
+
+    // Drop staged image volumes (#616) of containers that no longer exist.
+    runtime_svc.cleanup_image_volumes().await;
 
     // Re-adopt shim-backed pods that survived the restart before serving.
     runtime_svc.readopt_shim().await;

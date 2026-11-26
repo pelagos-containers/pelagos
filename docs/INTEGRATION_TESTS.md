@@ -6674,3 +6674,29 @@ the shim's cgroup: Kata's shim sits in the pod's kubelet cgroup, gVisor's in its
 `pelagos-shim-<id>.scope`. A failure means a CRI restart (an upgrade, a crash)
 kills or disturbs running shim pods. It checks the property, not the mechanism,
 so it holds whichever cgroup a shim ends up in.
+
+## scripts/test-image-volume-e2e.sh (kubelet end-to-end; node needs the handlers it tests)
+
+#616. A pod with a Kubernetes image volume (`volumes: - image: {reference: ...}`,
+KEP-4639) and a `subPath` volumeMount, through the real kubelet, on the native
+handler and optionally Kata/gVisor (`RUNTIMES="native kata"`). The volume image
+(`busybox:1.36-musl`) differs from the container image (alpine) so the test can tell
+which it sees. It asserts: the pod becomes Ready; the volume image's files are visible;
+the container's own image is not what is mounted; the volume is read-only; a binary
+from it executes (no `noexec`); `subPath: etc` exposes only that directory; and after
+the pods are removed no staged directories or mounts remain under
+`/run/pelagos-cri/imgvol`. Before the fix the pod started but the volume was an empty
+writable directory (4 of the 8 native checks failed). Node-local checks go through
+`NODE_EXEC` (e.g. `ssh -q <node>`).
+
+## pelagos-cri `imgvol` unit tests (pelagos-cri/src/imgvol/tests.rs)
+
+#616. `secure_join` resolves a sub path inside an image root: plain, empty, absolute
+and relative symlinks (resolved against the image root, never the host), `..` clamped
+at the root, symlinks that point above it, loops, and missing paths (`NotFound`, which
+becomes "sub path does not exist"). `mounts_under` matches a directory and its children
+only. `stage` rejects bad container ids and unknown images without leaving a directory;
+`cleanup_stale` keeps only listed containers. `stage_mounts_layers_read_only_and_unstage_detaches`
+(needs root, skips otherwise) mounts two layers for real: the upper layer shadows the
+lower, the mount is read-only, a sub path selects one directory, a missing sub path
+fails and cleans up, and `unstage` detaches every mount and leaves the layer store untouched.

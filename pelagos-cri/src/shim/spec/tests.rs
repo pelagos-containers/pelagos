@@ -496,6 +496,7 @@ fn mounts_standard_set_then_cri_binds_in_order() {
             readonly: false,
             recursive_read_only: false,
             propagation: 0,
+            ..Default::default()
         },
         CriMount {
             host_path: "/etc/cfg".into(),
@@ -503,6 +504,7 @@ fn mounts_standard_set_then_cri_binds_in_order() {
             readonly: true,
             recursive_read_only: true,
             propagation: 2,
+            ..Default::default()
         },
         CriMount {
             host_path: "/ro".into(),
@@ -510,6 +512,7 @@ fn mounts_standard_set_then_cri_binds_in_order() {
             readonly: true,
             recursive_read_only: false,
             propagation: 1,
+            ..Default::default()
         },
     ];
     let extra = [CriMount {
@@ -518,6 +521,7 @@ fn mounts_standard_set_then_cri_binds_in_order() {
         readonly: true,
         recursive_read_only: false,
         propagation: 0,
+        ..Default::default()
     }];
     let s = build_container_spec(&ContainerSpecInput {
         container: &c,
@@ -805,6 +809,7 @@ fn config_json_round_trips_and_is_written_to_a_bundle() {
         readonly: true,
         recursive_read_only: false,
         propagation: 0,
+        ..Default::default()
     }];
     let spec = build(&c, &sandbox(), &image()).unwrap();
     let bytes = to_config_json(&spec).unwrap();
