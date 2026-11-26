@@ -6559,7 +6559,6 @@ and `config_diff_ids_rewritten_only_when_they_differ` cover the helpers: a confi
 that is already consistent is left byte-identical (digest unchanged), otherwise
 only `rootfs.diff_ids` is replaced. Run `PELAGOS="sudo target/release/pelagos"
 BASE=gcr.io/distroless/static:nonroot REGISTRY=localhost:5000 scripts/test-image-diffids.sh`.
-||||||| 689df5f
 
 
 ## scripts/test-portforward-multi.sh (cluster) and streaming::tests::port_forward_serves_consecutive_connections_on_one_session (unit)
@@ -6637,6 +6636,19 @@ StopPodSandbox must not look like a loss) and
 `sandbox_cgroup_pids_match_only_the_exact_trailing_component` (the reaper only
 matches `/<sandbox id>` at the end of a cgroup path, because Kata moves qemu out
 of the shim's scope into the pod cgroup).
+
+## scripts/measure-secret-propagation.sh (measurement, not pass/fail; needs the kata handler)
+
+#645. After each Secret update it timestamps, per pod, when the kubelet applied
+it to the pod's own host-side volume dir and when the pod sees it: a native pod
+and a Kata pod mounting the same Secret on one node. The kubelet syncs each pod's
+volumes on its own schedule (about a minute with jitter), so each pod must be
+compared with its own host-side file, not with another pod's. Result on ipc7
+(v0.65.115, 4 rounds): the kubelet took 52-90 s; the native pod saw the change
+1-2 s later (one 10 s outlier) and the Kata guest 1-2 s later in every round. The
+delay is the kubelet's, the Kata/shim path adds about a second. Use it to check
+that this stays true.
+
 
 ## scripts/test-shim-cri-restart.sh (root, on a node with the handlers; in the shim-e2e CI gate)
 
