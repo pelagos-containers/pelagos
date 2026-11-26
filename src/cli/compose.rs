@@ -1312,9 +1312,16 @@ fn spawn_service(
         .stdout(Stdio::Piped)
         .stderr(Stdio::Piped);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn '{}' failed: {}", svc.name, e))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // The state dir was created above for a container that never started. The rollback
+            // only cleans up services that did start, so remove it here or it is left behind
+            // (and `compose ps` then mistakes the failed project for a live one).
+            let _ = pelagos::paths::guarded_remove_dir_all(&dir);
+            return Err(format!("spawn '{}' failed: {}", svc.name, e).into());
+        }
+    };
     let pid = child.pid();
 
     let spawn_config = build_compose_spawn_config(
