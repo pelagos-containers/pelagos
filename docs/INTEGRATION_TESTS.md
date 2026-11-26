@@ -6559,7 +6559,6 @@ and `config_diff_ids_rewritten_only_when_they_differ` cover the helpers: a confi
 that is already consistent is left byte-identical (digest unchanged), otherwise
 only `rootfs.diff_ids` is replaced. Run `PELAGOS="sudo target/release/pelagos"
 BASE=gcr.io/distroless/static:nonroot REGISTRY=localhost:5000 scripts/test-image-diffids.sh`.
-||||||| 689df5f
 
 
 ## scripts/test-portforward-multi.sh (cluster) and streaming::tests::port_forward_serves_consecutive_connections_on_one_session (unit)
@@ -6649,7 +6648,6 @@ compared with its own host-side file, not with another pod's. Result on ipc7
 1-2 s later (one 10 s outlier) and the Kata guest 1-2 s later in every round. The
 delay is the kubelet's, the Kata/shim path adds about a second. Use it to check
 that this stays true.
-||||||| d8e93e2
 
 
 ## scripts/test-shim-cri-restart.sh (root, on a node with the handlers; in the shim-e2e CI gate)
