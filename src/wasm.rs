@@ -193,6 +193,12 @@ pub fn spawn_wasm(
         WasmRuntime::Auto => unreachable!("Auto resolved to a concrete runtime above"),
     };
 
+    // Become a process group leader, like a Linux container's init (`setpgid(0, 0)` in
+    // container.rs): `compose down` and `stop` signal `kill(-pid, sig)` so a service's
+    // whole subtree dies. Without this the group does not exist, the signal reaches
+    // nothing and the Wasm runtime is left running (#70).
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
     cmd.stdin(stdin).stdout(stdout).stderr(stderr).spawn()
 }
 
