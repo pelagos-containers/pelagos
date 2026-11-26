@@ -1,0 +1,15 @@
+; Mixed Linux + Wasm compose project (#70): a Linux service writes a file into a
+; shared named volume; the Wasm service (an image whose layer is a .wasm module)
+; reads it through a WASI preopened directory and logs what it found.
+(compose-up
+  (compose
+    (volume "shared")
+    (service "writer"
+      '(image "alpine:3.20")
+      '(volume "shared" "/data")
+      '(command "sh" "-c" "echo from-linux-service > /data/message.txt; sleep 3600"))
+    (service "reader"
+      '(image "pelagos-wasm-compose-e2e")
+      '(volume "shared" "/data")
+      '(env "GREETING" "hello-from-compose")
+      (list 'depends-on "writer"))))

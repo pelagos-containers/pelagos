@@ -655,18 +655,22 @@ fn build_compose_spawn_config(
     }
 }
 
-fn spawn_service(
+/// What building a service yields: the command to spawn, the argv it runs, and the
+/// networks it joins (empty for Wasm services).
+type ServiceCommand = (Command, Vec<String>, Vec<String>);
+
+/// Build the `Command` for a Linux-image service: image layers, networks, volumes,
+/// limits and hardening. Returns the command, the argv it runs and the networks it
+/// joins. (Moved out of `spawn_service` unchanged so Wasm images can take another path.)
+fn build_linux_service_command(
     project: &str,
     svc: &ServiceSpec,
     container_name: &str,
     compose: &ComposeFile,
     compose_dir: &std::path::Path,
-) -> Result<(i32, std::thread::JoinHandle<()>), Box<dyn std::error::Error>> {
-    // Resolve image layers.
-    let image_ref = &svc.image;
-    let (full_ref, manifest) = resolve_image(image_ref)?;
-
-    let layers = pelagos::image::layer_dirs(&manifest);
+    manifest: &pelagos::image::ImageManifest,
+) -> Result<ServiceCommand, Box<dyn std::error::Error>> {
+    let layers = pelagos::image::layer_dirs(manifest);
     if layers.is_empty() {
         return Err(format!("service '{}': image has no layers", svc.name).into());
     }
@@ -865,6 +869,143 @@ fn spawn_service(
     if let Some(ref label) = svc.selinux_label {
         cmd = cmd.with_selinux_label(label);
     }
+
+    Ok((cmd, exe_and_args, svc_network_names))
+}
+
+/// The compose options a Wasm service cannot honour yet, by name. They are rejected
+/// instead of being silently dropped: a Wasm service runs as a `wasmtime`/`wasmedge`
+/// subprocess with a WASI environment and preopened directories only; it has no
+/// network namespace or WASI sockets (#71), no cgroup, user or capability handling.
+pub(crate) fn wasm_service_unsupported(svc: &ServiceSpec) -> Vec<&'static str> {
+    let mut bad = Vec::new();
+    if !svc.networks.is_empty() {
+        bad.push("networks (Wasm services have no network namespace or WASI sockets yet, #71)");
+    }
+    if !svc.ports.is_empty() {
+        bad.push("ports");
+    }
+    if !svc.dns.is_empty() {
+        bad.push("dns");
+    }
+    if svc.memory.is_some() {
+        bad.push("memory");
+    }
+    if svc.cpus.is_some() {
+        bad.push("cpus");
+    }
+    if svc.user.is_some() {
+        bad.push("user");
+    }
+    if svc.workdir.is_some() {
+        bad.push("workdir");
+    }
+    if !svc.cap_add.is_empty() || !svc.cap_drop.is_empty() {
+        bad.push("cap-add / cap-drop");
+    }
+    if svc.apparmor_profile.is_some() || svc.selinux_label.is_some() {
+        bad.push("apparmor / selinux");
+    }
+    if !svc.tmpfs_mounts.is_empty() {
+        bad.push("tmpfs mounts");
+    }
+    if svc.bind_mounts.iter().any(|b| b.read_only) {
+        bad.push("read-only bind mounts (WASI preopens are read-write)");
+    }
+    bad
+}
+
+/// Build the `Command` for a Wasm-image service: the module runs through the system
+/// Wasm runtime with the image and service environment as WASI env, and named
+/// volumes and bind mounts as preopened directories (mapped host path -> mount path).
+fn build_wasm_service_command(
+    project: &str,
+    svc: &ServiceSpec,
+    compose_dir: &std::path::Path,
+    manifest: &pelagos::image::ImageManifest,
+) -> Result<ServiceCommand, Box<dyn std::error::Error>> {
+    let unsupported = wasm_service_unsupported(svc);
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "service '{}': a Wasm image does not support: {}",
+            svc.name,
+            unsupported.join("; ")
+        )
+        .into());
+    }
+    let wasm_path = manifest.wasm_module_path().ok_or_else(|| {
+        format!(
+            "service '{}': Wasm image has no module.wasm layer — re-pull the image",
+            svc.name
+        )
+    })?;
+    let wasm_str = wasm_path.to_string_lossy().into_owned();
+    // Same argv convention as `pelagos run`: element 0 is the module path.
+    let exe_and_args: Vec<String> = match &svc.command {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => vec![wasm_str.clone()],
+    };
+    let mut cmd = Command::new(&wasm_str)
+        .args(&exe_and_args[1..])
+        .with_wasm_runtime(pelagos::wasm::WasmRuntime::Auto);
+    for env_str in &manifest.config.env {
+        if let Some((k, v)) = env_str.split_once('=') {
+            cmd = cmd.with_wasi_env(k, v);
+        }
+    }
+    for (k, v) in &svc.env {
+        cmd = cmd.with_wasi_env(k, v);
+    }
+    for vol in &svc.volumes {
+        let scoped = scoped_volume_name(project, &vol.name);
+        let v = Volume::open(&scoped)?;
+        cmd = cmd.with_wasi_preopened_dir_mapped(v.path(), &vol.mount_path);
+    }
+    for bm in &svc.bind_mounts {
+        let host = if std::path::Path::new(&bm.host_path).is_relative() {
+            compose_dir
+                .join(&bm.host_path)
+                .canonicalize()
+                .map_err(|e| {
+                    format!(
+                        "service '{}': bind-mount host path '{}': {}",
+                        svc.name, bm.host_path, e
+                    )
+                })?
+        } else {
+            std::path::PathBuf::from(&bm.host_path)
+        };
+        cmd = cmd.with_wasi_preopened_dir_mapped(host, &bm.container_path);
+    }
+    Ok((cmd, exe_and_args, Vec::new()))
+}
+
+fn spawn_service(
+    project: &str,
+    svc: &ServiceSpec,
+    container_name: &str,
+    compose: &ComposeFile,
+    compose_dir: &std::path::Path,
+) -> Result<(i32, std::thread::JoinHandle<()>), Box<dyn std::error::Error>> {
+    // Resolve image layers.
+    let image_ref = &svc.image;
+    let (full_ref, manifest) = resolve_image(image_ref)?;
+
+    // A Wasm image has no Linux rootfs to run in: it runs through the Wasm runtime
+    // (as `pelagos run` does). Treating it as a Linux container made the service
+    // silently fail to start (#70).
+    let (mut cmd, exe_and_args, svc_network_names) = if manifest.is_wasm_image() {
+        build_wasm_service_command(project, svc, compose_dir, &manifest)?
+    } else {
+        build_linux_service_command(
+            project,
+            svc,
+            container_name,
+            compose,
+            compose_dir,
+            &manifest,
+        )?
+    };
 
     // Spawn detached with log capture.
     std::fs::create_dir_all(containers_dir())?;
@@ -1641,4 +1782,113 @@ fn load_project_state(project: &str) -> Result<ComposeProject, Box<dyn std::erro
     let data = std::fs::read_to_string(pelagos::paths::compose_state_file(project))?;
     let state: ComposeProject = serde_json::from_str(&data)?;
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pelagos::compose::{BindMount, PortMapping, VolumeMount};
+
+    fn svc() -> ServiceSpec {
+        ServiceSpec {
+            name: "w".into(),
+            image: "wasm-img".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_plain_wasm_service_is_supported() {
+        assert!(wasm_service_unsupported(&svc()).is_empty());
+    }
+
+    #[test]
+    fn env_volumes_and_read_write_bind_mounts_are_supported() {
+        let mut s = svc();
+        s.env.insert("K".into(), "v".into());
+        s.volumes.push(VolumeMount {
+            name: "data".into(),
+            mount_path: "/data".into(),
+        });
+        s.bind_mounts.push(BindMount {
+            host_path: "/srv/in".into(),
+            container_path: "/in".into(),
+            read_only: false,
+        });
+        s.command = Some(vec!["/m.wasm".into(), "--flag".into()]);
+        assert!(wasm_service_unsupported(&s).is_empty());
+    }
+
+    /// Every option a Wasm service cannot honour is named, never silently ignored
+    /// (#70: it used to be dropped and the service just failed to start).
+    #[test]
+    fn options_a_wasm_service_cannot_honour_are_rejected_by_name() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut ServiceSpec)>)> = vec![
+            ("networks", Box::new(|s| s.networks.push("front".into()))),
+            (
+                "ports",
+                Box::new(|s| {
+                    s.ports.push(PortMapping {
+                        host: 8080,
+                        container: 80,
+                    })
+                }),
+            ),
+            ("dns", Box::new(|s| s.dns.push("1.1.1.1".into()))),
+            ("memory", Box::new(|s| s.memory = Some("64m".into()))),
+            ("cpus", Box::new(|s| s.cpus = Some("0.5".into()))),
+            ("user", Box::new(|s| s.user = Some("1000".into()))),
+            ("workdir", Box::new(|s| s.workdir = Some("/w".into()))),
+            ("cap-add", Box::new(|s| s.cap_add.push("NET_RAW".into()))),
+            ("cap-drop", Box::new(|s| s.cap_drop.push("ALL".into()))),
+            (
+                "apparmor",
+                Box::new(|s| s.apparmor_profile = Some("p".into())),
+            ),
+            ("selinux", Box::new(|s| s.selinux_label = Some("l".into()))),
+            ("tmpfs", Box::new(|s| s.tmpfs_mounts.push("/tmp".into()))),
+            (
+                "read-only",
+                Box::new(|s| {
+                    s.bind_mounts.push(BindMount {
+                        host_path: "/a".into(),
+                        container_path: "/b".into(),
+                        read_only: true,
+                    })
+                }),
+            ),
+        ];
+        for (what, set) in cases {
+            let mut s = svc();
+            set(&mut s);
+            let bad = wasm_service_unsupported(&s);
+            assert!(
+                bad.iter().any(|b| b.contains(what)),
+                "{what} must be rejected, got {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_service_error_names_the_service_and_every_offending_option() {
+        let mut s = svc();
+        s.ports.push(PortMapping {
+            host: 1,
+            container: 2,
+        });
+        s.memory = Some("1g".into());
+        let manifest = pelagos::image::ImageManifest {
+            reference: "wasm-img".into(),
+            digest: "sha256:0".into(),
+            layers: vec![],
+            layer_types: vec!["application/wasm".into()],
+            config: Default::default(),
+        };
+        let err = build_wasm_service_command("p", &s, std::path::Path::new("."), &manifest)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service 'w'"), "{err}");
+        assert!(err.contains("ports") && err.contains("memory"), "{err}");
+    }
 }
