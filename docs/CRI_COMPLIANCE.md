@@ -272,6 +272,31 @@ Design and upstream findings: `docs/SHIM_V2_CLIENT_DESIGN.md`. Not
 implemented: the containerd Sandbox API (not needed for Kata), an explicit
 `RuntimeDefault` seccomp profile for shim containers, and a generalised pelagos shim v2 *server*.
 
+## Image volumes (KEP-4639, `volumes: - image:`) — #616
+
+A pod volume of type `image` reaches the CRI as a `Mount` with `image` set (and
+`image_sub_path` when the volumeMount has a `subPath`) and **no host path**. The
+native handler used to drop both fields, so the container got an empty, writable
+directory instead of the image's files.
+
+`CreateContainer` now stages the image on the host (`pelagos-cri/src/imgvol.rs`):
+a read-only overlay of the image's layers (a read-only bind for a single-layer
+image) under `/run/pelagos-cri/imgvol/<container id>/<n>/root`, with `image_sub_path`
+resolved *inside* that mount without following any symlink out of it, and hands the
+resulting directory to the runtime as an ordinary read-only bind mount. So it works the
+same for the native handler and for Kata/gVisor (the shim shares a host path).
+
+- Rejected at `CreateContainer`: an image mount that is not `readonly`, one that also
+  sets `host_path`, `image_sub_path` without an image, and a sub path that does not
+  exist in the image. A missing image is `NotFound`.
+- `ContainerStatus.mounts` reports the image (`image`, `image_ref`, `image_sub_path`)
+  and an empty host path, as the CRI specifies.
+- Staging is detached and removed at `RemoveContainer`; at startup, staged volumes of
+  containers that no longer exist are removed (those of tracked containers are kept).
+- Verified through a real kubelet (`scripts/test-image-volume-e2e.sh`: native and
+  Kata, 15/15) and against critest v1.37.0: the five `Image Volume` specs pass, none
+  skipped.
+
 ## Dependency summary
 
 ```

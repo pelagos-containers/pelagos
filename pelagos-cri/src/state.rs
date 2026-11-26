@@ -233,7 +233,7 @@ impl CriSandbox {
 
 // ── CRI container metadata ───────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CriMount {
     pub host_path: String,
     pub container_path: String,
@@ -246,6 +246,15 @@ pub struct CriMount {
     /// CRI Mount.propagation enum value (0=PRIVATE, 1=HOST_TO_CONTAINER, 2=BIDIRECTIONAL).
     #[serde(default)]
     pub propagation: i32,
+    /// CRI Mount.image (an image volume, KEP-4639, #616): the image reference as the
+    /// kubelet gave it. When set, `host_path` is the staged read-only host directory
+    /// of the image (see `imgvol`), not something the kubelet supplied, and status
+    /// reports the image instead of that path.
+    #[serde(default)]
+    pub image: String,
+    /// CRI Mount.image_sub_path: the part of the image mounted instead of its root.
+    #[serde(default)]
+    pub image_sub_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

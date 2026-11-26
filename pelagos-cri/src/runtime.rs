@@ -823,6 +823,29 @@ impl RuntimeSvc {
         }
     }
 
+    /// Detach and remove the image volumes staged for `container_id` (#616).
+    async fn unstage_image_volumes(container_id: &str) {
+        let cid = container_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::imgvol::unstage(std::path::Path::new(crate::imgvol::IMGVOL_ROOT), &cid)
+        })
+        .await;
+    }
+
+    /// After a restart, drop staged image volumes whose container no longer exists
+    /// (a crash between CreateContainer and RemoveContainer). Staged volumes of
+    /// containers we still track are kept: their containers may be running.
+    pub async fn cleanup_image_volumes(&self) {
+        let keep: std::collections::HashSet<String> = {
+            let st = self.state.inner.lock().await;
+            st.containers.keys().cloned().collect()
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::imgvol::cleanup_stale(std::path::Path::new(crate::imgvol::IMGVOL_ROOT), &keep)
+        })
+        .await;
+    }
+
     /// Re-adopt shim-backed pods after a CRI restart (#602): reconnect their
     /// shims, re-attach running tasks, and fold what was lost or finished
     /// while we were down into the CRI records so the kubelet replaces them.
@@ -1867,6 +1890,27 @@ impl RuntimeService for RuntimeSvc {
         // recursive readonly mount to also be readonly and have PRIVATE propagation.
         // critest expects CreateContainer to reject violations.
         for m in &config.mounts {
+            // Image volumes (KEP-4639, #616): always read-only, never a host path.
+            let is_image = m.image.as_ref().is_some_and(|i| !i.image.is_empty());
+            if is_image {
+                if !m.readonly {
+                    return Err(Status::invalid_argument(format!(
+                        "image volume mount {:?} must be readonly",
+                        m.container_path
+                    )));
+                }
+                if !m.host_path.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "image volume mount {:?} must not also set host_path",
+                        m.container_path
+                    )));
+                }
+            } else if !m.image_sub_path.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "mount {:?} sets image_sub_path without an image",
+                    m.container_path
+                )));
+            }
             if m.recursive_read_only {
                 if !m.readonly {
                     return Err(Status::invalid_argument(format!(
@@ -1891,8 +1935,15 @@ impl RuntimeService for RuntimeSvc {
                 readonly: m.readonly,
                 recursive_read_only: m.recursive_read_only,
                 propagation: m.propagation,
+                image: m
+                    .image
+                    .as_ref()
+                    .map(|i| i.image.clone())
+                    .unwrap_or_default(),
+                image_sub_path: m.image_sub_path.clone(),
             })
             .collect();
+        let mut mounts = mounts;
 
         // Extract runAsUser/runAsGroup from the Linux security context.
         let (run_as_user, run_as_group, run_as_username) = config
@@ -2079,6 +2130,46 @@ impl RuntimeService for RuntimeSvc {
             .find(|m| m.container_path == termination_msg_container_path)
             .map(|m| m.host_path.clone())
             .unwrap_or_default();
+
+        // Stage image volumes last, after every validation that can reject the request,
+        // so a rejected CreateContainer never leaves a mount behind (#616).
+        for (i, m) in mounts.iter_mut().enumerate() {
+            if m.image.is_empty() {
+                continue;
+            }
+            let (img, sub, cid) = (m.image.clone(), m.image_sub_path.clone(), id.clone());
+            let staged = tokio::task::spawn_blocking(move || {
+                crate::imgvol::stage(
+                    &crate::shim::rootfs::StoreLayout::system(),
+                    std::path::Path::new(crate::imgvol::IMGVOL_ROOT),
+                    &cid,
+                    i,
+                    &img,
+                    &sub,
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(format!("image volume staging task: {e}")))?;
+            match staged {
+                Ok(src) => {
+                    m.host_path = src.to_string_lossy().into_owned();
+                    m.readonly = true;
+                }
+                Err(e) => {
+                    Self::unstage_image_volumes(&id).await;
+                    return Err(match e {
+                        crate::imgvol::ImgVolError::SubPathMissing { .. }
+                        | crate::imgvol::ImgVolError::BadSubPath { .. } => {
+                            Status::invalid_argument(e.to_string())
+                        }
+                        crate::imgvol::ImgVolError::Image(
+                            crate::shim::rootfs::RootfsError::ImageNotFound(_),
+                        ) => Status::not_found(format!("image volume: {e}")),
+                        _ => Status::internal(e.to_string()),
+                    });
+                }
+            }
+        }
 
         let container = CriContainer {
             id: id.clone(),
@@ -2717,6 +2808,7 @@ impl RuntimeService for RuntimeSvc {
 
         if let Some((shim, _)) = self.shim_for_container(&container_id).await {
             shim.remove_container(&container_id).await;
+            Self::unstage_image_volumes(&container_id).await;
             let mut st = self.state.inner.lock().await;
             st.containers.remove(&container_id);
             state::remove_container_file(&container_id);
@@ -2736,6 +2828,7 @@ impl RuntimeService for RuntimeSvc {
             backend.remove_container(&name).await;
             self.state.log_done.lock().await.remove(&name); // drop the #344 finalize flag
         }
+        Self::unstage_image_volumes(&container_id).await;
 
         let mut st = self.state.inner.lock().await;
         st.containers.remove(&container_id);
@@ -2938,10 +3031,22 @@ impl RuntimeService for RuntimeSvc {
                 .iter()
                 .map(|m| Mount {
                     container_path: m.container_path.clone(),
-                    host_path: m.host_path.clone(),
+                    // An image volume has no host path of its own (KEP-4639): report
+                    // the image, not the directory we staged it in.
+                    host_path: if m.image.is_empty() {
+                        m.host_path.clone()
+                    } else {
+                        String::new()
+                    },
                     readonly: m.readonly,
                     recursive_read_only: m.recursive_read_only,
                     propagation: m.propagation,
+                    image: (!m.image.is_empty()).then(|| crate::cri::ImageSpec {
+                        image: m.image.clone(),
+                        image_ref: m.image.clone(),
+                        ..Default::default()
+                    }),
+                    image_sub_path: m.image_sub_path.clone(),
                     ..Default::default()
                 })
                 .collect(),
