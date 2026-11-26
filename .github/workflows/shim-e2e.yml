@@ -14,6 +14,7 @@ on:
       - "scripts/test-shim-runtimeclass-e2e.sh"
       - "scripts/test-portforward-multi.sh"
       - "scripts/test-shim-failure-recovery.sh"
+      - "scripts/test-shim-cri-restart.sh"
       - "scripts/pelagos-cri-shim-handlers.sh"
       - ".github/workflows/shim-e2e.yml"
   pull_request:
@@ -23,6 +24,7 @@ on:
       - "scripts/test-shim-runtimeclass-e2e.sh"
       - "scripts/test-portforward-multi.sh"
       - "scripts/test-shim-failure-recovery.sh"
+      - "scripts/test-shim-cri-restart.sh"
       - "scripts/pelagos-cri-shim-handlers.sh"
       - ".github/workflows/shim-e2e.yml"
 
