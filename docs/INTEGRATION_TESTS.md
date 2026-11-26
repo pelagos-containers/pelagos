@@ -6637,3 +6637,16 @@ StopPodSandbox must not look like a loss) and
 `sandbox_cgroup_pids_match_only_the_exact_trailing_component` (the reaper only
 matches `/<sandbox id>` at the end of a cgroup path, because Kata moves qemu out
 of the shim's scope into the pod cgroup).
+
+## scripts/test-shim-cri-restart.sh (root, on a node with the handlers; in the shim-e2e CI gate)
+
+#644 (property behind #602 and #618). For each runtime (Kata and/or gVisor) a pod
+is started through the real kubelet, `pelagos-cri` is restarted, and the test
+asserts: the shim is the same process (pid still alive), the sandbox is still
+Ready with the same id, the pod is Running and the container never restarted
+(restartCount 0), and the guest's `/proc/uptime` kept counting (a restarted VM or
+sandbox would reset it; this also proves `kubectl exec` works again). It prints
+the shim's cgroup: Kata's shim sits in the pod's kubelet cgroup, gVisor's in its
+`pelagos-shim-<id>.scope`. A failure means a CRI restart (an upgrade, a crash)
+kills or disturbs running shim pods. It checks the property, not the mechanism,
+so it holds whichever cgroup a shim ends up in.

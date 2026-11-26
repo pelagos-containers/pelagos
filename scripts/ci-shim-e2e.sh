@@ -122,4 +122,8 @@ if has_rt kata; then
     CRICTL="/usr/local/bin/k3s crictl -r unix:///run/pelagos/cri.sock" \
     bash scripts/test-shim-failure-recovery.sh
 fi
+log "shim pods survive a pelagos-cri restart (#602, #618, #644)"
+NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" RUNTIMES="$RUNTIMES" \
+  CRICTL="/usr/local/bin/k3s crictl -r unix:///run/pelagos/cri.sock" \
+  bash scripts/test-shim-cri-restart.sh
 log "ALL SHIM E2E PASSED"

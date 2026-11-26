@@ -96,16 +96,24 @@ with handlers enabled; see the script header for variables.
 
 ## 5. Operating notes
 
-- Each shim runs in its own systemd scope (`pelagos-shim-<id>.scope` in
-  `pelagos.slice`) so restarting `pelagos-cri` does not kill VMs.
-  Inspect with `systemctl list-units 'pelagos-shim-*'`.
+- **Surviving a `pelagos-cri` restart.** Shims are started inside their own systemd
+  scope (`pelagos-shim-<id>.scope` in `pelagos.slice`), outside `pelagos-cri.service`,
+  so the service's `KillMode=control-group` does not kill them. gVisor's Go shim stays
+  in that scope. Kata's shim moves itself (and qemu/virtiofsd) into the pod's kubelet
+  cgroup (`/kubepods/.../<sandbox id>`) right after start, so its scope is empty and
+  disappears: do not expect `pelagos-shim-*` scopes for Kata pods. Either way the
+  shim and VM survive a CRI restart and are re-adopted; `scripts/test-shim-cri-restart.sh`
+  checks that (same shim process, sandbox still Ready, no container restart, guest
+  uptime keeps counting).
 - Shim bundles: `/run/pelagos-cri/shim/k8s.io/<id>/`; per-container logs follow normal CRI
-  paths. Leftover check after deleting all shim pods: no `pelagos-shim-*`
-  scopes, no `qemu`/`runsc` processes.
+  paths. Leftover check after deleting all shim pods: no `qemu`/`runsc`/shim
+  processes and no `pelagos-shim-*` scopes (gVisor).
 - **Removing a handler:** delete its pods first and let the kubelet garbage-collect
   them (stopped sandboxes linger until GC). A CRI without the handler can no
-  longer manage those sandboxes, and their shim scope is left running; stop it
-  with `systemctl stop pelagos-shim-<id>.scope`.
+  longer manage those sandboxes, and their shim is left running. gVisor: stop
+  `pelagos-shim-<id>.scope`. Kata: kill the processes in the pod cgroup
+  (`/sys/fs/cgroup/kubepods/.../<sandbox id>/cgroup.kill`) or the shim started with
+  `-id <sandbox id>`.
 - **A shim or VM that dies unasked** (SIGKILL, OOM, host kill of qemu) makes the
   pod's sandbox report NotReady within seconds; the kubelet then replaces the
   pod (`SandboxChanged`). pelagos-cri kills the VM processes the dead shim left
