@@ -58,9 +58,15 @@ t0=$(date +%s)
 [ $rc -eq 0 ] && grep -q "started" "$W/nw.out" && [ "$(secs $t0)" -lt 10 ] \
   && pass "--no-wait returned 0 straight away even though startup will fail" \
   || fail "--no-wait (rc=$rc, $(secs $t0) s): $(tail -2 "$W/nw.out" | tr '\n' ' ')"
-for _ in $(seq 1 30); do "$BINARY" compose ps -f "$CTX/fail.reml" -p csnowait 2>&1 | grep -q "no project" && break; sleep 1; done
-"$BINARY" compose ps -f "$CTX/fail.reml" -p csnowait 2>&1 | grep -q "no project" \
-  && pass "and the supervisor still rolled the project back in the background" || fail "csnowait project left behind"
+# Capture, then grep: `ps | grep -q` under pipefail races (grep -q exits early, ps gets SIGPIPE).
+gone=0
+for _ in $(seq 1 30); do
+  out="$("$BINARY" compose ps -f "$CTX/fail.reml" -p csnowait 2>&1)"
+  case "$out" in *"no project"*) gone=1; break ;; esac
+  sleep 1
+done
+[ "$gone" = 1 ] && pass "and the supervisor still rolled the project back in the background" \
+  || fail "csnowait project left behind: $out"
 
 echo "--- 4. a start that takes too long: --startup-timeout gives up waiting, says so"
 t0=$(date +%s)

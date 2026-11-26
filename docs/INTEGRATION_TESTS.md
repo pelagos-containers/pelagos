@@ -6731,3 +6731,31 @@ only. `stage` rejects bad container ids and unknown images without leaving a dir
 (needs root, skips otherwise) mounts two layers for real: the upper layer shadows the
 lower, the mount is read-only, a sub path selects one directory, a missing sub path
 fails and cleans up, and `unstage` detaches every mount and leaves the layer store untouched.
+
+## scripts/test-compose-startup.sh (root; needs alpine:3.20; fixtures in scripts/compose-startup-context/)
+
+#653. `pelagos compose up` (background mode) used to fork the supervisor, sleep 200 ms and
+print "Project started" whatever happened next, so a startup failure was invisible (exit 0,
+then `no project found`). Four scenarios against real containers: (1) a healthy project: `up`
+exits 0 and `compose ps` lists the service the moment it returns (no sleep in the test);
+(2) a project whose second service cannot spawn: `up` exits non-zero, the error says the
+project failed to start and names the service, no project stays registered, the service that
+did start is rolled back, no container state dir is left, and it fails promptly; (3) the same
+project with `--no-wait`: returns 0 at once saying started (old behaviour), and the supervisor
+still rolls it back in the background; (4) a service waiting on a port that never opens with
+`--startup-timeout 5`: `up` exits non-zero with `still starting after 5 s` after about 5 s (not
+the dependency's 60 s), and `compose down` abandons it cleanly. Before the change scenarios 2
+and 4 fail (and 3 does not exist). The test also found, and guards, a pre-existing leak: a
+service whose spawn failed left its container state dir behind and `compose ps` then
+mistook the failed project for a live one.
+
+## src/cli/compose.rs startup handshake unit tests
+
+#653. The frame (status byte, length, text) round-trips, including multi-line and non-ASCII
+text, and is not accepted until complete. `wait_for_startup` returns `Started` with the
+supervisor's notes, `Failed` with its text, `SupervisorDied` when the pipe closes without a
+frame or with a cut-short one, `TimedOut` while the supervisor is still going, and
+`SupervisorDied` when the supervisor process has exited but something still holds the
+pipe's write end open (the read end is non-blocking: a blocking read there waited forever,
+which this test caught). `StartupNotifier` sends exactly one frame (a later call is a
+no-op) and `none()` is silent. Run with `cargo test --bin pelagos cli::compose`.
