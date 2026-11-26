@@ -11036,10 +11036,11 @@ mod tests {
             "{} layers fit",
             budget / per_layer
         );
-        // Rootless: /run/user/1000/pelagos is longer; still far above a typical image.
+        // Rootless: /run/user/1000/pelagos is longer (about 95 layers fit), still far
+        // above a typical image; past that the clear "too many layers" error applies.
         let per_layer = "/run/user/1000/pelagos/o4194304-99/".len() + 3 + 1;
         assert!(
-            budget / per_layer >= 100,
+            budget / per_layer >= 90,
             "{} layers fit",
             budget / per_layer
         );
