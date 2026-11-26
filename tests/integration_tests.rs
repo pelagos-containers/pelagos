@@ -9729,6 +9729,81 @@ mod images {
         );
     }
 
+    /// test_many_layer_overlay_mounts_through_aliases
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// 90 layers whose store-style paths (`.../var/lib/pelagos/layers/<64 hex>`)
+    /// make the overlay `lowerdir=` list far longer than one page (4096 bytes),
+    /// which the kernel silently truncates (#612: ENOENT from mount). Each layer
+    /// holds one marker file; `ls /` inside the container must show all of them,
+    /// in the right order (the top layer shadows a file the bottom also has).
+    ///
+    /// Failure indicates the long-lowerdir aliasing is broken: the mount fails,
+    /// or layers are missing/reordered through the aliases.
+    #[test]
+    #[serial]
+    fn test_many_layer_overlay_mounts_through_aliases() {
+        if !is_root() {
+            eprintln!("Skipping test_many_layer_overlay_mounts_through_aliases: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_many_layer_overlay_mounts_through_aliases: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        let store = tempfile::tempdir().expect("layer store dir");
+        let mk = |i: usize| {
+            let d = store
+                .path()
+                .join("var/lib/pelagos/layers")
+                .join(format!("{:064x}", i + 1));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        // Layer 0 is the bottom (a working rootfs); 1..=89 add one marker file each.
+        let bottom = mk(0);
+        copy_rootfs(&rootfs, &bottom);
+        std::fs::write(bottom.join("shadowed"), "bottom").unwrap();
+        let mut layers: Vec<std::path::PathBuf> = Vec::new();
+        for i in 1..90 {
+            let d = mk(i);
+            std::fs::write(d.join(format!("marker{i}")), "x").unwrap();
+            layers.push(d);
+        }
+        std::fs::write(layers[0].join("shadowed"), "top-of-bottom").unwrap();
+        layers.reverse(); // top-first
+        layers.push(bottom);
+        let joined: usize = layers.iter().map(|p| p.as_os_str().len() + 1).sum();
+        assert!(joined > 4096, "test must exceed one page, got {joined}");
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "ls / | grep -c '^marker'; cat /shadowed"])
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn with 90 image layers");
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(status.success(), "container should exit 0, stderr: {err}");
+        assert!(
+            out.starts_with("89\n"),
+            "all 89 marker files should be visible, got: {out}"
+        );
+        assert!(
+            out.trim_end().ends_with("top-of-bottom"),
+            "the upper layer must shadow the bottom one, got: {out}"
+        );
+    }
+
     /// test_multi_layer_overlay_shadow
     ///
     /// Requires: root, alpine-rootfs.
