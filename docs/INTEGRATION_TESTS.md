@@ -6674,3 +6674,28 @@ the shim's cgroup: Kata's shim sits in the pod's kubelet cgroup, gVisor's in its
 `pelagos-shim-<id>.scope`. A failure means a CRI restart (an upgrade, a crash)
 kills or disturbs running shim pods. It checks the property, not the mechanism,
 so it holds whichever cgroup a shim ends up in.
+
+## scripts/test-wasm-compose-e2e.sh (root; needs wasmtime and the wasm32-wasip1 target; in the wasm-e2e-tests CI job)
+
+#70. A compose project with a Linux service (alpine) and a Wasm service (a synthetic
+Wasm image built from a small Rust module). The Linux service writes a file into a
+shared named volume; the Wasm service reads it through a WASI preopened directory
+and logs `greeting=<env> message=<file contents>`. Asserts: `compose up` accepts the
+project; the Wasm service starts and logs (before #70 it never did, and the project
+silently vanished); the service env arrives as WASI env; the shared-volume data
+arrives; `compose ps` lists both. A second project asking a Wasm service for ports
+and a memory limit must be refused with an error naming both (before the fix
+`compose up` printed "started" and the supervisor failed in the background). `compose
+down -v` must return within 30 s and leave no `wasmtime` process: before the Wasm
+subprocess became a process group leader, `kill(-pid)` reached nothing, down waited
+out the supervisor's 60 s timeout, and the runtime kept running.
+
+## src/cli/compose.rs Wasm service unit tests
+
+#70. `wasm_service_unsupported`: a plain Wasm service, and one with env, volumes,
+read-write bind mounts and a command, are accepted; each option a Wasm service cannot
+honour (networks, ports, dns, memory, cpus, user, workdir, cap-add, cap-drop,
+apparmor, selinux, tmpfs, read-only bind mounts) is rejected by name.
+`wasm_service_error_names_the_service_and_every_offending_option` checks the error
+text names the service and all offending options. Run with
+`cargo test --bin pelagos cli::compose`.

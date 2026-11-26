@@ -99,8 +99,13 @@ else
 fi
 
 echo "--- 3. compose down"
+t0=$SECONDS
 "$BINARY" compose down -f "$CTX/compose.reml" -p "$PROJECT" -v >/dev/null 2>&1 \
   && pass "compose down -v succeeds" || fail "compose down failed"
+# The Wasm subprocess must be a process group leader so kill(-pid) reaches it: before
+# that fix down waited out the supervisor's 60 s timeout and left the runtime behind.
+[ $((SECONDS - t0)) -lt 30 ] && pass "compose down returned promptly ($((SECONDS - t0)) s)" \
+  || fail "compose down took $((SECONDS - t0)) s (a Wasm service was not stopped by its signal)"
 sleep 2
 ! pgrep -f "wasmtime.*module.wasm" >/dev/null && pass "no wasmtime process left" || fail "wasmtime still running after compose down"
 

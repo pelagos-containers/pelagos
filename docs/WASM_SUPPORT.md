@@ -209,7 +209,7 @@ The meaningful comparison is:
 | containerd shim | ✅ | ✅ (via runc) | ✅ | via shim |
 | Same CLI for both | ✅ | n/a | n/a | n/a |
 | Same image store for both | ✅ | n/a | n/a | n/a |
-| Mixed Linux+Wasm compose | ✅ (code path exists) | ❌ | ❌ | ❌ |
+| Mixed Linux+Wasm compose | ✅ (shared volumes and env; no networking yet) | ❌ | ❌ | ❌ |
 | Embedded Wasm runtime | ❌ (subprocess) | n/a | ✅ | ✅ |
 | WASI preview 2 | via runtime upgrade | n/a | via runtime upgrade | partial |
 | Wasm Component Model | ❌ | ❌ | partial | ✅ |
@@ -239,10 +239,17 @@ The component media type (`application/vnd.bytecodealliance.wasm.component.layer
 is recognised and stored correctly, but execution is identical to a plain
 module. Component-aware execution requires embedding the wasmtime Rust crate.
 
-**Mixed Linux+Wasm compose is untested.** The code path exists — a `.reml`
-compose file can reference a Wasm image service alongside Linux services, and
-DNS service discovery runs independently of container type. But it has not
-been exercised in tests.
+**Mixed Linux+Wasm compose works, without networking.** A `.reml` compose file can
+contain Wasm-image services next to Linux ones (#70): a Wasm service runs through the
+Wasm runtime exactly as `pelagos run` would, with the service's `env` as WASI env and
+its named volumes and bind mounts as preopened directories, so it can share files with
+Linux services through a volume. Before #70 the Wasm image was treated as a Linux
+container and silently failed to start. What a Wasm service cannot do yet is refused
+at `compose up` by name, instead of being ignored: `network`, `port`, `dns`, `memory`,
+`cpus`, `user`, `workdir`, `cap-add`/`cap-drop`, AppArmor/SELinux, `tmpfs`, and
+read-only bind mounts. In particular a Wasm service cannot reach a Linux service by DNS
+name over a bridge network: that needs a network namespace for the Wasm runtime plus
+WASI sockets (#71). See `scripts/test-wasm-compose-e2e.sh`.
 
 **No persistent Wasm VM pool.** Each `pelagos run` spawns a fresh runtime
 process. A pelagos daemon mode that keeps a warm VM pool would reduce
@@ -254,8 +261,8 @@ cold-start latency to sub-millisecond for high-frequency invocations.
 
 See GitHub epic #67 for the tracked issues. High-level priorities:
 
-1. **Mixed Linux+Wasm compose test** — exercise and validate the existing
-   code path with a `.reml` file containing both service types.
+1. ~~**Mixed Linux+Wasm compose test**~~ — done (#70): Wasm services run in compose and
+   share volumes with Linux services; networking waits on item 2.
 
 2. **WASI preview 2 socket passthrough** — thread wasmtime's `--wasi` flags
    for TCP/UDP socket capability through `WasiConfig`, enabling network-facing
