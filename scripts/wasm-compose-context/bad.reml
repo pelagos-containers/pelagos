@@ -1,0 +1,8 @@
+; A Wasm service asking for options it cannot honour (#70): ports and a memory
+; limit. compose must refuse with a clear error, not start it and silently ignore them.
+(compose-up
+  (compose
+    (service "reader"
+      '(image "pelagos-wasm-compose-e2e")
+      '(port 8080 8080)
+      '(memory "64m"))))

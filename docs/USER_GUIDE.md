@@ -721,6 +721,35 @@ values — name them with `define`, pass them as arguments, generate them with `
       '(port       8080 8080))))
 ```
 
+### Wasm services in a compose file
+
+A service whose image is a Wasm image (see `docs/WASM_SUPPORT.md`) runs through the
+system Wasm runtime (wasmtime or wasmedge, which must be on `PATH`; under sudo use
+`sudo env "PATH=$PATH" pelagos compose up`), next to Linux services:
+
+```lisp
+(compose-up
+  (compose
+    (volume "shared")
+    (service "writer"
+      '(image "alpine:3.20")
+      '(volume "shared" "/data")
+      '(command "sh" "-c" "echo hi > /data/message.txt; sleep 3600"))
+    (service "reader"
+      '(image "my-wasm-module:latest")
+      '(volume "shared" "/data")        ; becomes a WASI preopened directory
+      '(env "GREETING" "hello")         ; becomes WASI env
+      (list 'depends-on "writer"))))
+```
+
+A Wasm service supports `env`, `volume`, `bind` mounts (read-write), `command` and
+`depends-on` (process-alive; port/HTTP health checks need a bridge IP a Wasm service
+does not have). Anything else it cannot honour (`network`, `port`, `dns`, `memory`,
+`cpus`, `user`, `workdir`, capabilities, AppArmor/SELinux, `tmpfs`, read-only binds)
+makes `compose up` fail up front with an error naming the option, rather than being
+silently ignored. A Wasm service cannot yet reach a Linux service by DNS name (it has
+no network namespace or WASI sockets, #71); share data through a volume.
+
 ### `depends-on` and Health Checks
 
 `depends-on` controls startup order. Pelagos polls until the check passes
