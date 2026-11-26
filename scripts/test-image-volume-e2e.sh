@@ -13,7 +13,7 @@
 #
 # Usage: NODE=<node> KUBECTL="kubectl" [NODE_EXEC=""] scripts/test-image-volume-e2e.sh
 # Optional: RUNTIMES="native" (default; add "kata" / "gvisor" when those handlers
-#           are enabled), NS=ivol-e2e, TIMEOUT=240, VOL_IMAGE=docker.io/library/busybox:1.36
+#           are enabled), NS=ivol-e2e, TIMEOUT=240, VOL_IMAGE=docker.io/library/busybox:1.36-musl (musl: the container is alpine, so binaries from the volume must run on its libc)
 set -uo pipefail
 
 NODE="${NODE:?set NODE}"
@@ -23,7 +23,7 @@ NS="${NS:-ivol-e2e}"
 RUNTIMES="${RUNTIMES:-native}"
 TIMEOUT="${TIMEOUT:-240}"
 CTR_IMAGE="${CTR_IMAGE:-docker.io/library/alpine:3.20}"
-VOL_IMAGE="${VOL_IMAGE:-docker.io/library/busybox:1.36}"
+VOL_IMAGE="${VOL_IMAGE:-docker.io/library/busybox:1.36-musl}"
 STAGING="${STAGING:-/run/pelagos-cri/imgvol}"
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
