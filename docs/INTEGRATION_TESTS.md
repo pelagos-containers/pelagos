@@ -1776,6 +1776,18 @@ Uses `with_image_layers()` to mount them via overlayfs. Runs `cat` inside the co
 to verify both files are visible. Failure indicates multi-layer overlayfs mount construction
 or `lowerdir` ordering is broken.
 
+### `test_many_layer_overlay_mounts_through_aliases`
+**Requires:** root, rootfs
+
+#612. 90 layers with store-style paths (`.../var/lib/pelagos/layers/<64 hex>`), whose
+`lowerdir=` list is far longer than the one page (4096 bytes) the kernel copies in for
+mount options (it truncates silently; before the fix the mount failed with ENOENT).
+Each layer has a marker file; `ls /` must show all 89, and a file present in the
+bottom two layers must show the upper one's content. Failure means the long-lowerdir
+aliasing (short symlinks under the runtime dir) is broken: the mount fails, or layers go
+missing or out of order. `scripts/test-many-layers.sh` is the end-to-end version
+(a 121-layer `pelagos build` + run, and the clear "too many layers" error past the limit).
+
 ### `test_multi_layer_overlay_shadow`
 **Requires:** root, rootfs
 

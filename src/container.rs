@@ -112,6 +112,73 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Counter for unique overlay merged-dir names.
 static OVERLAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Largest overlay option string handed to mount(2) (a page is 4096 bytes, with room
+/// for the NUL). The kernel copies the mount data argument in with a one-page limit
+/// and silently truncates the rest, so a long `lowerdir=` list is cut mid-path and the mount fails with
+/// ENOENT (#612).
+const OVERLAY_OPTIONS_MAX: usize = 4000;
+/// Slack for the fixed parts of the option string: the option names and the longest
+/// flag set (`,squash_to_uid=0,squash_to_gid=0,allow_other`) come to about 75 bytes.
+const OVERLAY_OPTIONS_SLACK: usize = 100;
+
+/// Short runtime-dir path for the symlink aliases of an overlay's lower layers,
+/// derived from the scratch base's name (`overlay-<pid>-<n>` -> `o<pid>-<n>`).
+fn overlay_alias_dir_for(merged: &std::path::Path) -> PathBuf {
+    let base = merged
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let short = base.strip_prefix("overlay-").unwrap_or(&base);
+    crate::paths::runtime_dir().join(format!("o{short}"))
+}
+
+/// If the overlay option string for `lowers` would not fit one page, create short
+/// symlink aliases (`<alias_dir>/0`, `/1`, ...) and return the aliased
+/// `lowerdir` value to use instead; `None` when the real paths fit. overlayfs
+/// resolves the symlinks when it mounts, so the aliases are needed only until
+/// then (the caller removes `alias_dir` at teardown). Errors, instead of letting
+/// the kernel truncate, when even the aliases do not fit.
+fn alias_long_overlay_lowers(
+    lowers: &[PathBuf],
+    upper: &std::path::Path,
+    work: &std::path::Path,
+    alias_dir: &std::path::Path,
+) -> io::Result<Option<String>> {
+    let join = |v: &[PathBuf]| {
+        v.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let fixed = upper.as_os_str().len() + work.as_os_str().len() + OVERLAY_OPTIONS_SLACK;
+    if join(lowers).len() + fixed <= OVERLAY_OPTIONS_MAX {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(alias_dir)?;
+    let mut aliases = Vec::with_capacity(lowers.len());
+    for (i, l) in lowers.iter().enumerate() {
+        let link = alias_dir.join(i.to_string());
+        match std::fs::remove_file(&link) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        std::os::unix::fs::symlink(l, &link)?;
+        aliases.push(link);
+    }
+    let joined = join(&aliases);
+    if joined.len() + fixed > OVERLAY_OPTIONS_MAX {
+        let _ = std::fs::remove_dir_all(alias_dir);
+        return Err(io::Error::other(format!(
+            "overlay mount options for {} layers are {} bytes even with short aliases \
+             (limit {OVERLAY_OPTIONS_MAX}): the image has too many layers",
+            lowers.len(),
+            joined.len() + fixed
+        )));
+    }
+    Ok(Some(joined))
+}
+
 /// Counter for unique pivot_root put_old directory names.
 /// Combined with the parent PID (captured before fork) to produce a globally
 /// unique name even when many containers share the same rootfs directory.
@@ -3752,7 +3819,7 @@ impl Command {
 
         // Pre-allocate CStrings for the overlay mount (lower, upper, work, merged).
         // Must be done in the parent — no allocation allowed in pre_exec.
-        let overlay_cstrings: Option<(
+        let mut overlay_cstrings: Option<(
             std::ffi::CString,
             std::ffi::CString,
             std::ffi::CString,
@@ -3929,6 +3996,47 @@ impl Command {
         // overlay is mounted inside pre_exec after unshare(CLONE_NEWUSER) where
         // the new userns provides the required CAP_SYS_ADMIN — attempting the
         // mount here in the parent would fail EPERM.
+        // The kernel overlay's mount options must fit one page; with many image layers
+        // the lowerdir list does not (#612), so mount through short symlink aliases.
+        // fuse-overlayfs takes its options on the command line and has no such limit.
+        let mut overlay_alias_dir: Option<PathBuf> = None;
+        if !use_fuse_overlay {
+            if let (Some(ov), Some(merged), Some(cs)) = (
+                &self.overlay,
+                &overlay_merged_dir,
+                overlay_cstrings.as_mut(),
+            ) {
+                if !ov.lower_dirs.is_empty() {
+                    let alias = overlay_alias_dir_for(merged);
+                    let aliased = alias_long_overlay_lowers(
+                        &ov.lower_dirs,
+                        &ov.upper_dir,
+                        &ov.work_dir,
+                        &alias,
+                    )
+                    .map_err(|e| {
+                        // Nothing was started: do not leave the scratch dirs created
+                        // above behind (an image with too many layers lands here).
+                        if let Some(base) = merged.parent() {
+                            let _ = crate::paths::guarded_remove_dir_all(base);
+                        }
+                        Error::Io(e)
+                    })?;
+                    if let Some(joined) = aliased {
+                        log::debug!(
+                            "overlay: {} layers; mounting through short aliases in {}",
+                            ov.lower_dirs.len(),
+                            alias.display()
+                        );
+                        cs.0 = std::ffi::CString::new(joined.as_bytes()).map_err(|e| {
+                            Error::Io(io::Error::other(format!("overlay lowerdir nul: {e}")))
+                        })?;
+                        overlay_alias_dir = Some(alias);
+                    }
+                }
+            }
+        }
+
         let native_overlay_host_mounted =
             if !use_fuse_overlay && !is_rootless && !lacks_sys_admin && self.overlay.is_some() {
                 match &overlay_cstrings {
@@ -6869,6 +6977,7 @@ impl Command {
             secondary_networks,
             pasta,
             overlay_merged_dir,
+            overlay_alias_dir,
             native_overlay_host_mounted,
             dns_temp_dir,
             hosts_temp_dir,
@@ -6956,6 +7065,7 @@ impl Command {
                 secondary_networks: Vec::new(),
                 pasta: None,
                 overlay_merged_dir: None,
+                overlay_alias_dir: None,
                 native_overlay_host_mounted: false,
                 dns_temp_dir: None,
                 hosts_temp_dir: None,
@@ -6988,6 +7098,7 @@ impl Command {
                 secondary_networks: Vec::new(),
                 pasta: None,
                 overlay_merged_dir: None,
+                overlay_alias_dir: None,
                 native_overlay_host_mounted: false,
                 dns_temp_dir: None,
                 hosts_temp_dir: None,
@@ -7406,7 +7517,7 @@ impl Command {
         };
 
         // Pre-allocate CStrings for the overlay mount (lower, upper, work, merged).
-        let overlay_cstrings: Option<(
+        let mut overlay_cstrings: Option<(
             std::ffi::CString,
             std::ffi::CString,
             std::ffi::CString,
@@ -7544,6 +7655,47 @@ impl Command {
         }
 
         // Mount native overlayfs in the HOST mount namespace (#451 — mirrors spawn()).
+        // The kernel overlay's mount options must fit one page; with many image layers
+        // the lowerdir list does not (#612), so mount through short symlink aliases.
+        // fuse-overlayfs takes its options on the command line and has no such limit.
+        let mut overlay_alias_dir: Option<PathBuf> = None;
+        if !use_fuse_overlay {
+            if let (Some(ov), Some(merged), Some(cs)) = (
+                &self.overlay,
+                &overlay_merged_dir,
+                overlay_cstrings.as_mut(),
+            ) {
+                if !ov.lower_dirs.is_empty() {
+                    let alias = overlay_alias_dir_for(merged);
+                    let aliased = alias_long_overlay_lowers(
+                        &ov.lower_dirs,
+                        &ov.upper_dir,
+                        &ov.work_dir,
+                        &alias,
+                    )
+                    .map_err(|e| {
+                        // Nothing was started: do not leave the scratch dirs created
+                        // above behind (an image with too many layers lands here).
+                        if let Some(base) = merged.parent() {
+                            let _ = crate::paths::guarded_remove_dir_all(base);
+                        }
+                        Error::Io(e)
+                    })?;
+                    if let Some(joined) = aliased {
+                        log::debug!(
+                            "overlay: {} layers; mounting through short aliases in {}",
+                            ov.lower_dirs.len(),
+                            alias.display()
+                        );
+                        cs.0 = std::ffi::CString::new(joined.as_bytes()).map_err(|e| {
+                            Error::Io(io::Error::other(format!("overlay lowerdir nul: {e}")))
+                        })?;
+                        overlay_alias_dir = Some(alias);
+                    }
+                }
+            }
+        }
+
         let native_overlay_host_mounted =
             if !use_fuse_overlay && !is_rootless && !lacks_sys_admin && self.overlay.is_some() {
                 match &overlay_cstrings {
@@ -9857,6 +10009,7 @@ impl Command {
                 secondary_networks,
                 pasta,
                 overlay_merged_dir,
+                overlay_alias_dir,
                 native_overlay_host_mounted,
                 dns_temp_dir,
                 hosts_temp_dir,
@@ -9925,6 +10078,8 @@ pub struct Child {
     pasta: Option<crate::network::PastaSetup>,
     /// Overlay merged-dir created before fork; removed after the child exits.
     overlay_merged_dir: Option<PathBuf>,
+    /// Short symlink aliases of the overlay's lower layers (#612); removed at teardown.
+    overlay_alias_dir: Option<PathBuf>,
     /// True when the native overlayfs was mounted in the host namespace before fork (#451).
     /// Cleanup must call umount2(merged, MNT_DETACH) before removing the overlay base dir.
     native_overlay_host_mounted: bool,
@@ -10273,6 +10428,11 @@ impl Child {
                     let _ = crate::paths::guarded_remove_dir_all(parent);
                 }
             }
+        }
+        // Symlink aliases of the lower layers (#612) are only needed until the mount;
+        // removing them never touches the layers (remove_dir_all does not follow links).
+        if let Some(ref dir) = self.overlay_alias_dir.take() {
+            let _ = crate::paths::guarded_remove_dir_all(dir);
         }
         if let Some(ref dir) = self.dns_temp_dir.take() {
             let _ = crate::paths::guarded_remove_dir_all(dir);
@@ -10796,5 +10956,113 @@ mod tests {
 
         let status = child.wait().expect("Failed to wait");
         assert!(status.success());
+    }
+
+    // ── #612: overlay option string longer than one page ──────────────────────
+
+    fn fake_layers(root: &std::path::Path, n: usize) -> Vec<PathBuf> {
+        // Same shape and length as the real store: <data>/layers/<64 hex>.
+        (0..n)
+            .map(|i| {
+                let d = root
+                    .join("var/lib/pelagos/layers")
+                    .join(format!("{:064x}", i + 1));
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join(format!("f{i}")), b"x").unwrap();
+                d
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overlay_lowers_that_fit_one_page_are_left_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let lowers = fake_layers(t.path(), 10);
+        let up = t.path().join("scratch/overlay-1-0/upper");
+        let wk = t.path().join("scratch/overlay-1-0/work");
+        let alias = t.path().join("alias");
+        assert_eq!(
+            alias_long_overlay_lowers(&lowers, &up, &wk, &alias).unwrap(),
+            None
+        );
+        assert!(
+            !alias.exists(),
+            "no aliases are created when none are needed"
+        );
+    }
+
+    #[test]
+    fn long_overlay_lowers_are_aliased_and_resolve_to_the_layers() {
+        let t = tempfile::tempdir().unwrap();
+        // 46 layers is where the unfixed code failed on a real store.
+        for n in [46usize, 60] {
+            let lowers = fake_layers(&t.path().join(format!("s{n}")), n);
+            let up = t.path().join("scratch/overlay-12345-6/upper");
+            let wk = t.path().join("scratch/overlay-12345-6/work");
+            let alias = t.path().join(format!("run/user/1000/pelagos/o12345-{n}"));
+            let real_len = lowers
+                .iter()
+                .map(|p| p.as_os_str().len() + 1)
+                .sum::<usize>();
+            let joined = alias_long_overlay_lowers(&lowers, &up, &wk, &alias)
+                .unwrap()
+                .expect("aliases needed");
+            let parts: Vec<&str> = joined.split(':').collect();
+            assert_eq!(parts.len(), n);
+            assert!(
+                joined.len() < real_len,
+                "aliases are shorter than the real paths"
+            );
+            assert!(
+                joined.len() + up.as_os_str().len() + wk.as_os_str().len() + OVERLAY_OPTIONS_SLACK
+                    <= OVERLAY_OPTIONS_MAX
+            );
+            // Order is preserved and each alias resolves to the right layer.
+            for (i, part) in parts.iter().enumerate() {
+                assert_eq!(std::fs::read_link(part).unwrap(), lowers[i], "layer {i}");
+                assert!(std::path::Path::new(part).join(format!("f{i}")).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn aliases_leave_room_for_docker_depth_layers_as_root() {
+        // Per-layer cost of an alias: "<runtime dir>/o<pid>-<n>/<index>:".
+        // Root's runtime dir is /run/pelagos; Docker's image depth limit is 125.
+        let per_layer = "/run/pelagos/o4194304-99/".len() + 3 + 1;
+        let budget = OVERLAY_OPTIONS_MAX - OVERLAY_OPTIONS_SLACK - 2 * 80;
+        assert!(
+            budget / per_layer >= 125,
+            "{} layers fit",
+            budget / per_layer
+        );
+        // Rootless: /run/user/1000/pelagos is longer (about 95 layers fit), still far
+        // above a typical image; past that the clear "too many layers" error applies.
+        let per_layer = "/run/user/1000/pelagos/o4194304-99/".len() + 3 + 1;
+        assert!(
+            budget / per_layer >= 90,
+            "{} layers fit",
+            budget / per_layer
+        );
+    }
+
+    #[test]
+    fn overlay_with_too_many_layers_errors_instead_of_truncating() {
+        let t = tempfile::tempdir().unwrap();
+        let lowers = fake_layers(t.path(), 600);
+        let up = t.path().join("u");
+        let wk = t.path().join("w");
+        let alias = t.path().join("a");
+        let err = alias_long_overlay_lowers(&lowers, &up, &wk, &alias).unwrap_err();
+        assert!(err.to_string().contains("too many layers"), "{err}");
+        assert!(!alias.exists(), "a failed aliasing leaves nothing behind");
+    }
+
+    #[test]
+    fn overlay_alias_dir_is_a_short_sibling_name_under_the_runtime_dir() {
+        let merged = std::path::Path::new("/var/lib/pelagos/scratch/overlay-4242-7/merged");
+        let d = overlay_alias_dir_for(merged);
+        assert_eq!(d.file_name().unwrap(), "o4242-7");
+        assert_eq!(d.parent().unwrap(), crate::paths::runtime_dir());
     }
 }
