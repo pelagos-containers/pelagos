@@ -250,6 +250,7 @@ fn cmd_compose_up_reml(
     // This keeps pull output in the parent process (visible to the user) and
     // fails early before any infrastructure is created.
     pull_missing_images(&spec, no_pull)?;
+    preflight_wasm_services(&spec)?;
 
     let compose_cfg = pelagos::config::PelagosConfig::load();
     let mut created_networks = Vec::new();
@@ -915,6 +916,44 @@ pub(crate) fn wasm_service_unsupported(svc: &ServiceSpec) -> Vec<&'static str> {
     bad
 }
 
+fn wasm_unsupported_error(svc: &ServiceSpec, unsupported: &[&str]) -> String {
+    format!(
+        "service '{}': a Wasm image does not support: {}",
+        svc.name,
+        unsupported.join("; ")
+    )
+}
+
+/// Refuse, before anything is created or forked, a project whose Wasm services cannot
+/// run (#70): options a Wasm service cannot honour, or no Wasm runtime installed.
+/// Otherwise the background supervisor fails after `compose up` has already printed
+/// "started", and the error is lost.
+fn preflight_wasm_services(spec: &ComposeFile) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wasm_services = Vec::new();
+    for svc in &spec.services {
+        let (_, manifest) = resolve_image(&svc.image)?;
+        if !manifest.is_wasm_image() {
+            continue;
+        }
+        let bad = wasm_service_unsupported(svc);
+        if !bad.is_empty() {
+            return Err(wasm_unsupported_error(svc, &bad).into());
+        }
+        wasm_services.push(svc.name.clone());
+    }
+    if !wasm_services.is_empty()
+        && pelagos::wasm::find_wasm_runtime(pelagos::wasm::WasmRuntime::Auto).is_none()
+    {
+        return Err(format!(
+            "service(s) {} use a Wasm image but no Wasm runtime was found in PATH — install \
+             wasmtime or wasmedge (under sudo, pass it on: sudo env \"PATH=$PATH\" pelagos ...)",
+            wasm_services.join(", ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Build the `Command` for a Wasm-image service: the module runs through the system
 /// Wasm runtime with the image and service environment as WASI env, and named
 /// volumes and bind mounts as preopened directories (mapped host path -> mount path).
@@ -926,12 +965,7 @@ fn build_wasm_service_command(
 ) -> Result<ServiceCommand, Box<dyn std::error::Error>> {
     let unsupported = wasm_service_unsupported(svc);
     if !unsupported.is_empty() {
-        return Err(format!(
-            "service '{}': a Wasm image does not support: {}",
-            svc.name,
-            unsupported.join("; ")
-        )
-        .into());
+        return Err(wasm_unsupported_error(svc, &unsupported).into());
     }
     let wasm_path = manifest.wasm_module_path().ok_or_else(|| {
         format!(
