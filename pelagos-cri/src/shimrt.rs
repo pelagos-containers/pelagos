@@ -22,6 +22,7 @@ use containerd_shim_protos::api;
 use crate::shim::bootstrap::{self, StartParams};
 use crate::shim::bundle::Bundle;
 use crate::shim::client::ShimClient;
+use crate::shim::diag;
 use crate::shim::events::{placeholder_publish_binary, EventsSink};
 use crate::shim::exec::{self, ExecLimits, ExecOutcome, ExecRequest, ExecSession};
 use crate::shim::exit::{ContainerExit, ExitTracker};
@@ -103,6 +104,9 @@ struct SandboxShim {
     /// Set before a deliberate stop/remove so the watch does not mistake our
     /// own teardown for a loss.
     stopping: std::sync::atomic::AtomicBool,
+    /// Consecutive container Creates this sandbox's shim has rejected (reset by any success).
+    /// Drives the escalating log and the diagnostics bundle (#659).
+    create_failures: std::sync::atomic::AtomicU32,
 }
 
 impl SandboxShim {
@@ -119,6 +123,7 @@ impl SandboxShim {
             plan,
             lost: Default::default(),
             stopping: Default::default(),
+            create_failures: Default::default(),
         }
     }
     fn is_lost(&self) -> bool {
@@ -679,6 +684,55 @@ impl ShimRuntime {
         )?)
     }
 
+    /// A container Create the sandbox's shim rejected, even after the fallback (#659). Counts
+    /// consecutive failures; at the escalation points logs the cause at `error` level and
+    /// writes a diagnostics bundle naming missing mount sources. Never changes the outcome:
+    /// the error still goes back to the kubelet, so the failure stays visible.
+    async fn note_create_failure(
+        &self,
+        sb: &CriSandbox,
+        c: &CriContainer,
+        bundle: &Bundle,
+        sandbox: &SandboxShim,
+        err: &ShimError,
+    ) {
+        metrics::counter!("pelagos_cri_shim_create_failures_total").increment(1);
+        let n = sandbox
+            .create_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if !diag::is_escalation_point(n) {
+            return;
+        }
+        let text = err.to_string();
+        let bundle_dir = diag::capture(
+            &self.cfg.root.join("diag"),
+            &sb.id,
+            &c.id,
+            bundle.dir(),
+            &text,
+            n,
+        )
+        .await;
+        let config = std::fs::read(bundle.dir().join("config.json")).unwrap_or_default();
+        let missing = diag::missing_mount_sources(&config, |p| p.exists());
+        log::error!(
+            "sandbox {}: its shim has rejected {n} consecutive container Creates (latest {}): {}; \
+             missing host mount sources: {}; diagnostics: {}",
+            sb.id,
+            c.id,
+            diag::root_cause(&text),
+            if missing.is_empty() {
+                "none".to_string()
+            } else {
+                missing.join(", ")
+            },
+            bundle_dir
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "not written".into())
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_and_start(
         &self,
@@ -709,9 +763,11 @@ impl ShimRuntime {
         if let Err(e) = client.create(make_req()).await {
             // Fallback: ask the shim binary to bootstrap this container.
             log::warn!(
-                "container {}: sandbox shim rejected Create ({e}); falling back to shim start",
-                c.id
+                "container {}: sandbox shim rejected Create ({}); falling back to shim start",
+                c.id,
+                diag::root_cause(&e.to_string())
             );
+            log::debug!("container {}: full Create error: {e}", c.id);
             let params = self.start_params(&sandbox.binary, &c.id, bundle);
             // Once `start` has launched a dedicated shim, every later failure
             // must stop it again: it lives in its own systemd scope, so nothing
@@ -737,10 +793,14 @@ impl ShimRuntime {
                         let _ = bootstrap::delete(&params, BOOTSTRAP_TIMEOUT).await;
                     }
                     pump.finish().await;
+                    self.note_create_failure(sb, c, bundle, sandbox, &e2).await;
                     return Err(e2);
                 }
             }
         }
+        sandbox
+            .create_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let dedicated = !Arc::ptr_eq(&client, &sandbox.client);
         let pid = match client.start(&c.id).await {
             Ok(r) => r.pid,

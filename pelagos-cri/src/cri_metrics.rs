@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use metrics::{describe_gauge, gauge};
+use metrics::{describe_counter, describe_gauge, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 /// Installs the Prometheus recorder and binds the `/metrics` HTTP listener.
@@ -31,6 +31,11 @@ pub fn install(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     describe_gauge!(
         "pelagos_cri_uptime_seconds",
         "Seconds since this pelagos-cri process started"
+    );
+
+    describe_counter!(
+        "pelagos_cri_shim_create_failures_total",
+        "Container Creates a sandbox shim rejected (after the per-container fallback); see #659"
     );
 
     let start = Instant::now();
