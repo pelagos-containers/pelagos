@@ -11,6 +11,22 @@ fn the_real_ipc9_error_is_boiled_down_to_its_cause() {
     );
 }
 
+/// A host-side failure from the forced repro on ipc7: Kata names the source itself, inside a
+/// long debug dump of the mount.
+const HOST_SIDE_ERR: &str = r#"rpc status: Status { code: UNKNOWN, message: "Others(\"failed to handle message create container\\n\\nCaused by:\\n    0: handler volumes\\n    1: new share fs volume Mount { destination: \\\"/gone\\\", typ: Some(\\\"bind\\\"), source: Some(\\\"/nonexistent-659-source\\\"), uid_mappings: None }\\n    2: mount shared volume\\n    3: share to guest\\n    4: failed to bind mount /nonexistent-659-source to /run/kata-containers/shared/x\\n    5: Invalid path: /nonexistent-659-source: Others(\\n\\nStack backtrace:\\n   0: <unknown>\")" }"#;
+
+#[test]
+fn a_host_side_error_stays_readable() {
+    let c = root_cause(HOST_SIDE_ERR);
+    assert!(
+        c.starts_with("handler volumes > new share fs volume Mount"),
+        "{c}"
+    );
+    assert!(c.contains("Invalid path: /nonexistent-659-source"), "{c}");
+    assert!(!c.contains("Others("), "{c}");
+    assert!(c.len() < 700, "{} chars: {c}", c.len());
+}
+
 #[test]
 fn an_unstructured_error_is_kept_as_is_and_bounded() {
     assert_eq!(root_cause("boom"), "boom");

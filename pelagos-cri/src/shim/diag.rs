@@ -18,6 +18,20 @@ pub fn is_escalation_point(n: u32) -> bool {
     matches!(n, 3 | 10 | 30) || (n >= 100 && n % 100 == 0)
 }
 
+/// One step of a cause chain: without the `Others(` wrapper the shim's error type leaves
+/// behind, and cut to a readable length (the full text is in the bundle).
+fn tidy(step: &str) -> String {
+    let s = step
+        .trim()
+        .trim_end_matches("Others(")
+        .trim_end_matches([':', ' ']);
+    if s.chars().count() > 90 {
+        format!("{}...", s.chars().take(90).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
 /// The cause of a shim error, without the backtrace or the escaping. Best effort: the full
 /// text is still written to the bundle.
 pub fn root_cause(err: &str) -> String {
@@ -35,7 +49,7 @@ pub fn root_cause(err: &str) -> String {
                 && !rest.contains("<unknown>")
                 && !rest.contains("::")
             {
-                chain.push(rest.trim().to_string());
+                chain.push(tidy(rest));
             }
         }
     }
@@ -49,7 +63,7 @@ pub fn root_cause(err: &str) -> String {
             .filter_map(|m| tail.find(m))
             .min()
             .unwrap_or(tail.len().min(200));
-        inner = tail[..end].trim_end_matches(['\\', '"']).trim().to_string();
+        inner = tidy(tail[..end].trim_end_matches(['\\', '"']));
     }
     match (chain.is_empty(), inner.is_empty()) {
         (false, false) => format!("{}: {}", chain.join(" > "), inner),

@@ -6,6 +6,7 @@
 #
 #   NODE=ipc7 KUBECTL="ssh ipc4 sudo kubectl" scripts/test-kata-secret-volumes.sh up     # create + wait
 #   NODE=ipc7 KUBECTL="..." scripts/test-kata-secret-volumes.sh check                    # verify (e.g. after a reboot)
+#   NODE=ipc7 KUBECTL="..." NODE_EXEC="ssh ipc7 sudo" scripts/test-kata-secret-volumes.sh negative  # forced Create failures
 #   NODE=ipc7 KUBECTL="..." scripts/test-kata-secret-volumes.sh down                     # remove everything
 set -uo pipefail
 : "${NODE:?set NODE to the node that has the Kata handler}"
@@ -103,10 +104,56 @@ check() {
   echo "=== $PASS passed, $FAIL failed"; [ $FAIL = 0 ]
 }
 
+# A Kata pod whose bind-mount source does not exist on the host makes the shim reject every
+# container Create. The CRI must keep returning the error (the kubelet sees it) AND escalate:
+# after 3 consecutive rejections an error-level line naming the cause and the missing source,
+# and a diagnostics bundle (#659). Needs NODE_EXEC to run commands on the node, e.g.
+# NODE_EXEC="ssh ipc7 sudo".
+negative() {
+  : "${NODE_EXEC:?set NODE_EXEC (e.g. 'ssh ipc7 sudo') to read the node journal}"
+  echo "=== forced Create failures on $NODE"
+  local src=/nonexistent-659-source
+  k -n $NS delete pod bad --ignore-not-found --wait=true >/dev/null 2>&1
+  cat <<YAML | k apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata: {name: bad, namespace: $NS}
+spec:
+  nodeName: $NODE
+  runtimeClassName: $RC
+  restartPolicy: Always
+  tolerations: [{operator: Exists}]
+  volumes: [{name: gone, hostPath: {path: $src}}]
+  containers:
+    - name: c
+      image: $IMG
+      command: [sleep, "3600"]
+      volumeMounts: [{name: gone, mountPath: /gone}]
+YAML
+  local line="" i
+  for i in $(seq 1 24); do
+    line=$($NODE_EXEC journalctl -u pelagos-cri --since -3min --no-pager -o cat 2>/dev/null | grep "consecutive container Creates" | tail -1)
+    [ -n "$line" ] && break; sleep 5
+  done
+  [ -n "$line" ] && ok "escalated at error level after repeated rejections" || bad "no escalation line in the journal"
+  case "$line" in *ERROR*) ok "logged at ERROR" ;; *) bad "not logged at ERROR: ${line:0:120}" ;; esac
+  case "$line" in *"$src"*) ok "the cause names the missing source" ;; *) bad "cause does not name $src" ;; esac
+  case "$line" in *"/gone <- $src"*) ok "missing host mount source reported with its destination" ;; *) bad "missing-source report absent" ;; esac
+  local dir; dir=$(echo "$line" | sed -n 's/.*diagnostics: \(\/[^ ]*\).*/\1/p')
+  if [ -n "$dir" ] && $NODE_EXEC test -s "$dir/summary.txt" && $NODE_EXEC test -s "$dir/error.txt" && $NODE_EXEC test -s "$dir/config.json"; then
+    ok "diagnostics bundle written ($dir)"
+  else bad "bundle missing: ${dir:-none}"; fi
+  local ev; ev=$(k -n $NS get events --field-selector involvedObject.name=bad -o jsonpath={.items[*].message} 2>/dev/null)
+  case "$ev" in *"$src"*|*"Create"*|*"create"*) ok "the kubelet still sees the failure (not hidden)" ;; *) bad "no failure event on the pod: ${ev:0:150}" ;; esac
+  k -n $NS delete pod bad --wait=false >/dev/null 2>&1
+  echo "=== $PASS passed, $FAIL failed"; [ $FAIL = 0 ]
+}
+
 case "${1:-}" in
   up)    manifest | k apply -f - >/dev/null && echo "applied"; k -n $NS wait --for=condition=Ready pod/$POD --timeout=${WAIT:-300s}; check ;;
   check) check ;;
   down)  k delete ns $NS --wait=true 2>&1 | tail -1; k delete runtimeclass $RC 2>&1 | tail -1 ;;
+  negative) negative ;;
   manifest) manifest ;;
-  *) echo "usage: $0 up|check|down|manifest" >&2; exit 2 ;;
+  *) echo "usage: $0 up|check|negative|down|manifest" >&2; exit 2 ;;
 esac
