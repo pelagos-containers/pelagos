@@ -1704,9 +1704,13 @@ impl RuntimeService for RuntimeSvc {
         // A pod whose shim died unasked is not ready (#641); the kubelet then
         // stops and recreates it. The stored state is left alone: `NotReady` is
         // only ever written by `stop_pod_sandbox`.
+        let mut info: HashMap<String, String> = HashMap::new();
         if let Some(shim) = &self.shim {
             if shim.sandbox_lost(&sandbox_id) {
                 sandbox.state = SandboxState::NotReady;
+                if let Some(reason) = shim.sandbox_lost_reason(&sandbox_id) {
+                    info.insert("lostReason".to_string(), reason);
+                }
             }
         }
 
@@ -1755,7 +1759,7 @@ impl RuntimeService for RuntimeSvc {
 
         Ok(Response::new(PodSandboxStatusResponse {
             status: Some(status),
-            info: HashMap::new(),
+            info,
             containers_statuses: vec![],
             timestamp: now_ns(),
         }))

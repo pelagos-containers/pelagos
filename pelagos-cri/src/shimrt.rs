@@ -22,6 +22,7 @@ use containerd_shim_protos::api;
 use crate::shim::bootstrap::{self, StartParams};
 use crate::shim::bundle::Bundle;
 use crate::shim::client::ShimClient;
+use crate::shim::diag;
 use crate::shim::events::{placeholder_publish_binary, EventsSink};
 use crate::shim::exec::{self, ExecLimits, ExecOutcome, ExecRequest, ExecSession};
 use crate::shim::exit::{ContainerExit, ExitTracker};
@@ -103,6 +104,13 @@ struct SandboxShim {
     /// Set before a deliberate stop/remove so the watch does not mistake our
     /// own teardown for a loss.
     stopping: std::sync::atomic::AtomicBool,
+    /// Consecutive container Creates this sandbox's shim has rejected (reset by any success).
+    /// Drives the escalating log and the diagnostics bundle (#659).
+    create_failures: std::sync::atomic::AtomicU32,
+    /// Set once this sandbox has been recycled for repeated Create failures (#660).
+    recycled: std::sync::atomic::AtomicBool,
+    /// Why the sandbox was declared lost by us (recycling), for `PodSandboxStatus` info.
+    lost_reason: Mutex<Option<String>>,
 }
 
 impl SandboxShim {
@@ -119,6 +127,9 @@ impl SandboxShim {
             plan,
             lost: Default::default(),
             stopping: Default::default(),
+            create_failures: Default::default(),
+            recycled: Default::default(),
+            lost_reason: Default::default(),
         }
     }
     fn is_lost(&self) -> bool {
@@ -189,6 +200,8 @@ pub struct ShimRuntime {
     tasks: Mutex<HashMap<String, Arc<TaskCtx>>>,
     /// Serialises pause-image pulls so concurrent pods pull it once.
     pull_lock: tokio::sync::Mutex<()>,
+    /// Caps sandbox recycling per pod (#660).
+    recycles: Mutex<diag::RecycleLimiter>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -208,6 +221,7 @@ impl ShimRuntime {
             sandboxes: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             pull_lock: tokio::sync::Mutex::new(()),
+            recycles: Mutex::new(diag::RecycleLimiter::default()),
         })
     }
 
@@ -679,6 +693,129 @@ impl ShimRuntime {
         )?)
     }
 
+    /// A container Create the sandbox's shim rejected, even after the fallback (#659). Counts
+    /// consecutive failures; at the escalation points logs the cause at `error` level and
+    /// writes a diagnostics bundle naming missing mount sources. Never changes the outcome:
+    /// the error still goes back to the kubelet, so the failure stays visible.
+    async fn note_create_failure(
+        &self,
+        sb: &CriSandbox,
+        c: &CriContainer,
+        bundle: &Bundle,
+        sandbox: &SandboxShim,
+        err: &ShimError,
+    ) {
+        metrics::counter!("pelagos_cri_shim_create_failures_total").increment(1);
+        let n = sandbox
+            .create_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let text = err.to_string();
+        if !diag::is_escalation_point(n) {
+            self.maybe_recycle(sb, c, bundle, sandbox, &text, n).await;
+            return;
+        }
+        let bundle_dir = diag::capture(
+            &self.cfg.root.join("diag"),
+            &sb.id,
+            &c.id,
+            bundle.dir(),
+            &text,
+            n,
+        )
+        .await;
+        let config = std::fs::read(bundle.dir().join("config.json")).unwrap_or_default();
+        let missing = diag::missing_mount_sources(&config, |p| p.exists());
+        log::error!(
+            "sandbox {}: its shim has rejected {n} consecutive container Creates (latest {}): {}; \
+             missing host mount sources: {}; diagnostics: {}",
+            sb.id,
+            c.id,
+            diag::root_cause(&text),
+            if missing.is_empty() {
+                "none".to_string()
+            } else {
+                missing.join(", ")
+            },
+            bundle_dir
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "not written".into())
+        );
+        self.maybe_recycle(sb, c, bundle, sandbox, &text, n).await;
+    }
+
+    /// After `RECYCLE_AFTER_FAILURES` consecutive Create failures, declare the sandbox lost so
+    /// the kubelet recreates the pod instead of retrying into it forever (#660). Capped per
+    /// pod, and loud on both outcomes: past the cap it refuses and fails exactly as before.
+    /// The evidence bundle is written before anything is torn down.
+    async fn maybe_recycle(
+        &self,
+        sb: &CriSandbox,
+        c: &CriContainer,
+        bundle: &Bundle,
+        sandbox: &SandboxShim,
+        text: &str,
+        n: u32,
+    ) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        if n < diag::RECYCLE_AFTER_FAILURES || sandbox.is_lost() {
+            return;
+        }
+        let pod = format!("{}/{}/{}", sb.namespace, sb.name, sb.uid);
+        let verdict = lock(&self.recycles).try_acquire(&pod, std::time::Instant::now());
+        let nth = match verdict {
+            Ok(nth) => nth,
+            Err(done) => {
+                // Once per escalation point, not on every failure.
+                if n == diag::RECYCLE_AFTER_FAILURES || diag::is_escalation_point(n) {
+                    metrics::counter!("pelagos_cri_sandbox_recycle_refused_total").increment(1);
+                    log::error!(
+                        "sandbox {}: NOT recycling: pod {pod} has already had its sandbox recycled \
+                         {done} time(s) in the last hour (cap {}); {n} consecutive Create failures, \
+                         still failing as before: {}",
+                        sb.id,
+                        diag::RECYCLE_CAP,
+                        diag::root_cause(text)
+                    );
+                }
+                return;
+            }
+        };
+        if sandbox
+            .recycled
+            .compare_exchange(false, true, AcqRel, Acquire)
+            .is_err()
+        {
+            return; // another failure of this sandbox got here first
+        }
+        let dir = diag::capture(
+            &self.cfg.root.join("diag"),
+            &sb.id,
+            &c.id,
+            bundle.dir(),
+            text,
+            n,
+        )
+        .await;
+        let reason = format!(
+            "recycled after {n} consecutive container Create failures: {}",
+            diag::root_cause(text)
+        );
+        log::error!(
+            "sandbox {}: RECYCLING it (recycle {nth} of {} for pod {pod} this hour): {reason}; \
+             the kubelet will recreate the pod; evidence: {}",
+            sb.id,
+            diag::RECYCLE_CAP,
+            dir.map(|d| d.display().to_string())
+                .unwrap_or_else(|| "not written".into())
+        );
+        metrics::counter!("pelagos_cri_sandbox_recycled_total", "reason" => "create-failures")
+            .increment(1);
+        *lock(&sandbox.lost_reason) = Some(reason);
+        sandbox.lost.store(true, Release);
+        reap_lost_sandbox(&sb.id).await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_and_start(
         &self,
@@ -709,9 +846,11 @@ impl ShimRuntime {
         if let Err(e) = client.create(make_req()).await {
             // Fallback: ask the shim binary to bootstrap this container.
             log::warn!(
-                "container {}: sandbox shim rejected Create ({e}); falling back to shim start",
-                c.id
+                "container {}: sandbox shim rejected Create ({}); falling back to shim start",
+                c.id,
+                diag::root_cause(&e.to_string())
             );
+            log::debug!("container {}: full Create error: {e}", c.id);
             let params = self.start_params(&sandbox.binary, &c.id, bundle);
             // Once `start` has launched a dedicated shim, every later failure
             // must stop it again: it lives in its own systemd scope, so nothing
@@ -737,10 +876,14 @@ impl ShimRuntime {
                         let _ = bootstrap::delete(&params, BOOTSTRAP_TIMEOUT).await;
                     }
                     pump.finish().await;
+                    self.note_create_failure(sb, c, bundle, sandbox, &e2).await;
                     return Err(e2);
                 }
             }
         }
+        sandbox
+            .create_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let dedicated = !Arc::ptr_eq(&client, &sandbox.client);
         let pid = match client.start(&c.id).await {
             Ok(r) => r.pid,
@@ -806,6 +949,13 @@ impl ShimRuntime {
                 exited_at: None,
             }));
         self.exits.exit_of(id)
+    }
+
+    /// Why we declared `sandbox_id` lost ourselves (recycling, #660), if we did.
+    pub fn sandbox_lost_reason(&self, sandbox_id: &str) -> Option<String> {
+        lock(&self.sandboxes)
+            .get(sandbox_id)
+            .and_then(|sb| lock(&sb.lost_reason).clone())
     }
 
     /// Whether the shim of `sandbox_id` died without being asked to (#641).

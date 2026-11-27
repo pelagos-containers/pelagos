@@ -23,6 +23,7 @@
 pub mod bootstrap;
 pub mod bundle;
 pub mod client;
+pub mod diag;
 pub mod events;
 pub mod exec;
 pub mod exit;
