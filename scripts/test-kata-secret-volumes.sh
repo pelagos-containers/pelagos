@@ -146,6 +146,24 @@ YAML
   if [ -n "$dir" ] && $NODE_EXEC test -s "$dir/summary.txt" && $NODE_EXEC test -s "$dir/error.txt" && $NODE_EXEC test -s "$dir/config.json"; then
     ok "diagnostics bundle written ($dir)"
   else bad "bundle missing: ${dir:-none}"; fi
+  # Recycling (#660): after 5 consecutive rejections the CRI declares the sandbox lost so the
+  # kubelet recreates the pod; capped per pod, loudly, then it refuses and fails as before.
+  local rl=""
+  for i in $(seq 1 60); do
+    rl=$($NODE_EXEC journalctl -u pelagos-cri --since=@$t0 --no-pager -o cat 2>/dev/null | grep "RECYCLING it" | head -1)
+    [ -n "$rl" ] && break; sleep 5
+  done
+  [ -n "$rl" ] && ok "sandbox recycled after repeated failures" || bad "no RECYCLING line"
+  case "$rl" in *ERROR*"recycle 1 of 2"*"$src"*) ok "recycle is loud (ERROR), numbered against the cap, and names the cause" ;; *) bad "recycle line: ${rl:0:200}" ;; esac
+  local refused=""
+  # Past the cap (2 per pod per hour) it must stop recycling and say so; the failure goes on.
+  for i in $(seq 1 ${CAP_WAIT_ROUNDS:-100}); do
+    refused=$($NODE_EXEC journalctl -u pelagos-cri --since=@$t0 --no-pager -o cat 2>/dev/null | grep "NOT recycling" | head -1)
+    [ -n "$refused" ] && break; sleep 5
+  done
+  local nrec; nrec=$($NODE_EXEC journalctl -u pelagos-cri --since=@$t0 --no-pager -o cat 2>/dev/null | grep -c "RECYCLING it")
+  [ -n "$refused" ] && ok "past the cap it refuses to recycle, loudly" || bad "no NOT recycling line after $nrec recycle(s)"
+  [ "$nrec" = 2 ] && ok "exactly 2 recycles for the pod (the cap)" || bad "$nrec recycles (cap is 2)"
   local ev; ev=$(k -n $NS get events --field-selector involvedObject.name=bad -o jsonpath={.items[*].message} 2>/dev/null)
   case "$ev" in *"$src"*|*"Create"*|*"create"*) ok "the kubelet still sees the failure (not hidden)" ;; *) bad "no failure event on the pod: ${ev:0:150}" ;; esac
   k -n $NS delete pod bad --wait=false >/dev/null 2>&1

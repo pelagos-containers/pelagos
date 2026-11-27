@@ -38,6 +38,15 @@ pub fn install(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "Container Creates a sandbox shim rejected (after the per-container fallback); see #659"
     );
 
+    describe_counter!(
+        "pelagos_cri_sandbox_recycled_total",
+        "Sandboxes declared lost after repeated container Create failures so the pod is recreated (#660)"
+    );
+    describe_counter!(
+        "pelagos_cri_sandbox_recycle_refused_total",
+        "Recycles refused because the pod already hit the per-hour cap (#660); the failure continues"
+    );
+
     let start = Instant::now();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));

@@ -105,3 +105,21 @@ async fn a_bundle_names_the_cause_and_the_missing_mount_and_old_ones_are_pruned(
         "oldest pruned"
     );
 }
+
+#[test]
+fn recycling_is_capped_per_pod_and_per_window() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let at = |secs| t0 + Duration::from_secs(secs);
+    let mut l = RecycleLimiter::default();
+    assert_eq!(l.try_acquire("ns/p/u1", at(0)), Ok(1));
+    assert_eq!(l.try_acquire("ns/p/u1", at(60)), Ok(2));
+    // Third within the hour: refused, and the refusal is not recorded.
+    assert_eq!(l.try_acquire("ns/p/u1", at(120)), Err(2));
+    assert_eq!(l.try_acquire("ns/p/u1", at(3599)), Err(2));
+    // Another pod is independent.
+    assert_eq!(l.try_acquire("ns/q/u2", at(120)), Ok(1));
+    // After the first recycle ages out of the window one more is allowed.
+    assert_eq!(l.try_acquire("ns/p/u1", at(3601)), Ok(2));
+    assert_eq!(l.try_acquire("ns/p/u1", at(3602)), Err(2));
+}

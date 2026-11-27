@@ -32,6 +32,36 @@ fn tidy(step: &str) -> String {
     }
 }
 
+/// Consecutive Create failures on one sandbox after which it is recycled (#660), if the cap
+/// allows. The diagnostics bundle is already written at the 3rd.
+pub const RECYCLE_AFTER_FAILURES: u32 = 5;
+/// At most this many recycles per pod ...
+pub const RECYCLE_CAP: usize = 2;
+/// ... within this window. Past the cap the CRI stops recycling and fails as before, loudly.
+pub const RECYCLE_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Bounds how often one pod's sandbox is recycled, so a deterministic failure (bad spec, bad
+/// image) cannot loop through fresh sandboxes and look like progress (#660).
+#[derive(Default)]
+pub struct RecycleLimiter {
+    by_pod: std::collections::HashMap<String, Vec<std::time::Instant>>,
+}
+
+impl RecycleLimiter {
+    /// Record a recycle of `pod` at `now` if fewer than `RECYCLE_CAP` happened within
+    /// `RECYCLE_WINDOW`. `Ok(n)` is this recycle's number in the window (1-based); `Err(n)` is
+    /// how many already happened (the request is refused and not recorded).
+    pub fn try_acquire(&mut self, pod: &str, now: std::time::Instant) -> Result<usize, usize> {
+        let v = self.by_pod.entry(pod.to_string()).or_default();
+        v.retain(|t| now.saturating_duration_since(*t) < RECYCLE_WINDOW);
+        if v.len() >= RECYCLE_CAP {
+            return Err(v.len());
+        }
+        v.push(now);
+        Ok(v.len())
+    }
+}
+
 /// The cause of a shim error, without the backtrace or the escaping. Best effort: the full
 /// text is still written to the bundle.
 pub fn root_cause(err: &str) -> String {
