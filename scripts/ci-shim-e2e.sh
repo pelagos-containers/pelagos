@@ -121,6 +121,11 @@ if has_rt kata; then
   NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" \
     CRICTL="/usr/local/bin/k3s crictl -r unix:///run/pelagos/cri.sock" \
     bash scripts/test-shim-failure-recovery.sh
+  log "Kata pod with 11 shared Secret volumes, and diagnostics when Create keeps failing (#659)"
+  S659="scripts/test-kata-secret-volumes.sh"
+  NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" WAIT=300s bash "$S659" up
+  NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" NODE_EXEC=env bash "$S659" negative
+  NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" bash "$S659" down
 fi
 log "shim pods survive a pelagos-cri restart (#602, #618, #644)"
 NODE=$NODE KUBECTL="/usr/local/bin/k3s kubectl" RUNTIMES="$RUNTIMES" \

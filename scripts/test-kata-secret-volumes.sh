@@ -114,6 +114,9 @@ negative() {
   echo "=== forced Create failures on $NODE"
   local src=/nonexistent-659-source
   k -n $NS delete pod bad --ignore-not-found --wait=true >/dev/null 2>&1
+  # Only journal lines from after this point count: a line from an earlier run must not pass
+  # the test. Epoch seconds, so there is no space to lose through "ssh host cmd".
+  local t0; t0=$($NODE_EXEC date +%s)
   cat <<YAML | k apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
@@ -132,7 +135,7 @@ spec:
 YAML
   local line="" i
   for i in $(seq 1 24); do
-    line=$($NODE_EXEC journalctl -u pelagos-cri --since -3min --no-pager -o cat 2>/dev/null | grep "consecutive container Creates" | tail -1)
+    line=$($NODE_EXEC journalctl -u pelagos-cri --since=@$t0 --no-pager -o cat 2>/dev/null | grep "consecutive container Creates" | tail -1)
     [ -n "$line" ] && break; sleep 5
   done
   [ -n "$line" ] && ok "escalated at error level after repeated rejections" || bad "no escalation line in the journal"

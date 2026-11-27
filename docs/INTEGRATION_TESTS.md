@@ -6759,3 +6759,33 @@ frame or with a cut-short one, `TimedOut` while the supervisor is still going, a
 pipe's write end open (the read end is non-blocking: a blocking read there waited forever,
 which this test caught). `StartupNotifier` sends exactly one frame (a later call is a
 no-op) and `none()` is silent. Run with `cargo test --bin pelagos cli::compose`.
+
+## scripts/test-kata-secret-volumes.sh (root-less script; needs a node with the Kata handler and a kubectl; also runs in the shim-e2e CI job)
+
+#659. `up`/`check`: a Kata pod shaped like the one that did not recover after a node cold boot
+(11 Secret volumes, 3 containers, some volumes mounted by two containers) reaches Running, all
+three containers run, and each container reads every one of its secret mounts. Asserts the
+shape works at all, so a regression in shared or watchable secret mounts shows up here. The
+cold-boot case itself could not be reproduced (a clean reboot of ipc7 recovered in about 40 s
+with zero rejected Creates), so this does not claim to cover it; `check` can be re-run after a
+real reboot. `negative`: a Kata pod bind-mounting a host path that does not exist makes the shim
+reject every container Create. Asserts that, only counting journal lines written after the pod
+was created (an earlier run's line must not pass it): the CRI escalates after 3 consecutive
+rejections with an error-level line, the cause names the missing source, the missing host mount
+source is reported with its destination, a diagnostics bundle (summary, error, config.json)
+exists, and the kubelet still sees the failure on the pod. The last assertion is the "do not hide
+the failure" requirement: diagnostics are added, the error is not swallowed. A failure of the
+escalation assertions means a stuck sandbox is silent again.
+
+## pelagos-cri shim::diag unit tests
+
+#659. `root_cause` reduces the real guest error from ipc9 (nested escaping, three-level error
+chain, 25-frame backtrace) to `agent create container: No such file or directory (os error
+2)`, keeps a host-side error readable (chain steps capped, no `Others(` wrapper), and returns an
+unstructured error as is, bounded to 300 characters. `is_escalation_point` fires at 3, 10, 30 and
+then every 100 (a stuck sandbox must not flood the log or the disk). `missing_mount_sources`
+names bind sources that do not exist on the host (including those given only by `rbind`) and
+ignores proc/tmpfs mounts and invalid JSON. `capture` writes the bundle with the cause and the
+missing mount in `summary.txt` and keeps only the newest 5 bundles per sandbox. Run with
+`cargo test -p pelagos-cri shim::diag`.
+
