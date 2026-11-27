@@ -6777,6 +6777,15 @@ exists, and the kubelet still sees the failure on the pod. The last assertion is
 the failure" requirement: diagnostics are added, the error is not swallowed. A failure of the
 escalation assertions means a stuck sandbox is silent again.
 
+The same scenario then covers recycling (#660): after 5 consecutive rejections the CRI declares
+the sandbox lost so the kubelet recreates the pod (asserted: an ERROR line "RECYCLING it"
+numbered "recycle 1 of 2" that names the cause). The recreated pod fails the same way (the spec is
+deterministic), and the test waits for the cap: exactly 2 recycles for the pod, then an ERROR
+"NOT recycling" and the failure goes on as before. That last part is what stops a deterministic
+error looping through fresh sandboxes and looking like progress; if it fails, recycling is
+unbounded. It takes several minutes (kubelet backoff between sandbox retries);
+`CAP_WAIT_ROUNDS` bounds the wait for the cap.
+
 ## pelagos-cri shim::diag unit tests
 
 #659. `root_cause` reduces the real guest error from ipc9 (nested escaping, three-level error
@@ -6787,5 +6796,7 @@ then every 100 (a stuck sandbox must not flood the log or the disk). `missing_mo
 names bind sources that do not exist on the host (including those given only by `rbind`) and
 ignores proc/tmpfs mounts and invalid JSON. `capture` writes the bundle with the cause and the
 missing mount in `summary.txt` and keeps only the newest 5 bundles per sandbox. Run with
-`cargo test -p pelagos-cri shim::diag`.
+`cargo test -p pelagos-cri shim::diag`. `RecycleLimiter` (#660) admits two recycles per
+pod within the hour, refuses a third without recording the refusal, keeps pods independent, and
+admits another once the oldest recycle ages out of the window.
 
